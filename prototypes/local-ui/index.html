@@ -1,0 +1,568 @@
+<!doctype html>
+<!--
+  PROTOTYPE — throwaway. Local UI variants for agb-trader, issue #9.
+
+  Three variants of the local UI, switchable via ?variant= and the floating
+  bar at the bottom. Not production code: no framework, no build, no server,
+  every number invented, nothing fetches anything.
+
+  The variants disagree about what the UI is FOR, which is the actual open
+  question in the ticket:
+
+    A — Console.  The UI is where you operate the system day to day.
+    B — Ledger.   The UI is where you justify trusting it.
+    C — Timeline. The UI is the archive of every decision it made.
+
+  Run:  python3 -m http.server -d prototypes/local-ui 8765
+  Then: http://localhost:8765/?variant=A
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agb-trader — local UI prototype</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel2: #1c232c; --line: #2a323d;
+    --ink: #e6edf3; --dim: #8b949e; --dimmer: #616b76;
+    --ok: #3fb950; --warn: #d29922; --bad: #f85149; --accent: #58a6ff;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 14px/1.5 -apple-system, system-ui, sans-serif; padding-bottom: 72px; }
+  h1, h2, h3 { font-weight: 600; margin: 0; }
+  a { color: var(--accent); }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .pos { color: var(--ok); } .neg { color: var(--bad); } .dim { color: var(--dim); }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 99px;
+          font-size: 11px; font-family: var(--mono); border: 1px solid var(--line); }
+  .pill.ok { color: var(--ok); border-color: #1f4a2a; background: #0f2915; }
+  .pill.warn { color: var(--warn); border-color: #5c4413; background: #2a1f06; }
+  .pill.bad { color: var(--bad); border-color: #6b2222; background: #2b1111; }
+  table { border-collapse: collapse; width: 100%; }
+  th { text-align: left; font-weight: 500; color: var(--dim); font-size: 11px;
+       text-transform: uppercase; letter-spacing: .06em; padding: 6px 10px;
+       border-bottom: 1px solid var(--line); }
+  td { padding: 7px 10px; border-bottom: 1px solid #1b2129; }
+  tr:last-child td { border-bottom: 0; }
+
+  /* ---------- floating variant switcher (not part of any design) ---------- */
+  #switcher { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 4px; z-index: 999;
+    background: #f0f6fc; color: #0d1117; border-radius: 99px; padding: 5px 6px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.6); font-size: 13px; }
+  #switcher button { border: 0; background: transparent; cursor: pointer;
+    font-size: 16px; line-height: 1; padding: 4px 9px; border-radius: 99px; color: inherit; }
+  #switcher button:hover { background: #d0d7de; }
+  #switcher .label { padding: 0 8px; font-weight: 600; white-space: nowrap; }
+  #switcher .hint { color: #57606a; font-size: 11px; padding-right: 8px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<div id="switcher"></div>
+<script>
+/* ======================================================================
+   Invented data. Consistent with the Telegram prototype's numbers so the
+   two surfaces can be compared side by side.
+   ====================================================================== */
+var DATA = {
+  mode: "LIVE", level: 0, halted: false, paused: false,
+  equity: 48210.44, cashPct: 0.4, cleanRun: 3, cleanNeeded: 6,
+  since: "2026-01-02", monthsLive: 9,
+  ret: 11.4, bench: 7.9, maxDD: -12.1, worstMonth: -6.3,
+  cpcvPct: 61,
+  pending: {
+    id: "2026-10", deadline: "15:45 ET", minsLeft: 58, turnover: 15.2,
+    cashAfter: 0.3, topSector: "Industrials", topSectorPct: 30,
+    sells: [["CULP","Culp Inc",47,12],["NVEE","NV5 Global",38,9],["SMLR","Semler Scientific",33,21]],
+    buys:  [["AMRC","Ameresco",4,0.71],["HCKT","Hackett Group",7,0.83],["PLPC","Preformed Line",11,0.58]],
+    flags: [["PLPC","accounting integrity 1/4, the panel's weakest score this month"]]
+  },
+  gate: [
+    ["price data freshness","SEP snapshot 2026-09-30, 0 days stale",1],
+    ["fundamentals point-in-time","SF1 datekey <= signal date on 3,214 rows",1],
+    ["universe size","3,214 names, within 2,500-5,000",1],
+    ["panel coverage","50 of 50 shortlisted names scored",1],
+    ["panel dispersion","sd 0.19, above 0.05 floor",1],
+    ["basket size","20 names",1],
+    ["basket weights","equal, max deviation 0.02%",1],
+    ["no leverage","gross 99.6% of equity",1],
+    ["no shorts","0 short orders",1],
+    ["sector concentration","Industrials 30%, below 40% cap",1],
+    ["order notional","max $2,410, below $5,000 cap",1],
+    ["duplicate orders","none against today's submitted set",1]
+  ],
+  validation: {
+    dsr: 0.94, dsrGate: 0.90, pbo: 0.31, pboGate: 0.50,
+    sharpe: 1.42, sharpeGate: 2.00, trials: 47, paths: 4000,
+    worstPathDD: -18.1, medianPathSharpe: 1.31,
+    certified: "2025-11-14", model: "lgbm-lambdarank-v4", refit: "2026-01-04"
+  },
+  promotion: [
+    ["Backtest","certified","2018-01 to 2025-10, walk-forward, cost-inclusive","2025-11-14"],
+    ["Paper","complete","12 months autonomous, fills matched official closes","2025-12-31"],
+    ["Live","active","L0, every rebalance approved by hand","2026-01-02"]
+  ],
+  positions: [
+    ["ACLS",5.0,18.2,4,0.88,6],["AMPH",5.0,-3.1,2,0.74,14],["ARIS",5.0,9.7,5,0.81,9],
+    ["ATEN",5.0,21.4,3,0.79,3],["AVAV",5.0,-6.8,1,0.69,18],["BCC",5.0,4.2,5,0.85,12],
+    ["CALM",5.0,12.9,2,0.91,7],["CEIX",5.0,-1.4,3,0.66,20],["CRVL",5.0,7.6,4,0.87,10],
+    ["CULP",5.0,-14.2,5,0.52,47],["DAKT",5.0,15.1,1,0.77,5],["EPAC",5.0,2.8,3,0.83,13],
+    ["GRBK",5.0,-8.9,2,0.71,17],["IESC",5.0,24.6,4,0.80,2],["JBSS",5.0,1.1,5,0.89,15],
+    ["MLI",5.0,11.3,3,0.84,8],["NVEE",5.0,-9.4,4,0.61,38],["PRDO",5.0,6.5,2,0.86,11],
+    ["SMLR",5.0,-11.7,3,0.58,33],["TGLS",5.0,13.8,1,0.82,4]
+  ],
+  rubric: {
+    PLPC: { total: 14, pct: 22, dims: [
+      ["going concern / liquidity",4,"Net cash, no revolver draw, current ratio 3.1x."],
+      ["accounting integrity",1,"Auditor change 8-K 2026-08-14. New ICFR risk factor added versus the FY2025 10-K."],
+      ["litigation / regulatory",3,"One ordinary-course contract dispute, immaterial to earnings."],
+      ["business-model impairment",2,"Two consecutive quarters of order-book decline disclosed in MD&A."],
+      ["governance / management",2,"CFO departed 2026-06, interim in seat, no permanent hire named."],
+      ["disclosure delta",2,"Item 1A expanded on supply concentration versus prior year."]
+    ], sources: ["10-K FY2025 (2026-03-02)","10-Q Q2 2026 (2026-08-07)","8-K (2026-08-14)"] }
+  },
+  events: [
+    {m:"2026-10", state:"pending",  who:"—",       note:"awaiting approval, 58m to cutoff", ret:null, turn:15.2},
+    {m:"2026-09", state:"approved", who:"agb1986", note:"6 of 6 filled at the official close, 0.0 bp slippage", ret:2.1, turn:12.7},
+    {m:"2026-08", state:"expired",  who:"system",  note:"cutoff passed with no answer, book unchanged", ret:-0.8, turn:0},
+    {m:"2026-07", state:"approved", who:"agb1986", note:"4 of 4 filled", ret:3.4, turn:9.8},
+    {m:"2026-06", state:"halted",   who:"system",  note:"gate failed: SEP snapshot 30 days stale", ret:-2.2, turn:0},
+    {m:"2026-05", state:"approved", who:"agb1986", note:"8 of 8 filled, 0.3 bp slippage", ret:1.6, turn:19.1},
+    {m:"2026-04", state:"rejected", who:"agb1986", note:"reject reason: two names on the same customer", ret:-6.3, turn:0},
+    {m:"2026-03", state:"approved", who:"agb1986", note:"6 of 6 filled", ret:4.9, turn:14.2}
+  ],
+  alerts: [
+    ["2026-09-08 15:31","drawdown","Live drawdown -19.4% versus worst CPCV path -18.1%. Nothing was done."],
+    ["2026-08-31 16:02","expiry","Rebalance 2026-08 expired without a decision. No orders sent."],
+    ["2026-06-30 15:29","halt","Gate failed on price data freshness. Rebalance not submitted."]
+  ]
+};
+
+/* ---------- tiny helpers ---------- */
+function el(html) { var d = document.createElement("div"); d.innerHTML = html.trim(); return d.firstChild; }
+function money(n) { return "$" + n.toLocaleString("en-US", {maximumFractionDigits: 0}); }
+function sign(n) { return (n > 0 ? "+" : "") + n.toFixed(1) + "%"; }
+function cls(n) { return n > 0 ? "pos" : (n < 0 ? "neg" : "dim"); }
+function stateBadge(s) {
+  var m = { approved:"ok", pending:"warn", expired:"bad", halted:"bad", rejected:"bad" };
+  return '<span class="pill ' + m[s] + '">' + s + '</span>';
+}
+
+/* ======================================================================
+   Shared fragments. A shared <Header> is allowed; a shared <Layout> is not
+   — the variants are supposed to disagree about layout.
+   ====================================================================== */
+function header(sub) {
+  var d = DATA;
+  var badge = d.halted ? '<span class="pill bad">HALTED</span>'
+            : d.paused ? '<span class="pill warn">PAUSED</span>'
+            : '<span class="pill ok">RUNNING</span>';
+  return '<header style="display:flex;align-items:center;gap:14px;padding:14px 22px;' +
+    'border-bottom:1px solid var(--line);background:var(--panel)">' +
+    '<strong style="letter-spacing:.02em">agb-trader</strong>' +
+    '<span class="pill">' + d.mode + '</span>' +
+    '<span class="pill">L' + d.level + '</span>' + badge +
+    '<span class="dim num">' + money(d.equity) + '</span>' +
+    '<span style="margin-left:auto;color:var(--dimmer);font-size:12px">' + sub + '</span>' +
+    '</header>';
+}
+function rubricRows(t) {
+  return DATA.rubric[t].dims.map(function (d) {
+    var c = d[1] <= 1 ? "bad" : (d[1] === 2 ? "warn" : "ok");
+    return '<tr><td style="width:210px">' + d[0] + '</td>' +
+      '<td style="width:60px"><span class="pill ' + c + '">' + d[1] + '/4</span></td>' +
+      '<td class="dim">' + d[2] + '</td></tr>';
+  }).join("");
+}
+
+/* ======================================================================
+   VARIANT A — Console.
+   Premise: the UI is where you operate the system. One column, ordered by
+   what needs you soonest. The pending basket is the page; everything else
+   is reference material under it. Primary affordance: approve or reject.
+   ====================================================================== */
+function variantA() {
+  var d = DATA, p = d.pending;
+  var sells = p.sells.map(function (s) {
+    return '<tr><td class="neg">OUT</td><td><strong>' + s[0] + '</strong> <span class="dim">' + s[1] +
+      '</span></td><td class="num dim">rank ' + s[2] + ' <span style="color:var(--dimmer)">(was ' + s[3] + ')</span></td></tr>';
+  }).join("");
+  var buys = p.buys.map(function (b) {
+    return '<tr><td class="pos">IN</td><td><strong>' + b[0] + '</strong> <span class="dim">' + b[1] +
+      '</span></td><td class="num dim">rank ' + b[2] + ' · safety ' + b[3].toFixed(2) + '</td></tr>';
+  }).join("");
+  var flags = p.flags.map(function (f) {
+    return '<div style="padding:10px 14px;background:#2a1f06;border:1px solid #5c4413;border-radius:6px;margin-top:10px">' +
+      '<span class="pill warn">flag</span> <strong>' + f[0] + '</strong> — ' + f[1] +
+      ' <a href="#rubric">rubric</a></div>';
+  }).join("");
+  var gate = d.gate.map(function (g) {
+    return '<tr><td style="width:22px" class="pos">✓</td><td style="width:230px">' + g[0] +
+      '</td><td class="dim">' + g[1] + '</td></tr>';
+  }).join("");
+  var pos = d.positions.map(function (r) {
+    return '<tr><td><strong>' + r[0] + '</strong></td><td class="num">' + r[1].toFixed(1) +
+      '%</td><td class="num ' + cls(r[2]) + '">' + sign(r[2]) + '</td><td class="num dim">' + r[5] +
+      '</td><td class="num dim">' + r[4].toFixed(2) + '</td></tr>';
+  }).join("");
+
+  return '' +
+  header('local UI · nothing here sends an order without you') +
+  '<main style="max-width:820px;margin:0 auto;padding:22px">' +
+
+    '<section style="border:1px solid #5c4413;border-radius:10px;background:var(--panel);overflow:hidden">' +
+      '<div style="padding:14px 18px;background:#2a1f06;display:flex;align-items:center;gap:12px">' +
+        '<span class="pill warn">decision needed</span>' +
+        '<strong>Rebalance ' + p.id + '</strong>' +
+        '<span style="margin-left:auto" class="num">' + p.minsLeft + ' min left · cutoff ' + p.deadline + '</span>' +
+      '</div>' +
+      '<div style="padding:16px 18px">' +
+        '<table>' + sells + buys + '</table>' +
+        '<div class="dim" style="padding:8px 10px;border-bottom:1px solid #1b2129">17 positions unchanged</div>' +
+        '<div class="num dim" style="padding:12px 10px 0">turnover ' + p.turnover + '% · cash after ' +
+          p.cashAfter + '% · top sector ' + p.topSector + ' ' + p.topSectorPct + '%</div>' +
+        flags +
+        '<div style="display:flex;gap:10px;align-items:center;margin-top:16px">' +
+          '<button style="background:var(--ok);color:#04170a;border:0;padding:9px 20px;border-radius:6px;font-weight:600;cursor:pointer">Approve ' + p.id + '</button>' +
+          '<button style="background:transparent;color:var(--bad);border:1px solid #6b2222;padding:9px 20px;border-radius:6px;cursor:pointer">Reject</button>' +
+          '<span class="dim" style="font-size:12px">No answer by ' + p.deadline + ' means no trades this month.</span>' +
+        '</div>' +
+      '</div>' +
+    '</section>' +
+
+    '<section style="display:flex;gap:12px;margin-top:18px">' +
+      panelA("Autonomy", 'L' + d.level, d.cleanRun + ' of ' + d.cleanNeeded + ' clean rebalances toward L1') +
+      panelA("Return since live", sign(d.ret), 'benchmark ' + sign(d.bench) + ' · ' + d.monthsLive + ' months') +
+      panelA("Drawdown", d.maxDD.toFixed(1) + '%', 'worst backtest path ' + d.validation.worstPathDD + '%') +
+      panelA("Kill-switch", 'armed', 'pause halts order flow · liquidate is two-step') +
+    '</section>' +
+
+    section('Pre-trade gate — 12 of 12 passed', '<table>' + gate + '</table>') +
+
+    '<div id="rubric"></div>' +
+    section('Why PLPC — panel rubric ' + DATA.rubric.PLPC.total + '/24 (weakest 22% of this month\'s 50)',
+      '<table>' + rubricRows("PLPC") + '</table>' +
+      '<div class="dim" style="padding:10px 12px;font-size:12px">Sources: ' + DATA.rubric.PLPC.sources.join(" · ") + '</div>') +
+
+    section('Positions — 20 names, equal weight',
+      '<table><tr><th>ticker</th><th>weight</th><th>return</th><th>rank</th><th>safety</th></tr>' + pos + '</table>') +
+
+  '</main>';
+}
+function panelA(label, big, sub) {
+  return '<div style="flex:1;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px">' +
+    '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dim)">' + label + '</div>' +
+    '<div class="num" style="font-size:20px;margin:4px 0">' + big + '</div>' +
+    '<div class="dim" style="font-size:11px">' + sub + '</div></div>';
+}
+function section(title, inner) {
+  return '<section style="margin-top:18px;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden">' +
+    '<h2 style="font-size:13px;padding:11px 14px;border-bottom:1px solid var(--line);color:var(--ink)">' + title + '</h2>' +
+    inner + '</section>';
+}
+
+/* ======================================================================
+   VARIANT B — Ledger.
+   Premise: the UI is where you decide whether to keep trusting the system.
+   Persistent left nav over separate dashboards, evidence first: the
+   validation gates and the promotion ladder are the landing view, and the
+   pending basket is a thin banner you click through to. Primary affordance:
+   navigate between dashboards and compare live against what was certified.
+   ====================================================================== */
+var B_VIEW = "validation";
+var B_NAV = [
+  ["validation", "Validation"],
+  ["promotion", "Promotion"],
+  ["performance", "Performance"],
+  ["basket", "Rebalance " + DATA.pending.id],
+  ["positions", "Positions"],
+  ["panel", "Panel"],
+  ["gate", "Gate"],
+  ["alerts", "Alerts"]
+];
+function variantB() {
+  var nav = B_NAV.map(function (n) {
+    var on = n[0] === B_VIEW;
+    return '<a href="#" data-bview="' + n[0] + '" style="display:block;padding:7px 14px;border-radius:6px;' +
+      'text-decoration:none;font-size:13px;' +
+      (on ? 'background:var(--panel2);color:var(--ink);font-weight:600' : 'color:var(--dim)') + '">' + n[1] + '</a>';
+  }).join("");
+  return header('local UI · evidence view') +
+    '<div style="display:flex;min-height:calc(100vh - 120px)">' +
+      '<nav style="width:190px;flex:none;border-right:1px solid var(--line);padding:14px 8px;background:var(--panel)">' +
+        '<div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--dimmer);padding:0 14px 8px">Dashboards</div>' +
+        nav +
+        '<div style="margin-top:18px;padding:10px 14px;border-top:1px solid var(--line);font-size:11px;color:var(--dimmer)">' +
+          'model ' + DATA.validation.model + '<br>certified ' + DATA.validation.certified +
+          '<br>last refit ' + DATA.validation.refit + '</div>' +
+      '</nav>' +
+      '<main style="flex:1;padding:0 0 30px">' +
+        '<div style="display:flex;gap:10px;align-items:center;padding:10px 22px;background:#2a1f06;border-bottom:1px solid #5c4413">' +
+          '<span class="pill warn">decision needed</span>' +
+          '<span>Rebalance ' + DATA.pending.id + ' expires in ' + DATA.pending.minsLeft + ' min</span>' +
+          '<a href="#" data-bview="basket" style="margin-left:auto">Open</a>' +
+        '</div>' +
+        '<div style="padding:20px 22px;max-width:900px">' + bView() + '</div>' +
+      '</main>' +
+    '</div>';
+}
+function bView() {
+  var d = DATA, v = d.validation;
+  if (B_VIEW === "validation") {
+    var g = [
+      ["Deflated Sharpe ratio", v.dsr, "≥ " + v.dsrGate, v.dsr >= v.dsrGate, v.trials + " trials declared"],
+      ["Probability of backtest overfitting", v.pbo, "≤ " + v.pboGate, v.pbo <= v.pboGate, "CPCV, " + v.paths + " paths"],
+      ["Cost-inclusive Sharpe", v.sharpe, "≥ " + v.sharpeGate.toFixed(2), v.sharpe >= v.sharpeGate, "median path " + v.medianPathSharpe]
+    ].map(function (r) {
+      return '<tr><td style="width:290px">' + r[0] + '</td>' +
+        '<td class="num" style="font-size:16px">' + r[1] + '</td>' +
+        '<td class="num dim">' + r[2] + '</td>' +
+        '<td>' + (r[3] ? '<span class="pill ok">pass</span>' : '<span class="pill bad">fail</span>') + '</td>' +
+        '<td class="dim">' + r[4] + '</td></tr>';
+    }).join("");
+    return h2B("Validation gates") +
+      '<div class="dim" style="margin-bottom:12px">These certify the classical ranker only. The panel is unbacktested by construction and is validated forward, in paper.</div>' +
+      card('<table><tr><th>gate</th><th>value</th><th>threshold</th><th></th><th>basis</th></tr>' + g + '</table>') +
+      h2B("CPCV path distribution") +
+      card('<div style="padding:14px">' + histB() +
+        '<div class="dim" style="margin-top:10px;font-size:12px">Live drawdown ' + d.maxDD +
+        '% sits at the ' + d.cpcvPct + 'th percentile of ' + v.paths +
+        ' backtest paths. Alert thresholds are taken from this distribution, not chosen.</div></div>');
+  }
+  if (B_VIEW === "promotion") {
+    var rows = d.promotion.map(function (p) {
+      var c = p[1] === "active" ? "ok" : (p[1] === "certified" ? "ok" : "");
+      return '<tr><td style="width:110px"><strong>' + p[0] + '</strong></td>' +
+        '<td style="width:110px"><span class="pill ' + c + '">' + p[1] + '</span></td>' +
+        '<td class="dim">' + p[2] + '</td><td class="num dim">' + p[3] + '</td></tr>';
+    }).join("");
+    return h2B("Promotion state") + card('<table>' + rows + '</table>') +
+      h2B("Autonomy ladder") + card('<table>' +
+        '<tr><td style="width:60px"><span class="pill ok">L0</span></td><td>Every rebalance approved by hand.</td><td class="dim">current</td></tr>' +
+        '<tr><td><span class="pill">L1</span></td><td>Auto-approve when no flags and turnover under 20%.</td><td class="dim">' +
+          d.cleanRun + ' of ' + d.cleanNeeded + ' clean rebalances</td></tr>' +
+        '<tr><td><span class="pill">L2</span></td><td>Auto-approve unless the gate fails.</td><td class="dim">locked</td></tr></table>');
+  }
+  if (B_VIEW === "performance") {
+    var rows2 = [
+      ["Return since live", sign(d.ret), "benchmark " + sign(d.bench)],
+      ["Max drawdown", d.maxDD.toFixed(1) + "%", "worst backtest path " + v.worstPathDD + "%"],
+      ["Worst month", d.worstMonth.toFixed(1) + "%", "2026-04, rebalance rejected"],
+      ["Months live", d.monthsLive, "since " + d.since]
+    ].map(function (r) {
+      return '<tr><td style="width:220px">' + r[0] + '</td><td class="num" style="font-size:16px">' +
+        r[1] + '</td><td class="dim">' + r[2] + '</td></tr>';
+    }).join("");
+    return h2B("Live versus expected") + card('<table>' + rows2 + '</table>') +
+      '<div class="dim" style="margin-top:12px;font-size:12px">Nine months of live returns cannot distinguish a working strategy from a lucky one. This view exists to detect malfunction, not to judge the edge.</div>';
+  }
+  if (B_VIEW === "basket") {
+    var p = d.pending;
+    var rows3 = p.sells.map(function (s) {
+      return '<tr><td class="neg">OUT</td><td><strong>' + s[0] + '</strong> ' + s[1] +
+        '</td><td class="num dim">rank ' + s[2] + ' (was ' + s[3] + ')</td></tr>';
+    }).concat(p.buys.map(function (b) {
+      return '<tr><td class="pos">IN</td><td><strong>' + b[0] + '</strong> ' + b[1] +
+        '</td><td class="num dim">rank ' + b[2] + ' · safety ' + b[3].toFixed(2) + '</td></tr>';
+    })).join("");
+    return h2B("Rebalance " + p.id) + card('<table>' + rows3 +
+      '<tr><td></td><td class="dim">17 unchanged</td><td></td></tr></table>' +
+      '<div class="num dim" style="padding:12px 14px">turnover ' + p.turnover + '% · cash after ' +
+      p.cashAfter + '% · ' + p.topSector + ' ' + p.topSectorPct + '%</div>') +
+      '<div style="margin-top:14px;display:flex;gap:10px;align-items:center">' +
+        '<button style="background:var(--ok);color:#04170a;border:0;padding:9px 20px;border-radius:6px;font-weight:600;cursor:pointer">Approve</button>' +
+        '<button style="background:transparent;color:var(--bad);border:1px solid #6b2222;padding:9px 20px;border-radius:6px;cursor:pointer">Reject</button>' +
+        '<span class="dim" style="font-size:12px">No answer by ' + p.deadline + ' means no trades.</span></div>';
+  }
+  if (B_VIEW === "positions") {
+    var rows4 = d.positions.map(function (r) {
+      return '<tr><td><strong>' + r[0] + '</strong></td><td class="num">' + r[1].toFixed(1) + '%</td>' +
+        '<td class="num ' + cls(r[2]) + '">' + sign(r[2]) + '</td><td class="num dim">' + r[3] +
+        '</td><td class="num dim">' + r[4].toFixed(2) + '</td><td class="num dim">' + r[5] + '</td></tr>';
+    }).join("");
+    return h2B("Positions") + card('<table><tr><th>ticker</th><th>weight</th><th>return</th>' +
+      '<th>months held</th><th>safety</th><th>rank</th></tr>' + rows4 + '</table>');
+  }
+  if (B_VIEW === "panel") {
+    return h2B("Panel — PLPC " + d.rubric.PLPC.total + "/24") +
+      card('<table>' + rubricRows("PLPC") + '</table>' +
+        '<div class="dim" style="padding:10px 14px;font-size:12px">Sources: ' + d.rubric.PLPC.sources.join(" · ") + '</div>') +
+      '<div class="dim" style="margin-top:12px;font-size:12px">Judge: Opus 5. Debate roles saw a name-scrubbed extract plus sector. SEC filings only.</div>';
+  }
+  if (B_VIEW === "gate") {
+    var rows5 = d.gate.map(function (g2) {
+      return '<tr><td style="width:22px" class="pos">✓</td><td style="width:250px">' + g2[0] +
+        '</td><td class="dim">' + g2[1] + '</td></tr>';
+    }).join("");
+    return h2B("Pre-trade gate — 12 of 12") + card('<table>' + rows5 + '</table>') +
+      '<div class="dim" style="margin-top:12px;font-size:12px">A failing check halts the whole rebalance. It never skips the offending order and sends the rest.</div>';
+  }
+  var rows6 = d.alerts.map(function (a) {
+    return '<tr><td class="num dim" style="width:150px">' + a[0] + '</td><td style="width:90px"><span class="pill warn">' +
+      a[1] + '</span></td><td>' + a[2] + '</td></tr>';
+  }).join("");
+  return h2B("Alerts") + card('<table>' + rows6 + '</table>') +
+    '<div class="dim" style="margin-top:12px;font-size:12px">Alerts notify. They never act.</div>';
+}
+function h2B(t) { return '<h2 style="font-size:15px;margin:22px 0 10px">' + t + '</h2>'; }
+function card(inner) {
+  return '<div style="background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden">' + inner + '</div>';
+}
+function histB() {
+  var bars = [2,5,11,19,28,37,44,48,43,35,26,17,10,5,2];
+  var max = 48;
+  return '<div style="display:flex;align-items:flex-end;gap:3px;height:90px">' + bars.map(function (b, i) {
+    var live = i === 8;
+    return '<div style="flex:1;height:' + (b / max * 100) + '%;background:' +
+      (live ? 'var(--accent)' : '#2f3945') + ';border-radius:2px 2px 0 0"></div>';
+  }).join("") + '</div>' +
+  '<div class="dim num" style="display:flex;justify-content:space-between;font-size:11px;margin-top:4px">' +
+  '<span>-30%</span><span style="color:var(--accent)">live -12.1%</span><span>0%</span></div>';
+}
+
+/* ======================================================================
+   VARIANT C — Timeline.
+   Premise: the UI is the archive of every decision the system made and who
+   made it. One reverse-chronological stream of rebalances, halts, expiries
+   and alerts; positions, gate and panel are reached by expanding the event
+   that produced them, not by navigating to a dashboard. Primary affordance:
+   scroll back and expand.
+   ====================================================================== */
+var C_OPEN = { "2026-10": true };
+function variantC() {
+  var d = DATA;
+  var rows = d.events.map(function (e) { return eventC(e); }).join("");
+  return header('local UI · decision log') +
+    '<main style="max-width:760px;margin:0 auto;padding:22px">' +
+      '<div style="display:flex;gap:16px;align-items:baseline;margin-bottom:4px">' +
+        '<h1 style="font-size:17px">Decision log</h1>' +
+        '<span class="dim" style="font-size:12px">' + d.events.length + ' rebalance cycles since ' + d.since +
+        ' · ' + money(d.equity) + ' · ' + sign(d.ret) + '</span>' +
+      '</div>' +
+      '<div class="dim" style="font-size:12px;margin-bottom:18px">Every line names an actor. <strong>system</strong> is an actor: an expiry happened to you, not by you.</div>' +
+      rows +
+      '<div style="margin-top:24px;padding-top:14px;border-top:1px solid var(--line)" class="dim">' +
+        'Earlier cycles collapse into the paper-trading period (' + d.promotion[1][2] + ').</div>' +
+    '</main>';
+}
+function eventC(e) {
+  var open = !!C_OPEN[e.m];
+  var body = open ? eventBodyC(e) : "";
+  var ret = e.ret === null ? '<span class="dim">—</span>'
+          : '<span class="num ' + cls(e.ret) + '">' + sign(e.ret) + '</span>';
+  return '<div style="display:flex;gap:14px">' +
+    '<div style="width:76px;flex:none;text-align:right;padding-top:12px" class="num dim">' + e.m + '</div>' +
+    '<div style="width:1px;background:var(--line);position:relative">' +
+      '<div style="position:absolute;top:16px;left:-4px;width:9px;height:9px;border-radius:99px;background:' +
+        (e.state === "approved" ? "var(--ok)" : e.state === "pending" ? "var(--warn)" : "var(--bad)") + '"></div>' +
+    '</div>' +
+    '<div style="flex:1;padding:8px 0 14px">' +
+      '<a href="#" data-cevent="' + e.m + '" style="display:block;text-decoration:none;color:inherit;' +
+        'background:var(--panel);border:1px solid ' + (e.state === "pending" ? "#5c4413" : "var(--line)") +
+        ';border-radius:8px;padding:11px 14px">' +
+        '<div style="display:flex;gap:10px;align-items:center">' +
+          stateBadge(e.state) +
+          '<span class="dim">by ' + e.who + '</span>' +
+          '<span style="margin-left:auto">' + ret + '</span>' +
+          '<span class="dim num" style="font-size:11px;width:74px;text-align:right">turnover ' + e.turn.toFixed(1) + '%</span>' +
+          '<span class="dim">' + (open ? "▾" : "▸") + '</span>' +
+        '</div>' +
+        '<div style="margin-top:5px">' + e.note + '</div>' +
+      '</a>' + body +
+    '</div></div>';
+}
+function eventBodyC(e) {
+  var d = DATA;
+  if (e.m !== "2026-10") {
+    return '<div style="margin-top:8px;padding:12px 14px;background:var(--panel2);border:1px solid var(--line);border-radius:8px">' +
+      '<div class="dim" style="font-size:12px">Snapshot at decision time: 20 names, equal weight, gate ' +
+      (e.state === "halted" ? '<span class="pill bad">1 of 12 failed</span>' : '<span class="pill ok">12 of 12</span>') +
+      '. Basket, gate detail and panel scores for this cycle are stored and reachable from here.</div></div>';
+  }
+  var p = d.pending;
+  var diff = p.sells.map(function (s) {
+    return '<tr><td class="neg" style="width:38px">OUT</td><td><strong>' + s[0] + '</strong> <span class="dim">' +
+      s[1] + '</span></td><td class="num dim">rank ' + s[2] + ' (was ' + s[3] + ')</td></tr>';
+  }).concat(p.buys.map(function (b) {
+    return '<tr><td class="pos" style="width:38px">IN</td><td><strong>' + b[0] + '</strong> <span class="dim">' +
+      b[1] + '</span></td><td class="num dim">rank ' + b[2] + ' · safety ' + b[3].toFixed(2) + '</td></tr>';
+  })).join("");
+  return '<div style="margin-top:8px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:4px 4px 14px">' +
+    '<table>' + diff + '<tr><td></td><td class="dim">17 unchanged</td><td></td></tr></table>' +
+    '<div class="num dim" style="padding:10px 12px">turnover ' + p.turnover + '% · cash after ' + p.cashAfter +
+      '% · ' + p.topSector + ' ' + p.topSectorPct + '% · gate <span class="pill ok">12 of 12</span></div>' +
+    '<details style="margin:0 12px"><summary style="cursor:pointer;color:var(--accent);font-size:13px">Panel flagged PLPC — ' +
+      d.rubric.PLPC.total + '/24</summary><table style="margin-top:8px">' + rubricRows("PLPC") + '</table></details>' +
+    '<div style="display:flex;gap:10px;align-items:center;padding:14px 12px 0">' +
+      '<button style="background:var(--ok);color:#04170a;border:0;padding:8px 18px;border-radius:6px;font-weight:600;cursor:pointer">Approve</button>' +
+      '<button style="background:transparent;color:var(--bad);border:1px solid #6b2222;padding:8px 18px;border-radius:6px;cursor:pointer">Reject</button>' +
+      '<span class="dim" style="font-size:12px">' + p.minsLeft + ' min left. No answer means no trades.</span>' +
+    '</div></div>';
+}
+
+/* ======================================================================
+   Variant switcher. Not part of any design — deliberately loud so it does
+   not read as one. Deleted with this file.
+   ====================================================================== */
+var VARIANTS = [
+  ["A", "Console", variantA],
+  ["B", "Ledger", variantB],
+  ["C", "Timeline", variantC]
+];
+function currentKey() {
+  var k = (new URLSearchParams(location.search).get("variant") || "A").toUpperCase();
+  return VARIANTS.some(function (v) { return v[0] === k; }) ? k : "A";
+}
+function indexOfKey(k) {
+  for (var i = 0; i < VARIANTS.length; i++) if (VARIANTS[i][0] === k) return i;
+  return 0;
+}
+function go(delta) {
+  var i = (indexOfKey(currentKey()) + delta + VARIANTS.length) % VARIANTS.length;
+  var u = new URL(location.href);
+  u.searchParams.set("variant", VARIANTS[i][0]);
+  history.replaceState(null, "", u);
+  render();
+}
+function render() {
+  var v = VARIANTS[indexOfKey(currentKey())];
+  document.getElementById("root").innerHTML = v[2]();
+  document.getElementById("switcher").innerHTML =
+    '<button id="prev" title="previous variant">&#8592;</button>' +
+    '<span class="label">' + v[0] + ' — ' + v[1] + '</span>' +
+    '<button id="next" title="next variant">&#8594;</button>' +
+    '<span class="hint">prototype</span>';
+  document.getElementById("prev").onclick = function () { go(-1); };
+  document.getElementById("next").onclick = function () { go(1); };
+  document.title = "agb-trader — " + v[0] + " " + v[1];
+  // Rule 5: say which variant is showing and what state it is showing it in.
+  console.log("[prototype] variant " + v[0] + " — " + v[1] +
+    " | mode " + DATA.mode + " L" + DATA.level +
+    " | pending " + DATA.pending.id + " (" + DATA.pending.minsLeft + "m) " +
+    "| B view: " + B_VIEW + " | C expanded: " + Object.keys(C_OPEN).join(","));
+}
+document.addEventListener("click", function (ev) {
+  var b = ev.target.closest("[data-bview]");
+  if (b) { ev.preventDefault(); B_VIEW = b.getAttribute("data-bview"); render(); return; }
+  var c = ev.target.closest("[data-cevent]");
+  if (c) {
+    ev.preventDefault();
+    var m = c.getAttribute("data-cevent");
+    if (C_OPEN[m]) delete C_OPEN[m]; else C_OPEN[m] = true;
+    render();
+  }
+});
+document.addEventListener("keydown", function (ev) {
+  var t = ev.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+  if (ev.key === "ArrowLeft") go(-1);
+  if (ev.key === "ArrowRight") go(1);
+});
+window.addEventListener("popstate", render);
+render();
+</script>
+</body>
+</html>
