@@ -69,7 +69,7 @@ After T03 and T04 have both merged, run the **full backfill from 1998** onto the
 Needed for T11 (Telegram bot).
 
 - [ ] In Telegram, message **@BotFather**, send `/newbot`, and choose a name and a username. Save the token it returns.
-- [ ] Send your new bot any message, then open `https://api.telegram.org/bot<token>/getUpdates` locally. Your chat id is `message.chat.id` in the response. Save it next to the token.
+- [ ] Open the bot's chat (`t.me/<bot username>`) and press **Start**. Then fetch `https://api.telegram.org/bot<token>/getUpdates` with `curl` rather than a browser, so the token stays out of your browser history. The chat id is the number at `result[].message.chat.id`, which appears in the response as `"chat":{"id":…}`; for a private chat it equals your own user id. Save it next to the token. If `result` is empty, send the bot a fresh message and fetch again, because Telegram keeps updates for only about 24 hours.
 - [ ] Optional: in @BotFather, turn off `/setjoingroups` so the bot cannot be added to groups.
 
 Both go in `env/bot.env` on the server. The bot's Telegram traffic leaves through agb-trader's own VPN tunnel, so T11's live check also needs the next item.
