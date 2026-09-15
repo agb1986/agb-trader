@@ -27,7 +27,12 @@ does.
   trigger. Never drop or disable those triggers.
 - **Grants are explicit and minimal.** Service roles get `SELECT` and, where they write,
   `INSERT` on history tables, and never `UPDATE`, `DELETE` or `TRUNCATE`. The roles are
-  `scheduler`, `pipeline`, `execution`, `bot`, `ui` and `cli`.
+  `scheduler`, `pipeline`, `execution`, `bot`, `ui`, `backup` and `cli`. `backup` already
+  reads every table through `pg_read_all_data`, so a new table needs no grant for it.
+- **Row-level security never hides a row from `backup`.** The nightly dump runs as `backup`
+  with `--enable-row-security`, and a policy that hides rows from it silently drops them from
+  every backup. A table with row-level security keeps a permissive `SELECT` policy that is
+  `USING (true)` for `backup`, as `agb.heartbeat` does. `tests/test_backup.py` checks this.
 - **The mutable exceptions** are the ones spec 08 names: the `heartbeat` upsert and the job
   lease columns. `tests/test_append_only.py` checks every table in the `agb` schema against
   this list, so a new exception has to be declared there. On `agb.job`, workers hold

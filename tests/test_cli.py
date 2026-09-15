@@ -35,11 +35,12 @@ def test_format_status_lists_every_known_service_then_any_others():
         "execution",
         "bot",
         "ui",
+        "backup",
         "zeta",
     ]
     assert out[1].split() == ["scheduler", "2026-09-15", "12:00:05", "12s", "abc123"]
     assert out[2].split() == ["pipeline", "never", "-", "-"]
-    assert out[6].split() == ["zeta", "2026-09-15", "12:00:05", "1h", "0m", "-"]
+    assert out[7].split() == ["zeta", "2026-09-15", "12:00:05", "1h", "0m", "-"]
 
 
 def test_status_reads_heartbeats_as_the_cli_role(db):

@@ -45,9 +45,12 @@ def test_a_data_pull_for_each_session_across_a_holiday_and_an_early_close(cal):
 
 
 def test_no_pulls_on_christmas_or_good_friday(cal):
-    periods = {p.period for p in schedule.plan(cal, date(2026, 12, 20))}
+    def pulls(today):
+        return {p.period for p in schedule.plan(cal, today) if p.kind == schedule.DATA_PULL}
+
+    periods = pulls(date(2026, 12, 20))
     assert "2026-12-24" in periods and "2026-12-25" not in periods
-    periods = {p.period for p in schedule.plan(cal, date(2026, 3, 30))}
+    periods = pulls(date(2026, 3, 30))
     assert "2026-04-02" in periods and "2026-04-03" not in periods
 
 
@@ -170,8 +173,34 @@ def test_expected_events_link_to_the_job_that_fulfils_them(db, cal):
     ]
 
 
+def test_a_backup_every_night_from_tomorrow(cal):
+    # Friday 2026-10-30 to Tuesday 2026-11-03: weekends included, and US daylight saving ends
+    # on Sunday 1 November, moving 03:00 New York from 07:00 to 08:00 UTC.
+    backups = {
+        p.period: p
+        for p in schedule.plan(cal, date(2026, 10, 30))
+        if p.kind == schedule.BACKUP and p.period <= "2026-11-03"
+    }
+    assert sorted(backups) == ["2026-10-31", "2026-11-01", "2026-11-02", "2026-11-03"]
+    assert backups["2026-10-31"].not_before == utc(2026, 10, 31, 7, 0)
+    assert backups["2026-11-02"].not_before == utc(2026, 11, 2, 8, 0)
+    job = backups["2026-11-02"]
+    assert job.session_date == date(2026, 11, 2)
+    [expected] = job.expected
+    assert (expected.kind, expected.period) == (schedule.BACKUP, "2026-11-02")
+    assert expected.due_at == utc(2026, 11, 2, 10, 0)
+    assert expected.by_job
+
+
+def test_backups_are_planned_across_the_whole_window(cal):
+    today = date(2026, 9, 15)
+    periods = {p.period for p in schedule.plan(cal, today) if p.kind == schedule.BACKUP}
+    assert len(periods) == schedule.LOOKAHEAD.days
+    assert min(periods) == "2026-09-16"
+
+
 def test_only_the_scheduler_creates_jobs(db):
-    for role in ("pipeline", "execution", "bot", "ui", "cli"):
+    for role in ("pipeline", "execution", "bot", "ui", "backup", "cli"):
         with pytest.raises(errors.InsufficientPrivilege):
             db.connect(role).execute(
                 "INSERT INTO agb.job (kind, period, session_date, not_before, created_by) "

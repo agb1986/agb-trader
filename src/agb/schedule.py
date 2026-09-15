@@ -17,24 +17,31 @@ The work:
     - an **approval_request** shortly after, which the bot fulfils when it sends one;
     - a **submission** by R's MOC cutoff, which execution fulfils. It is also the row the
       overdue view looks ahead for: no submission within the horizon means no rebalance.
+- **backup**, one per calendar day D, weekends and holidays included, period `YYYY-MM-DD`.
+  Claimable from 03:00 New York time on D and expected done BACKUP_GRACE later. Planning
+  starts from tomorrow, so the scheduler never writes a backup that is already late.
 """
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 
 import psycopg
 
-from agb.nyse import NyseCalendar
+from agb.nyse import NEW_YORK, NyseCalendar
 
 DATA_PULL = "data_pull"
 REBALANCE = "rebalance"
 PROPOSAL = "proposal"
 APPROVAL_REQUEST = "approval_request"
 SUBMISSION = "submission"
+BACKUP = "backup"
 
 # Poll intervals and lease durations are tuned against measured runs; these are first guesses.
 PULL_DELAY = timedelta(hours=2)
 APPROVAL_REQUEST_GRACE = timedelta(minutes=30)
+# Well clear of the evening pull, and outside the hour daylight saving skips or repeats.
+BACKUP_AT = time(3, 0)
+BACKUP_GRACE = timedelta(hours=2)
 # Longer than the widest gap between two rebalances, so the next one is always written well
 # before the overdue view's horizon (40 days by default) runs out.
 LOOKAHEAD = timedelta(days=45)
@@ -66,7 +73,7 @@ def calendar_window(today: date) -> tuple[date, date]:
 
 
 def plan(calendar: NyseCalendar, today: date, *, approval_required: bool = True) -> list[Planned]:
-    """Everything due from `today`'s session through the lookahead, in session order.
+    """Everything due from `today` through the lookahead, in the order it becomes claimable.
 
     `approval_required` is true at every ladder level that asks the human first, which
     includes L0, where live trading starts.
@@ -114,6 +121,17 @@ def plan(calendar: NyseCalendar, today: date, *, approval_required: bool = True)
                 )
             )
         year, month = (year, month + 1) if month < 12 else (year + 1, 1)
+
+    day = today + timedelta(days=1)
+    while day <= until:
+        period = day.isoformat()
+        start = datetime.combine(day, BACKUP_AT, NEW_YORK).astimezone(UTC)
+        planned.append(
+            Planned(
+                BACKUP, period, day, start, (Expected(BACKUP, period, start + BACKUP_GRACE, True),)
+            )
+        )
+        day += timedelta(days=1)
 
     planned.sort(key=lambda p: (p.not_before, p.kind))
     return planned

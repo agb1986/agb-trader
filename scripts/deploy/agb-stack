@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# The agb-trader stack on the server. deploy.sh ships a copy with each release, and the
+# deploy directory's `agb-stack` links to the current one. See docs/build/deploy.md.
+#
+# The deploy directory:
+#   env/               the real env files, which exist only here
+#   backups/           the nightly database dumps
+#   releases/<tag>/    compose.yaml and agb-stack as of commit <tag>
+#   current, previous  links to the release running now and to the one it replaced
+#   agb-stack          link to current/agb-stack
+set -euo pipefail
+
+IMAGE=${AGB_IMAGE:-agb-trader-app}
+dir=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
+
+usage() {
+    cat <<'EOF'
+usage: agb-stack <command>
+
+  status                          each service's last heartbeat
+  agb <args...>                   run an agb CLI command
+  tags                            the current and previous release
+  activate <tag>                  run the stack on release <tag>; the running one becomes previous
+  rollback                        activate the previous release
+  restore <dump> [<db>] [--keep]  load a dump into a scratch database (default agb_restore),
+                                  compare its row counts with the live database, then drop it
+  <anything else>                 passed to docker compose, e.g. `ps` or `logs --follow backup`
+EOF
+}
+
+die() {
+    echo "agb-stack: $*" >&2
+    exit 1
+}
+
+# The release a link points at, or nothing.
+tag_of() {
+    if [ -L "$dir/$1" ]; then basename "$(readlink "$dir/$1")"; fi
+}
+
+compose_at() {
+    local tag=$1
+    shift
+    AGB_IMAGE=$IMAGE \
+        AGB_IMAGE_TAG=$tag \
+        AGB_ENV_DIR="$dir/env" \
+        AGB_BACKUP_DIR="$dir/backups" \
+        AGB_BACKUP_USER="$(id -u):$(id -g)" \
+        docker compose --project-directory "$dir" --file "$dir/releases/$tag/compose.yaml" \
+        --env-file "$dir/env/db.env" "$@"
+}
+
+compose() {
+    local tag
+    tag=$(tag_of current)
+    [ -n "$tag" ] || die "nothing is deployed in $dir yet; run scripts/deploy/deploy.sh on the workstation"
+    compose_at "$tag" "$@"
+}
+
+# Point the link $1 at $2, atomically.
+relink() {
+    ln -sfn "$2" "$dir/.$1.new"
+    mv -T "$dir/.$1.new" "$dir/$1"
+}
+
+# Remove every release and image except the current and previous ones.
+prune() {
+    local keep tag rel
+    keep=" $(tag_of current) $(tag_of previous) "
+    shopt -s nullglob
+    for rel in "$dir"/releases/*/; do
+        tag=$(basename "$rel")
+        [[ $keep == *" $tag "* ]] || rm -rf -- "$rel"
+    done
+    docker image ls --format '{{.Tag}}' "$IMAGE" | while read -r tag; do
+        [[ $tag == "<none>" || $keep == *" $tag "* ]] && continue
+        if docker image rm "$IMAGE:$tag" >/dev/null; then
+            echo "removed image $IMAGE:$tag"
+        fi
+    done
+}
+
+activate() {
+    local tag=$1 current
+    [ -f "$dir/releases/$tag/compose.yaml" ] || die "no release $tag in $dir/releases"
+    docker image inspect "$IMAGE:$tag" >/dev/null 2>&1 || die "no image $IMAGE:$tag on this host"
+    [ -f "$dir/env/db.env" ] || die "no $dir/env/db.env"
+    mkdir -p "$dir/backups"
+    # The links move before the stack starts, so that if it fails to come up, `rollback`
+    # returns to the release that was running.
+    current=$(tag_of current)
+    if [ "$tag" != "$current" ]; then
+        if [ -n "$current" ]; then relink previous "releases/$current"; fi
+        relink current "releases/$tag"
+    fi
+    relink agb-stack current/agb-stack
+    echo "starting release $tag (previous: $(tag_of previous))"
+    if ! compose_at "$tag" up --detach --wait --wait-timeout 300 --no-build --pull missing \
+        --remove-orphans; then
+        die "release $tag did not come up; see \`$dir/agb-stack logs\`, and \`$dir/agb-stack rollback\` returns to $(tag_of previous)"
+    fi
+    prune
+}
+
+db_psql() {
+    compose exec -T db psql --username=postgres --no-psqlrc --set=ON_ERROR_STOP=1 --quiet "$@"
+}
+
+# Rows in every table of database $1, one "schema.table count" line each.
+counts() {
+    db_psql --dbname="$1" --no-align --tuples-only --field-separator=' ' --command="
+        SELECT table_schema || '.' || table_name,
+               (xpath('/row/n/text()', query_to_xml(
+                   format('SELECT count(*) AS n FROM %I.%I', table_schema, table_name),
+                   false, true, '')))[1]::text
+        FROM information_schema.tables
+        WHERE table_type = 'BASE TABLE'
+          AND table_schema NOT IN ('pg_catalog', 'information_schema')
+        ORDER BY 1"
+}
+
+restore() {
+    local dump="" db="" keep=false arg
+    for arg in "$@"; do
+        case $arg in
+        --keep) keep=true ;;
+        -*) die "unknown option $arg" ;;
+        *)
+            if [ -z "$dump" ]; then
+                dump=$arg
+            elif [ -z "$db" ]; then
+                db=$arg
+            else
+                die "usage: agb-stack restore <dump> [<db>] [--keep]"
+            fi
+            ;;
+        esac
+    done
+    [ -n "$dump" ] || die "usage: agb-stack restore <dump> [<db>] [--keep]"
+    [ -f "$dump" ] || die "no dump $dump"
+    db=${db:-agb_restore}
+    [[ $db =~ ^[a-z_][a-z0-9_]*$ ]] || die "the database name takes lowercase letters, digits and underscores"
+    [ "$db" != agb ] || die "refusing to restore over the live database; docs/build/deploy.md describes a disaster restore"
+    gunzip -c -- "$dump" | tail -c 4096 | grep -q -- "-- PostgreSQL database dump complete" ||
+        die "$dump is not a complete dump"
+
+    db_psql --dbname=postgres --command="CREATE DATABASE $db"
+    if ! $keep; then
+        trap "db_psql --dbname=postgres --command='DROP DATABASE IF EXISTS $db' && echo 'dropped $db'" EXIT
+    fi
+    echo "loading $dump into $db"
+    gunzip -c -- "$dump" | db_psql --dbname="$db" >/dev/null
+    echo "restored; rows per table:"
+    printf '  %-36s %10s %10s\n' table "$db" agb
+    awk 'NR == FNR { live[$1] = $2; next }
+         { n = ($1 in live) ? live[$1] : "-"
+           printf "  %-36s %10s %10s%s\n", $1, $2, n, (n == $2 ? "" : "  differs") }' \
+        <(counts agb) <(counts "$db")
+    echo "(a table that differs has rows written to the live database since the dump)"
+    if $keep; then
+        echo "kept $db; drop it with: $dir/agb-stack exec -T db dropdb -U postgres $db"
+    fi
+}
+
+case ${1:-} in
+activate)
+    [ $# -eq 2 ] || die "usage: agb-stack activate <tag>"
+    activate "$2"
+    ;;
+rollback)
+    previous=$(tag_of previous)
+    [ -n "$previous" ] || die "there is no previous release to roll back to"
+    activate "$previous"
+    ;;
+restore)
+    shift
+    restore "$@"
+    ;;
+status) compose run --rm cli status ;;
+agb)
+    shift
+    compose run --rm cli "$@"
+    ;;
+tags)
+    echo "current:  $(tag_of current)"
+    echo "previous: $(tag_of previous)"
+    ;;
+"" | help | -h | --help) usage ;;
+*) compose "$@" ;;
+esac

@@ -33,6 +33,10 @@ RUN uv sync --frozen --no-default-groups
 USER agb
 
 FROM runtime AS app
+# pg_dump for the backup service. Its major version must be at least the server's.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends postgresql-client-17 \
+    && rm -rf /var/lib/apt/lists/*
 RUN uv sync --frozen --no-default-groups --group app --no-install-project
 COPY --from=base /app /app
 RUN uv sync --frozen --no-default-groups --group app

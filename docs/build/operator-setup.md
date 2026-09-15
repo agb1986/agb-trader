@@ -49,8 +49,8 @@ Needed for T03 (server delivery). Images are built on the workstation and shippe
 
 - [x] Key-based SSH from the workstation to the server works without a password prompt.
 - [x] Your server user can run `docker` and `docker compose` without `sudo`.
-- [x] A directory for agb-trader exists on `/mnt/data` and is writable by that user. It will hold the Parquet lake, the nightly `pg_dump` backups and the content-addressed panel store. T03 fixes the exact layout inside it.
-- [ ] Note the free RAM (`free -h`) before the T03 live check. The server had 3.6 GB available with swap fully used at design time, and agb-trader adds about seven containers, including a second gluetun at 150–250 MB.
+- [x] A directory for agb-trader exists on `/mnt/data` and is writable by that user. It will hold the Parquet lake, the nightly `pg_dump` backups and the content-addressed panel store. [Deploying to the server](deploy.md#the-deploy-directory) describes the layout T03 set up inside it.
+- [ ] Note the free RAM (`free -h`) before the T03 live check. The server had 3.6 GB available with swap fully used at design time, and agb-trader adds about eight containers, including a second gluetun at 150–250 MB.
 
 ### 2. Sharadar subscription
 
@@ -117,6 +117,7 @@ Needed for the first server deploy in T03.
 
 - [ ] Once T01 has merged, read `env/db.env.example` to see which roles need passwords.
 - [ ] Generate a strong random password for each, for example with `openssl rand -base64 32`, and store them in the password manager before writing them into `env/db.env` on the server.
+- [ ] T03 added `BACKUP_DB_PASSWORD`, for the backup service. Add it to the server's `env/db.env` before the first `make deploy`. The deploy checks that each server env file sets every variable its example does, and stops if one is missing. It compares names only, on the server, so no value leaves it. See [Deploying to the server](deploy.md).
 
 ## During the build
 

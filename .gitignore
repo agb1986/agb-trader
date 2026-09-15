@@ -1,6 +1,8 @@
 # Real env files hold secrets and are never committed; only the .example templates are.
 env/*.env
 !env/*.env.example
+# Database dumps from `make up`'s backup service.
+/backups/
 
 __pycache__/
 *.py[cod]

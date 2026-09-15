@@ -7,7 +7,7 @@ from psycopg import errors
 
 from agb import jobs, schedule
 from agb.nyse import NyseCalendar
-from agb.roles import OWNER
+from agb.roles import OWNER, SERVICE_ROLES
 
 
 def expect(db, kind, period, due, job_id=None):
@@ -118,7 +118,7 @@ def test_a_dead_scheduler_shows_as_no_rebalance_within_horizon(db):
 
 
 def test_every_role_can_read_the_overdue_view(db):
-    for role in ("scheduler", "pipeline", "execution", "bot", "ui", "cli"):
+    for role in SERVICE_ROLES:
         db.connect(role).execute("SELECT * FROM agb.overdue").fetchall()
 
 

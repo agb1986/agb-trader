@@ -66,6 +66,16 @@ def test_networks(resolved):
     assert set(resolved["services"]["db"]["networks"]) == {"core"}
 
 
+def test_backup_writes_to_a_host_directory_as_its_owner(resolved):
+    backup = resolved["services"]["backup"]
+    assert backup.get("user"), "the dumps must belong to the host user that owns the directory"
+    [volume] = backup["volumes"]
+    assert (volume["type"], volume["target"]) == ("bind", "/backups")
+    assert backup["environment"]["AGB_BACKUP_DIR"] == "/backups"
+    assert backup["environment"]["PGUSER"] == "backup"
+    assert set(backup["networks"]) == {"core"}
+
+
 def test_app_services_share_one_image(resolved):
     services = resolved["services"]
     built = [name for name, service in services.items() if "build" in service]

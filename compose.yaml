@@ -1,5 +1,7 @@
 # The agb-trader stack. `make up` brings it up with the real env files:
 #   docker compose --env-file env/db.env up --build --detach --wait
+# On the server, `agb-stack` runs it from the deploy directory with the shipped image instead
+# (docs/build/deploy.md).
 #
 # Conventions, checked by tests/test_compose.py:
 #   - Every long-running service sets `restart: unless-stopped`. The only one-shots are
@@ -61,6 +63,7 @@ services:
       EXECUTION_DB_PASSWORD: ${EXECUTION_DB_PASSWORD:?set in env/db.env}
       BOT_DB_PASSWORD: ${BOT_DB_PASSWORD:?set in env/db.env}
       UI_DB_PASSWORD: ${UI_DB_PASSWORD:?set in env/db.env}
+      BACKUP_DB_PASSWORD: ${BACKUP_DB_PASSWORD:?set in env/db.env}
       CLI_DB_PASSWORD: ${CLI_DB_PASSWORD:?set in env/db.env}
     depends_on:
       db:
@@ -77,6 +80,29 @@ services:
       PGUSER: scheduler
       PGPASSWORD: ${SCHEDULER_DB_PASSWORD:?set in env/db.env}
       AGB_HEARTBEAT_SECONDS: ${AGB_HEARTBEAT_SECONDS:-30}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [core]
+    restart: unless-stopped
+    mem_limit: 256m
+
+  # Takes the scheduler's nightly backup job and writes a dated pg_dump into the backup
+  # directory. It runs as the host user that owns that directory, so the dumps belong to the
+  # operator: `make up` and `agb-stack` both set AGB_BACKUP_USER to the caller's uid:gid.
+  backup:
+    <<: *app-image
+    command: ["python", "-m", "agb.services.backup"]
+    user: "${AGB_BACKUP_USER:-agb}"
+    environment:
+      <<: *pg
+      PGUSER: backup
+      PGPASSWORD: ${BACKUP_DB_PASSWORD:?set in env/db.env}
+      AGB_HEARTBEAT_SECONDS: ${AGB_HEARTBEAT_SECONDS:-30}
+      AGB_BACKUP_DIR: /backups
+      AGB_BACKUP_KEEP: ${AGB_BACKUP_KEEP:-14}
+    volumes:
+      - ${AGB_BACKUP_DIR:-./backups}:/backups
     depends_on:
       migrate:
         condition: service_completed_successfully

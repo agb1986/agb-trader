@@ -1,11 +1,13 @@
 """Database roles.
 
 Each long-running service connects as the role of the same name, and the operator CLI has
-its own role. The owner role owns every table and runs migrations; no service uses it.
+its own role. The owner role owns every table and runs migrations; no service uses it. The
+backup service reads every table through `pg_read_all_data`, granted by `migrate.bootstrap`.
 """
 
 OWNER = "agb_owner"
-SERVICES = ("scheduler", "pipeline", "execution", "bot", "ui")
+BACKUP = "backup"
+SERVICES = ("scheduler", "pipeline", "execution", "bot", "ui", BACKUP)
 CLI = "cli"
 SERVICE_ROLES = (*SERVICES, CLI)
 ALL_ROLES = (OWNER, *SERVICE_ROLES)
