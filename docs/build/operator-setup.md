@@ -58,7 +58,7 @@ Needed for T04 (Sharadar lake).
 
 - [x] Subscribe directly at [sharadar.com](https://sharadar.com/subscribe) to the **Bundle** plan at **Full History**. T04 needs **SEP** (daily prices), **SF1** (fundamentals) and **TICKERS** from 1998, with delisted tickers included; without the delisted tickers the backtest has survivorship bias. The 5-year and 10-year tiers are too short. SEP is in the Prices plan and SF1 in the Fundamentals plan, and buying both separately at Full History costs more than the Bundle. When this was written the Bundle was $69 a month or $499 a year, so pay monthly until the backfill has been checked, then switch to annual.
 - [x] Check that the licence covers personal, non-professional use, and note the renewal date.
-- [ ] Copy the API key from your sharadar.com account profile into the password manager. It goes in `env/pipeline.env`. It is a sharadar.com key, not a Nasdaq Data Link key, and sharing it can get access revoked.
+- [x] Copy the API key from your sharadar.com account profile into the password manager. It goes in `env/pipeline.env`. It is a sharadar.com key, not a Nasdaq Data Link key, and sharing it can get access revoked.
 
 The direct API is `https://api.sharadar.com/v1.0/data/<table>`, with the key passed as `api_key`. It accepts the Nasdaq Data Link table names (`sep`, `sf1`, `tickers`) as well as its own (`stocks`, `fundamentals`, `tickers`). Two things differ from the Nasdaq Data Link version: SF1's SEC filing date is called `date`, not `datekey`, and the `table` column in TICKERS says `stocks` rather than `SEP`. A query returns at most 10,000 rows, so the backfill uses the bulk download instead: adding `years=full` to a table request redirects to a zipped CSV of the whole table. The public key `test-api-key` returns AAPL only, which is enough to exercise the pull without a subscription.
 
@@ -68,9 +68,9 @@ After T03 and T04 have both merged, run the **full backfill from 1998** onto the
 
 Needed for T11 (Telegram bot).
 
-- [ ] In Telegram, message **@BotFather**, send `/newbot`, and choose a name and a username. Save the token it returns.
-- [ ] Open the bot's chat (`t.me/<bot username>`) and press **Start**. Then fetch `https://api.telegram.org/bot<token>/getUpdates` with `curl` rather than a browser, so the token stays out of your browser history. The chat id is the number at `result[].message.chat.id`, which appears in the response as `"chat":{"id":…}`; for a private chat it equals your own user id. Save it next to the token. If `result` is empty, send the bot a fresh message and fetch again, because Telegram keeps updates for only about 24 hours.
-- [ ] Optional: in @BotFather, turn off `/setjoingroups` so the bot cannot be added to groups.
+- [x] In Telegram, message **@BotFather**, send `/newbot`, and choose a name and a username. Save the token it returns.
+- [x] Open the bot's chat (`t.me/<bot username>`) and press **Start**. Then fetch `https://api.telegram.org/bot<token>/getUpdates` with `curl` rather than a browser, so the token stays out of your browser history. The chat id is the number at `result[].message.chat.id`, which appears in the response as `"chat":{"id":…}`; for a private chat it equals your own user id. Save it next to the token. If `result` is empty, send the bot a fresh message and fetch again, because Telegram keeps updates for only about 24 hours.
+- [x] Optional: in @BotFather, turn off `/setjoingroups` so the bot cannot be added to groups.
 
 Both go in `env/bot.env` on the server. The bot's Telegram traffic leaves through agb-trader's own VPN tunnel, so T11's live check also needs the next item.
 
@@ -78,9 +78,9 @@ Both go in `env/bot.env` on the server. The bot's Telegram traffic leaves throug
 
 Needed for T11. This is a **new** key for agb-trader, separate from torrent-agent's. Two live tunnels cannot share one key, and separate keys mean revoking one does not take the other down. The existing Proton plan allows ten connections, and roughly three are in use.
 
-- [ ] In your Proton account, go to the WireGuard configuration downloads and create a new configuration. Name it `agb-trader`.
-- [ ] Turn **off** NAT-PMP (port forwarding). agb-trader's egress is outbound only.
-- [ ] Copy the `PrivateKey` value from the generated configuration. Proton shows it only once, so put it straight into the password manager.
+- [x] In your Proton account, go to the WireGuard configuration downloads and create a new configuration. Name it `agb-trader`.
+- [x] Turn **off** NAT-PMP (port forwarding). agb-trader's egress is outbound only.
+- [x] Copy the `PrivateKey` value from the generated configuration. Proton shows it only once, so put it straight into the password manager.
 
 It goes in `env/vpn.env` on the server as `WIREGUARD_PRIVATE_KEY`. The rest of the configuration file is not needed.
 
@@ -88,8 +88,8 @@ It goes in `env/vpn.env` on the server as `WIREGUARD_PRIVATE_KEY`. The rest of t
 
 Needed for T23 (panel retrieval).
 
-- [ ] In the Anthropic Console, create a workspace for agb-trader and an API key inside it.
-- [ ] Set a monthly spend limit on that workspace. The panel runs Haiku 4.5 as the Analyst, Sonnet 5 as the Prosecutor and Defender, and Opus 5 as the Judge. The design estimate is about 1M Analyst input tokens plus about 450k for the other three roles per month; see [03 — LLM panel](../architecture/03-llm-panel.md).
+- [x] In the Anthropic Console, create a workspace for agb-trader and an API key inside it.
+- [x] Set a monthly spend limit on that workspace. The panel runs Haiku 4.5 as the Analyst, Sonnet 5 as the Prosecutor and Defender, and Opus 5 as the Judge. The design estimate is about 1M Analyst input tokens plus about 450k for the other three roles per month; see [03 — LLM panel](../architecture/03-llm-panel.md).
 
 The key goes in `env/pipeline.env`.
 
@@ -97,15 +97,15 @@ The key goes in `env/pipeline.env`.
 
 Needed for T23. This is not a credential. The SEC's fair-access policy requires every automated request to declare a User-Agent with a name and a contact email, and limits clients to ten requests a second.
 
-- [ ] Decide the name and email to declare, for example `agb-trader Your Name you@example.com`. T23 defines the setting that holds it.
+- [x] Decide the name and email to declare, for example `agb-trader Your Name you@example.com`. T23 defines the setting that holds it.
 
 ### 7. Alpaca paper account
 
 Needed for T09 (paper market-on-close orders).
 
-- [ ] Open an Alpaca account and switch to the paper trading dashboard.
-- [ ] Set the paper balance to the capital you expect to trade live, and keep it below **$100,000**. That is the capital the model is certified at (twice the largest book expected in the first year), and the certified-capital alert fires when the book's value crosses it, so a paper balance at or above $100k would alert almost at once. See [01 — Data, broker and backtesting](../architecture/01-data-broker-backtesting.md).
-- [ ] Generate a paper API key and secret. The endpoint is `https://paper-api.alpaca.markets`.
+- [x] Open an Alpaca account and switch to the paper trading dashboard.
+- [x] Set the paper balance to the capital you expect to trade live, and keep it below **$100,000**. That is the capital the model is certified at (twice the largest book expected in the first year), and the certified-capital alert fires when the book's value crosses it, so a paper balance at or above $100k would alert almost at once. See [01 — Data, broker and backtesting](../architecture/01-data-broker-backtesting.md).
+- [x] Generate a paper API key and secret. The endpoint is `https://paper-api.alpaca.markets`.
 
 All three go in `env/execution.env`. This traffic never goes through the VPN; submitting orders from a foreign VPN exit invites account flags.
 
