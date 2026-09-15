@@ -110,6 +110,45 @@ services:
     restart: unless-stopped
     mem_limit: 256m
 
+  # agb-trader's own VPN tunnel: ProtonVPN over WireGuard, with no port forwarding. It exists
+  # to give the bot an HTTP proxy on port 8888 whose traffic leaves only through the tunnel;
+  # gluetun's firewall drops anything else. It is not on core and publishes nothing.
+  #
+  # vpn and bot are in the `telegram` profile. The server's agb-stack enables it; `make up`
+  # leaves both out unless COMPOSE_PROFILES=telegram, because only one process may poll a
+  # bot token, and the workstation has no VPN key.
+  vpn:
+    image: qmcgaw/gluetun:v3
+    profiles: [telegram]
+    env_file: ${AGB_ENV_DIR:-env}/vpn.env
+    cap_add: [NET_ADMIN]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    networks: [egress]
+    restart: unless-stopped
+    mem_limit: 256m
+
+  # The Telegram bot, the only service on both networks: it reads the database on core and
+  # reaches Telegram through the vpn's proxy on egress. bot.env holds the Telegram token, and
+  # no other service reads it.
+  bot:
+    <<: *app-image
+    profiles: [telegram]
+    command: ["python", "-m", "agb.services.bot"]
+    env_file: ${AGB_ENV_DIR:-env}/bot.env
+    environment:
+      <<: *pg
+      PGUSER: bot
+      PGPASSWORD: ${BOT_DB_PASSWORD:?set in env/db.env}
+      AGB_HEARTBEAT_SECONDS: ${AGB_HEARTBEAT_SECONDS:-30}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      vpn:
+        condition: service_healthy
+    networks: [core, egress]
+    restart: unless-stopped
+    mem_limit: 256m
+
   # The operator CLI: `make status`, or `make agb CMD="..."`.
   cli:
     <<: *app-image

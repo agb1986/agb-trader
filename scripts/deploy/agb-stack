@@ -38,10 +38,12 @@ tag_of() {
     if [ -L "$dir/$1" ]; then basename "$(readlink "$dir/$1")"; fi
 }
 
+# The server runs the `telegram` profile, vpn and bot, which the workstation leaves out.
 compose_at() {
     local tag=$1
     shift
-    AGB_IMAGE=$IMAGE \
+    COMPOSE_PROFILES=telegram \
+        AGB_IMAGE=$IMAGE \
         AGB_IMAGE_TAG=$tag \
         AGB_ENV_DIR="$dir/env" \
         AGB_BACKUP_DIR="$dir/backups" \
