@@ -228,6 +228,14 @@ Waves 1 to 7 rarely offer more than three tickets at once, so three workers are 
       orca-ide orchestration task-update --id <merge task> --status completed --result '{"pr": <pr>, "merge_sha": "<sha>"}' --run <run_id>
       ```
 
+   6. Remove the ticket's worktree:
+
+      ```sh
+      orca-ide worktree rm --worktree path:<worktree>
+      ```
+
+      Neither `worker-release` nor `--delete-branch` removes it. Remove it only after the merge, because a FIX task reuses it until then. Orca also deletes the local branch once it can prove the branch is merged.
+
 6. Go back to step 1. Every merge can unblock new BUILD tasks.
 
 A task that fails three times in a row is circuit-broken to `failed` by Orca. The coordinator reads its reports with `worker-show` and `worker-read`, then either:
