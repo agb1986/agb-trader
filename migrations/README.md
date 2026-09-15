@@ -30,7 +30,10 @@ does.
   `scheduler`, `pipeline`, `execution`, `bot`, `ui` and `cli`.
 - **The mutable exceptions** are the ones spec 08 names: the `heartbeat` upsert and the job
   lease columns. `tests/test_append_only.py` checks every table in the `agb` schema against
-  this list, so a new exception has to be declared there.
+  this list, so a new exception has to be declared there. On `agb.job`, workers hold
+  `UPDATE` on `claimed_by` and `lease_until` only, and the `lease_only` trigger refuses any
+  other change for every role, the owner included. `DELETE` and `TRUNCATE` are refused as on
+  any history table.
 - **Types.**
   - Money and share quantities are `numeric`, never floating point.
   - Timestamps are `timestamptz`, and every role's session runs in UTC.
