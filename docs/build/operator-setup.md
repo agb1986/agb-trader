@@ -13,29 +13,33 @@ No credential is needed to build code. Workers build against fakes, fixtures and
 
 Env file layout, from [07 — Services and deployment](../architecture/07-services-deployment.md):
 
-| File | Holds | Machine |
-|---|---|---|
-| `env/db.env` | `POSTGRES_PASSWORD`, per-service role passwords | server |
-| `env/pipeline.env` | Sharadar key, Anthropic key | server (and the workstation for early live checks) |
-| `env/execution.env` | Alpaca key, secret, endpoint | server (and the workstation for early live checks) |
-| `env/bot.env` | Telegram token and chat id, `HTTPS_PROXY`, `NO_PROXY` | server |
-| `env/vpn.env` | `WIREGUARD_PRIVATE_KEY` | server |
-| `env/research.env` | research settings | workstation only |
+
+| File                | Holds                                                 | Machine                                            |
+| ------------------- | ----------------------------------------------------- | -------------------------------------------------- |
+| `env/db.env`        | `POSTGRES_PASSWORD`, per-service role passwords       | server                                             |
+| `env/pipeline.env`  | Sharadar key, Anthropic key                           | server (and the workstation for early live checks) |
+| `env/execution.env` | Alpaca key, secret, endpoint                          | server (and the workstation for early live checks) |
+| `env/bot.env`       | Telegram token and chat id, `HTTPS_PROXY`, `NO_PROXY` | server                                             |
+| `env/vpn.env`       | `WIREGUARD_PRIVATE_KEY`                               | server                                             |
+| `env/research.env`  | research settings                                     | workstation only                                   |
+
 
 The exact variable names are fixed by the `.example` files once the tickets that introduce them merge. The coordinator says which file and variable each merge needs.
 
 ## Checklist by when it is needed
 
-| Item | Orca task | Gates | Needed by |
-|---|---|---|---|
-| Server access and storage | `PRE server` | MERGE T03 | wave 3 |
-| Sharadar via Nasdaq Data Link | `PRE sharadar` | MERGE T04 | wave 3 |
-| Telegram bot | `PRE telegram` | MERGE T11 | wave 3 |
-| ProtonVPN WireGuard key | `PRE vpn` | MERGE T11 | wave 3 |
-| Anthropic API key | `PRE anthropic` | MERGE T23 | wave 6 |
-| SEC EDGAR contact string | none | T23's retrieval | wave 6 |
-| Alpaca paper account | `PRE alpaca` | MERGE T09 | wave 7 |
-| Database passwords | none | first server deploy (T03) | wave 3 |
+
+| Item                          | Orca task       | Gates                     | Needed by |
+| ----------------------------- | --------------- | ------------------------- | --------- |
+| Server access and storage     | `PRE server`    | MERGE T03                 | wave 3    |
+| Sharadar subscription         | `PRE sharadar`  | MERGE T04                 | wave 3    |
+| Telegram bot                  | `PRE telegram`  | MERGE T11                 | wave 3    |
+| ProtonVPN WireGuard key       | `PRE vpn`       | MERGE T11                 | wave 3    |
+| Anthropic API key             | `PRE anthropic` | MERGE T23                 | wave 6    |
+| SEC EDGAR contact string      | none            | T23's retrieval           | wave 6    |
+| Alpaca paper account          | `PRE alpaca`    | MERGE T09                 | wave 7    |
+| Database passwords            | none            | first server deploy (T03) | wave 3    |
+
 
 Waves are a planning view, not a schedule; see [Waves](orca-build-plan.md#waves). Doing everything in the first three rows early means the build never stalls on a key.
 
@@ -43,18 +47,20 @@ Waves are a planning view, not a schedule; see [Waves](orca-build-plan.md#waves)
 
 Needed for T03 (server delivery). Images are built on the workstation and shipped with `docker save | ssh … docker load`, so the workstation has to reach the server non-interactively.
 
-- [ ] Key-based SSH from the workstation to the server works without a password prompt.
-- [ ] Your server user can run `docker` and `docker compose` without `sudo`.
-- [ ] A directory for agb-trader exists on `/mnt/data` and is writable by that user. It will hold the Parquet lake, the nightly `pg_dump` backups and the content-addressed panel store. T03 fixes the exact layout inside it.
+- [x] Key-based SSH from the workstation to the server works without a password prompt.
+- [x] Your server user can run `docker` and `docker compose` without `sudo`.
+- [x] A directory for agb-trader exists on `/mnt/data` and is writable by that user. It will hold the Parquet lake, the nightly `pg_dump` backups and the content-addressed panel store. T03 fixes the exact layout inside it.
 - [ ] Note the free RAM (`free -h`) before the T03 live check. The server had 3.6 GB available with swap fully used at design time, and agb-trader adds about seven containers, including a second gluetun at 150–250 MB.
 
-### 2. Sharadar via Nasdaq Data Link
+### 2. Sharadar subscription
 
 Needed for T04 (Sharadar lake).
 
-- [ ] Subscribe on Nasdaq Data Link to a Sharadar product that includes **SEP** (daily prices), **SF1** (fundamentals) and **TICKERS**, with history from 1998 and delisted tickers included. Without the delisted tickers the backtest has survivorship bias.
-- [ ] Check that the licence covers personal, non-professional use, and note the renewal date.
-- [ ] Copy the API key from your Nasdaq Data Link account settings into the password manager. It goes in `env/pipeline.env`.
+- [x] Subscribe directly at [sharadar.com](https://sharadar.com/subscribe) to the **Bundle** plan at **Full History**. T04 needs **SEP** (daily prices), **SF1** (fundamentals) and **TICKERS** from 1998, with delisted tickers included; without the delisted tickers the backtest has survivorship bias. The 5-year and 10-year tiers are too short. SEP is in the Prices plan and SF1 in the Fundamentals plan, and buying both separately at Full History costs more than the Bundle. When this was written the Bundle was $69 a month or $499 a year, so pay monthly until the backfill has been checked, then switch to annual.
+- [x] Check that the licence covers personal, non-professional use, and note the renewal date.
+- [ ] Copy the API key from your sharadar.com account profile into the password manager. It goes in `env/pipeline.env`. It is a sharadar.com key, not a Nasdaq Data Link key, and sharing it can get access revoked.
+
+The direct API is `https://api.sharadar.com/v1.0/data/<table>`, with the key passed as `api_key`. It accepts the Nasdaq Data Link table names (`sep`, `sf1`, `tickers`) as well as its own (`stocks`, `fundamentals`, `tickers`). One column differs from the Nasdaq Data Link version: SF1's SEC filing date is called `date`, not `datekey`. The public key `test-api-key` returns AAPL only, which is enough to exercise the pull without a subscription.
 
 After T03 and T04 have both merged, run the **full backfill from 1998** onto the server's `/mnt/data`. It must finish before the T17 live check (wave 6), which syncs the lake from the server. T04's own live check only pulls a small date range.
 
@@ -123,3 +129,4 @@ Needed for the first server deploy in T03.
 ## Housekeeping
 
 - Archive the old [finance-agent](https://github.com/agb1986/finance-agent) repository once you are happy nothing more is needed from it. agb-trader ports no code from it.
+
