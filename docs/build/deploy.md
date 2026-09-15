@@ -37,7 +37,21 @@ Run `agb-stack` from the deploy directory as `./agb-stack`, or by its full path.
   server, for example with `openssl rand -hex 24`, and keep a copy in the password manager.
   Make the file readable only by you (`chmod 600`).
 
+- `env/bot.env` sets every variable `env/bot.env.example` does: the bot's token and the id of
+  the one chat it answers (see
+  [Operator setup](operator-setup.md#3-telegram-bot)). Keep `HTTPS_PROXY` and `NO_PROXY` as
+  the example has them, so Telegram traffic goes through the VPN and database traffic does
+  not. No other service reads this file.
+- `env/vpn.env` sets every variable `env/vpn.env.example` does, with the WireGuard private
+  key generated for this stack alone (see
+  [Operator setup](operator-setup.md#4-protonvpn-wireguard-key)).
+
 The other env files join the list as the services that read them are deployed.
+
+`vpn` and `bot` are in the `telegram` Compose profile. `agb-stack` enables it on the server,
+so `./agb-stack logs bot` and every other command see them. `make up` on the workstation
+leaves them out, because only one process may poll a bot token. To check the bot's route to
+Telegram without sending a message, run `./agb-stack exec bot python -m agb.telegram`.
 
 ## Deploying
 

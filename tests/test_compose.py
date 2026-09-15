@@ -80,8 +80,61 @@ def test_app_services_share_one_image(resolved):
     services = resolved["services"]
     built = [name for name, service in services.items() if "build" in service]
     assert built == ["migrate"], "only migrate builds; the others reuse its image"
-    images = {service["image"] for name, service in services.items() if name != "db"}
+    images = {service["image"] for name, service in services.items() if name not in {"db", "vpn"}}
     assert images == {services["migrate"]["image"]}
+
+
+def test_only_the_bot_is_on_both_networks(resolved):
+    services = resolved["services"]
+    on = {
+        network: {name for name, service in services.items() if network in service["networks"]}
+        for network in ("core", "egress")
+    }
+    assert on["core"] & on["egress"] == {"bot"}
+    assert on["egress"] == {"vpn", "bot"}
+
+
+def test_the_vpn_is_a_gluetun_tunnel_that_publishes_nothing(resolved):
+    vpn = resolved["services"]["vpn"]
+    assert vpn["image"].startswith("qmcgaw/gluetun:")
+    assert not vpn.get("ports")
+    assert vpn["cap_add"] == ["NET_ADMIN"]
+    assert vpn["environment"]["HTTPPROXY"] == "on"
+    assert vpn["environment"]["VPN_PORT_FORWARDING"] == "off"
+
+
+def test_the_bot_reaches_telegram_through_the_vpn_and_the_database_directly(resolved):
+    bot = resolved["services"]["bot"]
+    env = bot["environment"]
+    assert env["HTTPS_PROXY"] == "http://vpn:8888"
+    assert "db" in env["NO_PROXY"].split(",")
+    assert (env["PGHOST"], env["PGUSER"]) == ("db", "bot")
+    assert bot["depends_on"]["vpn"]["condition"] == "service_healthy"
+
+
+def test_only_the_bot_holds_the_telegram_settings(resolved):
+    for name, service in resolved["services"].items():
+        env = service.get("environment") or {}
+        telegram = {key for key in env if key.startswith("TELEGRAM_") or key.endswith("_PROXY")}
+        expected = {"TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "HTTPS_PROXY", "NO_PROXY"}
+        assert telegram == (expected if name == "bot" else set()), name
+    services = yaml.safe_load((ROOT / "compose.yaml").read_text())["services"]
+    readers = {name for name, s in services.items() if "bot.env" in str(s.get("env_file", ""))}
+    assert readers == {"bot"}
+    holders = {
+        path.name
+        for path in (ROOT / "env").glob("*.env.example")
+        if "TELEGRAM_BOT_TOKEN" in path.read_text()
+    }
+    assert holders == {"bot.env.example"}
+
+
+def test_vpn_and_bot_run_only_where_the_telegram_profile_is_enabled():
+    services = yaml.safe_load((ROOT / "compose.yaml").read_text())["services"]
+    profiled = {name for name, s in services.items() if "telegram" in s.get("profiles", [])}
+    assert profiled == {"vpn", "bot"}
+    assert "COMPOSE_PROFILES=telegram" in (ROOT / "scripts/deploy/agb-stack").read_text()
+    assert "server_env=(db bot vpn)" in (ROOT / "scripts/deploy/deploy.sh").read_text()
 
 
 def test_dockerfile_has_every_target():
