@@ -21,7 +21,7 @@ from functools import lru_cache
 REPO = "agb1986/agb-trader"
 ORCA = os.environ.get("ORCA_CLI", "orca-ide")
 WORKER_START = ("{orca} orchestration worker-start --task {id} --worktree new-top-level --name {name} "
-                "--agent claude --model opus --effort high --setup run --json")
+                "--agent claude --model {model} --effort {effort} --setup run --json")
 
 # ticket: (issue, worktree slug, lane, blocked by). The edges mirror the native GitHub
 # blocked_by links; `seed` and `frontier` fail loudly if the two ever disagree.
@@ -74,6 +74,23 @@ PREREQS = {
 EXTRA_MERGE_DEPS = {11: [3], 17: [3]}
 # Tickets whose live check touches the server: the coordinator runs it with the operator watching.
 ATTENDED = {3, 11, 17}
+
+# The Claude model and effort each BUILD worker starts with, chosen for how costly a subtle
+# mistake in the ticket would be. `fable` takes the tickets where one costs money or silently
+# corrupts research: broker calls and crash recovery, leakage-free cross-validation, the
+# backtest engine, the validation statistics, and the rebalance rules everything later reuses.
+# `opus` at xhigh takes tickets with one hard invariant, such as point-in-time data, the halt
+# latch or the approval race. `opus` at high takes ordinary service work, and `sonnet` small,
+# well-specified or read-only views. The aliases always mean the newest model of each tier.
+# A FIX task reuses its worker's terminal, and with it the worker's model.
+WORKERS = {
+    **dict.fromkeys([9, 10, 17, 18, 20], ("fable", "xhigh")),
+    7: ("fable", "high"),
+    **dict.fromkeys([6, 8, 13, 16, 19, 21, 31], ("opus", "xhigh")),
+    **dict.fromkeys([1, 2, 3, 4, 5, 11, 12, 14, 15, 23, 24, 25, 28], ("opus", "high")),
+    **dict.fromkeys([22, 26, 27, 29, 30, 32], ("sonnet", "high")),
+}
+assert sorted(WORKERS) == sorted(TICKETS), "every ticket needs exactly one worker model"
 
 BUILD_SPEC = """BUILD T{t:02d}: {title} (GitHub issue #{issue}, {repo})
 Lane: {lane}. Critical-path height: {height}.
@@ -249,10 +266,13 @@ def next_(args):
         n = ticket_of(t["task_title"])
         if i == slots:
             print("\nReady, waiting for a slot:")
+        model, effort = WORKERS[n]
         flag = "  ATTENDED live check" if n in ATTENDED else ""
-        print(f"  {t['task_title']:<16} {t['id']}  height {height(n)}  lane {TICKETS[n][2]}{flag}")
+        print(f"  {t['task_title']:<16} {t['id']}  height {height(n)}  lane {TICKETS[n][2]}"
+              f"  {model}/{effort}{flag}")
         if i < slots:
-            print("    " + WORKER_START.format(orca=ORCA, id=t["id"], name=f"t{n:02d}-{TICKETS[n][1]}"))
+            print("    " + WORKER_START.format(orca=ORCA, id=t["id"], name=f"t{n:02d}-{TICKETS[n][1]}",
+                                                model=model, effort=effort))
 
     merges = sorted((t for t in ready if t["task_title"].startswith("MERGE")),
                     key=lambda t: (-height(ticket_of(t["task_title"])), ticket_of(t["task_title"])))

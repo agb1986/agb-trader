@@ -101,6 +101,20 @@ Height is the number of tickets on the longest chain from a ticket to the end of
 - the merge queue, which is the ready MERGE tasks, highest first;
 - any open operator prerequisites.
 
+## Worker models
+
+Each BUILD worker starts on a Claude model and effort level chosen for its ticket. The choice is `WORKERS` in `plan.py`, and `next` puts it into each `worker-start` command it prints. The rule is how costly a subtle mistake in the ticket would be, not how much code it needs.
+
+| Model | Effort | Tickets | Why |
+|---|---|---|---|
+| `fable` | xhigh | T09, T10, T17, T18, T20 | A subtle mistake costs money or silently corrupts research. These are idempotent broker calls and the halt re-read (T09), recovery from each crash point (T10), purged and embargoed cross-validation and the trial ledger (T17), the backtest engine and its parity with the fast path (T18), and the deflated Sharpe and overfitting statistics (T20). |
+| `fable` | high | T07 | The proposed basket's event-sourced state and rebalance rules are reused by execution, the backtest and the panel. |
+| `opus` | xhigh | T06, T08, T13, T16, T19, T21, T31 | Each has one hard invariant: point-in-time membership with delisted names (T06), the halt latch (T08), the approval race against the cutoff (T13), feature leakage (T16), corporate events matching between backtest and live (T19), promotion gates (T21) and the autonomy ladder (T31). |
+| `opus` | high | T01–T05, T11, T12, T14, T15, T23, T24, T25, T28 | Ordinary service and integration work. T01, T02, T03 and T05 were built this way. |
+| `sonnet` | high | T22, T26, T27, T29, T30, T32 | Small, well-specified tickets or read-only views. |
+
+The model names are Claude Code aliases, so each one always means the newest model of that tier. To change a ticket's model, edit `WORKERS` before its worker starts. A worker keeps the model it started with.
+
 ## Waves
 
 Waves are a planning view, not a schedule. A ticket is actually ready the moment its last blocker merges, so the coordinator works the live frontier and never waits for a whole wave to finish.
@@ -175,7 +189,7 @@ Waves 1 to 7 rarely offer more than three tickets at once, so three workers are 
 1. Run `plan.py next --run <run_id>`.
 2. For each free slot:
    1. Assign the ticket's GitHub issue to the operator. This is the claim, so a person browsing GitHub sees the ticket is taken.
-   2. Run the printed `worker-start` command.
+   2. Run the printed `worker-start` command. It carries the ticket's model and effort from [Worker models](#worker-models).
 3. Wait for worker messages, piping only stdout because keepalives go to stderr:
 
    ```sh
@@ -192,6 +206,8 @@ Waves 1 to 7 rarely offer more than three tickets at once, so three workers are 
         ```sh
         orca-ide orchestration worker-start --task <fix> --terminal <handle> --worktree <path>
         ```
+
+        `--model` and `--effort` cannot be combined with `--terminal`, so the fix runs on the model the BUILD worker started with.
 
      3. Review again when its `worker_done` arrives.
    - **PR is good:** release the worker with `worker-release --dispatch <id>`.
@@ -211,6 +227,14 @@ Waves 1 to 7 rarely offer more than three tickets at once, so three workers are 
       ```sh
       orca-ide orchestration task-update --id <merge task> --status completed --result '{"pr": <pr>, "merge_sha": "<sha>"}' --run <run_id>
       ```
+
+   6. Remove the ticket's worktree:
+
+      ```sh
+      orca-ide worktree rm --worktree path:<worktree>
+      ```
+
+      Neither `worker-release` nor `--delete-branch` removes it. Remove it only after the merge, because a FIX task reuses it until then. Orca also deletes the local branch once it can prove the branch is merged.
 
 6. Go back to step 1. Every merge can unblock new BUILD tasks.
 
