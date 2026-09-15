@@ -54,7 +54,7 @@ A BUILD task never depends on a PRE task. Workers build and test against fakes, 
 
 ## Operator prerequisites and live checks
 
-Six tickets have acceptance criteria that fakes cannot prove. For each one, the worker adds an opt-in live check, which is skipped by default. The worker describes how to run it under **Operator live check** in the PR. The coordinator runs the check before merging.
+Six tickets have acceptance criteria that fakes cannot prove. For each one, the worker adds an opt-in live check, which is skipped by default. The worker describes how to run it under **Operator live check** in the PR. The coordinator runs the check before merging. The operator's step-by-step checklist for each prerequisite is in [Operator setup outside the repo](operator-setup.md).
 
 | Prerequisite | What the operator provides | Gates |
 |---|---|---|
