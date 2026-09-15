@@ -1,0 +1,111 @@
+# The agb-trader stack. `make up` brings it up with the real env files:
+#   docker compose --env-file env/db.env up --build --detach --wait
+#
+# Conventions, checked by tests/test_compose.py:
+#   - Every long-running service sets `restart: unless-stopped`. The only one-shots are
+#     `migrate` and `cli`.
+#   - Every service sets an explicit `mem_limit`.
+#   - No service mounts the Docker socket, and `db` publishes no host port.
+#   - No `container_name`, so several copies of the stack can run side by side under
+#     different project names.
+#   - Each service's block stays contiguous; shared settings live in the x- anchors below.
+#
+# The database is the only channel between services. Each service connects as its own role,
+# and Compose interpolates only that role's password into its container from env/db.env.
+
+name: agb-trader
+
+x-app-image: &app-image
+  image: ${AGB_IMAGE:-agb-trader-app}:${AGB_IMAGE_TAG:-dev}
+
+x-pg: &pg
+  PGHOST: db
+  PGDATABASE: agb
+  PGTZ: UTC
+
+services:
+  db:
+    image: postgres:17-alpine
+    command: ["postgres", "-c", "timezone=UTC", "-c", "log_timezone=UTC"]
+    environment:
+      POSTGRES_DB: agb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in env/db.env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [core]
+    healthcheck:
+      test: ["CMD", "pg_isready", "--username=postgres", "--dbname=agb"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    mem_limit: 512m
+
+  # One-shot: creates the roles and applies migrations, then exits. Every service waits for it.
+  migrate:
+    <<: *app-image
+    build:
+      context: .
+      target: app
+      args:
+        AGB_VERSION: ${AGB_IMAGE_TAG:-dev}
+    command: ["python", "-m", "agb.migrate"]
+    environment:
+      <<: *pg
+      PGUSER: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set in env/db.env}
+      AGB_OWNER_PASSWORD: ${AGB_OWNER_PASSWORD:?set in env/db.env}
+      SCHEDULER_DB_PASSWORD: ${SCHEDULER_DB_PASSWORD:?set in env/db.env}
+      PIPELINE_DB_PASSWORD: ${PIPELINE_DB_PASSWORD:?set in env/db.env}
+      EXECUTION_DB_PASSWORD: ${EXECUTION_DB_PASSWORD:?set in env/db.env}
+      BOT_DB_PASSWORD: ${BOT_DB_PASSWORD:?set in env/db.env}
+      UI_DB_PASSWORD: ${UI_DB_PASSWORD:?set in env/db.env}
+      CLI_DB_PASSWORD: ${CLI_DB_PASSWORD:?set in env/db.env}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [core]
+    restart: "no"
+    mem_limit: 256m
+
+  scheduler:
+    <<: *app-image
+    command: ["python", "-m", "agb.services.scheduler"]
+    environment:
+      <<: *pg
+      PGUSER: scheduler
+      PGPASSWORD: ${SCHEDULER_DB_PASSWORD:?set in env/db.env}
+      AGB_HEARTBEAT_SECONDS: ${AGB_HEARTBEAT_SECONDS:-30}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [core]
+    restart: unless-stopped
+    mem_limit: 256m
+
+  # The operator CLI: `make status`, or `make agb CMD="..."`.
+  cli:
+    <<: *app-image
+    profiles: [cli]
+    entrypoint: ["agb"]
+    command: ["status"]
+    environment:
+      <<: *pg
+      PGUSER: cli
+      PGPASSWORD: ${CLI_DB_PASSWORD:?set in env/db.env}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [core]
+    restart: "no"
+    mem_limit: 256m
+
+volumes:
+  pgdata:
+
+networks:
+  # Every service. The database lives here and nowhere else.
+  core:
+  # Only `vpn` and `bot`: the bot reaches Telegram through the VPN's HTTP proxy.
+  egress:
