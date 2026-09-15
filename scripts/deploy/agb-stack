@@ -5,6 +5,7 @@
 # The deploy directory:
 #   env/               the real env files, which exist only here
 #   backups/           the nightly database dumps
+#   lake/              the Parquet lake the pipeline lands the vendor's data in
 #   releases/<tag>/    compose.yaml and agb-stack as of commit <tag>
 #   current, previous  links to the release running now and to the one it replaced
 #   agb-stack          link to current/agb-stack
@@ -48,6 +49,8 @@ compose_at() {
         AGB_ENV_DIR="$dir/env" \
         AGB_BACKUP_DIR="$dir/backups" \
         AGB_BACKUP_USER="$(id -u):$(id -g)" \
+        AGB_LAKE_DIR="$dir/lake" \
+        AGB_PIPELINE_USER="$(id -u):$(id -g)" \
         docker compose --project-directory "$dir" --file "$dir/releases/$tag/compose.yaml" \
         --env-file "$dir/env/db.env" "$@"
 }
@@ -87,7 +90,7 @@ activate() {
     [ -f "$dir/releases/$tag/compose.yaml" ] || die "no release $tag in $dir/releases"
     docker image inspect "$IMAGE:$tag" >/dev/null 2>&1 || die "no image $IMAGE:$tag on this host"
     [ -f "$dir/env/db.env" ] || die "no $dir/env/db.env"
-    mkdir -p "$dir/backups"
+    mkdir -p "$dir/backups" "$dir/lake"
     # The links move before the stack starts, so that if it fails to come up, `rollback`
     # returns to the release that was running.
     current=$(tag_of current)

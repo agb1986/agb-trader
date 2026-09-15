@@ -3,19 +3,22 @@
 # only the password of its own role.
 #
 # BACKUP_DIR receives the nightly dumps. The backup service runs as the calling user, so the
-# dumps belong to whoever ran `make up`.
+# dumps belong to whoever ran `make up`. LAKE_DIR receives the Parquet lake, owned the same way.
 ENV_DIR ?= env
 BACKUP_DIR ?= backups
+LAKE_DIR ?= lake
 export AGB_ENV_DIR := $(ENV_DIR)
 export AGB_BACKUP_DIR := $(abspath $(BACKUP_DIR))
 export AGB_BACKUP_USER := $(shell id -u):$(shell id -g)
+export AGB_LAKE_DIR := $(abspath $(LAKE_DIR))
+export AGB_PIPELINE_USER := $(shell id -u):$(shell id -g)
 COMPOSE := docker compose --env-file $(ENV_DIR)/db.env
 
 .DEFAULT_GOAL := help
-.PHONY: help env up down status logs agb deploy rollback test test-fast lint
+.PHONY: help env up down status logs agb backfill lake deploy rollback test test-fast lint
 
 help: ## List the targets
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-8s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-9s %s\n", $$1, $$2}'
 
 env: ## Copy each env/*.env.example to $(ENV_DIR)/*.env, keeping files that already exist
 	@mkdir -p $(ENV_DIR)
@@ -25,7 +28,7 @@ env: ## Copy each env/*.env.example to $(ENV_DIR)/*.env, keeping files that alre
 	done
 
 up: ## Build the app image and bring up the stack
-	@mkdir -p $(AGB_BACKUP_DIR)
+	@mkdir -p $(AGB_BACKUP_DIR) $(AGB_LAKE_DIR)
 	$(COMPOSE) up --build --detach --wait
 
 down: ## Stop the stack; the database volume is kept
@@ -39,6 +42,13 @@ logs: ## Follow the service logs
 
 agb: ## Run an agb CLI command, e.g. make agb CMD=status
 	$(COMPOSE) run --rm cli $(CMD)
+
+backfill: ## Land the vendor's SEP, SF1 and TICKERS history from 1998 in the lake
+	@mkdir -p $(AGB_LAKE_DIR)
+	$(COMPOSE) run --rm pipeline python -m agb.services.pipeline backfill
+
+lake: ## Query the lake with DuckDB, e.g. make lake SQL="SELECT count(*) FROM sep"
+	$(COMPOSE) exec pipeline python -m agb.lake "$(SQL)"
 
 deploy: ## Build this commit's image, ship it to the server and restart the stack there
 	scripts/deploy/deploy.sh
