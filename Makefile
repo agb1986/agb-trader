@@ -1,15 +1,21 @@
 # Operator entry points. ENV_DIR is the directory holding the real env files; it defaults to
 # env/ in this checkout. Compose reads db.env for interpolation, so each container receives
 # only the password of its own role.
+#
+# BACKUP_DIR receives the nightly dumps. The backup service runs as the calling user, so the
+# dumps belong to whoever ran `make up`.
 ENV_DIR ?= env
+BACKUP_DIR ?= backups
 export AGB_ENV_DIR := $(ENV_DIR)
+export AGB_BACKUP_DIR := $(abspath $(BACKUP_DIR))
+export AGB_BACKUP_USER := $(shell id -u):$(shell id -g)
 COMPOSE := docker compose --env-file $(ENV_DIR)/db.env
 
 .DEFAULT_GOAL := help
-.PHONY: help env up down status logs agb test test-fast lint
+.PHONY: help env up down status logs agb deploy rollback test test-fast lint
 
 help: ## List the targets
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-7s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-8s %s\n", $$1, $$2}'
 
 env: ## Copy each env/*.env.example to $(ENV_DIR)/*.env, keeping files that already exist
 	@mkdir -p $(ENV_DIR)
@@ -19,6 +25,7 @@ env: ## Copy each env/*.env.example to $(ENV_DIR)/*.env, keeping files that alre
 	done
 
 up: ## Build the app image and bring up the stack
+	@mkdir -p $(AGB_BACKUP_DIR)
 	$(COMPOSE) up --build --detach --wait
 
 down: ## Stop the stack; the database volume is kept
@@ -32,6 +39,12 @@ logs: ## Follow the service logs
 
 agb: ## Run an agb CLI command, e.g. make agb CMD=status
 	$(COMPOSE) run --rm cli $(CMD)
+
+deploy: ## Build this commit's image, ship it to the server and restart the stack there
+	scripts/deploy/deploy.sh
+
+rollback: ## Restart the server's stack on the previously deployed image
+	scripts/deploy/rollback.sh
 
 test: ## Run the test suite against throwaway Postgres containers
 	uv run pytest

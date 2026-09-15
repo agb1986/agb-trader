@@ -15,7 +15,18 @@ make down     # stop the stack; the database volume is kept
 ```
 
 The real `env/*.env` files are git-ignored and never committed. `make ENV_DIR=/some/dir up`
-reads them from elsewhere.
+reads them from elsewhere. The stack's backup service writes a dump of the database into
+`backups/` each night, also git-ignored; `make BACKUP_DIR=/some/dir up` puts them elsewhere.
+
+## Deploying to the server
+
+```sh
+make deploy     # build this commit's image, ship it to the server over SSH, restart the stack there
+make rollback   # restart the server's stack on the release before
+```
+
+[docs/build/deploy.md](docs/build/deploy.md) covers the server's layout, the nightly backups,
+and restoring from one.
 
 ## Development
 

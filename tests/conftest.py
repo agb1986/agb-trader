@@ -50,6 +50,8 @@ class Cluster:
     host: str
     port: int
     passwords: dict[str, str]
+    # The Postgres container, for running the client tools inside it.
+    container: str
 
     def connect(self, dbname: str, user: str) -> psycopg.Connection:
         return psycopg.connect(
@@ -108,7 +110,7 @@ def cluster() -> Iterator[Cluster]:
     )  # fmt: skip
     try:
         host, port = _docker("port", name, "5432/tcp").splitlines()[0].rsplit(":", 1)
-        cluster = Cluster(host, int(port), passwords)
+        cluster = Cluster(host, int(port), passwords, name)
         _wait_for(cluster)
         with cluster.connect("postgres", SUPERUSER) as admin:
             admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(TEMPLATE)))

@@ -23,7 +23,7 @@ from pathlib import Path
 import psycopg
 from psycopg import sql
 
-from agb.roles import ALL_ROLES, OWNER, PASSWORD_VARS, SERVICE_ROLES
+from agb.roles import ALL_ROLES, BACKUP, OWNER, PASSWORD_VARS, SERVICE_ROLES
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +89,9 @@ def bootstrap(admin: psycopg.Connection, passwords: Mapping[str, str]) -> None:
             )
             admin.execute(sql.SQL("ALTER ROLE {} SET timezone = 'UTC'").format(ident))
             admin.execute(sql.SQL("ALTER ROLE {} SET search_path = agb").format(ident))
+        # pg_dump reads every table. Only a superuser can grant a predefined role, so this
+        # lives here rather than in a migration, and it covers tables no migration names yet.
+        admin.execute(sql.SQL("GRANT pg_read_all_data TO {}").format(sql.Identifier(BACKUP)))
         db = sql.Identifier(dbname)
         admin.execute(sql.SQL("ALTER DATABASE {} OWNER TO {}").format(db, sql.Identifier(OWNER)))
         admin.execute(sql.SQL("ALTER DATABASE {} SET timezone = 'UTC'").format(db))

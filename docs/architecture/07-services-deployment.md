@@ -3,9 +3,9 @@
 **Source:** [#10 Define Docker Compose service boundaries for the monorepo](https://github.com/agb1986/agb-trader/issues/10), with the per-service database roles from [#12](https://github.com/agb1986/agb-trader/issues/12)
 **Parent:** [#1 AGB Trader — Architecture Spec Map](https://github.com/agb1986/agb-trader/issues/1)
 **Status:** Settled design.
-**Date:** 2026-09-10
+**Date:** 2026-09-10, revised 2026-09-15 when T03 added the `backup` service
 
-The stack is split across two machines, decomposed into seven services on the server plus a research profile on the workstation, coupled only through Postgres, and separated by credentials and egress rather than by tidiness.
+The stack is split across two machines, decomposed into eight services on the server plus a research profile on the workstation, coupled only through Postgres, and separated by credentials and egress rather than by tidiness.
 
 ## Where it runs
 
@@ -15,15 +15,16 @@ That asymmetry decides the split. The always-on half — scheduling, the monthly
 
 The specific argument is CPCV. It refits the model roughly 120 times per split-set, and the DSR discipline counts every declared trial, so the trial count is expected to grow. An overnight run on the workstation becomes a fortnight on the server, contending with Jellyfin for the same 3.6 GB. The realistic failure mode is not a slow run; it is that the validation discipline gets skipped because running it hurts. Moving research off the server keeps the gates cheap enough to actually apply.
 
-## The seven services
+## The eight services
 
 - **`db`** — stock Postgres. Holds jobs, baskets, approval decisions with their actors, the audit history, alerts, expected events, ladder and mode state, and the certified-model registry ([08 — Database schema](08-database-schema.md)). Market data does not live here; it stays Parquet on disk, read with DuckDB.
-- **`scheduler`** — owns the calendar. Fires the monthly rebalance and the daily data pull by writing `job` rows, writes `expected_event` rows ahead of time, marks approvals missed at the cutoff, and fires the nightly `pg_dump`. Needs an explicit timezone and a real NYSE market calendar, not naive cron syntax: the rebalance is defined against trading sessions and the MOC cutoff, not wall-clock days.
+- **`scheduler`** — owns the calendar. Fires the monthly rebalance and the daily data pull by writing `job` rows, writes `expected_event` rows ahead of time, marks approvals missed at the cutoff, and schedules the nightly backup job, which `backup` runs. Needs an explicit timezone and a real NYSE market calendar, not naive cron syntax: the rebalance is defined against trading sessions and the MOC cutoff, not wall-clock days.
 - **`pipeline`** — the Sharadar pull, feature construction, ranker inference, the LLM panel, and the pre-trade gate. Ends by writing a proposed basket (and the shadow basket). Holds the Sharadar and Anthropic credentials.
 - **`execution`** — the only service with Alpaca credentials. Polls for approved-and-unsubmitted baskets, submits MOC orders, reconciles fills, takes daily position snapshots, records `broker_state`, and owns the broker-side halt levers (`suspend_trade`, `DELETE /v2/positions`).
 - **`bot`** — the only service with the Telegram token ([05 — Telegram bot](05-telegram-bot.md)). Evaluates the health of every other service and sends the alerts.
 - **`ui`** — the local UI ([06 — Local UI](06-local-ui.md)). Read-mostly, server-rendered, no broker credentials, no outbound network at all.
 - **`vpn`** — agb-trader's own gluetun, with its own WireGuard key.
+- **`backup`** — claims the scheduler's nightly backup job and writes a `pg_dump` of the database to a dated file on `/mnt/data`. It connects as its own `backup` role, which reads every table through Postgres's `pg_read_all_data` and writes nothing but its heartbeat and its job's events. It is a service of its own so that no role which writes trading state also holds read access to everything, and so that only this container needs the Postgres client tools.
 
 Plus a **`research`** service behind a profile that only ever runs on the workstation, and an **`agb` CLI** run on the server (inside the `app` image) as its own `cli` database role, for the upward moves: `agb promote`, `agb level`, `agb mode`, and panel configuration.
 
@@ -41,7 +42,7 @@ The database-only rule also means there is no internal HTTP surface to secure, n
 
 Two networks:
 
-- **`core`** — `db`, `scheduler`, `pipeline`, `execution`, `bot`, `ui`.
+- **`core`** — `db`, `scheduler`, `pipeline`, `execution`, `bot`, `ui`, `backup`.
 - **`egress`** — `vpn`, `bot`.
 
 `bot` is the only service on both. This makes the most important constraint structural rather than conventional: **`execution` must never route broker traffic through the VPN.** Submitting Alpaca orders from a foreign VPN exit invites account flags. With two networks, a stray `HTTPS_PROXY` in the wrong env file causes a connection failure rather than silently tunnelling live orders, because `execution` has no route to the proxy at all. torrent-agent already carries the scar of a proxy variable reaching calls that should not have used it; there, `NO_PROXY=127.0.0.1,localhost` is load-bearing.
@@ -56,7 +57,7 @@ A second tunnel costs nothing on the existing Proton plan (ten simultaneous conn
 
 The bot attaches to the tunnel by **proxy environment variables**, not by sharing its network namespace. torrent-agent locks Deluge inside the tunnel with `network_mode: service:gluetun` so it has no interface except the VPN, but the bot cannot do that: sharing the VPN namespace would sever it from `core`, and the database is its only channel. So `vpn` sits on `egress` publishing nothing, and the bot runs with `HTTPS_PROXY=http://vpn:8888` and `NO_PROXY=db,localhost,127.0.0.1` — Telegram out through the tunnel, Postgres direct.
 
-The known weakness is that this is fail-open in one direction: a library that ignores proxy environment variables would bypass the VPN silently. Accepted, because the alternative (splitting the bot into a namespace-locked relay plus a bridge-side logic process) adds an eighth service, a second holder of the Telegram token, and a private protocol between the halves. If the tunnel drops, the proxy refuses the connection and the bot fails loudly, which is the common case, and the pre-flight health message exists to make a dead bot visible a session early.
+The known weakness is that this is fail-open in one direction: a library that ignores proxy environment variables would bypass the VPN silently. Accepted, because the alternative (splitting the bot into a namespace-locked relay plus a bridge-side logic process) adds a ninth service, a second holder of the Telegram token, and a private protocol between the halves. If the tunnel drops, the proxy refuses the connection and the bot fails loudly, which is the common case, and the pre-flight health message exists to make a dead bot visible a session early.
 
 ## Secrets
 
@@ -81,7 +82,7 @@ On a box with 3.6 GB available and swap fully consumed, the OOM killer is otherw
 
 ## Postgres durability
 
-Data on a named volume under the existing docker root on `/media/local`; the scheduler fires a nightly `pg_dump` to a dated file on `/mnt/data` with simple retention. The nightly job also hash-checks a sample of the content-addressed panel bodies on `/mnt/data`.
+Data on a named volume under the existing docker root on `/media/local`. The scheduler writes a nightly backup job with an expected event, and `backup` runs it: a `pg_dump` to a dated file in the deploy directory on `/mnt/data`, keeping the newest fourteen. The backup is an ordinary scheduled job, so a dump that fails or never runs leaves its expected event unfulfilled and shows in the overdue view like any other missed work. `agb-stack restore` loads a dump into a scratch database and compares it with the live one ([Deploying to the server](../build/deploy.md)). The nightly hash check of a sample of the content-addressed panel bodies on `/mnt/data` joins this job once the panel store exists.
 
 The database is small — baskets, decisions, audit rows, daily snapshots and heartbeats, not market data or panel bodies — so a plain-text dump is cheap, restores with one documented command, and survives a Postgres major-version upgrade in a way a raw volume does not. The exposure is up to a day of history, which for a monthly rebalance is almost always nothing. Continuous archiving was rejected as real Postgres operations (archive commands, replication slots that fill a disk when the workstation is off, a restore nobody rehearses) for a database that gains a handful of rows a month.
 
@@ -90,7 +91,7 @@ The database is small — baskets, decisions, audit rows, daily snapshots and he
 One multi-stage Dockerfile with three targets:
 
 - **`base`** — shared feature definitions, the cost function, and data access.
-- **`app`** — what the server runs, as five commands (`scheduler`, `pipeline`, `execution`, `bot`, `ui`) plus the `agb` CLI, alongside stock Postgres and stock gluetun.
+- **`app`** — what the server runs, as six commands (`scheduler`, `pipeline`, `execution`, `bot`, `ui`, `backup`) plus the `agb` CLI, alongside stock Postgres and stock gluetun.
 - **`research`** — workstation only, adding NautilusTrader, vectorbt and the training stack.
 
 Sharing `base` is what keeps the backtest and the live path from drifting: features and costs are defined once and both halves import the same definition. Splitting `app` from `research` keeps hundreds of megabytes of training dependencies off a 28 GB eMMC root that the server never imports. The UI is server-rendered Python within `app` rather than a separate JavaScript build, so the stack has no Node toolchain.
@@ -99,7 +100,7 @@ Rejected: running research natively on the workstation with `uv`. Faster to iter
 
 ## Image delivery
 
-Built on the workstation and shipped over SSH: `docker build`, then `docker save | ssh … docker load`, tagged with the commit.
+Built on the workstation and shipped over SSH: `docker build`, then `docker save | ssh … docker load`, tagged with the commit. `make deploy` and `make rollback` run [scripts/deploy](../../scripts/deploy/); [Deploying to the server](../build/deploy.md) is the runbook.
 
 Building on the server means a long build on four 1.1 GHz cores while seventeen containers compete for 3.6 GB; the build itself would be the largest memory spike the box ever sees. A registry would give immutable digests and real rollback, but it puts a credential on the server and sends the image to a third party, for a one-person stack on one LAN. Rollback is handled by keeping the previous tag on the server.
 
