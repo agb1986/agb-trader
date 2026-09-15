@@ -60,7 +60,7 @@ Needed for T04 (Sharadar lake).
 - [x] Check that the licence covers personal, non-professional use, and note the renewal date.
 - [ ] Copy the API key from your sharadar.com account profile into the password manager. It goes in `env/pipeline.env`. It is a sharadar.com key, not a Nasdaq Data Link key, and sharing it can get access revoked.
 
-The direct API is `https://api.sharadar.com/v1.0/data/<table>`, with the key passed as `api_key`. It accepts the Nasdaq Data Link table names (`sep`, `sf1`, `tickers`) as well as its own (`stocks`, `fundamentals`, `tickers`). One column differs from the Nasdaq Data Link version: SF1's SEC filing date is called `date`, not `datekey`. The public key `test-api-key` returns AAPL only, which is enough to exercise the pull without a subscription.
+The direct API is `https://api.sharadar.com/v1.0/data/<table>`, with the key passed as `api_key`. It accepts the Nasdaq Data Link table names (`sep`, `sf1`, `tickers`) as well as its own (`stocks`, `fundamentals`, `tickers`). Two things differ from the Nasdaq Data Link version: SF1's SEC filing date is called `date`, not `datekey`, and the `table` column in TICKERS says `stocks` rather than `SEP`. A query returns at most 10,000 rows, so the backfill uses the bulk download instead: adding `years=full` to a table request redirects to a zipped CSV of the whole table. The public key `test-api-key` returns AAPL only, which is enough to exercise the pull without a subscription.
 
 After T03 and T04 have both merged, run the **full backfill from 1998** onto the server's `/mnt/data`. It must finish before the T17 live check (wave 6), which syncs the lake from the server. T04's own live check only pulls a small date range.
 
