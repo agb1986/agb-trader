@@ -1,0 +1,53 @@
+[project]
+name = "agb-trader"
+version = "0.1.0"
+description = "Semi-autonomous, AI-integrated US equities trader"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+# Base dependencies: everything the `base` image target installs. Shared by the
+# live services and the research profile, so both import the same definitions.
+dependencies = [
+    "psycopg[binary]>=3.3.5",
+]
+
+[project.scripts]
+agb = "agb.cli:main"
+
+[dependency-groups]
+# Server services only (the `app` image target).
+app = []
+# Workstation research only (the `research` image target).
+research = []
+dev = [
+    "pytest>=9.1.1",
+    "pyyaml>=6.0.3",
+    "ruff>=0.16.7",
+]
+
+[tool.uv]
+# A plain `uv sync` installs every group, so workers and tests see all code paths.
+default-groups = ["app", "research", "dev"]
+
+[build-system]
+requires = ["uv_build>=0.10,<0.11"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+# The distribution is agb-trader; the import package is agb.
+module-name = "agb"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "stack: brings up the Compose stack (builds the app image)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# The Orca coordinator script predates these settings and is not part of the product.
+extend-exclude = ["scripts/orca"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

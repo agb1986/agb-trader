@@ -1,0 +1,10 @@
+# Real env files hold secrets and are never committed; only the .example templates are.
+env/*.env
+!env/*.env.example
+
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
