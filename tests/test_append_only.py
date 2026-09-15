@@ -8,8 +8,8 @@ from psycopg import errors
 from agb.roles import OWNER, SERVICE_ROLES, SERVICES
 
 # The spec's mutable exceptions: tables, and the operations on them, that are not
-# append-only. T02 adds the job lease columns here.
-MUTABLE = {"agb.heartbeat": {"UPDATE"}}
+# append-only. On agb.job only the lease columns may change; tests/test_jobs.py covers that.
+MUTABLE = {"agb.heartbeat": {"UPDATE"}, "agb.job": {"UPDATE"}}
 
 CHANGES = {
     "UPDATE": "UPDATE {} SET note = 'edited'",
