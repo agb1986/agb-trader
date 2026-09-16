@@ -59,6 +59,10 @@ TICKER_TABLES = ("stocks", "fundamentals")
 DEFAULT_DIR = Path("/lake")
 FILE = "part.parquet"
 CHUNK = 1 << 20
+# A zip file's first bytes. The vendor answers a bulk request with a redirect to a zip, but an
+# error can arrive as an ordinary 200 whose body is JSON or XML, which would otherwise only show
+# up later as a corrupt archive.
+ZIP_MAGIC = b"PK\x03\x04"
 # DuckDB's memory while it splits a bulk export; it spills the rest to disk. The pipeline
 # container is limited to 2g.
 BULK_MEMORY = "1GB"
@@ -254,6 +258,14 @@ class Sharadar:
         `target`. The API answers with a redirect to the file."""
         with open(target, "wb") as out:
             self._fetch(dataset.api, {"years": "full"}, out)
+        with open(target, "rb") as f:
+            head = f.read(300)
+        if not head.startswith(ZIP_MAGIC):
+            shown = head.decode(errors="replace").replace(self.api_key, "***")
+            raise LakeError(
+                f"GET {dataset.api}?years=full did not return a zip, but "
+                f"{target.stat().st_size} bytes starting: {shown}"
+            )
         return target
 
 
@@ -382,13 +394,16 @@ def land_bulk(
         raise ValueError(f"{dataset.name} has no bulk export")
     work.mkdir(parents=True, exist_ok=True)
     source = work / f"{dataset.name}.csv"
-    with zipfile.ZipFile(archive) as z:
-        members = [m for m in z.infolist() if not m.is_dir()]
-        if len(members) != 1:
-            found = [m.filename for m in members]
-            raise LakeError(f"{dataset.name}: the export should hold one CSV, not {found}")
-        with z.open(members[0]) as src, open(source, "wb") as dst:
-            shutil.copyfileobj(src, dst, CHUNK)
+    try:
+        with zipfile.ZipFile(archive) as z:
+            members = [m for m in z.infolist() if not m.is_dir()]
+            if len(members) != 1:
+                found = [m.filename for m in members]
+                raise LakeError(f"{dataset.name}: the export should hold one CSV, not {found}")
+            with z.open(members[0]) as src, open(source, "wb") as dst:
+                shutil.copyfileobj(src, dst, CHUNK)
+    except zipfile.BadZipFile as exc:
+        raise LakeError(f"{dataset.name}: the export is not a readable zip: {exc}") from None
     with open(source, newline="") as f:
         header = next(csv.reader(f), [])
     schema = dataset.schema(header)
