@@ -62,6 +62,14 @@ CHUNK = 1 << 20
 # DuckDB's memory while it splits a bulk export; it spills the rest to disk. The pipeline
 # container is limited to 2g.
 BULK_MEMORY = "1GB"
+# A bulk export is written as one Parquet file per partition, and SEP's history from 1998 is
+# about 7,000 daily partitions. DuckDB buffers rows for every partition it holds open, once per
+# thread, and a partitioned write does not spill those buffers. The defaults (a thread per core,
+# 100 partitions open, half a million rows buffered before a flush) run out of BULK_MEMORY on
+# the server, so hold all three down. The write is slower for it.
+BULK_THREADS = 2
+BULK_OPEN_FILES = 16
+BULK_FLUSH_ROWS = 65_536
 _NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
 STRING, FLOAT, DATE, INT = pa.string(), pa.float64(), pa.date32(), pa.int64()
@@ -394,6 +402,9 @@ def land_bulk(
         db.execute(f"SET temp_directory = '{_sql(work / 'spill')}'")
         db.execute(f"SET memory_limit = '{BULK_MEMORY}'")
         db.execute("SET preserve_insertion_order = false")
+        db.execute(f"SET threads = {BULK_THREADS}")
+        db.execute(f"SET partitioned_write_max_open_files = {BULK_OPEN_FILES}")
+        db.execute(f"SET partitioned_write_flush_threshold = {BULK_FLUSH_ROWS}")
         db.execute(f"""
             COPY (
                 SELECT {select}
