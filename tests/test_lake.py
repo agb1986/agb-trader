@@ -13,7 +13,7 @@ import pytest
 from sharadar_fake import HEADERS, FakeVendor, sample, sep_row, sf1_row, ticker_row, to_csv
 
 from agb import lake
-from agb.lake import SEP, SF1, TICKERS, LakeError, NotYet, Sharadar
+from agb.lake import SEP, SF1, TICKERS, ZIP_MAGIC, LakeError, NotYet, Sharadar
 
 SESSION = date(2026, 9, 14)
 KEY = "k3y-not-a-real-one"
@@ -277,6 +277,25 @@ def test_an_export_must_hold_one_csv(tmp_path):
         z.writestr("a.csv", to_csv(HEADERS["stocks"], []))
         z.writestr("b.csv", to_csv(HEADERS["stocks"], []))
     with pytest.raises(LakeError, match="one CSV"):
+        lake.land_bulk(tmp_path / "lake", SEP, archive, lake.SINCE, tmp_path / "work")
+
+
+def test_a_bulk_download_that_is_not_a_zip_says_what_came_back(tmp_path):
+    body = f'{{"error": "too many requests for key {KEY}"}}'.encode()
+    client = Sharadar(KEY, lambda url: io.BytesIO(body))
+
+    with pytest.raises(LakeError) as exc:
+        client.bulk(SEP, tmp_path / "sep.zip")
+
+    assert "did not return a zip" in str(exc.value)
+    assert "too many requests" in str(exc.value)
+    assert KEY not in str(exc.value)
+
+
+def test_a_corrupt_export_fails_as_a_lake_error(tmp_path):
+    archive = tmp_path / "sep.zip"
+    archive.write_bytes(ZIP_MAGIC + b" but truncated here")
+    with pytest.raises(LakeError, match="not a readable zip"):
         lake.land_bulk(tmp_path / "lake", SEP, archive, lake.SINCE, tmp_path / "work")
 
 
