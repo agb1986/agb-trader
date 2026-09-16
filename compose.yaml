@@ -149,6 +149,31 @@ services:
     restart: unless-stopped
     mem_limit: 256m
 
+  # Takes the scheduler's data_pull job for each session and lands Sharadar's SEP, SF1 and
+  # TICKERS in the Parquet lake. It is the only service that holds the Sharadar key, which
+  # comes from env/pipeline.env, and it reaches the vendor directly. It runs as the host user
+  # that owns the lake directory: `make up` and `agb-stack` set AGB_PIPELINE_USER to the
+  # caller's uid:gid. `python -m agb.lake "SQL"` inside it queries the lake with DuckDB.
+  pipeline:
+    <<: *app-image
+    command: ["python", "-m", "agb.services.pipeline"]
+    user: "${AGB_PIPELINE_USER:-agb}"
+    env_file: ["${AGB_ENV_DIR:-env}/pipeline.env"]
+    environment:
+      <<: *pg
+      PGUSER: pipeline
+      PGPASSWORD: ${PIPELINE_DB_PASSWORD:?set in env/db.env}
+      AGB_HEARTBEAT_SECONDS: ${AGB_HEARTBEAT_SECONDS:-30}
+      AGB_LAKE_DIR: /lake
+    volumes:
+      - ${AGB_LAKE_DIR:-./lake}:/lake
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [core]
+    restart: unless-stopped
+    mem_limit: 2g
+
   # The operator CLI: `make status`, or `make agb CMD="..."`.
   cli:
     <<: *app-image
@@ -170,7 +195,8 @@ volumes:
   pgdata:
 
 networks:
-  # Every service. The database lives here and nowhere else.
+  # Every service. The database lives here and nowhere else. It is not internal: `pipeline`
+  # reaches the vendor's API through it.
   core:
   # Only `vpn` and `bot`: the bot reaches Telegram through the VPN's HTTP proxy.
   egress:

@@ -8,9 +8,13 @@ import os
 import shutil
 import subprocess
 import time
+from datetime import date
 
 import pytest
 from conftest import ROOT, worktree_id
+from sharadar_fake import HEADERS, sep_row, to_csv
+
+from agb import lake
 
 pytestmark = pytest.mark.stack
 
@@ -21,7 +25,12 @@ def image_tag():
 
 
 @pytest.fixture(scope="module")
-def compose(tmp_path_factory, image_tag):
+def lake_dir(tmp_path_factory):
+    return tmp_path_factory.mktemp("lake")
+
+
+@pytest.fixture(scope="module")
+def compose(tmp_path_factory, image_tag, lake_dir):
     project = image_tag
     env_dir = tmp_path_factory.mktemp("env")
     for example in (ROOT / "env").glob("*.env.example"):
@@ -33,6 +42,8 @@ def compose(tmp_path_factory, image_tag):
         "AGB_HEARTBEAT_SECONDS": "1",
         "AGB_BACKUP_DIR": str(tmp_path_factory.mktemp("backups")),
         "AGB_BACKUP_USER": f"{os.getuid()}:{os.getgid()}",
+        "AGB_LAKE_DIR": str(lake_dir),
+        "AGB_PIPELINE_USER": f"{os.getuid()}:{os.getgid()}",
     }
     base = [
         "docker", "compose",
@@ -66,10 +77,28 @@ def test_one_command_brings_up_the_database_and_the_services(compose):
     assert states["db"].startswith("running")
     assert states["scheduler"].startswith("running")
     assert states["backup"].startswith("running")
+    assert states["pipeline"].startswith("running")
     assert states["migrate"] == "exited 0"
 
 
-@pytest.mark.parametrize("service", ["scheduler", "backup"])
+def test_duckdb_queries_the_lake_inside_the_pipeline_container(compose, lake_dir):
+    rows = [
+        sep_row("AAPL", "2026-09-14", "328.21"),
+        sep_row("LEHMQ", "2008-09-12", "3.65"),
+        sep_row("MSFT", "2026-09-14", "512.3"),
+    ]
+    table = lake.parse(lake.SEP, to_csv(HEADERS["stocks"], rows))
+    lake.land(lake_dir, lake.SEP, table, date(2026, 9, 14))
+
+    out = compose(
+        "exec", "-T", "pipeline", "python", "-m", "agb.lake",
+        "SELECT count(*) AS n, max(date) AS latest FROM sep",
+    ).stdout  # fmt: skip
+
+    assert out == "n\tlatest\n3\t2026-09-14\n"
+
+
+@pytest.mark.parametrize("service", ["scheduler", "backup", "pipeline"])
 def test_cli_lists_the_heartbeat_and_it_advances(compose, service):
     first = status_line(compose, service)
     assert first[1] != "never", first

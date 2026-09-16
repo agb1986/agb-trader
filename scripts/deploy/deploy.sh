@@ -13,7 +13,7 @@ host=${AGB_DEPLOY_HOST:-casaos.local}
 dir=${AGB_DEPLOY_DIR:-/mnt/data/AppData/agb-trader}
 image=agb-trader-app
 # The env files the server's stack reads. Each must set every variable its example does.
-server_env=(db bot vpn)
+server_env=(db pipeline bot vpn)
 
 die() {
     echo "deploy: $*" >&2

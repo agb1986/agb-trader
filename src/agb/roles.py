@@ -6,8 +6,9 @@ backup service reads every table through `pg_read_all_data`, granted by `migrate
 """
 
 OWNER = "agb_owner"
+PIPELINE = "pipeline"
 BACKUP = "backup"
-SERVICES = ("scheduler", "pipeline", "execution", "bot", "ui", BACKUP)
+SERVICES = ("scheduler", PIPELINE, "execution", "bot", "ui", BACKUP)
 CLI = "cli"
 SERVICE_ROLES = (*SERVICES, CLI)
 ALL_ROLES = (OWNER, *SERVICE_ROLES)

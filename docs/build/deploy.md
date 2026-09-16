@@ -16,6 +16,7 @@ Everything on the server lives in one directory, `/mnt/data/AppData/agb-trader` 
 | ------------------ | ---------------------------------------------------------------------- |
 | `env/`             | The real env files. They exist only here, and nothing copies them off. |
 | `backups/`         | The nightly dumps, `agb-YYYY-MM-DD.sql.gz`.                            |
+| `lake/`            | The Parquet lake: the vendor's data in `sep/`, `sf1/` and `tickers/`.  |
 | `releases/<tag>/`  | `compose.yaml` and `agb-stack` as of commit `<tag>`.                   |
 | `current`          | A link to the release that is running.                                 |
 | `previous`         | A link to the release it replaced.                                     |
@@ -36,7 +37,10 @@ Run `agb-stack` from the deploy directory as `./agb-stack`, or by its full path.
   `env/db.env.example` sets, including `BACKUP_DB_PASSWORD`. Generate each password on the
   server, for example with `openssl rand -hex 24`, and keep a copy in the password manager.
   Make the file readable only by you (`chmod 600`).
-
+- `env/pipeline.env` exists in the deploy directory and sets every variable that
+  `env/pipeline.env.example` sets. `SHARADAR_API_KEY` is the vendor's API key, and this file
+  is the only place it is kept. `ANTHROPIC_API_KEY` may stay empty until a service uses it.
+  Make the file readable only by you (`chmod 600`).
 - `env/bot.env` sets every variable `env/bot.env.example` does: the bot's token and the id of
   the one chat it answers (see
   [Operator setup](operator-setup.md#3-telegram-bot)). Keep `HTTPS_PROXY` and `NO_PROXY` as
@@ -139,6 +143,46 @@ ls -l backups/
 
 The failure's message is in `./agb-stack logs backup` and in the job's `failed` event in
 `agb.job_event`.
+
+## The Parquet lake
+
+The `pipeline` service lands the vendor's SEP, SF1 and TICKERS tables in `lake/`, one Parquet
+file per partition:
+
+```text
+lake/sep/date=YYYY-MM-DD/part.parquet          prices for one session
+lake/sf1/lastupdated=YYYY-MM-DD/part.parquet   fundamentals rows the vendor changed that day
+lake/tickers/snapshot=YYYY-MM-DD/part.parquet  the tickers table as it stood that session
+```
+
+The scheduler plans a `data_pull` job for every session. It becomes claimable two hours after
+the close, and its expected event is due at the next open. The service pulls the session's
+prices, the fundamentals the vendor changed in the week to it, and the tickers table,
+delisted tickers included. It records each partition's date and SHA-256 in
+`agb.lake_snapshot`. If the vendor has not published the session yet, the service tries
+again every 15 minutes. A pull that fails is recorded as a failed job. A pull that fails, or
+never runs, shows in the overdue view from the next open. Re-running a pull for a session that
+already landed writes the same bytes, so it leaves each file and its hash as they were.
+
+The first time, land the history from 1998 on. It downloads the vendor's full exports, so
+it takes a while, and it is safe to run again:
+
+```sh
+./agb-stack run --rm pipeline python -m agb.services.pipeline backfill
+```
+
+To query the lake with DuckDB, and to see the latest snapshots:
+
+```sh
+./agb-stack exec pipeline python -m agb.lake "SELECT max(date), count(*) FROM sep"
+./agb-stack exec -T db psql -U postgres -d agb -c \
+  "SELECT snapshot_date, partition, sha256 FROM agb.lake_snapshot ORDER BY id DESC LIMIT 5"
+./agb-stack exec -T db psql -U postgres -d agb -c \
+  "SELECT period, state FROM agb.job_state WHERE kind = 'data_pull' ORDER BY period DESC LIMIT 5"
+```
+
+The views are `sep`, `sf1`, which shows the latest version of each fundamentals row, and
+`tickers`, which shows the newest snapshot.
 
 ## Restoring a backup
 

@@ -76,6 +76,27 @@ def test_backup_writes_to_a_host_directory_as_its_owner(resolved):
     assert set(backup["networks"]) == {"core"}
 
 
+def test_pipeline_writes_the_lake_to_a_host_directory_as_its_owner(resolved):
+    pipeline = resolved["services"]["pipeline"]
+    assert pipeline.get("user"), "the lake must belong to the host user that owns the directory"
+    [volume] = pipeline["volumes"]
+    assert (volume["type"], volume["target"]) == ("bind", "/lake")
+    assert pipeline["environment"]["AGB_LAKE_DIR"] == "/lake"
+    assert pipeline["environment"]["PGUSER"] == "pipeline"
+    assert set(pipeline["networks"]) == {"core"}
+
+
+def test_only_the_pipeline_has_the_vendor_key(resolved):
+    # Compose inlines each env file into the service's environment.
+    for name, service in resolved["services"].items():
+        has_key = "SHARADAR_API_KEY" in service.get("environment", {})
+        assert has_key == (name == "pipeline"), name
+    holders = [p.name for p in (ROOT / "env").glob("*.env.example") if "SHARADAR" in p.read_text()]
+    assert holders == ["pipeline.env.example"]
+    assert "SHARADAR" not in (ROOT / "compose.yaml").read_text()
+    assert "pipeline" in server_env()
+
+
 def test_app_services_share_one_image(resolved):
     services = resolved["services"]
     built = [name for name, service in services.items() if "build" in service]
@@ -129,12 +150,19 @@ def test_only_the_bot_holds_the_telegram_settings(resolved):
     assert holders == {"bot.env.example"}
 
 
+def server_env() -> set[str]:
+    """The env files deploy.sh requires on the server."""
+    text = (ROOT / "scripts/deploy/deploy.sh").read_text()
+    [line] = [line for line in text.splitlines() if line.startswith("server_env=(")]
+    return set(line.removeprefix("server_env=(").removesuffix(")").split())
+
+
 def test_vpn_and_bot_run_only_where_the_telegram_profile_is_enabled():
     services = yaml.safe_load((ROOT / "compose.yaml").read_text())["services"]
     profiled = {name for name, s in services.items() if "telegram" in s.get("profiles", [])}
     assert profiled == {"vpn", "bot"}
     assert "COMPOSE_PROFILES=telegram" in (ROOT / "scripts/deploy/agb-stack").read_text()
-    assert "server_env=(db bot vpn)" in (ROOT / "scripts/deploy/deploy.sh").read_text()
+    assert {"bot", "vpn"} <= server_env()
 
 
 def test_dockerfile_has_every_target():

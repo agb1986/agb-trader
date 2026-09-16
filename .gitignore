@@ -3,6 +3,8 @@ env/*.env
 !env/*.env.example
 # Database dumps from `make up`'s backup service.
 /backups/
+# The Parquet lake from `make up`'s pipeline service.
+/lake/
 
 __pycache__/
 *.py[cod]
