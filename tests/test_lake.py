@@ -313,6 +313,40 @@ def test_a_corrupt_export_fails_as_a_lake_error(tmp_path):
         lake.land_bulk(tmp_path / "lake", SEP, archive, lake.SINCE, tmp_path / "work")
 
 
+def test_a_query_too_big_for_memory_spills_beside_the_lake(tmp_path, monkeypatch):
+    # The service runs from a working directory it cannot write, so DuckDB's default spill
+    # directory is unusable and a query that outgrows memory has nowhere to go.
+    read_only = tmp_path / "cwd"
+    read_only.mkdir()
+    read_only.chmod(0o555)
+    monkeypatch.chdir(read_only)
+    root = tmp_path / "lake"
+    root.mkdir()
+
+    db = lake.connect(root)
+    db.execute("SET memory_limit = '100MB'")
+    db.execute("SET threads = 1")
+    big = "SELECT count(*) FROM (SELECT i FROM generate_series(1, 10000000) t(i) ORDER BY i)"
+    rows = db.sql(big)
+
+    assert rows.fetchone() == (10_000_000,)
+    assert (root / lake.SPILL).exists()
+
+
+def test_a_lake_it_cannot_write_leaves_the_spill_directory_alone(tmp_path):
+    # The query path is read-only work, so a reader with no write access still gets its views.
+    root = tmp_path / "lake"
+    root.mkdir()
+    lake.pull(root, client(sample()), SESSION)
+    root.chmod(0o555)
+    try:
+        db = lake.connect(root)
+        assert db.sql("SELECT count(*) FROM sep").fetchone() == (2,)
+        assert not (root / lake.SPILL).exists()
+    finally:
+        root.chmod(0o755)
+
+
 def test_duckdb_views_cover_what_has_landed(tmp_path):
     assert lake.connect(tmp_path).sql("SHOW TABLES").fetchall() == []
     with pytest.raises(duckdb.CatalogException):

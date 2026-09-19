@@ -58,6 +58,9 @@ SF1_LOOKBACK = timedelta(days=7)
 TICKER_TABLES = ("stocks", "fundamentals")
 DEFAULT_DIR = Path("/lake")
 FILE = "part.parquet"
+# Where a query that outgrows memory spills. It sits in the lake directory, beside the datasets,
+# whose names are the ones in DATASETS, so the leading dot keeps it out of their way.
+SPILL = ".query"
 CHUNK = 1 << 20
 # A zip file's first bytes. The vendor answers a bulk request with a redirect to a zip, but an
 # error can arrive as an ordinary 200 whose body is JSON or XML, which would otherwise only show
@@ -470,8 +473,14 @@ _VIEW_FILTER = {
 def connect(lake: Path = DEFAULT_DIR) -> duckdb.DuckDBPyConnection:
     """An in-memory DuckDB with a view over the lake for each dataset that has landed:
     `sep`, every session's prices; `sf1`, the latest version of each fundamentals row; and
-    `tickers`, the newest snapshot as of this call."""
+    `tickers`, the newest snapshot as of this call.
+
+    A query that runs out of memory spills to DuckDB's temp directory, which defaults to `.tmp`
+    under the working directory. The service image's working directory is not writable, so spill
+    beside the lake, which the service owns and which has the room for it."""
     conn = duckdb.connect()
+    if os.access(lake, os.W_OK):
+        conn.execute(f"SET temp_directory = '{_sql(lake / SPILL)}'")
     for dataset in DATASETS:
         files = sorted(lake.glob(f"{dataset.name}/{dataset.partition}=*/{FILE}"))
         if not files:
