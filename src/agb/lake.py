@@ -67,12 +67,14 @@ ZIP_MAGIC = b"PK\x03\x04"
 # container is limited to 2g.
 BULK_MEMORY = "1GB"
 # A bulk export is written as one Parquet file per partition, and SEP's history from 1998 is
-# about 7,000 daily partitions. DuckDB buffers rows for every partition it holds open, once per
-# thread, and a partitioned write does not spill those buffers. The defaults (a thread per core,
-# 100 partitions open, half a million rows buffered before a flush) run out of BULK_MEMORY on
-# the server, so hold all three down. The write is slower for it.
+# about 7,200 daily partitions. DuckDB buffers rows for every distinct partition value one COPY
+# writes, and a partitioned write does not spill those buffers, so a single COPY over the whole
+# history runs out of BULK_MEMORY no matter how few files it holds open. land_bulk copies a year
+# at a time instead, which is at most 366 partitions. Holding open more files than a year has
+# dates then leaves one file per partition, rather than a new file each time DuckDB cycles past
+# a partition it had closed.
 BULK_THREADS = 2
-BULK_OPEN_FILES = 16
+BULK_OPEN_FILES = 400
 BULK_FLUSH_ROWS = 65_536
 _NAME = re.compile(r"^[a-z][a-z0-9_]*$")
 
@@ -389,6 +391,10 @@ def land_bulk(
     The export is too big for memory, so DuckDB first splits it into partitions on disk under
     `work`, spilling as it goes. Each partition is then written as a pull writes it, so its bytes
     match what a daily pull of the same rows lands.
+
+    The split runs a year of the partition key at a time, because a partitioned write holds a
+    buffer per partition and cannot spill them; see BULK_OPEN_FILES. Every copy after the first
+    appends, so a year adds to what the last one staged instead of replacing it.
     """
     if dataset.key is None or dataset.since is None:
         raise ValueError(f"{dataset.name} has no bulk export")
@@ -411,6 +417,15 @@ def land_bulk(
         f"'{n}': '{_DUCKDB_TYPES[t]}'" for n, t in zip(header, schema.types, strict=True)
     )
     select = ", ".join(f'"{n}" AS "{f.name}"' for n, f in zip(header, schema, strict=True))
+    key = dataset.vendor(dataset.key)
+    export = (
+        f"""read_csv('{_sql(source)}', header = true, delim = ',', quote = '"', """
+        f"""escape = '"', columns = {{{columns}}})"""
+    )
+    kept = (
+        f"""WHERE "{dataset.vendor(dataset.since)}" >= DATE '{since.isoformat()}' """
+        f"""AND "{key}" IS NOT NULL"""
+    )
     staged = work / dataset.name
     shutil.rmtree(staged, ignore_errors=True)
     with duckdb.connect() as db:
@@ -420,16 +435,20 @@ def land_bulk(
         db.execute(f"SET threads = {BULK_THREADS}")
         db.execute(f"SET partitioned_write_max_open_files = {BULK_OPEN_FILES}")
         db.execute(f"SET partitioned_write_flush_threshold = {BULK_FLUSH_ROWS}")
-        db.execute(f"""
-            COPY (
-                SELECT {select}
-                FROM read_csv('{_sql(source)}', header = true, delim = ',', quote = '"',
-                              escape = '"', columns = {{{columns}}})
-                WHERE "{dataset.vendor(dataset.since)}" >= DATE '{since.isoformat()}'
-                  AND "{dataset.vendor(dataset.key)}" IS NOT NULL
-            ) TO '{_sql(staged)}'
-            (FORMAT parquet, PARTITION_BY ("{dataset.key}"), WRITE_PARTITION_COLUMNS true)
-        """)
+        span = f'SELECT min("{key}"), max("{key}") FROM {export} {kept}'
+        first, last = db.execute(span).fetchone()
+        for staged_years, year in enumerate(range(first.year, last.year + 1) if first else []):
+            db.execute(f"""
+                COPY (
+                    SELECT {select}
+                    FROM {export}
+                    {kept}
+                      AND "{key}" >= DATE '{year}-01-01'
+                      AND "{key}" < DATE '{year + 1}-01-01'
+                ) TO '{_sql(staged)}'
+                (FORMAT parquet, PARTITION_BY ("{dataset.key}"),
+                 WRITE_PARTITION_COLUMNS true{", APPEND" if staged_years else ""})
+            """)
     source.unlink()
     partitions = []
     for directory in sorted(staged.iterdir()) if staged.exists() else []:

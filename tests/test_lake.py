@@ -271,6 +271,20 @@ def test_the_backfill_again_changes_nothing(tmp_path):
     assert mtimes(root) == before
 
 
+def test_the_backfill_copies_a_year_at_a_time_over_a_gap(tmp_path):
+    # The export is split into one copy per year of the partition key, so rows have to survive
+    # the years with no rows at all, and no row may land twice where two copies share a lake.
+    days = ["1998-01-02", "1998-06-15", "1999-03-04", "2002-11-27"]
+    vendor = FakeVendor(stocks=[sep_row(t, day, "10.5") for day in days for t in ("AAPL", "MSFT")])
+    root = tmp_path / "lake"
+
+    sep = bulk(tmp_path, vendor, SEP, root)
+
+    assert [p.path for p in sep] == [f"sep/date={day}" for day in days]
+    for day in days:
+        assert read(root, f"sep/date={day}").column("ticker").to_pylist() == ["AAPL", "MSFT"]
+
+
 def test_an_export_must_hold_one_csv(tmp_path):
     archive = tmp_path / "sep.zip"
     with zipfile.ZipFile(archive, "w") as z:
