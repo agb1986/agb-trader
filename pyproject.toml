@@ -44,7 +44,7 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 markers = [
     "stack: brings up the Compose stack (builds the app image)",
-    "live: calls the real vendor API; skipped unless AGB_LIVE_SHARADAR=1",
+    "live: needs the real vendor API or the real lake; each module names the variable that enables it",
 ]
 
 [tool.ruff]
