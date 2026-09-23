@@ -6,6 +6,8 @@ env/*.env
 # The Parquet lake from `make up`'s pipeline service, or `make sync-lake`'s copy of the
 # server's.
 /lake/
+# The panel store from `make up`'s pipeline service.
+/panel/
 # The research profile's trial ledger and models.
 /research/
 

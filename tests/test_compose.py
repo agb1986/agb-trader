@@ -76,12 +76,13 @@ def test_backup_writes_to_a_host_directory_as_its_owner(resolved):
     assert set(backup["networks"]) == {"core"}
 
 
-def test_pipeline_writes_the_lake_to_a_host_directory_as_its_owner(resolved):
+def test_pipeline_writes_the_lake_and_panel_store_to_host_directories_as_their_owner(resolved):
     pipeline = resolved["services"]["pipeline"]
     assert pipeline.get("user"), "the lake must belong to the host user that owns the directory"
-    [volume] = pipeline["volumes"]
-    assert (volume["type"], volume["target"]) == ("bind", "/lake")
+    volumes = {volume["target"]: volume["type"] for volume in pipeline["volumes"]}
+    assert volumes == {"/lake": "bind", "/panel": "bind"}
     assert pipeline["environment"]["AGB_LAKE_DIR"] == "/lake"
+    assert pipeline["environment"]["AGB_PANEL_DIR"] == "/panel"
     assert pipeline["environment"]["PGUSER"] == "pipeline"
     assert set(pipeline["networks"]) == {"core"}
 

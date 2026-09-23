@@ -1,0 +1,425 @@
+"""The pre-trade gate: the last step of the rebalance, and the only way a basket moves on.
+
+The limits are malfunction detectors, not risk management. They catch a broken pipeline, not
+a bad month, so the thresholds are deliberately wide (docs/architecture/04-risk-and-approval.md).
+The gate runs every check that does not need the broker, in three groups:
+
+  * **Provenance.** The universe's snapshot is the month-end before the basket's period, the
+    universe's size is inside the band agb.universe expects, and the ranks came from the
+    model the pipeline is meant to run.
+  * **The basket.** Twenty positions whose weights sum to one, no symbol twice, cash left
+    over after the targets are bought, and turnover below 60% of the book.
+  * **Each order.** Its symbol is in the universe, its side agrees with the book (a buy opens
+    a position, a sell closes one it holds), its notional is at most 8% of equity, it is
+    market-on-close, and the clock is before the session's MOC cutoff (15:45 ET on a full
+    day).
+
+Every check is recorded with what it measured and the threshold it had to meet, whether it
+passed or not, so the result reads check by check. A single failure halts the whole
+rebalance: the basket moves to halted and the halt latch's `gate_breach` cause opens, so
+nothing trades and the book stays as last month left it until a human clears it. A basket
+that passes waits for the human in live mode; in paper mode the system approves it.
+
+Equity is the capital the basket was sized against until execution reads the broker's
+account, and the book is `basket.book`. Both change source later; the checks do not.
+
+The gate is safe to redo. It runs once per basket, in one transaction with its verdict, and
+a rebalance job reclaimed after the gate ran reads the recorded verdict back.
+"""
+
+from collections import Counter
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+
+import psycopg
+
+from agb import basket, nyse, rebalance, universe
+from agb.placeholder_ranker import PlaceholderMomentum
+from agb.roles import PIPELINE
+
+SYSTEM = "system"
+PAPER = "paper"
+
+PROVENANCE, BASKET, ORDER = "provenance", "basket", "order"
+
+
+class GateError(Exception):
+    """A basket the gate cannot run on."""
+
+
+@dataclass(frozen=True)
+class Limits:
+    """The gate's thresholds. `model` is the placeholder ranker's identity until the model
+    registry records a promoted certification."""
+
+    universe_min: int = universe.MIN_SIZE
+    universe_max: int = universe.MAX_SIZE
+    model: str = field(default_factory=lambda: PlaceholderMomentum().name)
+    positions: int = rebalance.SIZE
+    weight_tolerance: Decimal = Decimal("0.0001")
+    turnover: Decimal = Decimal("0.60")
+    notional: Decimal = Decimal("0.08")
+
+
+LIMITS = Limits()
+
+
+@dataclass(frozen=True)
+class Target:
+    symbol: str
+    weight: Decimal
+    shares: Decimal
+
+
+@dataclass(frozen=True)
+class Order:
+    symbol: str
+    side: str
+    qty: Decimal
+    tif: str
+    notional: Decimal
+
+
+@dataclass(frozen=True)
+class Basket:
+    """What the gate reads of a proposed basket."""
+
+    id: int
+    period: str
+    session_date: date
+    snapshot_date: date
+    universe_size: int
+    ranker: str
+    capital: Decimal
+    targets: tuple[Target, ...]
+    orders: tuple[Order, ...]
+
+
+@dataclass(frozen=True)
+class Check:
+    level: str
+    name: str
+    symbol: str | None
+    measured: str
+    threshold: str
+    passed: bool
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """The gate's result for one basket, and the state it left the basket in."""
+
+    basket_id: int
+    mode: str
+    state: str
+    checks: tuple[Check, ...]
+    recorded: bool = False  # an earlier attempt had already run the gate
+
+    @property
+    def failed(self) -> tuple[Check, ...]:
+        return tuple(c for c in self.checks if not c.passed)
+
+    @property
+    def passed(self) -> bool:
+        return not self.failed
+
+
+def evaluate(
+    target: Basket,
+    *,
+    members: Collection[str],
+    marks: Mapping[str, Decimal],
+    book: Mapping[str, Decimal],
+    now: datetime,
+    limits: Limits = LIMITS,
+    calendar: nyse.NyseCalendar | None = None,
+) -> list[Check]:
+    """Every check on `target`, in order: provenance, the basket, then each order.
+
+    `members` is the universe the basket was ranked from, `marks` each name's last as-traded
+    close on or before the signal session, `book` the positions before the rebalance and
+    `now` the moment the gate runs."""
+    year, month = (int(part) for part in target.period.split("-"))
+    first = date(year, month, 1)
+    calendar = calendar or nyse.NyseCalendar(first - timedelta(days=40), target.session_date)
+    return [
+        *_provenance(target, limits, calendar, first),
+        *_basket(target, marks, book, limits),
+        *(
+            check
+            for order in target.orders
+            for check in _order(target, order, members, book, now, limits, calendar)
+        ),
+    ]
+
+
+def _provenance(
+    target: Basket, limits: Limits, calendar: nyse.NyseCalendar, first: date
+) -> list[Check]:
+    before = first - timedelta(days=1)
+    month_end = calendar.last_session_of_month(before.year, before.month)
+    size = target.universe_size
+    return [
+        Check(
+            PROVENANCE,
+            "snapshot_date",
+            None,
+            target.snapshot_date.isoformat(),
+            month_end.isoformat(),
+            target.snapshot_date == month_end,
+        ),
+        Check(
+            PROVENANCE,
+            "universe_size",
+            None,
+            str(size),
+            f"{limits.universe_min} to {limits.universe_max}",
+            limits.universe_min <= size <= limits.universe_max,
+        ),
+        Check(
+            PROVENANCE, "model", None, target.ranker, limits.model, target.ranker == limits.model
+        ),
+    ]
+
+
+def _basket(
+    target: Basket, marks: Mapping[str, Decimal], book: Mapping[str, Decimal], limits: Limits
+) -> list[Check]:
+    positions = len(target.targets)
+    total = sum((t.weight for t in target.targets), Decimal(0))
+    return [
+        Check(
+            BASKET,
+            "positions",
+            None,
+            str(positions),
+            str(limits.positions),
+            positions == limits.positions,
+        ),
+        Check(
+            BASKET,
+            "weight_sum",
+            None,
+            str(total),
+            f"1 within {limits.weight_tolerance}",
+            abs(total - 1) <= limits.weight_tolerance,
+        ),
+        _duplicates(target),
+        _cash(target, marks),
+        _turnover(target, marks, book, limits),
+    ]
+
+
+def _duplicates(target: Basket) -> Check:
+    found = []
+    for what, symbols in (
+        ("targets", [t.symbol for t in target.targets]),
+        ("orders", [o.symbol for o in target.orders]),
+    ):
+        twice = sorted(s for s, n in Counter(symbols).items() if n > 1)
+        if twice:
+            found.append(f"{what} {', '.join(twice)}")
+    return Check(BASKET, "duplicates", None, "; ".join(found) or "none", "none", not found)
+
+
+def _cash(target: Basket, marks: Mapping[str, Decimal]) -> Check:
+    """The cash left once the basket holds its targets: equity less the targets' value at
+    their marks."""
+    unpriced = sorted(t.symbol for t in target.targets if t.symbol not in marks)
+    if unpriced:
+        return Check(BASKET, "cash", None, f"no mark for {', '.join(unpriced)}", ">= 0", False)
+    cash = target.capital - sum((t.shares * marks[t.symbol] for t in target.targets), Decimal(0))
+    return Check(BASKET, "cash", None, _dollars(cash), ">= 0", cash >= 0)
+
+
+def _turnover(
+    target: Basket, marks: Mapping[str, Decimal], book: Mapping[str, Decimal], limits: Limits
+) -> Check:
+    """What the plan sells, as a share of the book's value at its marks. An empty book has
+    nothing to turn over."""
+    threshold = f"< {limits.turnover:.0%}"
+    if not book:
+        return Check(BASKET, "turnover", None, "no book", threshold, True)
+    unpriced = sorted(s for s in book if s not in marks)
+    if unpriced:
+        measured = f"no mark for {', '.join(unpriced)}"
+        return Check(BASKET, "turnover", None, measured, threshold, False)
+    value = sum((shares * marks[s] for s, shares in book.items()), Decimal(0))
+    sold = sum((o.notional for o in target.orders if o.side == "sell"), Decimal(0))
+    if value <= 0:
+        return Check(BASKET, "turnover", None, f"book worth {_dollars(value)}", threshold, False)
+    ratio = sold / value
+    return Check(BASKET, "turnover", None, f"{ratio:.2%}", threshold, ratio < limits.turnover)
+
+
+def _order(
+    target: Basket,
+    order: Order,
+    members: Collection[str],
+    book: Mapping[str, Decimal],
+    now: datetime,
+    limits: Limits,
+    calendar: nyse.NyseCalendar,
+) -> list[Check]:
+    symbol = order.symbol
+    held = book.get(symbol, Decimal(0))
+    # A name leaves the book by being sold, including one that has left the universe.
+    in_universe = symbol in members
+    if in_universe:
+        membership = "in the universe"
+    elif order.side == "sell" and held > 0:
+        membership = "held, not in the universe"
+    else:
+        membership = "not in the universe"
+    if order.side == "buy":
+        side_ok = held == 0
+    else:
+        side_ok = order.side == "sell" and 0 < order.qty <= held
+    share = order.notional / target.capital
+    cutoff = calendar.moc_cutoff(target.session_date)
+    return [
+        Check(
+            ORDER,
+            "universe",
+            symbol,
+            membership,
+            "in the universe, or held for a sell",
+            in_universe or (order.side == "sell" and held > 0),
+        ),
+        Check(
+            ORDER,
+            "side",
+            symbol,
+            f"{order.side} {order.qty}, holding {held}",
+            "a buy opens a position; a sell closes at most what is held",
+            side_ok,
+        ),
+        Check(
+            ORDER,
+            "notional",
+            symbol,
+            f"{share:.2%} of {_dollars(target.capital)}",
+            f"<= {limits.notional:.0%}",
+            share <= limits.notional,
+        ),
+        Check(ORDER, "tif", symbol, order.tif, "cls", order.tif == "cls"),
+        Check(ORDER, "clock", symbol, _eastern(now), f"before {_eastern(cutoff)}", now < cutoff),
+    ]
+
+
+def _dollars(amount: Decimal) -> str:
+    return f"{amount:.2f}"
+
+
+def _eastern(at: datetime) -> str:
+    return at.astimezone(nyse.NEW_YORK).strftime("%Y-%m-%d %H:%M ET")
+
+
+_BASKET = """
+    SELECT id, period, session_date, snapshot_date, universe_size, ranker, capital_usd
+    FROM agb.basket WHERE id = %s
+"""
+_TARGETS = "SELECT symbol, weight, shares FROM agb.basket_target WHERE basket_id = %s ORDER BY id"
+_ORDERS = """
+    SELECT symbol, side, qty, tif, notional_usd FROM agb.basket_order
+    WHERE basket_id = %s ORDER BY id
+"""
+_RUN = "SELECT id, mode FROM agb.gate_run WHERE basket_id = %s"
+_INSERT_RUN = """
+    INSERT INTO agb.gate_run (basket_id, checks, mode, actor) VALUES (%s, %s, %s, %s)
+    RETURNING id
+"""
+_CHECKS = """
+    SELECT level, name, symbol, measured, threshold, passed FROM agb.gate_check
+    WHERE run_id = %s ORDER BY id
+"""
+_INSERT_CHECK = """
+    INSERT INTO agb.gate_check (run_id, level, name, symbol, measured, threshold, passed)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+"""
+_STATE = "SELECT state, seq FROM agb.basket_state WHERE id = %s"
+_MOVE = """
+    INSERT INTO agb.basket_event (basket_id, seq, from_state, to_state, actor, surface, reason)
+    VALUES (%s, %s, 'proposed', %s, %s, %s, %s)
+"""
+_BREACH = """
+    INSERT INTO agb.halt_event (cause, action, basket_id, actor, reason)
+    VALUES ('gate_breach', 'set', %s, %s, %s)
+"""
+
+
+def load(conn: psycopg.Connection, basket_id: int) -> Basket:
+    """A basket as the gate reads it."""
+    row = conn.execute(_BASKET, (basket_id,)).fetchone()
+    if row is None:
+        raise GateError(f"basket {basket_id} does not exist")
+    targets = tuple(Target(*t) for t in conn.execute(_TARGETS, (basket_id,)).fetchall())
+    orders = tuple(Order(*o) for o in conn.execute(_ORDERS, (basket_id,)).fetchall())
+    return Basket(*row, targets, orders)
+
+
+def run(
+    conn: psycopg.Connection,
+    basket_id: int,
+    *,
+    members: Collection[str],
+    marks: Mapping[str, Decimal],
+    now: datetime,
+    limits: Limits = LIMITS,
+    calendar: nyse.NyseCalendar | None = None,
+) -> Verdict:
+    """Gate a proposed basket, record every check, and move it on: to halted with a
+    `gate_breach` on any failure, to approved by the system on a pass in paper mode, and
+    nowhere on a pass in live mode. A basket already gated returns its recorded verdict."""
+    with conn.transaction():
+        recorded = conn.execute(_RUN, (basket_id,)).fetchone()
+        current = conn.execute(_STATE, (basket_id,)).fetchone()
+        if recorded is not None:
+            run_id, mode = recorded
+            checks = tuple(Check(*c) for c in conn.execute(_CHECKS, (run_id,)).fetchall())
+            return Verdict(basket_id, mode, current[0], checks, recorded=True)
+        if current is None or current[0] != "proposed":
+            state = current[0] if current else "unproposed"
+            raise GateError(f"basket {basket_id} is {state}, not proposed")
+        seq = current[1] + 1
+
+        target = load(conn, basket_id)
+        checks = evaluate(
+            target,
+            members=members,
+            marks=marks,
+            book=basket.book(conn),
+            now=now,
+            limits=limits,
+            calendar=calendar,
+        )
+        (mode,) = conn.execute("SELECT mode FROM agb.current_mode").fetchone()
+        (run_id,) = conn.execute(_INSERT_RUN, (basket_id, len(checks), mode, PIPELINE)).fetchone()
+        with conn.cursor() as cur:
+            cur.executemany(
+                _INSERT_CHECK,
+                [
+                    (run_id, c.level, c.name, c.symbol, c.measured, c.threshold, c.passed)
+                    for c in checks
+                ],
+            )
+        failed = [c for c in checks if not c.passed]
+        if failed:
+            reason = "pre-trade gate failed: " + "; ".join(_describe(c) for c in failed)
+            conn.execute(_MOVE, (basket_id, seq, "halted", PIPELINE, basket.SURFACE, reason))
+            conn.execute(_BREACH, (basket_id, PIPELINE, reason))
+            state = "halted"
+        elif mode == PAPER:
+            reason = "passed the pre-trade gate in paper mode"
+            conn.execute(_MOVE, (basket_id, seq, "approved", SYSTEM, basket.SURFACE, reason))
+            state = "approved"
+        else:
+            state = "proposed"
+    return Verdict(basket_id, mode, state, tuple(checks))
+
+
+def _describe(check: Check) -> str:
+    name = f"{check.name} {check.symbol}" if check.symbol else check.name
+    return f"{name} measured {check.measured}, needs {check.threshold}"

@@ -1,0 +1,80 @@
+"""The panel store: content-addressed, zstd-compressed bodies on the data disk.
+
+The panel's full prompt and response bodies and the filing texts it read are too large and too
+rarely read to belong in Postgres (docs/architecture/08, "Panel logs"). Each body is stored
+once, under the SHA-256 of its uncompressed bytes, and the database refers to it by that hash:
+
+    <root>/<sha[:2]>/<sha>.zst
+
+A body is written to a temporary file in its directory and renamed into place, so a reader
+never sees a partial file. Storing bytes that are already present is a no-op: the hash names
+the content, so the file on disk is already right.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import tempfile
+from pathlib import Path
+
+import zstandard
+
+DEFAULT_DIR = Path("panel")
+LEVEL = 10
+
+
+class StoreError(Exception):
+    """A body that is missing, or whose content no longer matches its hash."""
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+class PanelStore:
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+
+    def path(self, digest: str) -> Path:
+        return self.root / digest[:2] / f"{digest}.zst"
+
+    def put(self, data: bytes) -> str:
+        """Store `data` and return its SHA-256. Storing identical content again writes nothing."""
+        digest = sha256(data)
+        target = self.path(digest)
+        if target.exists():
+            return digest
+        target.parent.mkdir(parents=True, exist_ok=True)
+        compressed = zstandard.ZstdCompressor(level=LEVEL).compress(data)
+        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{digest}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as out:
+                out.write(compressed)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp, target)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+        return digest
+
+    def put_text(self, text: str) -> str:
+        return self.put(text.encode())
+
+    def get(self, digest: str) -> bytes:
+        """The body stored under `digest`, checked against it."""
+        try:
+            compressed = self.path(digest).read_bytes()
+        except FileNotFoundError:
+            raise StoreError(f"no body {digest} in {self.root}") from None
+        data = zstandard.ZstdDecompressor().decompress(compressed)
+        if sha256(data) != digest:
+            raise StoreError(f"body {digest} in {self.root} does not match its hash")
+        return data
+
+    def get_text(self, digest: str) -> str:
+        return self.get(digest).decode()
+
+    def has(self, digest: str) -> bool:
+        return self.path(digest).exists()
