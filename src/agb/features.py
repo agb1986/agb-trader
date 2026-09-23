@@ -445,18 +445,10 @@ def forward_returns(
     conn = db if db is not None else lake.connect(lake_dir)
     try:
         session = features.snapshot_date
-        following = _month_start(session, -2)
-        entry, month_end = conn.execute(
-            "SELECT min(date) FILTER (WHERE date > $session),"
-            " max(date) FILTER (WHERE date < $following)"
-            " FROM sep WHERE date > $session",
-            {"session": session, "following": following},
-        ).fetchone()
-        if entry is None or month_end is None or month_end < _month_start(session, -1):
+        window = forward_window(session, db=conn)
+        if window is None:
             return None
-        exit_ = conn.execute("SELECT min(date) FROM sep WHERE date > ?", [month_end]).fetchone()[0]
-        if exit_ is None:
-            return None
+        entry, exit_ = window
         conn.register(_MEMBERS, features.raw.select(["ticker"]))
         try:
             rows = conn.execute(
@@ -468,6 +460,31 @@ def forward_returns(
         if db is None:
             conn.close()
     return {ticker: value for ticker, value in rows if value is not None}
+
+
+def forward_window(
+    session: date, lake_dir: Path = lake.DEFAULT_DIR, *, db: duckdb.DuckDBPyConnection | None = None
+) -> tuple[date, date] | None:
+    """The sessions a forward return over `session`'s features runs between: the entry, the first
+    session after `session`, and the exit, the first session after the following month's last.
+    Research labels and the live basket's month are the same window. None if the lake does not
+    reach the exit session yet."""
+    conn = db if db is not None else lake.connect(lake_dir)
+    try:
+        following = _month_start(session, -2)
+        entry, month_end = conn.execute(
+            "SELECT min(date) FILTER (WHERE date > $session),"
+            " max(date) FILTER (WHERE date < $following)"
+            " FROM sep WHERE date > $session",
+            {"session": session, "following": following},
+        ).fetchone()
+        if entry is None or month_end is None or month_end < _month_start(session, -1):
+            return None
+        exit_ = conn.execute("SELECT min(date) FROM sep WHERE date > ?", [month_end]).fetchone()[0]
+    finally:
+        if db is None:
+            conn.close()
+    return None if exit_ is None else (entry, exit_)
 
 
 def information_coefficients(

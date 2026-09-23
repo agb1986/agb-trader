@@ -4,18 +4,23 @@
 #
 # BACKUP_DIR receives the nightly dumps. The backup service runs as the calling user, so the
 # dumps belong to whoever ran `make up`. LAKE_DIR receives the Parquet lake, owned the same way.
+# RESEARCH_DIR receives the research profile's trial ledger and models, on the workstation.
 ENV_DIR ?= env
 BACKUP_DIR ?= backups
 LAKE_DIR ?= lake
+RESEARCH_DIR ?= research
 export AGB_ENV_DIR := $(ENV_DIR)
 export AGB_BACKUP_DIR := $(abspath $(BACKUP_DIR))
 export AGB_BACKUP_USER := $(shell id -u):$(shell id -g)
 export AGB_LAKE_DIR := $(abspath $(LAKE_DIR))
 export AGB_PIPELINE_USER := $(shell id -u):$(shell id -g)
+export AGB_RESEARCH_DIR := $(abspath $(RESEARCH_DIR))
+export AGB_RESEARCH_USER := $(shell id -u):$(shell id -g)
 COMPOSE := docker compose --env-file $(ENV_DIR)/db.env
 
 .DEFAULT_GOAL := help
-.PHONY: help env up down status logs agb backfill lake deploy rollback test test-fast lint
+.PHONY: help env up down status logs agb backfill lake sync-lake research deploy rollback \
+	test test-fast lint
 
 help: ## List the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-9s %s\n", $$1, $$2}'
@@ -49,6 +54,14 @@ backfill: ## Land the vendor's SEP, SF1 and TICKERS history from 1998 in the lak
 
 lake: ## Query the lake with DuckDB, e.g. make lake SQL="SELECT count(*) FROM sep"
 	$(COMPOSE) exec pipeline python -m agb.lake "$(SQL)"
+
+sync-lake: ## Pull the server's lake into $(LAKE_DIR), read-only against the server
+	@mkdir -p $(AGB_LAKE_DIR)
+	uv run python -m agb.research sync --env-file $(ENV_DIR)/research.env --lake $(AGB_LAKE_DIR)
+
+research: sync-lake ## Sync the lake, then run a research command, e.g. make research CMD="cpcv"
+	@mkdir -p $(AGB_RESEARCH_DIR)
+	$(COMPOSE) --profile research run --build --rm research $(CMD)
 
 deploy: ## Build this commit's image, ship it to the server and restart the stack there
 	scripts/deploy/deploy.sh

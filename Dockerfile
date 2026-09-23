@@ -45,9 +45,16 @@ ARG AGB_VERSION=dev
 ENV AGB_VERSION=$AGB_VERSION
 
 FROM runtime AS research
+# lightgbm's shared library links the GNU OpenMP runtime, which the slim image lacks.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
 RUN uv sync --frozen --no-default-groups --group research --no-install-project
 COPY --from=base /app /app
 RUN uv sync --frozen --no-default-groups --group research
 USER agb
 ARG AGB_VERSION=dev
-ENV AGB_VERSION=$AGB_VERSION
+# numba caches vectorbt's compiled functions beside the package, which the container's user
+# cannot write; keep them in a scratch directory instead.
+ENV AGB_VERSION=$AGB_VERSION \
+    NUMBA_CACHE_DIR=/tmp/numba-cache

@@ -180,3 +180,23 @@ def blank_db(cluster: Cluster) -> Iterator[str]:
         yield name
     finally:
         drop_database(cluster, name)
+
+
+# The research panel: a fake lake of two dozen names over several years, built once per
+# session because the feature history over thirty month-ends takes a while.
+
+
+@pytest.fixture(scope="session")
+def research_lake(tmp_path_factory) -> Path:
+    from research_fake import Market
+
+    return Market(tmp_path_factory.mktemp("research-lake")).names().land()
+
+
+@pytest.fixture(scope="session")
+def research_panel(research_lake: Path):
+    from research_fake import END, PANEL_START
+
+    from agb.research import panel
+
+    return panel.build(research_lake, PANEL_START, END)

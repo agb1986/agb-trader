@@ -12,7 +12,7 @@ from conftest import ROOT
 
 from agb.roles import PASSWORD_VARS
 
-ONE_SHOT = {"migrate", "cli"}
+ONE_SHOT = {"migrate", "cli", "research"}
 ENV_NAMES = {"db", "pipeline", "execution", "bot", "vpn", "research"}
 
 
@@ -100,15 +100,17 @@ def test_only_the_pipeline_has_the_vendor_key(resolved):
 def test_app_services_share_one_image(resolved):
     services = resolved["services"]
     built = [name for name, service in services.items() if "build" in service]
-    assert built == ["migrate"], "only migrate builds; the others reuse its image"
-    images = {service["image"] for name, service in services.items() if name not in {"db", "vpn"}}
-    assert images == {services["migrate"]["image"]}
+    assert built == ["migrate", "research"], "migrate builds the app image; research its own"
+    assert services["research"]["build"]["target"] == "research"
+    shared = {n: s for n, s in services.items() if n not in {"db", "vpn", "research"}}
+    assert {service["image"] for service in shared.values()} == {services["migrate"]["image"]}
+    assert services["research"]["image"] != services["migrate"]["image"]
 
 
 def test_only_the_bot_is_on_both_networks(resolved):
     services = resolved["services"]
     on = {
-        network: {name for name, service in services.items() if network in service["networks"]}
+        network: {n for n, s in services.items() if network in s.get("networks", ())}
         for network in ("core", "egress")
     }
     assert on["core"] & on["egress"] == {"bot"}
@@ -191,6 +193,31 @@ def test_real_env_files_are_ignored():
         assert ignored.returncode == 0, f"env/{name}.env is not git-ignored"
 
 
-def test_migrate_and_cli_are_the_only_one_shot_services():
+def test_migrate_cli_and_research_are_the_only_one_shot_services():
     services = yaml.safe_load((ROOT / "compose.yaml").read_text())["services"]
     assert {name for name, s in services.items() if s.get("restart") == "no"} == ONE_SHOT
+
+
+def test_research_runs_only_on_the_workstation_with_a_read_only_lake(resolved):
+    """The research profile starts only on the workstation, off the network, and its lake is a
+    read-only mount of what the host-side rsync pulled."""
+    assert "research" not in server_env(), "deploy.sh never ships research.env"
+    assert "research" not in (ROOT / "scripts/deploy/agb-stack").read_text()
+    deploy = (ROOT / "scripts/deploy/deploy.sh").read_text()
+    assert "--target app" in deploy and "--target research" not in deploy
+    services = yaml.safe_load((ROOT / "compose.yaml").read_text())["services"]
+    assert services["research"]["profiles"] == ["research"]
+    assert services["research"]["network_mode"] == "none"
+    research = resolved["services"]["research"]
+    assert research["network_mode"] == "none"
+    assert "networks" not in research
+    assert research.get("user"), "the ledger must belong to the host user that owns the directory"
+    env = research["environment"]
+    assert env["AGB_LAKE_DIR"] == "/lake" and env["AGB_RESEARCH_DIR"] == "/research"
+    assert ":" in env["AGB_LAKE_SOURCE"], "the example names the server's lake"
+    assert not {key for key in env if key.startswith(("SHARADAR", "PG", "POSTGRES", "TELEGRAM"))}
+    mounts = {volume["target"]: volume for volume in research["volumes"]}
+    assert set(mounts) == {"/lake", "/research"}
+    assert mounts["/lake"].get("read_only") is True, "the lake is never written by research"
+    assert not mounts["/research"].get("read_only")
+    assert all(volume["type"] == "bind" for volume in mounts.values())
