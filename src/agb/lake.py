@@ -287,6 +287,59 @@ def file_hash(path: Path) -> str:
         return hashlib.file_digest(f, "sha256").hexdigest()
 
 
+def partition_files(lake: Path, through: date | None = None) -> list[Path]:
+    """The partition files `connect` reads, in path order, with SEP cut to the sessions on or
+    before `through`.
+
+    Only SEP is cut. SF1 is partitioned by `lastupdated`, the day the vendor last changed a row,
+    so a figure filed in 1999 sits in whichever partition the vendor most recently stamped it
+    with; cutting SF1 by a date in the past would drop nearly all of history. What keeps a later
+    filing out of an earlier result is the `datekey` gate in the query, not the partition it
+    landed in. The tickers table is a snapshot, and `connect` shows the newest one.
+    """
+    files: list[Path] = []
+    for dataset in DATASETS:
+        landed = sorted(lake.glob(f"{dataset.name}/{dataset.partition}=*/{FILE}"))
+        if not landed:
+            continue
+        if dataset.key is None:
+            files.append(landed[-1])
+        elif dataset is SEP and through is not None:
+            cutoff = through.isoformat()
+            files += [p for p in landed if p.parent.name.partition("=")[2] <= cutoff]
+        else:
+            files += landed
+    return files
+
+
+def partition_digest(
+    lake: Path, through: date | None = None, *, hashes: dict[object, str] | None = None
+) -> str:
+    """A SHA-256 over the partitions a query up to `through` reads: one line of
+    "<path in the lake> <file sha256>" each, in path order. It names the exact bytes a result
+    was built from, so a basket can be tied to the data it saw, and the pre-trade gate can tell
+    that the lake moved under it.
+
+    `hashes` is a dictionary the caller keeps across calls. A file whose path, size and
+    modification time are unchanged is not read a second time. Pass one when building many
+    snapshots in a row; leave it out for a single build.
+    """
+    digest = hashlib.sha256()
+    for path in partition_files(lake, through):
+        digest.update(f"{path.relative_to(lake)} {_cached_hash(path, hashes)}\n".encode())
+    return digest.hexdigest()
+
+
+def _cached_hash(path: Path, hashes: dict[object, str] | None) -> str:
+    if hashes is None:
+        return file_hash(path)
+    stat = path.stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    if key not in hashes:
+        hashes[key] = file_hash(path)
+    return hashes[key]
+
+
 def _fsync_dir(directory: Path) -> None:
     fd = os.open(directory, os.O_RDONLY)
     try:
