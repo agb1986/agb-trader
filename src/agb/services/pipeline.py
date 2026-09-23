@@ -5,12 +5,15 @@
     the job, which fulfils the pull's expected event. A pull that fails, or never runs, leaves
     that event unfulfilled, so it shows in the overdue view like any other missed work.
   * `rebalance`: proposes the month's basket (agb.basket) from the universe as of the signal
-    session, ranked by the ranker the service was built with, and completes the job, which
-    fulfils the proposal's expected event. The ranker is the placeholder until the classical
-    model is certified; swapping it is a change to `from_env` alone.
+    session, ranked by the ranker the service was built with, runs the pre-trade gate on it
+    (agb.gate), and completes the job, which fulfils the proposal's expected event. The gate
+    halts a basket that fails any check and opens the halt latch; in paper mode it approves
+    one that passes, and in live mode leaves it for the human. The ranker is the placeholder
+    until the classical model is certified; swapping it is a change to `from_env` alone.
 
 Both are safe to redo, so an expired lease is reclaimed: a partition that lands with the same
-bytes is left untouched and recorded nothing new, and a reference already proposed is kept.
+bytes is left untouched and recorded nothing new, a reference already proposed is kept, and a
+basket already gated keeps its verdict.
 Data the vendor has not yet published is not a failure: the service keeps the job and shortens
 its lease to RETRY, so the work is tried again once the lease runs out, until it lands.
 
@@ -22,7 +25,7 @@ import argparse
 import logging
 import os
 import shutil
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -31,8 +34,9 @@ import duckdb
 import psycopg
 import pyarrow as pa
 
-from agb import basket, jobs, lake, nyse, schedule
+from agb import basket, gate, jobs, lake, nyse, schedule
 from agb.basket import BasketError, NotReady
+from agb.gate import GateError
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.lake import LakeError, NotYet, Partition, Sharadar
 from agb.placeholder_ranker import PlaceholderMomentum
@@ -81,8 +85,8 @@ def capital_from_env() -> Decimal:
 
 
 class Pipeline:
-    """One pipeline cycle, run by `serve`. The URL opener, the ranker and the capital are
-    injectable for tests."""
+    """One pipeline cycle, run by `serve`. The URL opener, the ranker, the capital, the gate's
+    limits and the clock the gate reads are injectable for tests."""
 
     def __init__(
         self,
@@ -94,6 +98,8 @@ class Pipeline:
         capital: Decimal = basket.DEFAULT_CAPITAL,
         lease: timedelta = LEASE,
         retry: timedelta = RETRY,
+        limits: gate.Limits = gate.LIMITS,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.lake_dir = lake_dir
         self.api_key = api_key
@@ -102,6 +108,8 @@ class Pipeline:
         self.capital = capital
         self.lease = lease
         self.retry = retry
+        self.limits = limits
+        self.clock = clock
 
     @classmethod
     def from_env(cls) -> "Pipeline":
@@ -132,11 +140,27 @@ class Pipeline:
     def rebalance(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
         try:
             proposal = basket.propose(conn, claim, self.lake_dir, self.ranker, capital=self.capital)
+            verdict = gate.run(
+                conn,
+                proposal.basket_id,
+                members=proposal.members,
+                marks=proposal.marks,
+                now=self.clock(),
+                limits=self.limits,
+            )
         except NotReady as exc:
             jobs.renew(conn, claim, self.retry)
             log.info("rebalance %s: %s; trying again in %s", claim.period, exc, self.retry)
             return
-        except (BasketError, UniverseError, LakeError, OSError, ValueError, duckdb.Error) as exc:
+        except (
+            BasketError,
+            GateError,
+            UniverseError,
+            LakeError,
+            OSError,
+            ValueError,
+            duckdb.Error,
+        ) as exc:
             jobs.fail(conn, claim, str(exc))
             log.error("rebalance %s failed: %s", claim.period, exc)
             return
@@ -149,6 +173,24 @@ class Pipeline:
             proposal.names,
             proposal.orders,
         )
+        if verdict.failed:
+            log.error(
+                "rebalance %s halted: basket %d failed %d of %d pre-trade checks: %s",
+                claim.period,
+                verdict.basket_id,
+                len(verdict.failed),
+                len(verdict.checks),
+                "; ".join(f"{c.name} {c.symbol or ''}".strip() for c in verdict.failed),
+            )
+        else:
+            log.info(
+                "rebalance %s: basket %d passed %d pre-trade checks in %s mode and is %s",
+                claim.period,
+                verdict.basket_id,
+                len(verdict.checks),
+                verdict.mode,
+                verdict.state,
+            )
 
     def pull(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
         session = date.fromisoformat(claim.period)
