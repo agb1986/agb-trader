@@ -1,13 +1,18 @@
-"""The pipeline service. For now it lands the vendor's data: for each session it takes the
-scheduler's `data_pull` job, pulls Sharadar's SEP, SF1 and TICKERS into the Parquet lake
-(agb.lake), records each partition's date and hash in `agb.lake_snapshot`, and completes the
-job, which fulfils the pull's expected event. A pull that fails, or never runs, leaves that
-event unfulfilled, so it shows in the overdue view like any other missed work.
+"""The pipeline service. It takes the scheduler's jobs in turn, one per cycle:
 
-Pulling is safe to redo: a partition that lands with the same bytes is left untouched and
-recorded nothing new. So an expired lease is reclaimed. A session the vendor has not yet
-published is not a failure: the service keeps the job and shortens its lease to RETRY, so the
-pull is tried again once the lease runs out, until it lands.
+  * `data_pull`: pulls Sharadar's SEP, SF1 and TICKERS for the session into the Parquet lake
+    (agb.lake), records each partition's date and hash in `agb.lake_snapshot`, and completes
+    the job, which fulfils the pull's expected event. A pull that fails, or never runs, leaves
+    that event unfulfilled, so it shows in the overdue view like any other missed work.
+  * `rebalance`: proposes the month's basket (agb.basket) from the universe as of the signal
+    session, ranked by the ranker the service was built with, and completes the job, which
+    fulfils the proposal's expected event. The ranker is the placeholder until the classical
+    model is certified; swapping it is a change to `from_env` alone.
+
+Both are safe to redo, so an expired lease is reclaimed: a partition that lands with the same
+bytes is left untouched and recorded nothing new, and a reference already proposed is kept.
+Data the vendor has not yet published is not a failure: the service keeps the job and shortens
+its lease to RETRY, so the work is tried again once the lease runs out, until it lands.
 
     python -m agb.services.pipeline             run the service
     python -m agb.services.pipeline backfill    land the vendor's history from 1998, then exit
@@ -19,15 +24,21 @@ import os
 import shutil
 from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+import duckdb
 import psycopg
 import pyarrow as pa
 
-from agb import jobs, lake, nyse, schedule
+from agb import basket, jobs, lake, nyse, schedule
+from agb.basket import BasketError, NotReady
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.lake import LakeError, NotYet, Partition, Sharadar
+from agb.placeholder_ranker import PlaceholderMomentum
+from agb.ranker import Ranker
 from agb.roles import PIPELINE
+from agb.universe import UniverseError
 
 log = logging.getLogger(__name__)
 
@@ -58,8 +69,20 @@ def record(
         return cur.rowcount
 
 
+def capital_from_env() -> Decimal:
+    """The capital a basket is sized against, in dollars, from AGB_CAPITAL_USD."""
+    raw = os.environ.get(basket.CAPITAL_ENV, "")
+    if not raw:
+        return basket.DEFAULT_CAPITAL
+    try:
+        return Decimal(raw)
+    except InvalidOperation:
+        raise SystemExit(f"{basket.CAPITAL_ENV} is not a number: {raw!r}") from None
+
+
 class Pipeline:
-    """One pipeline cycle, run by `serve`. The URL opener is injectable for tests."""
+    """One pipeline cycle, run by `serve`. The URL opener, the ranker and the capital are
+    injectable for tests."""
 
     def __init__(
         self,
@@ -67,12 +90,16 @@ class Pipeline:
         api_key: str = "",
         *,
         opener: lake.Opener = lake.urlopen,
+        ranker: Ranker | None = None,
+        capital: Decimal = basket.DEFAULT_CAPITAL,
         lease: timedelta = LEASE,
         retry: timedelta = RETRY,
     ) -> None:
         self.lake_dir = lake_dir
         self.api_key = api_key
         self.opener = opener
+        self.ranker = ranker if ranker is not None else PlaceholderMomentum()
+        self.capital = capital
         self.lease = lease
         self.retry = retry
 
@@ -81,15 +108,49 @@ class Pipeline:
         return cls(
             Path(os.environ.get("AGB_LAKE_DIR", lake.DEFAULT_DIR)),
             os.environ.get("SHARADAR_API_KEY", ""),
+            capital=capital_from_env(),
         )
 
     def client(self) -> Sharadar:
         return Sharadar(self.api_key, self.opener)
 
     def __call__(self, conn: psycopg.Connection) -> None:
-        claim = jobs.claim(conn, [schedule.DATA_PULL], PIPELINE, self.lease, reclaim_expired=True)
+        claim = jobs.claim(
+            conn,
+            [schedule.DATA_PULL, schedule.REBALANCE],
+            PIPELINE,
+            self.lease,
+            reclaim_expired=True,
+        )
         if claim is None:
             return
+        if claim.kind == schedule.REBALANCE:
+            self.rebalance(conn, claim)
+        else:
+            self.pull(conn, claim)
+
+    def rebalance(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
+        try:
+            proposal = basket.propose(conn, claim, self.lake_dir, self.ranker, capital=self.capital)
+        except NotReady as exc:
+            jobs.renew(conn, claim, self.retry)
+            log.info("rebalance %s: %s; trying again in %s", claim.period, exc, self.retry)
+            return
+        except (BasketError, UniverseError, LakeError, OSError, ValueError, duckdb.Error) as exc:
+            jobs.fail(conn, claim, str(exc))
+            log.error("rebalance %s failed: %s", claim.period, exc)
+            return
+        jobs.complete(conn, claim)
+        log.info(
+            "rebalance %s proposed basket %d%s: %d names, %d orders",
+            claim.period,
+            proposal.basket_id,
+            " (already proposed by an earlier attempt)" if proposal.existing else "",
+            proposal.names,
+            proposal.orders,
+        )
+
+    def pull(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
         session = date.fromisoformat(claim.period)
         try:
             partitions = lake.pull(self.lake_dir, self.client(), session)

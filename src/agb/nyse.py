@@ -40,6 +40,13 @@ class NyseCalendar:
         return self.start <= start and end <= self.end
 
     def sessions(self, start: date, end: date) -> list[date]:
+        # The underlying calendar's bounds are its first and last sessions, not the dates it was
+        # built with, and it refuses a range that reaches past them. A range that starts on a
+        # weekend or a holiday means the sessions inside it, so clamp rather than raise.
+        start = max(start, self._cal.first_session.date())
+        end = min(end, self._cal.last_session.date())
+        if start > end:
+            return []
         return [ts.date() for ts in self._cal.sessions_in_range(start.isoformat(), end.isoformat())]
 
     def is_session(self, day: date) -> bool:
