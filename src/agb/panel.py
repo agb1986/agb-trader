@@ -1,6 +1,8 @@
-"""The panel's evidence-gathering half: filings, Analyst quotes and the scrubbed extract.
+"""The LLM panel: filings, Analyst quotes and the scrubbed extract, then the debate and the
+rubric score.
 
-For each shortlisted name, as of the panel's run date (docs/architecture/03):
+`run` gathers the evidence for each shortlisted name, as of the panel's run date
+(docs/architecture/03):
 
 1. Retrieve its filings from EDGAR (agb.edgar), recording a delinquent filer, a recent IPO
    read from its registration statement, or an EDGAR failure.
@@ -10,8 +12,13 @@ For each shortlisted name, as of the panel's run date (docs/architecture/03):
 3. Scrub the company's names and tickers from the verified quotes (agb.scrubber). The result
    is the extract the Prosecutor, Defender and Judge read.
 
+`score` then debates each extract of a run (agb.debate): the Prosecutor argues from it, the
+Defender answers, and the Judge scores the six rubric dimensions, which code checks, adjusts
+by the filing rules and sums. `replay` recomputes a stored score from the stored Judge's answer
+without calling a model.
+
 Every run references a panel_config row, made only by `agb panel-config create`, and refuses
-one whose prompt hash, rubric or scrubber version is not the code's. Every body (filing
+one whose prompt hashes, rubric or scrubber version are not the code's. Every body (filing
 documents and texts, requests, responses, extracts) goes to the content-addressed panel store,
 and Postgres holds the structured rows that refer to them. Each name is written in its own
 transaction, after its network calls have finished.
@@ -21,7 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import date
@@ -29,7 +36,7 @@ from typing import Any
 
 import psycopg
 
-from agb import analyst, edgar
+from agb import analyst, debate, edgar
 from agb.panel_store import PanelStore
 from agb.scrubber import SCRUBBER_VERSION, Scrubber
 
@@ -57,8 +64,10 @@ class Config:
 
 
 def prompt_hashes() -> dict[str, str]:
-    """The prompt-template hash of each role this code has. The debate roles add theirs."""
-    return {"analyst": analyst.template_hash()}
+    """The prompt-template hash of each role."""
+    return {"analyst": analyst.template_hash()} | {
+        role: debate.template_hash(role) for role in debate.ROLES
+    }
 
 
 def create_config(
@@ -121,9 +130,11 @@ def load_config(conn: psycopg.Connection, config_id: int) -> Config:
 
 def check(config: Config) -> None:
     """Refuses a configuration made for other prompts, another rubric or another scrubber."""
-    stale = []
-    if config.prompt_hashes.get("analyst") != analyst.template_hash():
-        stale.append("the Analyst's prompt templates")
+    stale = [
+        f"the {role.capitalize()}'s prompt templates"
+        for role, template in prompt_hashes().items()
+        if config.prompt_hashes.get(role) != template
+    ]
     if config.rubric_version != analyst.RUBRIC_VERSION:
         stale.append(f"rubric version {config.rubric_version}")
     if config.scrubber_version != SCRUBBER_VERSION:
@@ -294,7 +305,18 @@ def _write(conn: psycopg.Connection, run_id: int, name: Name, store: PanelStore)
 
     call_id = None
     if name.completion is not None:
-        call_id = _log_call(conn, run_id, retrieval_id, name, store)
+        assert name.request is not None and name.request_sha256 is not None
+        call_id = log_call(
+            conn,
+            run_id,
+            retrieval_id,
+            "analyst",
+            name.request,
+            name.request_sha256,
+            name.completion,
+            name.cached,
+            store,
+        )
     failure = name.failure
     quotes: list[analyst.Quote] = []
     if name.completion is not None:
@@ -354,30 +376,39 @@ def _write(conn: psycopg.Connection, run_id: int, name: Name, store: PanelStore)
         log.warning("%s: rejected %d of %d quotes", retrieval.ticker, rejected, len(quotes))
 
 
-def _log_call(
-    conn: psycopg.Connection, run_id: int, retrieval_id: int, name: Name, store: PanelStore
+def log_call(
+    conn: psycopg.Connection,
+    run_id: int,
+    retrieval_id: int,
+    role: str,
+    request: dict[str, Any],
+    request_sha256: str,
+    completion: analyst.Completion,
+    was_cached: bool,
+    store: PanelStore,
 ) -> int:
-    completion = name.completion
-    assert completion is not None and name.request is not None
-    request_sha256 = store.put(analyst.canonical(name.request))
-    assert request_sha256 == name.request_sha256
+    """Store a call's request and response bodies and log it, with the model asked for and the
+    model that answered; returns the panel_model_call id."""
+    stored = store.put(analyst.canonical(request))
+    assert stored == request_sha256
     row = conn.execute(
         """
         INSERT INTO agb.panel_model_call
             (run_id, retrieval_id, role, model, response_model, request_sha256,
              response_sha256, cached, input_tokens, output_tokens, cache_read_tokens,
              cache_creation_tokens, stop_reason, request_id)
-        VALUES (%s, %s, 'analyst', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING id
         """,
         (
             run_id,
             retrieval_id,
-            name.request["model"],
+            role,
+            request["model"],
             completion.model,
             request_sha256,
             store.put(analyst.canonical(asdict(completion))),
-            name.cached,
+            was_cached,
             completion.input_tokens,
             completion.output_tokens,
             completion.cache_read_tokens,
@@ -388,6 +419,222 @@ def _log_call(
     ).fetchone()
     assert row is not None
     return row[0]
+
+
+@dataclass
+class Call:
+    """One debate call: its request, and the answer from the model or the cache."""
+
+    role: str
+    request: dict[str, Any]
+    request_sha256: str
+    completion: analyst.Completion | None = None
+    cached: bool = False
+
+
+@dataclass
+class Debate:
+    """One name's debate, from extract to score, before it is written."""
+
+    retrieval_id: int
+    symbol: str
+    sector: str
+    delinquent: str | None
+    ipo: bool
+    extract: dict[str, Any]
+    calls: list[Call] = field(default_factory=list)
+    answers: dict[str, str] = field(default_factory=dict)
+    score: debate.Score | None = None
+    failure: str | None = None
+
+
+def score(
+    conn: psycopg.Connection,
+    run_id: int,
+    sectors: Mapping[str, str],
+    model: analyst.Model,
+    store: PanelStore,
+    workers: int = WORKERS,
+) -> int:
+    """Debate and score each name `run_id` extracted and has not scored yet, telling the debate
+    roles its sector from `sectors` (symbol to sector); returns how many names were debated.
+
+    The roles speak in turn, each stage for every name at once: the Prosecutor, then the
+    Defender answering the Prosecutor, then the Judge reading both. A request made before is
+    answered from the store. A name whose call fails or whose answer is unusable is recorded as
+    a debate failure, with no score."""
+    row = conn.execute(
+        "SELECT panel_config_id FROM agb.panel_run WHERE id = %s", (run_id,)
+    ).fetchone()
+    if row is None:
+        raise PanelError(f"no panel_run {run_id}")
+    config = load_config(conn, row[0])
+    check(config)
+    rows = conn.execute(
+        """
+        SELECT r.id, r.symbol, r.delinquent, r.ipo, e.extract_sha256
+        FROM agb.panel_retrieval r
+        JOIN agb.panel_extract e ON e.retrieval_id = r.id
+        WHERE r.run_id = %s AND e.outcome = 'extracted'
+          AND NOT EXISTS (SELECT 1 FROM agb.panel_score s WHERE s.retrieval_id = r.id)
+        ORDER BY r.id
+        """,
+        (run_id,),
+    ).fetchall()
+    missing = [symbol for _, symbol, *_ in rows if not (sectors.get(symbol) or "").strip()]
+    if missing:
+        raise PanelError(f"no sector for {', '.join(missing)}; the debate needs every name's")
+    debates = [
+        Debate(
+            retrieval_id,
+            symbol,
+            sectors[symbol].strip(),
+            delinquent,
+            ipo,
+            json.loads(store.get(extract_sha256)),
+        )
+        for retrieval_id, symbol, delinquent, ipo, extract_sha256 in rows
+    ]
+
+    asked = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for role in debate.ROLES:
+            live = [d for d in debates if d.failure is None]
+            for d in live:
+                request = _debate_request(role, config.models[role], d)
+                call = Call(role, request, analyst.cache_key(request))
+                call.completion = cached(conn, store, call.request_sha256)
+                call.cached = call.completion is not None
+                d.calls.append(call)
+            missed = [d for d in live if d.calls[-1].completion is None]
+            asked += len(missed)
+            for d, outcome in zip(missed, pool.map(lambda d: _ask(model, d), missed), strict=True):
+                d.calls[-1].completion, d.failure = outcome
+            for d in live:
+                if d.failure is None:
+                    _read(d, d.calls[-1])
+
+    for d in debates:
+        with conn.transaction():
+            _write_score(conn, run_id, config.id, d, store)
+    log.info(
+        "panel run %d: %d names debated, %d scored, %d model calls",
+        run_id,
+        len(debates),
+        sum(d.failure is None for d in debates),
+        asked,
+    )
+    return len(debates)
+
+
+def _debate_request(role: str, model_id: str, d: Debate) -> dict[str, Any]:
+    case = (model_id, d.sector, debate.status(d.delinquent, d.ipo), d.extract)
+    if role == "prosecutor":
+        return debate.prosecutor_request(*case)
+    if role == "defender":
+        return debate.defender_request(*case, d.answers["prosecutor"])
+    return debate.judge_request(*case, d.answers["prosecutor"], d.answers["defender"])
+
+
+def _ask(model: analyst.Model, d: Debate) -> tuple[analyst.Completion | None, str | None]:
+    call = d.calls[-1]
+    try:
+        return model.complete(call.request), None
+    except analyst.AnalystError as exc:
+        log.warning("%s: the %s failed: %s", d.symbol, call.role.capitalize(), exc)
+        return None, f"{call.role}: {exc}"
+
+
+def _read(d: Debate, call: Call) -> None:
+    """Take a role's answer: an advocate's argument, or the Judge's scores with the filing
+    rules applied."""
+    assert call.completion is not None
+    try:
+        if call.role == "judge":
+            d.score = debate.score(debate.parse(call.completion), d.delinquent, d.ipo)
+        else:
+            d.answers[call.role] = debate.answer(call.completion)
+    except debate.DebateError as exc:
+        log.warning("%s: the %s's answer is unusable: %s", d.symbol, call.role.capitalize(), exc)
+        d.failure = f"{call.role}: {exc}"
+
+
+def _write_score(
+    conn: psycopg.Connection, run_id: int, config_id: int, d: Debate, store: PanelStore
+) -> None:
+    call_ids = {
+        call.role: log_call(
+            conn,
+            run_id,
+            d.retrieval_id,
+            call.role,
+            call.request,
+            call.request_sha256,
+            call.completion,
+            call.cached,
+            store,
+        )
+        for call in d.calls
+        if call.completion is not None
+    }
+    result = d.score
+    row = conn.execute(
+        """
+        INSERT INTO agb.panel_score
+            (retrieval_id, run_id, panel_config_id, sector, prosecutor_call_id,
+             defender_call_id, judge_call_id, outcome, detail, total, score)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            d.retrieval_id,
+            run_id,
+            config_id,
+            d.sector,
+            call_ids.get("prosecutor"),
+            call_ids.get("defender"),
+            call_ids.get("judge"),
+            "debate_failure" if result is None else "scored",
+            d.failure,
+            None if result is None else result.total,
+            None if result is None else result.value,
+        ),
+    ).fetchone()
+    assert row is not None
+    if result is None:
+        return
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            INSERT INTO agb.panel_dimension
+                (score_id, dimension, score, reason, source, judge_score, judge_reason)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """,
+            [
+                (row[0], x.dimension, x.score, x.reason, x.source, x.judge_score, x.judge_reason)
+                for x in result.dimensions
+            ],
+        )
+
+
+def replay(conn: psycopg.Connection, store: PanelStore, score_id: int) -> debate.Score:
+    """Recompute a stored score from the stored Judge's answer and the name's filing status,
+    without calling a model."""
+    row = conn.execute(
+        """
+        SELECT c.response_sha256, r.delinquent, r.ipo
+        FROM agb.panel_score s
+        JOIN agb.panel_model_call c ON c.id = s.judge_call_id
+        JOIN agb.panel_retrieval r ON r.id = s.retrieval_id
+        WHERE s.id = %s AND s.outcome = 'scored'
+        """,
+        (score_id,),
+    ).fetchone()
+    if row is None:
+        raise PanelError(f"no scored panel_score {score_id}")
+    response_sha256, delinquent, ipo = row
+    completion = analyst.Completion(**json.loads(store.get(response_sha256)))
+    return debate.score(debate.parse(completion), delinquent, ipo)
 
 
 def extract_body(
