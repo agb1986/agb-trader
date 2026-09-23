@@ -5,6 +5,8 @@ env/*.env
 /backups/
 # The Parquet lake from `make up`'s pipeline service.
 /lake/
+# The panel store from `make up`'s pipeline service.
+/panel/
 
 __pycache__/
 *.py[cod]
