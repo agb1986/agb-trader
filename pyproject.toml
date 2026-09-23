@@ -22,7 +22,12 @@ agb = "agb.cli:main"
 # Server services only (the `app` image target).
 app = []
 # Workstation research only (the `research` image target).
-research = []
+research = [
+    "lightgbm>=4.7.0",
+    "pandas>=3.0.5",
+    "plotly<7",
+    "vectorbt>=1.1.0",
+]
 dev = [
     "pytest>=9.1.1",
     "pyyaml>=6.0.3",
