@@ -78,6 +78,7 @@ def test_one_command_brings_up_the_database_and_the_services(compose):
     assert states["scheduler"].startswith("running")
     assert states["backup"].startswith("running")
     assert states["pipeline"].startswith("running")
+    assert states["execution"].startswith("running")
     assert states["migrate"] == "exited 0"
 
 
@@ -98,7 +99,7 @@ def test_duckdb_queries_the_lake_inside_the_pipeline_container(compose, lake_dir
     assert out == "n\tlatest\n3\t2026-09-14\n"
 
 
-@pytest.mark.parametrize("service", ["scheduler", "backup", "pipeline"])
+@pytest.mark.parametrize("service", ["scheduler", "backup", "pipeline", "execution"])
 def test_cli_lists_the_heartbeat_and_it_advances(compose, service):
     first = status_line(compose, service)
     assert first[1] != "never", first

@@ -121,12 +121,49 @@ def rebalance_not_scheduled(conn: psycopg.Connection, period: str, trade: date) 
 
 
 def open_halt_causes(conn: psycopg.Connection) -> list[Finding]:
-    """Open halt causes. The halt latch and its view come with the pre-trade gate (#21), whose
-    columns are not yet defined; until then there is nothing to read and nothing is reported."""
-    return []
+    """Every open halt cause, oldest first. One alert per opening: when it opened
+    identifies it, so a cause cleared and set again raises a new one."""
+    rows = conn.execute(
+        "SELECT cause, at, basket_id, actor, reason FROM agb.halt_open ORDER BY at"
+    ).fetchall()
+    findings = []
+    for cause, at, basket_id, actor, reason in rows:
+        facts = f"since {et(at)}, by {actor}"
+        if basket_id is not None:
+            facts += f", basket {basket_id}"
+        if reason:
+            facts += f": {reason}"
+        findings.append(
+            Finding(
+                "halt",
+                cause,
+                at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                f"halt open: {cause}",
+                facts,
+            )
+        )
+    return findings
 
 
 def broker_mismatch(conn: psycopg.Connection) -> list[Finding]:
-    """A broker `suspend_trade` that disagrees with the halt latch. The observed broker state
-    comes with execution (#22); until then there is nothing to read and nothing is reported."""
-    return []
+    """The broker's `suspend_trade`, as execution last observed it, against the `pause`
+    halt cause: a mismatch in either direction. Nothing is reported until execution has
+    observed the broker. One alert per observation that disagrees."""
+    row = conn.execute("SELECT observed_at, suspend_trade FROM agb.broker_state_now").fetchone()
+    if row is None:
+        return []
+    observed_at, suspend_trade = row
+    paused = (
+        conn.execute("SELECT 1 FROM agb.halt_open WHERE cause = 'pause'").fetchone() is not None
+    )
+    if suspend_trade == paused:
+        return []
+    return [
+        Finding(
+            "broker",
+            "suspend_trade",
+            observed_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            f"broker suspend_trade: {'on' if suspend_trade else 'off'}",
+            f"{'pause open' if paused else 'no pause open'}; observed {et(observed_at)}",
+        )
+    ]

@@ -181,6 +181,25 @@ services:
     restart: unless-stopped
     mem_limit: 2g
 
+  # Execution: the only service with broker keys. It submits the approved basket's
+  # market-on-close orders and reads the fills back. No lake, no proxy: it talks to the
+  # broker directly.
+  execution:
+    <<: *app-image
+    command: ["python", "-m", "agb.services.execution"]
+    env_file: ["${AGB_ENV_DIR:-env}/execution.env"]
+    environment:
+      <<: *pg
+      PGUSER: execution
+      PGPASSWORD: ${EXECUTION_DB_PASSWORD:?set in env/db.env}
+      AGB_HEARTBEAT_SECONDS: ${AGB_HEARTBEAT_SECONDS:-30}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks: [core]
+    restart: unless-stopped
+    mem_limit: 256m
+
   # The operator CLI: `make status`, or `make agb CMD="..."`.
   cli:
     <<: *app-image
