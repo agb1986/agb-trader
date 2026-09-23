@@ -7,10 +7,12 @@ requires-python = ">=3.12,<3.13"
 # Base dependencies: everything the `base` image target installs. Shared by the
 # live services and the research profile, so both import the same definitions.
 dependencies = [
+    "anthropic>=1.8.0",
     "duckdb>=1.5.5",
     "exchange-calendars>=4.13.2",
     "psycopg[binary]>=3.3.5",
     "pyarrow>=25.0.1",
+    "zstandard>=0.25.0",
 ]
 
 [project.scripts]

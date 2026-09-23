@@ -154,6 +154,8 @@ services:
   # comes from env/pipeline.env, and it reaches the vendor directly. It runs as the host user
   # that owns the lake directory: `make up` and `agb-stack` set AGB_PIPELINE_USER to the
   # caller's uid:gid. `python -m agb.lake "SQL"` inside it queries the lake with DuckDB.
+  # The panel store, the content-addressed bodies behind the panel's database rows, sits
+  # beside the lake on the same data disk.
   pipeline:
     <<: *app-image
     command: ["python", "-m", "agb.services.pipeline"]
@@ -165,8 +167,10 @@ services:
       PGPASSWORD: ${PIPELINE_DB_PASSWORD:?set in env/db.env}
       AGB_HEARTBEAT_SECONDS: ${AGB_HEARTBEAT_SECONDS:-30}
       AGB_LAKE_DIR: /lake
+      AGB_PANEL_DIR: /panel
     volumes:
       - ${AGB_LAKE_DIR:-./lake}:/lake
+      - ${AGB_PANEL_DIR:-./panel}:/panel
     depends_on:
       migrate:
         condition: service_completed_successfully
