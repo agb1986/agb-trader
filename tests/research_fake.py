@@ -83,12 +83,16 @@ class Market:
         margin=0.1,
         sector=None,
         category=COMMON,
+        until: date | None = None,
     ):
         """A name whose adjusted close starts at `price` and moves by `drift` plus a normal
         noise of `noise` per session, filing statements every quarter at a `margin` of its
-        revenue."""
+        revenue. `until` ends its bars after that date: a name delisted mid-history, whose
+        last print is its last session on or before `until`."""
         close = price
         for day in self.sessions:
+            if until is not None and day > until:
+                break
             close *= math.exp(drift + self.random.gauss(0.0, noise))
             self.rows["sep"].append(
                 (ticker, day, close, close * 1.01, close * 0.99, close, close, close, volume)

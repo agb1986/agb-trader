@@ -14,7 +14,7 @@ from typing import Any
 import duckdb
 
 from agb import lake
-from agb.research import cpcv, scan, train, walkforward
+from agb.research import backtest, cpcv, scan, train, walkforward
 from agb.research.panel import Panel
 from agb.research.trials import Ledger, Run
 
@@ -61,6 +61,9 @@ def rerun(
     if kind == scan.KIND:
         options = scan.Options(**config[scan.KIND])
         return scan.run(panel, options, ledger, lake_dir=lake_dir, db=db)
+    if kind == backtest.KIND:
+        options = backtest.Options(**config[backtest.KIND])
+        return backtest.run(panel, options, ledger, lake_dir=lake_dir, db=db)
     raise ReproduceError(f"no way to rerun a {kind!r} trial")
 
 
