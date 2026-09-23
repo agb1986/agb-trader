@@ -1,9 +1,10 @@
+import json
 import threading
 import time
 from datetime import date
 
 import pytest
-from edgar_fake import AS_OF, USER_AGENT, FakeEdgar, client
+from edgar_fake import AS_OF, COMPANIES, USER_AGENT, FakeEdgar, client, submissions
 
 from agb import edgar
 
@@ -150,6 +151,19 @@ def test_reads_a_recent_ipo_from_its_final_prospectus():
     assert (section.filing.form, section.section) == ("424B4", "Risk Factors")
     assert "accumulated deficit of $412 million" in section.text
     assert "Forward-looking statements" not in section.text
+
+
+def test_reads_a_recent_ipo_from_its_s1_before_the_prospectus_is_filed():
+    fake = FakeEdgar()
+    newco = COMPANIES["NEWCO"]
+    fake.pages["https://data.sec.gov/submissions/CIK0000001011.json"] = json.dumps(
+        submissions({**newco, "filings": newco["filings"][1:]})
+    ).encode()
+
+    result = edgar.retrieve(client(fake), "NEWCO", AS_OF)
+
+    assert result.ipo is True
+    assert [(s.filing.form, s.section) for s in result.sections] == [("S-1", "Risk Factors")]
 
 
 def test_a_name_with_nothing_to_read_has_no_filings():
