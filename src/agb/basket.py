@@ -7,7 +7,9 @@ agb.rebalance to the current book, prices the orders and freezes each one's mode
 under the current cost model, and writes the lot in one transaction: the basket with its
 provenance (snapshot date, lake partition hash, universe size, ranker identity), every rank,
 the twenty targets, the order plan and the basket's first event, `proposed`. The basket's
-reference is the job's period, so October 2026's basket is `2026-10`.
+reference is the job's period, so October 2026's basket is `2026-10`. The proposal also
+carries the universe and each name's mark, which the pre-trade gate (agb.gate) checks the
+basket against before it can move on.
 
 Proposing is safe to redo. A job whose lease expired mid-proposal is reclaimed and proposed
 again; the second attempt finds the reference taken, writes nothing and completes the job with
@@ -20,7 +22,7 @@ replaces `book` with the broker's positions; the rules that consume it do not ch
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -46,6 +48,15 @@ _PRINTS = """
     SELECT ticker, closeunadj FROM sep
     WHERE date = ? AND volume > 0 AND closeunadj IS NOT NULL AND closeunadj > 0
 """
+# The last as-traded close of each held name that did not print on the signal session, within
+# the quarter before it, so the gate can value the whole book.
+_LAST_CLOSE = """
+    SELECT ticker, arg_max(closeunadj, date) FROM sep
+    WHERE list_contains(?, ticker) AND date <= ? AND date > ?
+      AND volume > 0 AND closeunadj IS NOT NULL AND closeunadj > 0
+    GROUP BY ticker
+"""
+_MARK_WINDOW = timedelta(days=92)
 # How many of the cost model's trailing sessions each name has a bar for.
 _BAR_COUNTS = """
     WITH recent AS (SELECT DISTINCT date FROM sep WHERE date <= ? ORDER BY date DESC LIMIT ?)
@@ -108,13 +119,17 @@ class NotReady(BasketError):
 
 @dataclass(frozen=True)
 class Proposal:
-    """What `propose` wrote, for the log."""
+    """What `propose` wrote, for the log, and what the gate reads beside the basket: the
+    universe it was ranked from and each name's mark, its last as-traded close on or before
+    the signal session."""
 
     basket_id: int
     reference: str
     existing: bool  # an earlier attempt had already proposed this reference
     names: int
     orders: int
+    members: frozenset[str] = frozenset()
+    marks: dict[str, Decimal] = field(default_factory=dict)
 
 
 def book(conn: psycopg.Connection) -> dict[str, Decimal]:
@@ -170,6 +185,7 @@ def propose(
             for t, n in lake_db.execute(_BAR_COUNTS, [signal, _BARS]).fetchall()
             if n >= _BARS
         }
+        marks = prints | _last_closes(lake_db, [s for s in held if s not in prints], signal)
         untradeable = {s for s in (*held, *snapshot.tickers) if s not in prints or s not in counted}
         selection = rebalance.select([r.symbol for r in ranking], held, untradeable=untradeable)
         weight = rebalance.weights(selection.names)
@@ -179,6 +195,7 @@ def propose(
         lake_db.close()
 
     rank_of = {r.symbol: r for r in ranking}
+    members = frozenset(snapshot.tickers)
     with conn.transaction():
         row = conn.execute(
             _INSERT_BASKET,
@@ -201,7 +218,7 @@ def propose(
             existing = conn.execute(
                 "SELECT id FROM agb.basket WHERE reference = %s", (claim.period,)
             ).fetchone()[0]
-            return Proposal(existing, claim.period, True, 0, 0)
+            return Proposal(existing, claim.period, True, 0, 0, members, marks)
         basket_id = row[0]
         with conn.cursor() as cur:
             cur.executemany(_INSERT_RANK, [(basket_id, r.symbol, r.rank, r.score) for r in ranking])
@@ -235,7 +252,7 @@ def propose(
                 ],
             )
         conn.execute(_INSERT_EVENT, (basket_id, PIPELINE, SURFACE))
-    return Proposal(basket_id, claim.period, False, len(selection.names), len(plan))
+    return Proposal(basket_id, claim.period, False, len(selection.names), len(plan), members, marks)
 
 
 def _bps(value: float) -> Decimal:
@@ -265,6 +282,15 @@ def _target(
         symbol in selection.carry,
         ranked.rank if ranked else None,
     )
+
+
+def _last_closes(
+    db: duckdb.DuckDBPyConnection, symbols: list[str], signal: date
+) -> dict[str, Decimal]:
+    if not symbols:
+        return {}
+    rows = db.execute(_LAST_CLOSE, [symbols, signal, signal - _MARK_WINDOW]).fetchall()
+    return {str(t): Decimal(str(p)) for t, p in rows}
 
 
 def _cost(db: duckdb.DuckDBPyConnection, order: rebalance.Order, signal: date) -> cost.TradeCost:

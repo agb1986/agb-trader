@@ -5,9 +5,11 @@ at a lake the operator has already pulled or copied down:
 
 Nothing here talks to the vendor, the broker or the deployment; the database is the test
 harness's throwaway Postgres and the lake is only read. It checks what the fixtures cannot: that
-the placeholder ranker and the cost model run over a real month-end universe, and that the
+the placeholder ranker and the cost model run over a real month-end universe, that the
 proposal comes out at twenty names with a costed order plan and the provenance the ticket asks
-for.
+for, and that a real month passes every pre-trade check, so the gate approves it in paper
+mode. The gate's clock is the evening of the signal session, before the trade session's MOC
+cutoff, whatever the date the test runs on.
 
 The lake is on the deployment server and the deployed image carries no tests, so run this on a
 workstation against a copy of it:
@@ -57,7 +59,8 @@ def test_the_latest_month_end_in_the_lake_proposes_a_twenty_name_basket(db, lake
     )
     schedule.write(db.connect("scheduler"), [job])
 
-    Pipeline(lake_dir, "")(db.connect("pipeline"))
+    evening = nyse.NyseCalendar(signal, trade).close_at(signal) + timedelta(hours=2)
+    Pipeline(lake_dir, "", clock=lambda: evening)(db.connect("pipeline"))
 
     cli = db.connect("cli")
     [(state,)] = cli.execute("SELECT state FROM agb.job_state").fetchall()
@@ -72,7 +75,15 @@ def test_the_latest_month_end_in_the_lake_proposes_a_twenty_name_basket(db, lake
     assert digest == lake.partition_digest(lake_dir, signal)
     assert universe.size_is_plausible(size)
     assert (ranker, version) == (PlaceholderMomentum().name, "1")
-    assert cli.execute("SELECT state FROM agb.basket_state").fetchall() == [("proposed",)]
+    failed = cli.execute(
+        "SELECT level, name, symbol, measured, threshold FROM agb.gate_check WHERE NOT passed"
+    ).fetchall()
+    for level, name, symbol, measured, threshold in failed:
+        print(f"{level} {name} {symbol or ''}: measured {measured}, needs {threshold}")
+    assert failed == []
+    assert cli.execute("SELECT state, actor FROM agb.basket_state").fetchall() == [
+        ("approved", "system")
+    ]
 
     targets = cli.execute(
         "SELECT symbol, weight, shares, held, carried, rank FROM agb.basket_target ORDER BY rank"

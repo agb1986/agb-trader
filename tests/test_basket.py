@@ -1,5 +1,6 @@
 """The monthly rebalance end to end: the pipeline turns the scheduler's `rebalance` job into a
-proposed basket with its ranks, targets, order plan, provenance and first event. And the
+proposed basket with its ranks, targets, order plan, provenance and first event, which the
+pre-trade gate then approves in paper mode (tests/test_gate.py covers the gate itself). And the
 basket's state machine: the CAS on `basket_event`, the transition trigger and the grants."""
 
 import os
@@ -13,7 +14,7 @@ import pytest
 from market_fake import PERIOD, SIGNAL, TRADE, Market
 from psycopg import errors
 
-from agb import basket, jobs, lake, schedule
+from agb import basket, gate, jobs, lake, schedule
 from agb.placeholder_ranker import PlaceholderMomentum
 from agb.rebalance import SIZE
 from agb.schedule import Expected, Planned
@@ -23,6 +24,11 @@ MINUTE = timedelta(minutes=1)
 # A short window, so ninety sessions of fake prices are enough to rank on.
 RANKER = PlaceholderMomentum(lookback=80, skip=5)
 CAPITAL = Decimal("100000")
+# The fake market is small, so the gate's universe band is widened to fit it, and the ranker
+# is the short-window one above.
+LIMITS = gate.Limits(universe_min=20, model=RANKER.name)
+# The evening of the signal session, well before the trade session's MOC cutoff.
+EVENING = datetime(2026, 9, 30, 22, 0, tzinfo=UTC)
 ZERO_HASH = "0" * 64
 
 
@@ -41,6 +47,7 @@ def plan_rebalance(db, period=PERIOD, session_date=TRADE):
 
 
 def run(db, root, **kwargs):
+    kwargs = {"limits": LIMITS, "clock": lambda: EVENING, **kwargs}
     Pipeline(root, "", ranker=RANKER, capital=CAPITAL, **kwargs)(db.connect("pipeline"))
 
 
@@ -99,8 +106,9 @@ def test_the_rebalance_job_proposes_a_twenty_name_equal_weight_basket(db, tmp_pa
         lake.partition_digest(root, SIGNAL), 25, "placeholder-momentum-80-5", "1",
         CAPITAL, "pipeline",
     )  # fmt: skip
-    assert rows(db, "SELECT state, seq, actor, surface FROM agb.basket_state") == [
-        ("proposed", 1, "pipeline", "pipeline")
+    assert rows(db, "SELECT seq, to_state, actor, surface FROM agb.basket_event ORDER BY seq") == [
+        (1, "proposed", "pipeline", "pipeline"),
+        (2, "approved", "system", "pipeline"),  # the gate passed it, in paper mode
     ]
 
     ranked = rows(db, "SELECT symbol, score FROM agb.basket_rank ORDER BY rank")
@@ -163,10 +171,34 @@ def test_the_basket_is_the_book_and_the_order_plan_moves_it(db, tmp_path):
     assert plan[-1][9] > 0  # a sell pays the regulatory fees
     assert rows(db, "SELECT reference, state FROM agb.basket_state ORDER BY id") == [
         ("2026-09", "filled"),
-        ("2026-10", "proposed"),
+        ("2026-10", "approved"),
     ]
+    # Selling OLD turns over 8,000 of the book's 22,500, with HALT marked at its last close.
+    [(turnover,)] = rows(db, "SELECT measured FROM agb.gate_check WHERE name = 'turnover'")
+    assert turnover == "35.56%"
     # The book is the last filled basket, so the proposal has not moved it yet.
     assert basket.book(db.connect("pipeline")) == book
+
+
+def test_a_rebalance_that_fails_the_gate_is_halted_and_opens_the_latch(db, tmp_path):
+    plan_rebalance(db)
+    root = Market(tmp_path).names(25).land()
+    cutoff = datetime(2026, 10, 1, 19, 45, tzinfo=UTC)  # 15:45 ET on the trade session
+
+    run(db, root, clock=lambda: cutoff)
+
+    # The job did its work: the basket is proposed and gated, and the gate halted it.
+    assert job_state(db) == "completed"
+    [(basket_id,)] = rows(db, "SELECT id FROM agb.basket")
+    assert rows(db, "SELECT state, seq, actor, surface FROM agb.basket_state") == [
+        ("halted", 2, "pipeline", "pipeline")
+    ]
+    assert rows(db, "SELECT DISTINCT name FROM agb.gate_check WHERE NOT passed") == [("clock",)]
+    [(cause, halted, actor, reason)] = rows(
+        db, "SELECT cause, basket_id, actor, reason FROM agb.halt_open"
+    )
+    assert (cause, halted, actor) == ("gate_breach", basket_id, "pipeline")
+    assert "clock N01 measured 2026-10-01 15:45 ET, needs before 2026-10-01 15:45 ET" in reason
 
 
 def test_a_proposal_already_made_is_kept_when_the_job_is_redone(db, tmp_path):
@@ -371,8 +403,7 @@ def test_an_event_that_does_not_follow_the_latest_is_refused(db, seq, from_state
 @pytest.mark.parametrize(
     ("role", "from_state", "to_state"),
     [
-        ("pipeline", "proposed", "approved"),  # the proposer cannot approve
-        ("pipeline", "proposed", "pending"),  # nor ask for approval
+        ("pipeline", "proposed", "pending"),  # the proposer cannot ask for approval
         ("bot", "proposed", "approved"),  # nothing skips the request
         ("scheduler", "proposed", "pending"),
         ("execution", "proposed", "pending"),
