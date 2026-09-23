@@ -35,7 +35,7 @@ Checks span three levels, because a basket can be perfectly self-consistent and 
 
 **Upstream provenance.**
 - The Sharadar snapshot date equals the expected month-end.
-- Universe size falls in a plausible band, roughly 2,500 to 5,000 names, so a 200-name universe stops everything.
+- Universe size falls in a plausible band, 1,500 to 3,500 names, so a 200-name universe stops everything. The band brackets the measured history (1,700 to 2,500 at month-ends since mid-1998) with room either side; it is a provenance check on the lake and the filters, not a view on how many names the strategy wants.
 - The model artifact hash matches the promoted certification.
 - The panel returned scores for the entire shortlist, with dispersion above the gate specified in [03 — LLM panel](03-llm-panel.md).
 

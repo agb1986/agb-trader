@@ -291,9 +291,9 @@ def test_an_open_connection_is_reused_rather_than_rebuilt(tmp_path):
 
 
 def test_the_gate_s_band_is_the_one_the_ticket_names():
-    assert (universe.MIN_SIZE, universe.MAX_SIZE) == (2_500, 5_000)
+    assert (universe.MIN_SIZE, universe.MAX_SIZE) == (1_500, 3_500)
     assert not universe.size_is_plausible(200)
-    assert not universe.size_is_plausible(7_000)
+    assert not universe.size_is_plausible(4_000)
     assert universe.size_is_plausible(3_500)
 
 

@@ -56,8 +56,12 @@ MIN_PRICE = 5.0
 # date, not 60 calendar days, so a holiday-shortened month does not shorten the window.
 LIQUIDITY_SESSIONS = 60
 # The pre-trade gate's provenance band (docs/architecture/04-risk-and-approval.md). A universe
-# outside it is a provenance failure, not a small universe: today's should be 3,000-4,000 names.
-MIN_SIZE, MAX_SIZE = 2_500, 5_000
+# outside it is a provenance failure, not a small universe. The band is measured against the
+# lake rather than estimated: the filters above yield 2,432 names on 2026-08-31, and between
+# 1,703 (2000-12-29) and 2,432 across month-ends since mid-1998. The spec's earlier estimate of
+# 3,000-4,000 counted the names the common-stock test removes -- the three quantitative screens
+# alone pass 3,040 today, of which 359 are ADRs, 144 REITs and 105 Canadian.
+MIN_SIZE, MAX_SIZE = 1_500, 3_500
 # The vendor's category values for ordinary domestic common stock. Listed rather than matched by
 # prefix because "Domestic Common Stock Warrant" shares the prefix and is not common stock.
 COMMON = (
