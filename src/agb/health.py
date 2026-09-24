@@ -1,5 +1,6 @@
-"""What is unhealthy, read from the database: stale heartbeats, overdue expected events and
-a rebalance that was never scheduled. The bot turns these into alerts and the pre-flight.
+"""What is unhealthy, read from the database: stale heartbeats, overdue expected events, a
+rebalance that was never scheduled, open halts, and the broker disagreeing with the database.
+The bot turns these into alerts and the pre-flight.
 
 Each finding carries the dedupe key of the alert it raises, and two short lines of plain
 text: what is wrong, then the facts behind it.
@@ -166,4 +167,24 @@ def broker_mismatch(conn: psycopg.Connection) -> list[Finding]:
             f"broker suspend_trade: {'on' if suspend_trade else 'off'}",
             f"{'pause open' if paused else 'no pause open'}; observed {et(observed_at)}",
         )
+    ]
+
+
+def position_mismatch(conn: psycopg.Connection) -> list[Finding]:
+    """Every symbol in the latest position snapshot whose quantity is not the previous
+    snapshot's plus the fills between the two reads. One alert per symbol and snapshot."""
+    rows = conn.execute(
+        "SELECT snapshot_date, symbol, expected_qty, observed_qty FROM agb.position_mismatch "
+        "WHERE snapshot_id = (SELECT max(id) FROM agb.position_snapshot) ORDER BY symbol"
+    ).fetchall()
+    return [
+        Finding(
+            "position_mismatch",
+            symbol,
+            snapshot_date.isoformat(),
+            f"position mismatch: {symbol}",
+            f"broker holds {observed.normalize():f}, expected {expected.normalize():f}"
+            f" from the previous snapshot plus fills; snapshot {snapshot_date}",
+        )
+        for snapshot_date, symbol, expected, observed in rows
     ]

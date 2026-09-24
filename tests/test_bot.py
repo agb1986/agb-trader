@@ -1,5 +1,5 @@
 """The Telegram bot, with a fake Telegram: alerts and their delivery, the pre-flight, the
-configured chat, and the bot's own heartbeat."""
+configured chat, and the bot's own heartbeat. The commands are in tests/test_bot_commands.py."""
 
 import logging
 import threading
@@ -13,7 +13,7 @@ from agb.health import Finding
 from agb.nyse import NEW_YORK, NyseCalendar
 from agb.roles import OWNER
 from agb.services import bot as bot_service
-from agb.services.bot import NO_COMMANDS, Bot
+from agb.services.bot import Bot, help_text
 from agb.telegram import TelegramError
 
 CHAT = "4242"
@@ -269,10 +269,20 @@ def test_only_the_configured_chat_is_answered(db, telegram, rebalance_ahead, cap
     with caplog.at_level(logging.WARNING, logger="agb.services.bot"):
         bot(conn)
         bot(conn)
-    assert telegram.sent == [(CHAT, NO_COMMANDS)]
+    assert telegram.sent == [(CHAT, help_text("not a command"))]
     assert "refused a message from chat 999, user 999" in caplog.text
     # Each read confirms the ones before it, so nothing is answered twice.
     assert telegram.offsets == [None, 10]
+    # Both messages are on record, the other chat's included; the edit is not a message.
+    rows = (
+        db.connect("cli")
+        .execute("SELECT actor, chat_id, verb, outcome, reason FROM agb.command ORDER BY id")
+        .fetchall()
+    )
+    assert rows == [
+        ("telegram:999", "999", "status", "refused", "not the configured chat"),
+        ("telegram:1", CHAT, None, "refused", "not a command"),
+    ]
 
 
 def test_telegram_unreachable_does_not_stop_the_cycle(db, telegram, rebalance_ahead, caplog):

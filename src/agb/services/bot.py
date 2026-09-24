@@ -1,21 +1,26 @@
-"""The Telegram bot service. Each cycle it beats its heartbeat, reads new messages, raises an
-alert for each unhealthy finding, raises the pre-flight on the session before a rebalance,
-and delivers every undelivered alert to the configured chat.
+"""The Telegram bot service. Each cycle it beats its heartbeat, reads new messages and
+answers the read-only commands, raises an alert for each unhealthy finding, a fill
+confirmation for each rebalance that filled and a gate-halt alert for each one the checks
+halted, raises the pre-flight on the session before a rebalance, and delivers every
+undelivered alert to the configured chat.
 
 It holds no state beyond the Telegram update offset. Every message it sends is computed from
-the database, and every delivery attempt is an `alert_event`. Alerts notify and never act.
+the database, every message it receives is a `command` row whatever became of it, and every
+delivery attempt is an `alert_event`. Alerts notify and never act.
 """
 
 import logging
 import os
+import re
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 import psycopg
 
-from agb import health
+from agb import health, readout
 from agb.health import Finding
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.nyse import NEW_YORK, NyseCalendar, trading_date
@@ -32,9 +37,92 @@ RETRY_AFTER = timedelta(minutes=1)
 RETRY_CAP = timedelta(hours=1)
 
 ALERT_HEADER = "HEALTH ALERT — nothing has been done and nothing will be."
-NO_COMMANDS = "No commands yet. Alerts and the pre-flight arrive in this chat."
+FILL_CONFIRMATION = "fill_confirmation"
+GATE_HALT = "gate_halt"
+# The unprompted rebalance messages look back over this many of the latest live baskets.
+RECENT_BASKETS = 3
+# Telegram refuses a message longer than this; a longer answer goes out in parts.
+MESSAGE_MAX = 4096
+
+# The commands this bot answers, and what each shows, in the order /help lists them.
+COMMANDS = {
+    "status": ("/status", "mode, open halts, the account, the latest and next rebalance"),
+    "positions": ("/positions", "the latest broker snapshot, name by name"),
+    "pnl": ("/pnl [YYYY-MM]", "realised return from account equity, for a month or all time"),
+    "basket": ("/basket", "the full target of the current or most recent rebalance"),
+    "gate": ("/gate", "every check of the latest gate run, with what it measured"),
+    "log": (f"/log [1-{readout.LOG_MAX}]", "the latest events, oldest first"),
+    "help": ("/help", "this list"),
+}
+# Commands the spec names that later tickets bring. They are refused, and recorded.
+LATER = frozenset({"pending", "approve", "reject", "why", "level", "pause", "resume", "liquidate"})
+VERB = re.compile(r"^[a-z][a-z0-9_]*$")
 
 Check = Callable[[psycopg.Connection], list[Finding]]
+
+
+def help_text(reason: str | None = None) -> str:
+    items = [readout.Item(usage, shows) for usage, shows in COMMANDS.values()]
+    return readout.message(reason or "COMMANDS", items)
+
+
+@dataclass(frozen=True)
+class Parsed:
+    verb: str | None
+    args: list[str]
+    # Why the command is refused, or None when it is answered.
+    refusal: str | None
+
+
+def parse(text: str) -> Parsed:
+    """Read a verb and its arguments from a message and check them, without running it."""
+    words = text.split()
+    if not words or not words[0].startswith("/"):
+        return Parsed(None, words, "not a command")
+    verb = words[0][1:].split("@", 1)[0].lower()
+    args = words[1:]
+    if not VERB.match(verb):
+        return Parsed(None, args, "not a command")
+    if verb == "start":
+        verb = "help"
+    if verb in LATER:
+        return Parsed(verb, args, f"/{verb} is not available yet")
+    if verb not in COMMANDS:
+        return Parsed(verb, args, f"unknown command /{verb}")
+    usage = COMMANDS[verb][0]
+    if verb == "pnl":
+        if len(args) > 1 or (args and not readout.PERIOD.match(args[0])):
+            return Parsed(verb, args, f"usage: {usage}")
+    elif verb == "log":
+        if len(args) > 1 or (
+            args and not (args[0].isdigit() and 1 <= int(args[0]) <= readout.LOG_MAX)
+        ):
+            return Parsed(verb, args, f"usage: {usage}")
+    elif args:
+        return Parsed(verb, args, f"usage: {usage}, no arguments")
+    return Parsed(verb, args, None)
+
+
+def split(text: str, limit: int = MESSAGE_MAX) -> list[str]:
+    """Cut a message into parts Telegram accepts, between items where it can."""
+    parts: list[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        while len(block) > limit:
+            if current:
+                parts.append(current)
+                current = ""
+            parts.append(block[:limit])
+            block = block[limit:]
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) > limit:
+            parts.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts
 
 
 def alert_text(finding: Finding) -> str:
@@ -63,6 +151,22 @@ _DUE = """
        OR last_failed_at <= now() - least(%(first)s * power(2, least(failures - 1, 20)), %(cap)s)
     ORDER BY id
 """
+
+_COMMAND = """
+    INSERT INTO agb.command (actor, surface, raw_text, verb, args, outcome, reason, chat_id,
+                             telegram_message_id)
+    VALUES (%(actor)s, 'telegram', %(text)s, %(verb)s, %(args)s, %(outcome)s, %(reason)s,
+            %(chat_id)s, %(message_id)s)
+"""
+
+# The latest live baskets that filled or were halted, for the unprompted messages.
+_SETTLED = """
+    SELECT id, reference, period, state FROM agb.basket_state
+    WHERE kind = 'live' AND state IN ('filled', 'halted')
+      AND id IN (SELECT id FROM agb.basket WHERE kind = 'live' ORDER BY id DESC LIMIT %s)
+    ORDER BY id
+"""
+_RAISED = "SELECT 1 FROM agb.alert WHERE kind = %s AND subject = %s AND period = %s"
 
 _RECORD = """
     INSERT INTO agb.alert_event (alert_id, event, channel, chat_id, telegram_message_id,
@@ -105,18 +209,20 @@ class Bot:
 
     def __call__(self, conn: psycopg.Connection) -> None:
         now = self.clock()
-        self.poll()
+        self.poll(conn, now)
         for finding in self.findings(conn, now):
             self.raise_alert(
                 conn, finding.kind, finding.subject, finding.period, alert_text(finding)
             )
+        self.rebalances(conn)
         self.preflight(conn, now)
         self.deliver(conn)
 
     # Messages in.
 
-    def poll(self) -> None:
-        """Read new messages. Only the configured chat is ever answered."""
+    def poll(self, conn: psycopg.Connection, now: datetime) -> None:
+        """Read new messages and record each as a command. Only the configured chat is ever
+        answered."""
         try:
             updates = self.telegram.get_updates(self._offset)
         except TelegramError as exc:
@@ -128,29 +234,97 @@ class Bot:
             if message is None:
                 continue
             if str(message.get("chat", {}).get("id")) == self.chat_id:
-                self.answer(message)
+                self.answer(conn, message, now)
             else:
-                self.refuse(message)
+                self.refuse(conn, message)
 
-    def answer(self, message: dict[str, Any]) -> None:
-        # The commands, and a `command` row for every message, arrive with #25.
+    def answer(self, conn: psycopg.Connection, message: dict[str, Any], now: datetime) -> None:
+        """Record the command, then answer it: the command's readout, or why it was refused
+        and what is available."""
+        parsed = parse(message.get("text") or "")
+        self._command(conn, message, parsed.verb, parsed.args, parsed.refusal)
+        if parsed.refusal is not None:
+            reply = help_text(parsed.refusal)
+        else:
+            reply = self.run(conn, parsed.verb, parsed.args, now)
         try:
-            self.telegram.send_message(self.chat_id, NO_COMMANDS)
+            for part in split(reply):
+                self.telegram.send_message(self.chat_id, part)
         except TelegramError as exc:
-            log.warning("could not answer: %s", exc)
+            log.warning("could not answer /%s: %s", parsed.verb, exc)
 
-    def refuse(self, message: dict[str, Any]) -> None:
-        """A message from any other chat is never answered, only logged."""
+    def run(self, conn: psycopg.Connection, verb: str, args: list[str], now: datetime) -> str:
+        if verb == "status":
+            return readout.status(conn, now)
+        if verb == "positions":
+            return readout.positions(conn)
+        if verb == "pnl":
+            return readout.pnl(conn, args[0] if args else None)
+        if verb == "basket":
+            return readout.basket(conn)
+        if verb == "gate":
+            return readout.gate(conn)
+        if verb == "log":
+            return readout.log(conn, int(args[0]) if args else readout.LOG_DEFAULT)
+        return help_text()
+
+    def refuse(self, conn: psycopg.Connection, message: dict[str, Any]) -> None:
+        """A message from any other chat is never answered, only recorded and logged."""
+        chat = message.get("chat", {}).get("id")
+        parsed = parse(message.get("text") or "")
+        self._command(conn, message, parsed.verb, parsed.args, "not the configured chat")
         log.warning(
-            "refused a message from chat %s, user %s",
-            message.get("chat", {}).get("id"),
-            message.get("from", {}).get("id"),
+            "refused a message from chat %s, user %s", chat, message.get("from", {}).get("id")
+        )
+
+    def _command(
+        self,
+        conn: psycopg.Connection,
+        message: dict[str, Any],
+        verb: str | None,
+        args: list[str],
+        refusal: str | None,
+    ) -> None:
+        sender = message.get("from", {}).get("id")
+        chat = message.get("chat", {}).get("id")
+        conn.execute(
+            _COMMAND,
+            {
+                "actor": f"telegram:{sender if sender is not None else 'unknown'}",
+                "text": message.get("text") or "",
+                "verb": verb,
+                "args": args,
+                "outcome": "accepted" if refusal is None else "refused",
+                "reason": refusal,
+                "chat_id": str(chat) if chat is not None else None,
+                "message_id": message.get("message_id"),
+            },
         )
 
     # Alerts.
 
     def findings(self, conn: psycopg.Connection, now: datetime) -> list[Finding]:
-        return health.stale_heartbeats(conn, now, self.stale_after) + health.overdue(conn, now)
+        return [
+            *health.stale_heartbeats(conn, now, self.stale_after),
+            *health.overdue(conn, now),
+            *health.position_mismatch(conn),
+        ]
+
+    def rebalances(self, conn: psycopg.Connection) -> None:
+        """A fill confirmation for each recent rebalance that filled, and a gate-halt alert
+        for each one the gate or the broker checks halted, once each."""
+        for basket_id, reference, period, state in conn.execute(
+            _SETTLED, (RECENT_BASKETS,)
+        ).fetchall():
+            kind = FILL_CONFIRMATION if state == "filled" else GATE_HALT
+            if conn.execute(_RAISED, (kind, reference, period)).fetchone():
+                continue
+            if state == "filled":
+                body = readout.filled_text(conn, basket_id, reference)
+            else:
+                body = readout.halted_text(conn, basket_id, reference)
+            if body is not None:
+                self.raise_alert(conn, kind, reference, period, body)
 
     def raise_alert(
         self, conn: psycopg.Connection, kind: str, subject: str, period: str, body: str
@@ -203,7 +377,9 @@ class Bot:
         due = conn.execute(_DUE, {"first": self.retry_after, "cap": self.retry_cap}).fetchall()
         for alert_id, kind, subject, period, body in due:
             try:
-                message_id = self.telegram.send_message(self.chat_id, body)
+                # A long alert goes out in parts; the delivery names the last part sent.
+                for part in split(body):
+                    message_id = self.telegram.send_message(self.chat_id, part)
             except TelegramError as exc:
                 self._record(conn, alert_id, "failed", detail=str(exc))
                 log.warning("could not deliver alert %s (%s %s): %s", alert_id, kind, subject, exc)
