@@ -149,21 +149,43 @@ def open_halt_causes(conn: psycopg.Connection) -> list[Finding]:
 def broker_mismatch(conn: psycopg.Connection) -> list[Finding]:
     """The broker's `suspend_trade`, as execution last observed it, against the `pause`
     halt cause: a mismatch in either direction. Nothing is reported until execution has
-    observed the broker. One alert per observation that disagrees."""
-    row = conn.execute("SELECT observed_at, suspend_trade FROM agb.broker_state_now").fetchone()
+    observed the broker since the pause cause last changed, nor while a pause or resume is
+    waiting for execution to carry it to the broker. One alert per episode: the first
+    observation of the disagreeing value since the cause last changed identifies it, so a
+    mismatch that persists raises one alert and one that recurs later raises another."""
+    row = conn.execute(
+        "SELECT id, observed_at, suspend_trade FROM agb.broker_state ORDER BY id DESC LIMIT 1"
+    ).fetchone()
     if row is None:
         return []
-    observed_at, suspend_trade = row
+    latest_id, observed_at, suspend_trade = row
+    if conn.execute("SELECT 1 FROM agb.latch_pending").fetchone() is not None:
+        return []
+    (changed_at,) = conn.execute(
+        "SELECT max(at) FROM agb.halt_event WHERE cause = 'pause'"
+    ).fetchone()
+    if changed_at is not None and observed_at < changed_at:
+        return []
     paused = (
         conn.execute("SELECT 1 FROM agb.halt_open WHERE cause = 'pause'").fetchone() is not None
     )
     if suspend_trade == paused:
         return []
+    (since,) = conn.execute(
+        """
+        SELECT min(s.observed_at) FROM agb.broker_state s
+        WHERE s.id > coalesce(
+                  (SELECT max(o.id) FROM agb.broker_state o
+                   WHERE o.suspend_trade <> %(suspend)s AND o.id < %(latest)s), 0)
+          AND s.observed_at >= coalesce(%(changed)s, '-infinity'::timestamptz)
+        """,
+        {"suspend": suspend_trade, "latest": latest_id, "changed": changed_at},
+    ).fetchone()
     return [
         Finding(
             "broker",
             "suspend_trade",
-            observed_at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             f"broker suspend_trade: {'on' if suspend_trade else 'off'}",
             f"{'pause open' if paused else 'no pause open'}; observed {et(observed_at)}",
         )

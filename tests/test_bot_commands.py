@@ -251,7 +251,17 @@ def test_every_message_is_a_command_row_with_its_outcome(db):
         (None, [], "refused", "not a command"),
     ]
     assert commands(db) == [
-        (f"telegram:{SENDER}", "telegram", text or "", verb, args, outcome, reason, CHAT, 100 + i)
+        (
+            f"telegram:{SENDER}",
+            "telegram",
+            text or "",
+            verb,
+            {"args": args},
+            outcome,
+            reason,
+            CHAT,
+            100 + i,
+        )
         for i, (text, (verb, args, outcome, reason)) in enumerate(zip(texts, expected, strict=True))
     ]
     assert len(replies) == len(texts)
@@ -280,7 +290,7 @@ def test_a_message_from_another_chat_is_recorded_and_never_answered(db):
 
     assert telegram.sent == []
     assert commands(db) == [
-        ("telegram:31", "telegram", "/positions", "positions", [], "refused",
+        ("telegram:31", "telegram", "/positions", "positions", {"args": []}, "refused",
          "not the configured chat", "999", 100),
     ]  # fmt: skip
 

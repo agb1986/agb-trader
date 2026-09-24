@@ -1,30 +1,14 @@
--- The bot's commands and the audit view it reads back.
+-- Where each command came from, and the audit view the bot reads back.
 --
--- Every command a human surface receives is a row here, whatever became of it: a verb the
--- bot answered, a verb it does not know, arguments it could not read, text that is not a
--- command, and a message from a chat that is not the configured one. The row is written
--- before the answer is sent, so a command that was refused or never answered is still on
--- record. The bot, the UI and the CLI write here; nothing is ever changed.
-CREATE TABLE agb.command (
-    id                   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    -- Who sent it: the sender's identity on the surface, such as `telegram:<user id>`.
-    actor                agb.actor NOT NULL,
-    surface              text NOT NULL CHECK (surface IN ('telegram', 'ui', 'cli')),
-    -- The message as received, and the verb and arguments read from it. A message that is
-    -- not a command has no verb.
-    raw_text             text NOT NULL,
-    verb                 text CHECK (verb ~ '^[a-z][a-z0-9_]*$'),
-    args                 text[] NOT NULL DEFAULT '{}',
-    outcome              text NOT NULL CHECK (outcome IN ('accepted', 'refused')),
-    reason               text CHECK (reason <> ''),
-    -- Where it came from on Telegram.
-    chat_id              text,
-    telegram_message_id  bigint,
-    at                   timestamptz NOT NULL DEFAULT now(),
-    CHECK ((outcome = 'refused') = (reason IS NOT NULL))
-);
-SELECT agb.make_append_only('agb.command');
-CREATE INDEX command_at ON agb.command (at);
+-- `agb.command` records every message a human surface receives, whatever became of it.
+-- The bot also records messages from a chat that is not the configured one, refused, so
+-- the chat and the Telegram message it came from are kept alongside. A refusal says why,
+-- and an accepted command has nothing to explain.
+ALTER TABLE agb.command
+    ADD COLUMN chat_id              text,
+    ADD COLUMN telegram_message_id  bigint,
+    ADD CONSTRAINT command_reason CHECK (reason <> ''),
+    ADD CONSTRAINT command_reason_iff_refused CHECK ((outcome = 'refused') = (reason IS NOT NULL));
 
 -- The audit log: one row per recorded event across the event tables, with the time, the
 -- actor, what happened, the fields that identify what it happened to, and any detail. It
@@ -77,5 +61,4 @@ SELECT e.at, 'job_event', e.id, e.actor,
 FROM agb.job_event e
 JOIN agb.job j ON j.id = e.job_id;
 
-GRANT SELECT ON agb.command, agb.audit_log TO scheduler, pipeline, execution, bot, ui, cli;
-GRANT INSERT ON agb.command TO bot, ui, cli;
+GRANT SELECT ON agb.audit_log TO scheduler, pipeline, execution, bot, ui, cli;

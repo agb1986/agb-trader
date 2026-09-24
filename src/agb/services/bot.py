@@ -7,6 +7,12 @@ undelivered alert to the configured chat.
 It holds no state beyond the Telegram update offset. Every message it sends is computed from
 the database, every message it receives is a `command` row whatever became of it, and every
 delivery attempt is an `alert_event`. Alerts notify and never act.
+
+`/pause` opens the `pause` halt cause and `/resume` clears every open cause, one clear each;
+both are written here, so the database latch holds the moment the reply goes out. The
+broker's `suspend_trade` is execution's to set, since only execution holds the broker's keys:
+it picks up the accepted command, and its confirmation arrives in this chat as an alert. The
+other commands only read.
 """
 
 import logging
@@ -19,6 +25,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 import psycopg
+from psycopg.types.json import Jsonb
 
 from agb import health, readout
 from agb.health import Finding
@@ -52,11 +59,13 @@ COMMANDS = {
     "basket": ("/basket", "the full target of the current or most recent rebalance"),
     "gate": ("/gate", "every check of the latest gate run, with what it measured"),
     "log": (f"/log [1-{readout.LOG_MAX}]", "the latest events, oldest first"),
+    "pause": ("/pause", "open the pause halt cause and suspend trading at the broker"),
+    "resume": ("/resume", "clear every open halt cause and lift the broker suspension"),
     "help": ("/help", "this list"),
 }
 # Commands the spec names that later tickets bring. They are refused, and recorded.
-LATER = frozenset({"pending", "approve", "reject", "why", "level", "pause", "resume", "liquidate"})
-VERB = re.compile(r"^[a-z][a-z0-9_]*$")
+LATER = frozenset({"pending", "approve", "reject", "why", "level", "liquidate"})
+VERB = re.compile(r"^[a-z][a-z_]*$")
 
 Check = Callable[[psycopg.Connection], list[Finding]]
 
@@ -137,6 +146,18 @@ def preflight_text(period: str, findings: list[Finding]) -> str:
     return f"PRE-FLIGHT {period}\nrebalance tomorrow, {count}\n\n{items}"
 
 
+_PAUSE_OPEN = "SELECT at, actor FROM agb.halt_open WHERE cause = 'pause'"
+_OPEN_CAUSES = "SELECT cause FROM agb.halt_open ORDER BY at, cause"
+_HALT = """
+    INSERT INTO agb.halt_event (cause, action, actor, reason) VALUES (%s, %s, %s, %s)
+"""
+
+
+def operator(message: dict[str, Any]) -> str:
+    """The actor a message is attributed to: the Telegram user who sent it."""
+    return f"telegram:{message.get('from', {}).get('id', 'unknown')}"
+
+
 _RAISE = """
     INSERT INTO agb.alert (kind, subject, period, body, raised_by)
     VALUES (%(kind)s, %(subject)s, %(period)s, %(body)s, %(actor)s)
@@ -210,7 +231,7 @@ class Bot:
     def __call__(self, conn: psycopg.Connection) -> None:
         now = self.clock()
         self.poll(conn, now)
-        for finding in self.findings(conn, now):
+        for finding in [*self.findings(conn, now), *self.broker(conn)]:
             self.raise_alert(
                 conn, finding.kind, finding.subject, finding.period, alert_text(finding)
             )
@@ -220,9 +241,10 @@ class Bot:
 
     # Messages in.
 
-    def poll(self, conn: psycopg.Connection, now: datetime) -> None:
+    def poll(self, conn: psycopg.Connection, now: datetime | None = None) -> None:
         """Read new messages and record each as a command. Only the configured chat is ever
         answered."""
+        now = now or self.clock()
         try:
             updates = self.telegram.get_updates(self._offset)
         except TelegramError as exc:
@@ -242,10 +264,15 @@ class Bot:
         """Record the command, then answer it: the command's readout, or why it was refused
         and what is available."""
         parsed = parse(message.get("text") or "")
-        self._command(conn, message, parsed.verb, parsed.args, parsed.refusal)
         if parsed.refusal is not None:
+            self._command(conn, message, parsed.verb, {"args": parsed.args}, parsed.refusal)
             reply = help_text(parsed.refusal)
+        elif parsed.verb == "pause":
+            reply = self.pause(conn, message)
+        elif parsed.verb == "resume":
+            reply = self.resume(conn, message)
         else:
+            self._command(conn, message, parsed.verb, {"args": parsed.args})
             reply = self.run(conn, parsed.verb, parsed.args, now)
         try:
             for part in split(reply):
@@ -268,11 +295,48 @@ class Bot:
             return readout.log(conn, int(args[0]) if args else readout.LOG_DEFAULT)
         return help_text()
 
+    def pause(self, conn: psycopg.Connection, message: dict[str, Any]) -> str:
+        """Open the `pause` cause, unless it is open already, and ask execution to set the
+        broker's `suspend_trade`. Returns the reply."""
+        actor = operator(message)
+        with conn.transaction():
+            already = conn.execute(_PAUSE_OPEN).fetchone()
+            if already is None:
+                conn.execute(_HALT, ("pause", "set", actor, "/pause"))
+            self._command(conn, message, "pause", {"already_open": already is not None})
+        if already is None:
+            opened = "halt cause pause: open. No further order goes out."
+        else:
+            opened = (
+                f"halt cause pause: already open since {health.et(already[0])}, by {already[1]}."
+            )
+        log.info("pause by %s", actor)
+        return (
+            f"PAUSED\n{opened}\nbroker suspend_trade: asked on. Execution confirms it here, "
+            "with anything it cancelled."
+        )
+
+    def resume(self, conn: psycopg.Connection, message: dict[str, Any]) -> str:
+        """Clear every open halt cause, one clear each, and ask execution to unset the
+        broker's `suspend_trade`. Returns the reply, which lists what was cleared."""
+        actor = operator(message)
+        with conn.transaction():
+            causes = [cause for (cause,) in conn.execute(_OPEN_CAUSES).fetchall()]
+            for cause in causes:
+                conn.execute(_HALT, (cause, "clear", actor, "/resume"))
+            self._command(conn, message, "resume", {"cleared": causes})
+        log.info("resume by %s, cleared: %s", actor, ", ".join(causes) or "nothing")
+        cleared = f"cleared: {', '.join(causes)}" if causes else "cleared: nothing was open"
+        return (
+            f"RESUMED\n{cleared}\nbroker suspend_trade: asked off. Execution confirms it "
+            "here.\nA halted rebalance is not resubmitted."
+        )
+
     def refuse(self, conn: psycopg.Connection, message: dict[str, Any]) -> None:
         """A message from any other chat is never answered, only recorded and logged."""
         chat = message.get("chat", {}).get("id")
         parsed = parse(message.get("text") or "")
-        self._command(conn, message, parsed.verb, parsed.args, "not the configured chat")
+        self._command(conn, message, parsed.verb, {"args": parsed.args}, "not the configured chat")
         log.warning(
             "refused a message from chat %s, user %s", chat, message.get("from", {}).get("id")
         )
@@ -282,18 +346,17 @@ class Bot:
         conn: psycopg.Connection,
         message: dict[str, Any],
         verb: str | None,
-        args: list[str],
-        refusal: str | None,
+        args: dict[str, Any],
+        refusal: str | None = None,
     ) -> None:
-        sender = message.get("from", {}).get("id")
         chat = message.get("chat", {}).get("id")
         conn.execute(
             _COMMAND,
             {
-                "actor": f"telegram:{sender if sender is not None else 'unknown'}",
+                "actor": operator(message),
                 "text": message.get("text") or "",
                 "verb": verb,
-                "args": args,
+                "args": Jsonb(args),
                 "outcome": "accepted" if refusal is None else "refused",
                 "reason": refusal,
                 "chat_id": str(chat) if chat is not None else None,

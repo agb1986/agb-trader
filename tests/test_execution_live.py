@@ -1,6 +1,7 @@
-"""Read-only checks against Alpaca paper with the operator's keys: the account is reachable
+"""Checks against Alpaca paper with the operator's keys: the account is reachable
 and can trade, its configuration is readable, and the asset and quote endpoints answer
-the questions the broker checks ask. Nothing is submitted.
+the questions the broker checks ask, and `suspend_trade` can be set and unset, as `/pause`
+and `/resume` do. Nothing is submitted.
 
 Opt in with AGB_LIVE_ALPACA=1 and the keys in the shell environment (ALPACA_API_KEY,
 ALPACA_SECRET_KEY, and ALPACA_BASE_URL pointing at paper); the keys are read from the
@@ -62,3 +63,15 @@ def test_the_latest_quote_gives_a_positive_nbbo_mid(alpaca):
         assert quote.bid > 0 and quote.ask >= quote.bid
         assert quote.mid == (quote.bid + quote.ask) / Decimal(2)
         assert quote.at.tzinfo is not None
+
+
+def test_suspend_trade_is_set_read_back_and_unset(alpaca):
+    """The broker half of `/pause` and `/resume`. The account is left as it was found."""
+    before = alpaca.configuration().suspend_trade
+    try:
+        assert alpaca.suspend(True).suspend_trade is True
+        assert alpaca.configuration().suspend_trade is True
+        assert alpaca.suspend(False).suspend_trade is False
+        assert alpaca.configuration().suspend_trade is False
+    finally:
+        alpaca.suspend(before)

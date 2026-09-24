@@ -24,6 +24,14 @@ naming what happened.
 The daily snapshot, once per closed session: the broker's positions and the account flags,
 so the halt latch can be compared with the broker's `suspend_trade`, and a snapshot with the
 previous one plus the day's fills.
+
+The broker latch, first thing each cycle. The operator's surfaces write the database half of
+`/pause` and `/resume` themselves and record the command; execution carries each accepted
+command to the broker in the order they arrived. A pause first cancels the sent orders of any
+submitted basket whose session has not reached its cancel deadline, ten minutes before the
+close, and halts that basket, then sets `suspend_trade`; a resume unsets it. Either way the
+account is read back, the result recorded against the command, and a confirmation raised for
+the bot to deliver. A broker that refuses leaves the command waiting for the next cycle.
 """
 
 import logging
@@ -55,6 +63,11 @@ ORDER = "order"
 # Broker order states from which nothing more will come.
 DONE = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
 PARTIAL_REBALANCE = "partial_rebalance"
+# A pause cancels a submitted basket's orders only up to this long before the close.
+CANCEL_BEFORE = timedelta(minutes=10)
+PAUSE = "pause"
+RESUME = "resume"
+LATCH_FAILED = "latch_failed"
 
 
 class ExecutionError(Exception):
@@ -113,6 +126,17 @@ class Sent:
     @property
     def done(self) -> bool:
         return self.kind == "rejected" or self.kind == "cancelled" or self.status in DONE
+
+
+@dataclass(frozen=True)
+class Command:
+    """An accepted pause or resume that execution has not yet carried to the broker."""
+
+    id: int
+    verb: str
+    actor: str
+    at: datetime
+    args: dict
 
 
 @dataclass(frozen=True)
@@ -199,6 +223,18 @@ _INSERT_SNAPSHOT = """
 _INSERT_POSITION = """
     INSERT INTO agb.position (snapshot_id, symbol, qty, avg_entry_price, market_value_usd)
     VALUES (%s, %s, %s, %s, %s)
+"""
+_LATCH_PENDING = "SELECT id, verb, actor, at, args FROM agb.latch_pending"
+_INSERT_LATCH = """
+    INSERT INTO agb.broker_latch (command_id, suspend_trade, observed_suspend, detail, actor)
+    VALUES (%s, %s, %s, %s, %s)
+"""
+_PAUSE_OPEN = "SELECT at, actor FROM agb.halt_open WHERE cause = 'pause'"
+_HALTED_SINCE = """
+    SELECT b.reference, e.at, e.reason
+    FROM agb.basket_event e JOIN agb.basket b ON b.id = e.basket_id
+    WHERE e.to_state = 'halted' AND e.surface = %s AND e.at >= %s
+    ORDER BY e.id
 """
 _RAISE = """
     INSERT INTO agb.alert (kind, subject, period, body, raised_by)
@@ -678,3 +714,147 @@ def snapshot(
     record_state(conn, broker)
     log.info("snapshot %s: %d positions", session, len(positions))
     return True
+
+
+# -- the broker latch ----------------------------------------------------------------------
+
+
+def pending_latch(conn: psycopg.Connection) -> list[Command]:
+    """The accepted pauses and resumes not yet carried to the broker, oldest first."""
+    return [Command(*row) for row in conn.execute(_LATCH_PENDING).fetchall()]
+
+
+def cancel_deadline(calendar: nyse.NyseCalendar, session: date) -> datetime:
+    """The last moment a pause cancels `session`'s orders: `CANCEL_BEFORE` before its close,
+    15:50 ET on a full day and ten minutes before an early close."""
+    return calendar.close_at(session) - CANCEL_BEFORE
+
+
+def cancel_in_flight(
+    conn: psycopg.Connection, broker: Broker, calendar: nyse.NyseCalendar, now: datetime
+) -> list[str]:
+    """A pause's cancel: every submitted basket whose session has not closed. Before the
+    cancel deadline its sent orders are cancelled and it is halted, with a partial-rebalance
+    alert naming any order that stayed live; after it, the orders are left to the close.
+    Returns a line for each basket left to the close."""
+    left = []
+    for basket in waiting(conn, "submitted"):
+        close = calendar.close_at(basket.session_date)
+        if now >= close:
+            continue
+        orders = sent(conn, basket.id)
+        live = [o for o in orders if o.live and not o.done]
+        deadline = cancel_deadline(calendar, basket.session_date)
+        if now >= deadline:
+            left.append(
+                f"basket {basket.reference}: past the "
+                f"{deadline.astimezone(nyse.NEW_YORK):%H:%M} ET cancel deadline, "
+                f"{len(live)} orders left to the close"
+            )
+            continue
+        remaining = _cancel_sent(conn, broker, orders)
+        reason = (
+            f"paused mid-submission: {len(live) - len(remaining)} of {len(live)} orders cancelled"
+        )
+        if remaining:
+            names = ", ".join(f"{o.side} {o.qty} {o.symbol}" for o in remaining)
+            reason += f"; still live at the broker: {names}"
+        with conn.transaction():
+            current = conn.execute(_STATE, (basket.id,)).fetchone()
+            if current is None or current[0] != "submitted":
+                raise ExecutionError(f"basket {basket.id} is no longer submitted")
+            conn.execute(
+                _MOVE, (basket.id, current[1] + 1, "submitted", "halted", ACTOR, SURFACE, reason)
+            )
+        if remaining:
+            raise_alert(
+                conn,
+                PARTIAL_REBALANCE,
+                basket.reference,
+                basket.period,
+                f"basket {basket.reference} halted by a pause mid-submission; still live at "
+                f"the broker: {names}",
+            )
+        log.warning("basket %s: %s", basket.reference, reason)
+    return left
+
+
+def _at(at: datetime) -> str:
+    return at.astimezone(nyse.NEW_YORK).strftime("%Y-%m-%d %H:%M ET")
+
+
+def _confirmation(
+    conn: psycopg.Connection, command: Command, observed: bool, left: Sequence[str]
+) -> str:
+    """The message the operator gets once execution has carried `command` to the broker."""
+    wanted = command.verb == PAUSE
+    broker_line = f"broker suspend_trade: {'on' if observed else 'off'}"
+    if observed != wanted:
+        broker_line += f", asked for {'on' if wanted else 'off'}"
+    pause = conn.execute(_PAUSE_OPEN).fetchone()
+    if pause is not None:
+        pause_line = f"halt cause pause: open since {_at(pause[0])}, by {pause[1]}"
+    else:
+        pause_line = "halt cause pause: not open"
+    if wanted:
+        lines = [f"PAUSE by {command.actor} at {_at(command.at)}", pause_line, broker_line]
+        halted = conn.execute(_HALTED_SINCE, (SURFACE, command.at)).fetchall()
+        lines += [f"basket {ref} halted at {_at(at)}: {reason}" for ref, at, reason in halted]
+        lines += list(left)
+        if not halted and not left:
+            lines.append("no submission in flight")
+    else:
+        cleared = command.args.get("cleared") or []
+        lines = [
+            f"RESUME by {command.actor} at {_at(command.at)}",
+            f"cleared: {', '.join(cleared)}" if cleared else "cleared: nothing was open",
+            broker_line,
+            "a halted rebalance is not resubmitted",
+        ]
+    return "\n".join(lines)
+
+
+def apply_latch(
+    conn: psycopg.Connection, broker: Broker, calendar: nyse.NyseCalendar, now: datetime
+) -> int:
+    """Carry each waiting pause and resume to the broker, oldest first, and raise its
+    confirmation. A broker error raises a `latch_failed` alert once per command and stops,
+    leaving that command and those after it for the next cycle. Returns how many were
+    carried."""
+    done = 0
+    for command in pending_latch(conn):
+        wanted = command.verb == PAUSE
+        try:
+            left = cancel_in_flight(conn, broker, calendar, now) if wanted else []
+            broker.suspend(wanted)
+            observed, _ = record_state(conn, broker)
+        except AlpacaError as exc:
+            raise_alert(
+                conn,
+                LATCH_FAILED,
+                f"command {command.id}",
+                command.at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                f"{command.verb.upper()} by {command.actor} at {_at(command.at)} could not "
+                f"set the broker's suspend_trade {'on' if wanted else 'off'}: {exc}\n"
+                "execution tries again each cycle",
+            )
+            log.error("command %d (%s): %s", command.id, command.verb, exc)
+            return done
+        body = _confirmation(conn, command, observed, left)
+        with conn.transaction():
+            conn.execute(_INSERT_LATCH, (command.id, wanted, observed, body, ACTOR))
+            raise_alert(
+                conn,
+                command.verb,
+                f"command {command.id}",
+                command.at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                body,
+            )
+        log.info(
+            "command %d (%s) carried to the broker: suspend_trade %s",
+            command.id,
+            command.verb,
+            observed,
+        )
+        done += 1
+    return done
