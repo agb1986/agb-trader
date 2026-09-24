@@ -18,7 +18,9 @@ Every check is recorded with what it measured and the threshold it had to meet, 
 passed or not, so the result reads check by check. A single failure halts the whole
 rebalance: the basket moves to halted and the halt latch's `gate_breach` cause opens, so
 nothing trades and the book stays as last month left it until a human clears it. A basket
-that passes waits for the human in live mode; in paper mode the system approves it.
+that passes waits for the human in live mode; in paper mode the system approves it, unless
+the operator has set paper mode to ask the human too (`agb.paper_approval`), when it waits
+as in live mode.
 
 Equity is the capital the basket was sized against until execution reads the broker's
 account, and the book is `basket.book`. Both change source later; the checks do not.
@@ -35,7 +37,7 @@ from decimal import Decimal
 
 import psycopg
 
-from agb import basket, nyse, rebalance, universe
+from agb import basket, jobs, nyse, rebalance, schedule, universe
 from agb.placeholder_ranker import PlaceholderMomentum
 from agb.roles import PIPELINE
 
@@ -343,6 +345,7 @@ _STATE = "SELECT state, seq FROM agb.basket_state WHERE id = %s"
 _MOVE = """
     INSERT INTO agb.basket_event (basket_id, seq, from_state, to_state, actor, surface, reason)
     VALUES (%s, %s, 'proposed', %s, %s, %s, %s)
+    RETURNING id
 """
 _BREACH = """
     INSERT INTO agb.halt_event (cause, action, basket_id, actor, reason)
@@ -372,7 +375,8 @@ def run(
 ) -> Verdict:
     """Gate a proposed basket, record every check, and move it on: to halted with a
     `gate_breach` on any failure, to approved by the system on a pass in paper mode, and
-    nowhere on a pass in live mode. A basket already gated returns its recorded verdict."""
+    nowhere on a pass in live mode or in a paper mode that asks the human. A basket already
+    gated returns its recorded verdict."""
     with conn.transaction():
         recorded = conn.execute(_RUN, (basket_id,)).fetchone()
         current = conn.execute(_STATE, (basket_id,)).fetchone()
@@ -396,6 +400,7 @@ def run(
             calendar=calendar,
         )
         (mode,) = conn.execute("SELECT mode FROM agb.current_mode").fetchone()
+        (asks,) = conn.execute("SELECT required FROM agb.paper_approval").fetchone()
         (run_id,) = conn.execute(_INSERT_RUN, (basket_id, len(checks), mode, PIPELINE)).fetchone()
         with conn.cursor() as cur:
             cur.executemany(
@@ -411,9 +416,15 @@ def run(
             conn.execute(_MOVE, (basket_id, seq, "halted", PIPELINE, basket.SURFACE, reason))
             conn.execute(_BREACH, (basket_id, PIPELINE, reason))
             state = "halted"
-        elif mode == PAPER:
+        elif mode == PAPER and not asks:
             reason = "passed the pre-trade gate in paper mode"
-            conn.execute(_MOVE, (basket_id, seq, "approved", SYSTEM, basket.SURFACE, reason))
+            (event_id,) = conn.execute(
+                _MOVE, (basket_id, seq, "approved", SYSTEM, basket.SURFACE, reason)
+            ).fetchone()
+            # Nobody is asked, so the approval the month expects is this one.
+            jobs.fulfil(
+                conn, schedule.APPROVAL_REQUEST, target.period, "basket_event", event_id, PIPELINE
+            )
             state = "approved"
         else:
             state = "proposed"

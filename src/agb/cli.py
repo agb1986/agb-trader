@@ -4,11 +4,12 @@ import argparse
 import os
 import sys
 from collections.abc import Iterable
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import psycopg
 
 from agb import panel
+from agb.nyse import NyseCalendar, trading_date
 from agb.roles import SERVICES
 
 _HEARTBEATS = """
@@ -49,6 +50,10 @@ def format_status(rows: Iterable[tuple[str, datetime, timedelta, str | None]]) -
 
 def status(conn: psycopg.Connection) -> str:
     return format_status(conn.execute(_HEARTBEATS).fetchall())
+
+
+def clock() -> datetime:
+    return datetime.now(UTC)
 
 
 def _status(args: argparse.Namespace) -> int:
@@ -94,6 +99,39 @@ def _panel_config_list(args: argparse.Namespace) -> int:
     return 0
 
 
+# agb.approval reads agb.health, which reads this module's format_age, so the two commands
+# that use it import it where they run.
+
+
+def _paper_approval(args: argparse.Namespace) -> int:
+    from agb import approval
+
+    with psycopg.connect(application_name="agb-cli") as conn:
+        if args.setting == "show":
+            print(approval.paper_approval_text(conn))
+        else:
+            required = args.setting == "require"
+            print(approval.set_paper_approval(conn, required, args.actor, args.reason))
+    return 0
+
+
+def _rerun(args: argparse.Namespace) -> int:
+    from agb import approval
+
+    now = clock()
+    today = trading_date(now)
+    calendar = NyseCalendar(today - timedelta(days=7), today + timedelta(days=30))
+    source = approval.Source(args.actor, "cli", f"agb rerun {args.reference}")
+    with psycopg.connect(application_name="agb-cli") as conn:
+        try:
+            print(approval.request_rerun(conn, args.reference, source, now, calendar))
+        except approval.RerunRefused as exc:
+            # The refusal is recorded; leaving the block commits it.
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agb", description="agb-trader operator CLI")
     parser.add_argument("--version", action="version", version=os.environ.get("AGB_VERSION", "dev"))
@@ -124,6 +162,31 @@ def main(argv: list[str] | None = None) -> int:
     configs.add_parser("list", help="every panel_config, oldest first").set_defaults(
         run=_panel_config_list
     )
+    actor = {
+        "default": os.environ.get("USER") or "operator",
+        "help": "who is asking (default $USER)",
+    }
+    paper = commands.add_parser(
+        "paper-approval",
+        help="whether a paper rebalance waits for the human, as live mode does",
+        description="Paper mode runs unattended by default: a basket that passes the gate is "
+        "approved by the system. 'require' makes it wait for /approve, as in live mode, to "
+        "rehearse the loop; it applies from the next gate run.",
+    )
+    paper.add_argument("setting", choices=["show", "require", "unattended"])
+    paper.add_argument("--reason", help="why, kept with the setting")
+    paper.add_argument("--actor", **actor)
+    paper.set_defaults(run=_paper_approval)
+    rerun = commands.add_parser(
+        "rerun",
+        help="trade a missed rebalance at the next session's close",
+        description="Asks for a new basket, REFERENCE r1 and on, whose deviation_of names the "
+        "missed one, which keeps its outcome. The pipeline builds and gates it, and it waits "
+        "for /approve like any other.",
+    )
+    rerun.add_argument("reference", help="the missed rebalance, e.g. 2026-10")
+    rerun.add_argument("--actor", **actor)
+    rerun.set_defaults(run=_rerun)
     args = parser.parse_args(argv)
     try:
         return args.run(args)

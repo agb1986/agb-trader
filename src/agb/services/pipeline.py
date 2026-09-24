@@ -8,12 +8,18 @@
     session, ranked by the ranker the service was built with, runs the pre-trade gate on it
     (agb.gate), and completes the job, which fulfils the proposal's expected event. The gate
     halts a basket that fails any check and opens the halt latch; in paper mode it approves
-    one that passes, and in live mode leaves it for the human. The ranker is the placeholder
-    until the classical model is certified; swapping it is a change to `from_env` alone.
+    one that passes, and in live mode (or in paper mode set to ask) leaves it for the human.
+    The ranker is the placeholder until the classical model is certified; swapping it is a
+    change to `from_env` alone.
+
+Before taking a job it builds any rerun the operator asked for (`agb rerun`, agb.approval):
+a copy of the missed basket under its new reference, for the next session, gated like any
+other. A rerun has no job; the command is done once its basket has a gate run.
 
 Both are safe to redo, so an expired lease is reclaimed: a partition that lands with the same
 bytes is left untouched and recorded nothing new, a reference already proposed is kept, and a
-basket already gated keeps its verdict.
+basket already gated keeps its verdict. The same holds for a rerun interrupted between
+building and gating.
 Data the vendor has not yet published is not a failure: the service keeps the job and shortens
 its lease to RETRY, so the work is tried again once the lease runs out, until it lands.
 
@@ -50,6 +56,10 @@ log = logging.getLogger(__name__)
 LEASE = timedelta(hours=1)
 # How long to wait before asking the vendor again for a session it has not published.
 RETRY = timedelta(minutes=15)
+
+_RERUNS = """
+    SELECT command_id, actor, basket_id, reference, session_date FROM agb.rerun_pending
+"""
 
 _RECORD = """
     INSERT INTO agb.lake_snapshot
@@ -123,6 +133,8 @@ class Pipeline:
         return Sharadar(self.api_key, self.opener)
 
     def __call__(self, conn: psycopg.Connection) -> None:
+        for row in conn.execute(_RERUNS).fetchall():
+            self.rerun(conn, *row)
         claim = jobs.claim(
             conn,
             [schedule.DATA_PULL, schedule.REBALANCE],
@@ -191,6 +203,49 @@ class Pipeline:
                 verdict.mode,
                 verdict.state,
             )
+
+    def rerun(
+        self,
+        conn: psycopg.Connection,
+        command_id: int,
+        actor: str,
+        original: int,
+        reference: str,
+        session_date: date,
+    ) -> None:
+        try:
+            proposal = basket.rerun(
+                conn, original, reference, session_date, command_id, self.lake_dir
+            )
+            verdict = gate.run(
+                conn,
+                proposal.basket_id,
+                members=proposal.members,
+                marks=proposal.marks,
+                now=self.clock(),
+                limits=self.limits,
+            )
+        except (
+            BasketError,
+            GateError,
+            UniverseError,
+            LakeError,
+            OSError,
+            ValueError,
+            duckdb.Error,
+        ) as exc:
+            log.error("rerun %s, asked for by %s, failed: %s", reference, actor, exc)
+            return
+        log.info(
+            "rerun %s of basket %d, asked for by %s, is basket %d for %s: %s, %s",
+            reference,
+            original,
+            actor,
+            proposal.basket_id,
+            session_date,
+            f"passed {len(verdict.checks)} pre-trade checks" if verdict.passed else "halted",
+            verdict.state,
+        )
 
     def pull(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
         session = date.fromisoformat(claim.period)

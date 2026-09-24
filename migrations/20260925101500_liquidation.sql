@@ -130,8 +130,15 @@ SELECT e.at, 'job_event', e.id, e.actor,
 FROM agb.job_event e
 JOIN agb.job j ON j.id = e.job_id
 UNION ALL
+SELECT p.at, 'paper_approval_event', p.id, p.actor,
+       CASE WHEN p.required THEN 'paper approval required' ELSE 'paper approval unattended' END,
+       NULL, p.reason
+FROM agb.paper_approval_event p
+UNION ALL
 SELECT l.at, 'liquidation', l.id, l.actor,
        'liquidation ' || l.kind,
        CASE WHEN l.follows IS NULL THEN NULL ELSE 'liquidation ' || l.follows END,
        l.detail
 FROM agb.liquidation l;
+
+GRANT SELECT ON agb.audit_log TO scheduler, pipeline, execution, bot, ui, cli;

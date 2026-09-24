@@ -16,6 +16,12 @@ again; the second attempt finds the reference taken, writes nothing and complete
 the first basket. A lake that does not yet hold the signal session is not a failure: `NotReady`
 tells the service to keep the job and try again later, as the data pull does.
 
+A missed basket may be rerun at a later session's close when the operator asks (`agb rerun`,
+agb.approval): `rerun` copies it, ranks, targets and orders as they were, under a new
+reference such as `2026-10r1` whose `deviation_of` names the original, and proposes it for
+the new session. The signal and the provenance are the original's, so the gate checks the
+same universe and marks.
+
 The book is what the last filled live basket holds. Until the execution ticket lands there is
 no filled basket, so the book is empty and the first proposal buys twenty names. Execution
 replaces `book` with the broker's positions; the rules that consume it do not change.
@@ -106,6 +112,47 @@ _BOOK = """
         ORDER BY session_date DESC, id DESC
         LIMIT 1
     )
+"""
+
+
+# A rerun: the missed basket's provenance under a new reference and session.
+_INSERT_RERUN = """
+    INSERT INTO agb.basket
+        (reference, period, deviation_of, job_id, session_date, signal_date, snapshot_date,
+         partition_hash, universe_size, ranker, cost_model_version, capital_usd, actor)
+    SELECT %(reference)s, period, id, NULL, %(session)s, signal_date, snapshot_date,
+           partition_hash, universe_size, ranker, cost_model_version, capital_usd, %(actor)s
+    FROM agb.basket WHERE id = %(original)s
+    ON CONFLICT (reference) DO NOTHING
+    RETURNING id
+"""
+_COPY_RANKS = """
+    INSERT INTO agb.basket_rank (basket_id, symbol, rank, score)
+    SELECT %(basket)s, symbol, rank, score FROM agb.basket_rank
+    WHERE basket_id = %(original)s ORDER BY id
+"""
+_COPY_TARGETS = """
+    INSERT INTO agb.basket_target (basket_id, symbol, weight, shares, held, carried, rank)
+    SELECT %(basket)s, symbol, weight, shares, held, carried, rank FROM agb.basket_target
+    WHERE basket_id = %(original)s ORDER BY id
+"""
+_COPY_ORDERS = """
+    INSERT INTO agb.basket_order
+        (basket_id, client_order_id, symbol, side, qty, tif, reference_price, notional_usd,
+         cost_model_version, floor_bps, impact_bps, fees_usd, modelled_cost_bps)
+    SELECT %(basket)s, %(reference)s || '-' || symbol, symbol, side, qty, tif, reference_price,
+           notional_usd, cost_model_version, floor_bps, impact_bps, fees_usd, modelled_cost_bps
+    FROM agb.basket_order
+    WHERE basket_id = %(original)s ORDER BY id
+"""
+_COUNTS = """
+    SELECT (SELECT count(*) FROM agb.basket_target WHERE basket_id = %(basket)s),
+           (SELECT count(*) FROM agb.basket_order WHERE basket_id = %(basket)s)
+"""
+_PROPOSE_RERUN = """
+    INSERT INTO agb.basket_event
+        (basket_id, seq, from_state, to_state, actor, surface, reason, command_id)
+    VALUES (%s, 1, NULL, 'proposed', %s, %s, %s, %s)
 """
 
 
@@ -309,3 +356,53 @@ def _require_bars(db: duckdb.DuckDBPyConnection) -> None:
     missing = sorted({"high", "low", "close", "volume", "closeunadj"} - present)
     if missing:
         raise BasketError(f"the lake's sep lacks {missing}")
+
+
+def rerun(
+    conn: psycopg.Connection,
+    original: int,
+    reference: str,
+    session_date: date,
+    command_id: int,
+    lake_dir: Path,
+) -> Proposal:
+    """Propose a copy of a missed basket for a later session, under the rerun's reference,
+    as the operator's `rerun` command asked. Safe to redo: a reference already taken writes
+    nothing and returns the basket that holds it."""
+    row = conn.execute("SELECT signal_date FROM agb.basket WHERE id = %s", (original,)).fetchone()
+    if row is None:
+        raise BasketError(f"basket {original} does not exist")
+    signal = row[0]
+    held = book(conn)
+    lake_db = lake.connect(lake_dir)
+    try:
+        members = frozenset(universe.snapshot(signal, lake_dir, db=lake_db).tickers)
+        prints = {str(t): Decimal(str(p)) for t, p in lake_db.execute(_PRINTS, [signal]).fetchall()}
+        marks = prints | _last_closes(lake_db, [s for s in held if s not in prints], signal)
+    finally:
+        lake_db.close()
+
+    with conn.transaction():
+        row = conn.execute(
+            _INSERT_RERUN,
+            {
+                "reference": reference,
+                "session": session_date,
+                "original": original,
+                "actor": PIPELINE,
+            },
+        ).fetchone()
+        if row is None:
+            basket_id = conn.execute(
+                "SELECT id FROM agb.basket WHERE reference = %s", (reference,)
+            ).fetchone()[0]
+            return Proposal(basket_id, reference, True, 0, 0, members, marks)
+        basket_id = row[0]
+        copy = {"basket": basket_id, "original": original, "reference": reference}
+        conn.execute(_COPY_RANKS, copy)
+        conn.execute(_COPY_TARGETS, copy)
+        conn.execute(_COPY_ORDERS, copy)
+        reason = f"rerun of basket {original}, as asked by command {command_id}"
+        conn.execute(_PROPOSE_RERUN, (basket_id, PIPELINE, SURFACE, reason, command_id))
+        names, orders = conn.execute(_COUNTS, {"basket": basket_id}).fetchone()
+    return Proposal(basket_id, reference, False, names, orders, members, marks)

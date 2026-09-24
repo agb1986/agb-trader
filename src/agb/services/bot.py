@@ -1,8 +1,9 @@
 """The Telegram bot service. Each cycle it beats its heartbeat, reads new messages and
 answers the read-only commands, raises an alert for each unhealthy finding, a fill
 confirmation for each rebalance that filled and a gate-halt alert for each one the checks
-halted, raises the pre-flight on the session before a rebalance, and delivers every
-undelivered alert to the configured chat.
+halted, puts each gated rebalance to the human and reminds them before its cutoff, raises the
+pre-flight on the session before a rebalance, and delivers every undelivered alert to the
+configured chat.
 
 It holds no state beyond the Telegram update offset. Every message it sends is computed from
 the database, every message it receives is a `command` row whatever became of it, and every
@@ -12,6 +13,8 @@ delivery attempt is an `alert_event`. Alerts notify and never act.
 both are written here, so the database latch holds the moment the reply goes out. The
 broker's `suspend_trade` is execution's to set, since only execution holds the broker's keys:
 it picks up the accepted command, and its confirmation arrives in this chat as an alert.
+`/approve` and `/reject` answer the approval request, through `agb.approval`, which records
+the command whatever became of it.
 
 `/liquidate` is two steps. Bare, it says what closing every position would mean and issues a
 short random token, valid for five minutes. With the token typed back in time, it opens the
@@ -35,7 +38,7 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
-from agb import health, readout
+from agb import approval, health, jobs, readout, schedule
 from agb.health import Finding
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.nyse import NEW_YORK, NyseCalendar, trading_date
@@ -68,6 +71,9 @@ COMMANDS = {
     "status": ("/status", "mode, open halts, the account, the latest and next rebalance"),
     "positions": ("/positions", "the latest broker snapshot, name by name"),
     "pnl": ("/pnl [YYYY-MM]", "realised return from account equity, for a month or all time"),
+    "pending": ("/pending", "the rebalance waiting for your answer, as the request shows it"),
+    "approve": ("/approve <reference>", "approve the pending rebalance, e.g. /approve 2026-10"),
+    "reject": ("/reject <reference> [reason]", "reject the pending rebalance: no trades"),
     "basket": ("/basket", "the full target of the current or most recent rebalance"),
     "gate": ("/gate", "every check of the latest gate run, with what it measured"),
     "log": (f"/log [1-{readout.LOG_MAX}]", "the latest events, oldest first"),
@@ -77,7 +83,9 @@ COMMANDS = {
     "help": ("/help", "this list"),
 }
 # Commands the spec names that later tickets bring. They are refused, and recorded.
-LATER = frozenset({"pending", "approve", "reject", "why", "level"})
+LATER = frozenset({"why", "level"})
+# Commands whose arguments `agb.approval` checks, against what is pending.
+DECISIONS = frozenset({"approve", "reject"})
 VERB = re.compile(r"^[a-z][a-z_]*$")
 
 Check = Callable[[psycopg.Connection], list[Finding]]
@@ -123,7 +131,7 @@ def parse(text: str) -> Parsed:
     elif verb == "liquidate":
         if len(args) > 1:
             return Parsed(verb, args, f"usage: {usage}")
-    elif args:
+    elif args and verb not in DECISIONS:
         return Parsed(verb, args, f"usage: {usage}, no arguments")
     return Parsed(verb, args, None)
 
@@ -241,6 +249,7 @@ _RECORD = """
                                  detail, actor)
     VALUES (%(alert_id)s, %(event)s, %(channel)s, %(chat_id)s, %(message_id)s,
             %(detail)s, %(actor)s)
+    RETURNING id
 """
 
 
@@ -283,6 +292,7 @@ class Bot:
                 conn, finding.kind, finding.subject, finding.period, alert_text(finding)
             )
         self.rebalances(conn)
+        self.approvals(conn, now)
         self.preflight(conn, now)
         self.deliver(conn)
 
@@ -320,6 +330,8 @@ class Bot:
             reply = self.resume(conn, message)
         elif parsed.verb == "liquidate":
             reply = self.liquidate(conn, message, parsed.args, now)
+        elif parsed.verb in DECISIONS:
+            reply = self.decide(conn, message, parsed, now)
         else:
             self._command(conn, message, parsed.verb, {"args": parsed.args})
             reply = self.run(conn, parsed.verb, parsed.args, now)
@@ -336,6 +348,8 @@ class Bot:
             return readout.positions(conn)
         if verb == "pnl":
             return readout.pnl(conn, args[0] if args else None)
+        if verb == "pending":
+            return approval.pending_text(conn, now, self.calendar(trading_date(now)))
         if verb == "basket":
             return readout.basket(conn)
         if verb == "gate":
@@ -486,6 +500,25 @@ class Bot:
             "The liquidation cause stays open until /resume."
         )
 
+    def decide(
+        self, conn: psycopg.Connection, message: dict[str, Any], parsed: Parsed, now: datetime
+    ) -> str:
+        """Approve or reject the pending rebalance the message names. Returns the reply."""
+        assert parsed.verb is not None
+        chat = message.get("chat", {}).get("id")
+        source = approval.Source(
+            operator(message),
+            CHANNEL,
+            message.get("text") or "",
+            str(chat) if chat is not None else None,
+            message.get("message_id"),
+        )
+        reply = approval.decide(
+            conn, parsed.verb, parsed.args, source, now, self.calendar(trading_date(now))
+        )
+        log.info("/%s by %s: %s", parsed.verb, source.actor, reply.splitlines()[0])
+        return reply
+
     def refuse(self, conn: psycopg.Connection, message: dict[str, Any]) -> None:
         """A message from any other chat is never answered, only recorded and logged."""
         chat = message.get("chat", {}).get("id")
@@ -543,6 +576,19 @@ class Bot:
                 body = readout.halted_text(conn, basket_id, reference)
             if body is not None:
                 self.raise_alert(conn, kind, reference, period, body)
+
+    def approvals(self, conn: psycopg.Connection, now: datetime) -> None:
+        """Put each gated rebalance to the human, and raise the reminder due for each one
+        still pending. One the cutoff has passed is left for the scheduler to mark missed."""
+        calendar = self.calendar(trading_date(now))
+        for basket in approval.waiting(conn):
+            if basket.state == "proposed":
+                if now >= approval.cutoff_of(calendar, basket.session_date):
+                    continue
+                if approval.put(conn, basket, now, calendar):
+                    log.info("rebalance %s: sent for approval", basket.reference)
+            elif approval.remind(conn, basket, now, calendar):
+                log.info("rebalance %s: reminder raised", basket.reference)
 
     def raise_alert(
         self, conn: psycopg.Connection, kind: str, subject: str, period: str, body: str
@@ -602,7 +648,10 @@ class Bot:
                 self._record(conn, alert_id, "failed", detail=str(exc))
                 log.warning("could not deliver alert %s (%s %s): %s", alert_id, kind, subject, exc)
                 continue
-            self._record(conn, alert_id, "delivered", message_id=message_id)
+            event_id = self._record(conn, alert_id, "delivered", message_id=message_id)
+            if kind == approval.APPROVAL_REQUEST:
+                # The request reaching the chat is what the month expects of the bot.
+                jobs.fulfil(conn, schedule.APPROVAL_REQUEST, period, "alert_event", event_id, ACTOR)
             log.info("delivered alert %s (%s %s %s)", alert_id, kind, subject, period)
 
     def _record(
@@ -613,8 +662,8 @@ class Bot:
         *,
         message_id: int | None = None,
         detail: str | None = None,
-    ) -> None:
-        conn.execute(
+    ) -> int:
+        (event_id,) = conn.execute(
             _RECORD,
             {
                 "alert_id": alert_id,
@@ -625,7 +674,8 @@ class Bot:
                 "detail": detail,
                 "actor": ACTOR,
             },
-        )
+        ).fetchone()
+        return event_id
 
 
 def main() -> None:

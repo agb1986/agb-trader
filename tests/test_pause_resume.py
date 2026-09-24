@@ -439,8 +439,9 @@ def test_a_suspend_trade_mismatch_alerts_once_per_episode_in_both_directions(db,
 def test_only_pause_and_resume_reach_the_latches(db, operator):
     assert operator.says("/status").startswith("agb-trader")
     assert operator.says("hello") == help_text("not a command")
-    assert operator.says("/approve@agb_bot 2026-10 yes") == help_text(
-        "/approve is not available yet"
+    assert operator.says("/approve@agb_bot 2026-10 yes") == (
+        "usage: /approve <reference>, nothing after it\n\n"
+        "Nothing is waiting for an answer.  /status"
     )
     assert operator.says("/pause now") == help_text("usage: /pause, no arguments")
 
@@ -454,7 +455,7 @@ def test_only_pause_and_resume_reach_the_latches(db, operator):
             "approve",
             {"args": ["2026-10", "yes"]},
             "refused",
-            "/approve is not available yet",
+            "usage: /approve <reference>, nothing after it",
         ),
         (
             ACTOR,
