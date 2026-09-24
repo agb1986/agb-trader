@@ -5,6 +5,7 @@
     cpcv         combinatorial purged cross-validation of a LambdaRank configuration
     walkforward  the annual expanding-window test of a configuration
     scan         a vectorbt scan of one signal, costed with the live cost model
+    backtest     the NautilusTrader validation backtest of one signal, checking the scan
     trials       list the trial ledger
     reproduce    rerun a trial from its row and compare the results
 
@@ -56,6 +57,21 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--hold-through", type=int, default=rebalance.HOLD_THROUGH)
     p.add_argument("--cash", type=float, default=1_000_000.0)
 
+    p = commands.add_parser("backtest", help="the NautilusTrader validation backtest")
+    _panel_argument(p)
+    p.add_argument("--signal", default="mom_12_1")
+    p.add_argument("--size", type=int, default=rebalance.SIZE)
+    p.add_argument("--hold-through", type=int, default=rebalance.HOLD_THROUGH)
+    p.add_argument("--cash", type=float, default=1_000_000.0)
+    p.add_argument("--cost-multiple", type=float, default=1.0, help="scale the cost model")
+    p.add_argument(
+        "--start",
+        action="append",
+        default=[],
+        metavar="DATE",
+        help="also run from the first month on or after DATE; repeatable",
+    )
+
     commands.add_parser("trials", help="list the trial ledger")
 
     p = commands.add_parser("reproduce", help="rerun a trial and compare")
@@ -83,7 +99,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def _run(args):
-    from agb.research import cpcv, reproduce, scan, train, walkforward
+    from agb.research import backtest, cpcv, reproduce, scan, train, walkforward
     from agb.research.trials import FILE, Ledger
 
     ledger = Ledger(_research_dir() / FILE)
@@ -104,6 +120,19 @@ def _run(args):
             init_cash=args.cash,
         )
         return scan.run(panel, options, ledger, lake_dir=_lake_dir())
+    if args.command == "backtest":
+        options = backtest.Options(
+            signal=args.signal,
+            size=args.size,
+            hold_through=args.hold_through,
+            init_cash=args.cash,
+            cost_multiple=args.cost_multiple,
+            starts=tuple(args.start),
+        )
+        try:
+            return backtest.run(panel, options, ledger, lake_dir=_lake_dir())
+        except backtest.BacktestError as error:
+            sys.exit(f"backtest: {error}")
     config = _config(args, train)
     if args.command == "cpcv":
         options = cpcv.Options(

@@ -12,6 +12,8 @@ research measures is what the basket will trade.
     cpcv         combinatorial purged cross-validation with a one-month embargo
     walkforward  the annual expanding-window test: trained through year Y, trades Y+1
     scan         vectorbt scans of a signal, costed with the live cost model
+    backtest     the NautilusTrader validation backtest: the same strategy, event-driven,
+                 filled and charged by an independent engine, checking the scan
     trials       the hashed ledger every configuration tried appends a row to
     sync         the read-only rsync of the server's lake
 

@@ -24,6 +24,7 @@ app = []
 # Workstation research only (the `research` image target).
 research = [
     "lightgbm>=4.7.0",
+    "nautilus-trader>=1.200",
     "pandas>=3.0.5",
     "plotly<7",
     "vectorbt>=1.1.0",
