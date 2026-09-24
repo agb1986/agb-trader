@@ -206,7 +206,7 @@ def test_before_anything_has_run_each_command_says_so(db):
         "PNL — since the first reading",
         "BASKET — none yet",
         "GATE — no run yet",
-        "LOG — last 7 events, oldest first",
+        "LOG — last 8 events, oldest first",
     ]
     assert blocks(replies[0])[1:] == [
         "  account not yet observed\n    execution has not read the broker",
@@ -229,7 +229,7 @@ def test_every_message_is_a_command_row_with_its_outcome(db):
         "/log 500",
         "/pnl October",
         "/positions N01",
-        "/approve 2026-10",
+        "/why 2026-10",
         "what is going on",
         "/",
         None,
@@ -245,7 +245,7 @@ def test_every_message_is_a_command_row_with_its_outcome(db):
         ("log", ["500"], "refused", "usage: /log [1-100]"),
         ("pnl", ["October"], "refused", "usage: /pnl [YYYY-MM]"),
         ("positions", ["N01"], "refused", "usage: /positions, no arguments"),
-        ("approve", ["2026-10"], "refused", "/approve is not available yet"),
+        ("why", ["2026-10"], "refused", "/why is not available yet"),
         (None, ["what", "is", "going", "on"], "refused", "not a command"),
         (None, [], "refused", "not a command"),
         (None, [], "refused", "not a command"),
