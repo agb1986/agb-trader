@@ -1,6 +1,7 @@
 """The scheduler service. It owns the calendar: each cycle it beats its heartbeat, writes the
-jobs and expected events due from today's session through the lookahead, and records any
-lease that has expired."""
+jobs and expected events due from today's session through the lookahead, records any lease
+that has expired, and marks missed every rebalance still waiting for the human at its
+session's MOC cutoff."""
 
 import logging
 from collections.abc import Callable
@@ -8,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 import psycopg
 
-from agb import jobs, schedule
+from agb import approval, jobs, schedule
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.nyse import NyseCalendar, trading_date
 
@@ -53,6 +54,8 @@ class Scheduler:
         expired = jobs.record_expiries(conn, schedule.ACTOR)
         if expired:
             log.warning("recorded %d expired job leases", expired)
+        for reference in approval.sweep(conn, now, self.calendar(now)):
+            log.warning("rebalance %s: no answer by the cutoff, marked missed", reference)
 
 
 def main() -> None:
