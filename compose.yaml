@@ -68,6 +68,7 @@ services:
       UI_DB_PASSWORD: ${UI_DB_PASSWORD:?set in env/db.env}
       BACKUP_DB_PASSWORD: ${BACKUP_DB_PASSWORD:?set in env/db.env}
       CLI_DB_PASSWORD: ${CLI_DB_PASSWORD:?set in env/db.env}
+      RESEARCH_DB_PASSWORD: ${RESEARCH_DB_PASSWORD:?set in env/db.env}
     depends_on:
       db:
         condition: service_healthy

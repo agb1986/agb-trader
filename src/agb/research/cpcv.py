@@ -114,8 +114,17 @@ def paths(split_list: list[Split], options: Options) -> list[tuple[tuple[int, in
     return [tuple((g, holders[g][p]) for g in range(options.groups)) for p in range(count)]
 
 
-def run(panel: Panel, config: train.Config, options: Options, ledger: Ledger) -> Run:
-    """Every split's refit and score, and the per-path results, recorded as one trial."""
+def run(
+    panel: Panel,
+    config: train.Config,
+    options: Options,
+    ledger: Ledger,
+    *,
+    scores_out: dict[int, pd.Series] | None = None,
+) -> Run:
+    """Every split's refit and score, and the per-path results, recorded as one trial.
+    `scores_out`, when given, is filled with each path's out-of-sample scores as a series
+    aligned to `panel.frame`, for the certification backtest to trade."""
     months = panel.months
     split_list = splits(months, options)
     grouped = group_months(months, options.groups)
@@ -153,6 +162,8 @@ def run(panel: Panel, config: train.Config, options: Options, ledger: Ledger) ->
                 "splits": [index for _, index in members],
                 "metrics": train.evaluate(frame, np.concatenate(scores)),
             })  # fmt: skip
+            if scores_out is not None:
+                scores_out[p] = _aligned(panel.frame, frame, np.concatenate(scores))
         trial.results = {
             "groups": [len(group) for group in grouped],
             "splits": per_split,
@@ -160,6 +171,15 @@ def run(panel: Panel, config: train.Config, options: Options, ledger: Ledger) ->
             "summary": summarise([path["metrics"] for path in per_path]),
         }
         return Run(trial.trial_id, trial.results)
+
+
+def _aligned(target: pd.DataFrame, frame: pd.DataFrame, scores: np.ndarray) -> pd.Series:
+    """`scores`, given row by row for `frame`, as a series over `target`'s rows, matched by
+    month and ticker; a row of `target` the path never scored is NaN."""
+    key = ["as_of", "ticker"]
+    scored = pd.Series(scores, index=pd.MultiIndex.from_frame(frame[key]))
+    values = scored.reindex(pd.MultiIndex.from_frame(target[key])).to_numpy(dtype="float64")
+    return pd.Series(values, index=target.index)
 
 
 def summarise(metrics: list[dict[str, Any]]) -> dict[str, Any]:

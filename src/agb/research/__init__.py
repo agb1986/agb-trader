@@ -14,6 +14,11 @@ research measures is what the basket will trade.
     scan         vectorbt scans of a signal, costed with the live cost model
     backtest     the NautilusTrader validation backtest: the same strategy, event-driven,
                  filled and charged by an independent engine, checking the scan
+    gates        the validation gates on a model's CPCV paths: deflated Sharpe, probability
+                 of backtest overfitting and cost-inclusive Sharpe, each at 1x modelled
+                 cost, deflated Sharpe again at 2x, and the diagnostics beside them
+    certify      one run of the gates over a configuration, the versioned artifact it leaves
+                 and the import of its model_certification row; stage 1 only
     trials       the hashed ledger every configuration tried appends a row to
     sync         the read-only rsync of the server's lake
 

@@ -27,8 +27,9 @@ does.
   trigger. Never drop or disable those triggers.
 - **Grants are explicit and minimal.** Service roles get `SELECT` and, where they write,
   `INSERT` on history tables, and never `UPDATE`, `DELETE` or `TRUNCATE`. The roles are
-  `scheduler`, `pipeline`, `execution`, `bot`, `ui`, `backup` and `cli`. `backup` already
-  reads every table through `pg_read_all_data`, so a new table needs no grant for it.
+  `scheduler`, `pipeline`, `execution`, `bot`, `ui`, `backup`, `cli` and `research` (which
+  writes only `model_certification`, through the artifact import). `backup` already reads
+  every table through `pg_read_all_data`, so a new table needs no grant for it.
 - **Row-level security never hides a row from `backup`.** The nightly dump runs as `backup`
   with `--enable-row-security`, and a policy that hides rows from it silently drops them from
   every backup. A table with row-level security keeps a permissive `SELECT` policy that is

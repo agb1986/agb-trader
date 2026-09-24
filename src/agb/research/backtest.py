@@ -157,22 +157,9 @@ def run(
         partition_hash=panel.partition_hash,
         cost_model_version=panel.cost_model_version,
     ) as trial:
-        conn = db if db is not None else lake.connect(lake_dir)
-        try:
-            _require(conn)
-            depth = options.hold_through + options.size
-            tickers = sorted(
-                {name for r in runs.values() for m in r.values() for name in m[:depth]}
-            )
-            feed = load(conn, tickers, months)
-        finally:
-            if db is None:
-                conn.close()
+        feed = _feed(runs, months, options, lake_dir=lake_dir, db=db)
         if isinstance(scores, Mapping):
-            paths = []
-            for label, ranked in runs.items():
-                outcome = simulate(feed, months, ranked, options)
-                paths.append({"path": label, **_report(outcome, feed, months, options)})
+            paths = _paths(feed, months, runs, options)
             trial.results = {"months": len(months), "paths": paths, "summary": _summary(paths)}
         else:
             ranked = runs[""]
@@ -182,6 +169,59 @@ def run(
             ]
             trial.results = results
         return Run(trial.trial_id, trial.results)
+
+
+def replay(
+    panel: Panel,
+    options: Options,
+    scores: Mapping[str, pd.Series],
+    *,
+    lake_dir: Path = lake.DEFAULT_DIR,
+    db: duckdb.DuckDBPyConnection | None = None,
+) -> list[dict[str, Any]]:
+    """Each path's report, as `run` gives them, without a trial: the certification's second
+    pass at twice the modelled cost reruns the same paths with a different constant and, as
+    the specification says, adds no trial."""
+    months = panel.months
+    if not months:
+        raise BacktestError("the panel has no months")
+    if not scores:
+        raise BacktestError("no paths to run")
+    runs = {str(label): rankings(panel.frame, options, series) for label, series in scores.items()}
+    feed = _feed(runs, months, options, lake_dir=lake_dir, db=db)
+    return _paths(feed, months, runs, options)
+
+
+def _feed(
+    runs: Mapping[str, Mapping[date, list[str]]],
+    months: Sequence[Month],
+    options: Options,
+    *,
+    lake_dir: Path,
+    db: duckdb.DuckDBPyConnection | None,
+) -> "Feed":
+    """The bars of every name any ranking could trade."""
+    conn = db if db is not None else lake.connect(lake_dir)
+    try:
+        _require(conn)
+        depth = options.hold_through + options.size
+        tickers = sorted({name for r in runs.values() for m in r.values() for name in m[:depth]})
+        return load(conn, tickers, months)
+    finally:
+        if db is None:
+            conn.close()
+
+
+def _paths(
+    feed: "Feed",
+    months: Sequence[Month],
+    runs: Mapping[str, Mapping[date, list[str]]],
+    options: Options,
+) -> list[dict[str, Any]]:
+    return [
+        {"path": label, **_report(simulate(feed, months, ranked, options), feed, months, options)}
+        for label, ranked in runs.items()
+    ]
 
 
 # Rankings and the start dates -----------------------------------------------------------------
