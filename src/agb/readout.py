@@ -86,6 +86,10 @@ _LATEST_BASKET = """
     ORDER BY b.id DESC
     LIMIT 1
 """
+_LIVE_MODEL = """
+    SELECT model_id, certification_id, promoted_by, promoted_at, voided_at
+    FROM agb.promoted_model
+"""
 _NEXT_SUBMISSION = """
     SELECT period, due_at FROM agb.expected_event
     WHERE kind = 'submission' AND due_at > %s
@@ -131,6 +135,22 @@ def status(conn: psycopg.Connection, now: datetime) -> str:
         items.append(
             Item(f"rebalance {reference} {state}", f"since {et(since)}, by {actor}; model {ranker}")
         )
+
+    model = conn.execute(_LIVE_MODEL).fetchone()
+    if model is None:
+        items.append(Item("no model promoted", "rebalances fail until `agb promote` runs"))
+    else:
+        model_id, certification_id, promoted_by, promoted_at, voided_at = model
+        facts = f"certification {certification_id}, promoted {et(promoted_at)} by {promoted_by}"
+        if voided_at is None:
+            items.append(Item(f"model {model_id} live", facts))
+        else:
+            items.append(
+                Item(
+                    f"model {model_id} voided {et(voided_at)}",
+                    f"{facts}; rebalances fail until another is promoted",
+                )
+            )
 
     upcoming = conn.execute(_NEXT_SUBMISSION, (now,)).fetchone()
     if upcoming is None:

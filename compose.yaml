@@ -159,7 +159,8 @@ services:
   # that owns the lake directory: `make up` and `agb-stack` set AGB_PIPELINE_USER to the
   # caller's uid:gid. `python -m agb.lake "SQL"` inside it queries the lake with DuckDB.
   # The panel store, the content-addressed bodies behind the panel's database rows, sits
-  # beside the lake on the same data disk.
+  # beside the lake on the same data disk. Each rebalance ranks with the promoted
+  # certification's artifact under /models, which it only reads.
   pipeline:
     <<: *app-image
     command: ["python", "-m", "agb.services.pipeline"]
@@ -172,9 +173,11 @@ services:
       AGB_HEARTBEAT_SECONDS: ${AGB_HEARTBEAT_SECONDS:-30}
       AGB_LAKE_DIR: /lake
       AGB_PANEL_DIR: /panel
+      AGB_MODELS_DIR: /models
     volumes:
       - ${AGB_LAKE_DIR:-./lake}:/lake
       - ${AGB_PANEL_DIR:-./panel}:/panel
+      - ${AGB_MODELS_DIR:-./models}:/models:ro
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -201,7 +204,8 @@ services:
     restart: unless-stopped
     mem_limit: 256m
 
-  # The operator CLI: `make status`, or `make agb CMD="..."`.
+  # The operator CLI: `make status`, or `make agb CMD="..."`. `agb promote` verifies the
+  # certified artifact under /models before it makes the model live.
   cli:
     <<: *app-image
     profiles: [cli]
@@ -211,6 +215,9 @@ services:
       <<: *pg
       PGUSER: cli
       PGPASSWORD: ${CLI_DB_PASSWORD:?set in env/db.env}
+      AGB_MODELS_DIR: /models
+    volumes:
+      - ${AGB_MODELS_DIR:-./models}:/models:ro
     depends_on:
       db:
         condition: service_healthy

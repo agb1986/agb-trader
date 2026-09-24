@@ -17,6 +17,7 @@ Everything on the server lives in one directory, `/mnt/data/AppData/agb-trader` 
 | `env/`             | The real env files. They exist only here, and nothing copies them off. |
 | `backups/`         | The nightly dumps, `agb-YYYY-MM-DD.sql.gz`.                            |
 | `lake/`            | The Parquet lake: the vendor's data in `sep/`, `sf1/` and `tickers/`.  |
+| `models/`          | Certified model artifacts, one `<model id>/` each. See below.          |
 | `releases/<tag>/`  | `compose.yaml` and `agb-stack` as of commit `<tag>`.                   |
 | `current`          | A link to the release that is running.                                 |
 | `previous`         | A link to the release it replaced.                                     |
@@ -183,6 +184,50 @@ To query the lake with DuckDB, and to see the latest snapshots:
 
 The views are `sep`, `sf1`, which shows the latest version of each fundamentals row, and
 `tickers`, which shows the newest snapshot.
+
+## Promoting a model
+
+Each rebalance ranks with the promoted model, and nothing else. Until a model is promoted,
+and whenever the promoted one is voided or its artifact is missing or altered, the rebalance
+job fails and no basket is proposed. `./agb-stack status` says which model is live.
+
+A model is certified on the workstation by the research profile, which writes its artifact
+directory under `research/certifications/<model id>/`. Getting it live takes three steps:
+
+1. Import its `model_certification` row into the server's database, as the research docs
+   describe (`python -m agb.research import`).
+2. Copy the artifact directory, unchanged, to `models/<model id>/` in the deploy directory:
+
+   ```sh
+   rsync -a research/certifications/<model id> <server>:/mnt/data/AppData/agb-trader/models/
+   ```
+
+3. Promote it on the server:
+
+   ```sh
+   ./agb-stack agb promote <model id>
+   ```
+
+`agb promote` refuses a model with no certification, one that failed its gates, a voided
+one, one certified under an earlier cost model, and one whose artifact is missing from
+`models/`, altered since certification, or ships a trial ledger whose row count is not the
+trial count the certification declared. It also refuses the model that is already live. Each
+refusal says why and is recorded in `agb.command`, as is each promotion, which also writes an
+`agb.promotion_event`. The next rebalance loads the new model and checks its artifact again.
+
+To take a certification out of service for good:
+
+```sh
+./agb-stack agb void <model id> --reason "why"
+```
+
+A voided model cannot be promoted. If it is the live one, rebalances fail until another is
+promoted. A release that changes the cost model voids every certification made under the old
+one: `agb-stack activate` runs `agb void-stale` once the stack is up, and `agb promote` runs it
+too. Each voiding is an `agb.certification_event`. A certification made under a cost model the
+running release does not know yet, by research code ahead of the deploy, is refused but not
+voided, so it can be promoted once that release is live; for the same reason a rollback voids
+nothing.
 
 ## Restoring a backup
 

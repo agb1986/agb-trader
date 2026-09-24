@@ -5,11 +5,13 @@ at a lake the operator has already pulled or copied down:
 
 Nothing here talks to the vendor, the broker or the deployment; the database is the test
 harness's throwaway Postgres and the lake is only read. It checks what the fixtures cannot: that
-the placeholder ranker and the cost model run over a real month-end universe, that the
+a ranker and the cost model run over a real month-end universe, that the
 proposal comes out at twenty names with a costed order plan and the provenance the ticket asks
 for, and that a real month passes every pre-trade check, so the gate approves it in paper
-mode. The gate's clock is the evening of the signal session, before the trade session's MOC
-cutoff, whatever the date the test runs on.
+mode. The ranker is the tests' promoted stand-in (tests/registry_fake.py) over twelve-one
+momentum, since a certified model is a research artifact the harness does not hold;
+tests/test_registry.py ranks with a real certified booster. The gate's clock is the evening of
+the signal session, before the trade session's MOC cutoff, whatever the date the test runs on.
 
 The lake is on the deployment server and the deployed image carries no tests, so run this on a
 workstation against a copy of it:
@@ -22,9 +24,9 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import registry_fake
 
 from agb import lake, nyse, schedule, universe
-from agb.placeholder_ranker import PlaceholderMomentum
 from agb.rebalance import SIZE
 from agb.schedule import Expected, Planned
 from agb.services.pipeline import Pipeline
@@ -60,7 +62,8 @@ def test_the_latest_month_end_in_the_lake_proposes_a_twenty_name_basket(db, lake
     schedule.write(db.connect("scheduler"), [job])
 
     evening = nyse.NyseCalendar(signal, trade).close_at(signal) + timedelta(hours=2)
-    Pipeline(lake_dir, "", clock=lambda: evening)(db.connect("pipeline"))
+    ranker = registry_fake.Momentum(registry_fake.promote(db), lookback=252, skip=21)
+    Pipeline(lake_dir, "", ranker=ranker, clock=lambda: evening)(db.connect("pipeline"))
 
     cli = db.connect("cli")
     [(state,)] = cli.execute("SELECT state FROM agb.job_state").fetchall()
@@ -74,7 +77,7 @@ def test_the_latest_month_end_in_the_lake_proposes_a_twenty_name_basket(db, lake
     assert (reference, session_date, signal_date, snapshot_date) == (period, trade, signal, signal)
     assert digest == lake.partition_digest(lake_dir, signal)
     assert universe.size_is_plausible(size)
-    assert (ranker, version) == (PlaceholderMomentum().name, "1")
+    assert (ranker, version) == (registry_fake.MODEL_ID, "1")
     failed = cli.execute(
         "SELECT level, name, symbol, measured, threshold FROM agb.gate_check WHERE NOT passed"
     ).fetchall()

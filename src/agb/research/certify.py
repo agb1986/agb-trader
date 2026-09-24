@@ -12,12 +12,15 @@ same months, partition and cost-model version is a candidate, as its paths' mean
 net return, and the run's own series is one more.
 
 The declared trial count is the ledger's row count, read after the nested trials have
-closed and never from anything the run itself says. Whatever the gates decide, the run
-leaves an artifact directory, `<research dir>/certifications/<model id>/`, that is never
-overwritten:
+closed and never from anything the run itself says. The final model is fitted on the whole
+panel inside the certification's own trial, as one more refit of it, so it adds no row.
+Whatever the gates decide, the run leaves an artifact directory,
+`<research dir>/certifications/<model id>/`, that is never overwritten:
 
     manifest.json    every field the `model_certification` row carries, the sha256 of each
                      other file, and the sha256 over those digests
+    model.txt        the LightGBM booster fitted on every panel month, which is what the
+                     live pipeline ranks with once the certification is promoted
     trials.parquet   the ledger as it stood at certification, so the declared count can be
                      checked against it by anyone holding the artifact
     paths.json       each path's monthly net and gross returns at 1x cost and net at 2x
@@ -66,6 +69,7 @@ DIRECTORY = "certifications"
 MANIFEST = "manifest.json"
 PATHS = "paths.json"
 REPORT = "report.md"
+MODEL = "model.txt"
 ACTOR = "research"
 MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # The trial kinds whose results carry monthly net returns the overfitting gate can read.
@@ -174,6 +178,8 @@ def run(
             participation=[(p["participation_max"], p["participation_mean"]) for p in paths],
             thresholds=options.thresholds,
         )
+        # What would trade: the configuration refitted on every month the gates judged.
+        booster = train.fit(panel.select(months), config, trial=trial)
         trial.results = {
             **verdict,
             "model_id": options.model_id,
@@ -195,7 +201,14 @@ def run(
             ],
         }
     return _write(
-        directory, Run(trial.trial_id, trial.results), ledger, config, panel, months, options
+        directory,
+        Run(trial.trial_id, trial.results),
+        ledger,
+        config,
+        panel,
+        months,
+        options,
+        booster,
     )
 
 
@@ -243,10 +256,12 @@ def _write(
     panel: Panel,
     months,
     options: Options,
+    booster,
 ) -> Certification:
     results = run.results
     directory.mkdir(parents=True)
     shutil.copyfile(ledger.path, directory / LEDGER_FILE)
+    booster.save_model(str(directory / MODEL))
     (directory / PATHS).write_text(json.dumps(results["paths"], indent=1) + "\n")
     manifest = {
         "model_id": options.model_id,
@@ -362,8 +377,8 @@ def report(manifest: dict[str, Any]) -> str:
 def load(directory: Path) -> dict[str, Any]:
     """The manifest of the artifact at `directory`, after every check: each listed file is
     present and unaltered, nothing unlisted is there, the digest over the digests matches,
-    and the shipped ledger holds exactly the declared number of trials, among them this
-    certification's own row saying the same."""
+    the booster is among the files, and the shipped ledger holds exactly the declared number
+    of trials, among them this certification's own row saying the same."""
     path = directory / MANIFEST
     if not path.is_file():
         raise CertificationError(f"{directory} holds no {MANIFEST}")
@@ -384,6 +399,8 @@ def load(directory: Path) -> dict[str, Any]:
     )
     if unlisted:
         raise CertificationError(f"{directory} holds unlisted files: {', '.join(unlisted)}")
+    if MODEL not in files:
+        raise CertificationError(f"{directory} holds no {MODEL}")
     if files.get(LEDGER_FILE) != manifest["ledger_sha256"]:
         raise CertificationError(f"{LEDGER_FILE} is not the ledger the manifest names")
     if artifact_sha256(files) != manifest["artifact_sha256"]:

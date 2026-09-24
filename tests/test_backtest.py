@@ -435,9 +435,9 @@ def test_a_backtest_signal_is_a_feature_or_a_supplied_score(research_panel, rese
 
 
 def test_a_lake_without_the_cost_columns_is_refused(tmp_path, research_panel, ledger):
-    from market_fake import Market as PlaceholderMarket
+    from market_fake import Market as ServiceMarket
 
-    root = PlaceholderMarket(tmp_path / "lake").names(3).land()
+    root = ServiceMarket(tmp_path / "lake").names(3).land()
     with pytest.raises(backtest.BacktestError, match=r"lacks \['closeadj'\]"):
         backtest.run(sliced(research_panel, 2), backtest.Options(**SMALL), ledger, lake_dir=root)
     [row] = ledger.rows()

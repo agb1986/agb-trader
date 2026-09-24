@@ -4,18 +4,22 @@
 #
 # BACKUP_DIR receives the nightly dumps. The backup service runs as the calling user, so the
 # dumps belong to whoever ran `make up`. LAKE_DIR receives the Parquet lake, owned the same way,
-# and PANEL_DIR the panel store's content-addressed bodies. RESEARCH_DIR receives the research
+# and PANEL_DIR the panel store's content-addressed bodies. MODELS_DIR holds the certified
+# model artifacts the pipeline may rank with, each copied from a certification's directory as
+# `<model id>/`; the pipeline and the CLI only read it. RESEARCH_DIR receives the research
 # profile's trial ledger and models, on the workstation.
 ENV_DIR ?= env
 BACKUP_DIR ?= backups
 LAKE_DIR ?= lake
 PANEL_DIR ?= panel
+MODELS_DIR ?= models
 RESEARCH_DIR ?= research
 export AGB_ENV_DIR := $(ENV_DIR)
 export AGB_BACKUP_DIR := $(abspath $(BACKUP_DIR))
 export AGB_BACKUP_USER := $(shell id -u):$(shell id -g)
 export AGB_LAKE_DIR := $(abspath $(LAKE_DIR))
 export AGB_PANEL_DIR := $(abspath $(PANEL_DIR))
+export AGB_MODELS_DIR := $(abspath $(MODELS_DIR))
 export AGB_PIPELINE_USER := $(shell id -u):$(shell id -g)
 export AGB_RESEARCH_DIR := $(abspath $(RESEARCH_DIR))
 export AGB_RESEARCH_USER := $(shell id -u):$(shell id -g)
@@ -36,7 +40,7 @@ env: ## Copy each env/*.env.example to $(ENV_DIR)/*.env, keeping files that alre
 	done
 
 up: ## Build the app image and bring up the stack
-	@mkdir -p $(AGB_BACKUP_DIR) $(AGB_LAKE_DIR) $(AGB_PANEL_DIR)
+	@mkdir -p $(AGB_BACKUP_DIR) $(AGB_LAKE_DIR) $(AGB_PANEL_DIR) $(AGB_MODELS_DIR)
 	$(COMPOSE) up --build --detach --wait
 
 down: ## Stop the stack; the database volume is kept

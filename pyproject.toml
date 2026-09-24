@@ -19,8 +19,11 @@ dependencies = [
 agb = "agb.cli:main"
 
 [dependency-groups]
-# Server services only (the `app` image target).
-app = []
+# Server services only (the `app` image target). The pipeline ranks with the promoted
+# certification's LightGBM booster.
+app = [
+    "lightgbm>=4.7.0",
+]
 # Workstation research only (the `research` image target).
 research = [
     "lightgbm>=4.7.0",

@@ -106,7 +106,7 @@ def expect_submission(db, period=PERIOD):
 
 
 def test_the_approved_basket_passes_the_broker_checks_and_is_submitted_as_moc(db):
-    """Acceptance criteria 1, 2 and 6: the placeholder-ranker basket that passed the gate
+    """Acceptance criteria 1, 2 and 6: the basket that passed the gate
     passes the broker checks, every order row exists before its broker call, carries the
     NBBO mid, and the basket is submitted by execution before the cutoff."""
     conn = db.connect("execution")

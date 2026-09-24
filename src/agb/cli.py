@@ -2,9 +2,11 @@
 
 import argparse
 import os
+import shlex
 import sys
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import psycopg
 
@@ -99,8 +101,8 @@ def _panel_config_list(args: argparse.Namespace) -> int:
     return 0
 
 
-# agb.approval reads agb.health, which reads this module's format_age, so the two commands
-# that use it import it where they run.
+# agb.approval reads agb.health, which reads this module's format_age, so the commands that
+# use it, directly or through agb.registry, import it where they run.
 
 
 def _paper_approval(args: argparse.Namespace) -> int:
@@ -129,6 +131,54 @@ def _rerun(args: argparse.Namespace) -> int:
             # The refusal is recorded; leaving the block commits it.
             print(f"agb: refused: {exc}", file=sys.stderr)
             return 1
+    return 0
+
+
+def _models_dir() -> Path:
+    from agb import registry
+
+    return Path(os.environ.get(registry.MODELS_ENV, registry.DEFAULT_MODELS_DIR))
+
+
+def _promote(args: argparse.Namespace) -> int:
+    from agb import registry
+
+    source = registry.Source(args.actor, "cli", f"agb promote {args.model_id}")
+    with psycopg.connect(application_name="agb-cli") as conn:
+        try:
+            print(registry.promote(conn, args.model_id, source, _models_dir()))
+        except registry.Refused as exc:
+            # The refusal is recorded; leaving the block commits it.
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+    return 0
+
+
+def _void(args: argparse.Namespace) -> int:
+    from agb import registry
+
+    source = registry.Source(
+        args.actor, "cli", f"agb void {args.model_id} --reason {shlex.quote(args.reason)}"
+    )
+    with psycopg.connect(application_name="agb-cli") as conn:
+        try:
+            print(registry.void(conn, args.model_id, args.reason, source))
+        except registry.Refused as exc:
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+    return 0
+
+
+def _void_stale(args: argparse.Namespace) -> int:
+    from agb import cost, registry
+
+    source = registry.Source(args.actor, "cli", "agb void-stale")
+    with psycopg.connect(application_name="agb-cli") as conn:
+        voided = registry.void_stale(conn, source)
+    if voided:
+        print(f"voided under cost model {cost.CURRENT.version}: {', '.join(voided)}")
+    else:
+        print(f"nothing to void: none is under a cost model before {cost.CURRENT.version}")
     return 0
 
 
@@ -187,6 +237,36 @@ def main(argv: list[str] | None = None) -> int:
     rerun.add_argument("reference", help="the missed rebalance, e.g. 2026-10")
     rerun.add_argument("--actor", **actor)
     rerun.set_defaults(run=_rerun)
+    promote = commands.add_parser(
+        "promote",
+        help="make a certified model the one the pipeline ranks with",
+        description="Refuses a model with no passing certification, a voided or stale one, and "
+        "one whose artifact under AGB_MODELS_DIR is missing, altered or ships a trial count "
+        "other than the certification declared. Every refusal is recorded.",
+    )
+    promote.add_argument(
+        "model_id", help="the certified model, as `agb.model_certification` has it"
+    )
+    promote.add_argument("--actor", **actor)
+    promote.set_defaults(run=_promote)
+    void = commands.add_parser(
+        "void",
+        help="void a model's certification for good",
+        description="A voided certification cannot be promoted, and if it is the live model "
+        "every rebalance fails until another is promoted.",
+    )
+    void.add_argument("model_id", help="the certified model")
+    void.add_argument("--reason", required=True, help="why, kept with the voiding")
+    void.add_argument("--actor", **actor)
+    void.set_defaults(run=_void)
+    stale = commands.add_parser(
+        "void-stale",
+        help="void every certification made under an earlier cost model",
+        description="Any change to the cost model invalidates the certifications made under "
+        "it. The deploy runs this once the new code is up; promotion runs it first.",
+    )
+    stale.add_argument("--actor", **actor)
+    stale.set_defaults(run=_void_stale)
     args = parser.parse_args(argv)
     try:
         return args.run(args)

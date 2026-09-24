@@ -11,22 +11,20 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+import registry_fake
 from market_fake import PERIOD, SIGNAL, TRADE, Market
 from psycopg import errors
+from registry_fake import ARTIFACT, MODEL_ID
 
 from agb import basket, gate, jobs, lake, schedule
-from agb.placeholder_ranker import PlaceholderMomentum
 from agb.rebalance import SIZE
 from agb.schedule import Expected, Planned
 from agb.services.pipeline import RETRY, Pipeline, capital_from_env
 
 MINUTE = timedelta(minutes=1)
-# A short window, so ninety sessions of fake prices are enough to rank on.
-RANKER = PlaceholderMomentum(lookback=80, skip=5)
 CAPITAL = Decimal("100000")
-# The fake market is small, so the gate's universe band is widened to fit it, and the ranker
-# is the short-window one above.
-LIMITS = gate.Limits(universe_min=20, model=RANKER.name)
+# The fake market is small, so the gate's universe band is widened to fit it.
+LIMITS = gate.Limits(universe_min=20)
 # The evening of the signal session, well before the trade session's MOC cutoff.
 EVENING = datetime(2026, 9, 30, 22, 0, tzinfo=UTC)
 ZERO_HASH = "0" * 64
@@ -47,8 +45,10 @@ def plan_rebalance(db, period=PERIOD, session_date=TRADE):
 
 
 def run(db, root, **kwargs):
+    """One pipeline cycle, ranking with the promoted stand-in model (tests/registry_fake.py)."""
     kwargs = {"limits": LIMITS, "clock": lambda: EVENING, **kwargs}
-    Pipeline(root, "", ranker=RANKER, capital=CAPITAL, **kwargs)(db.connect("pipeline"))
+    ranker = registry_fake.ranker(db)
+    Pipeline(root, "", ranker=ranker, capital=CAPITAL, **kwargs)(db.connect("pipeline"))
 
 
 def rows(db, query, *params):
@@ -98,12 +98,13 @@ def test_the_rebalance_job_proposes_a_twenty_name_equal_weight_basket(db, tmp_pa
     [row] = rows(
         db,
         "SELECT kind, reference, period, job_id, session_date, signal_date, snapshot_date,"
-        " partition_hash, universe_size, ranker, cost_model_version, capital_usd, actor"
-        " FROM agb.basket",
+        " partition_hash, universe_size, ranker, model_certification_id, model_sha256,"
+        " cost_model_version, capital_usd, actor FROM agb.basket",
     )
+    certification_id = registry_fake.certify(db)
     assert row == (
         "live", "2026-10", "2026-10", job_id, TRADE, SIGNAL, SIGNAL,
-        lake.partition_digest(root, SIGNAL), 25, "placeholder-momentum-80-5", "1",
+        lake.partition_digest(root, SIGNAL), 25, MODEL_ID, certification_id, ARTIFACT, "1",
         CAPITAL, "pipeline",
     )  # fmt: skip
     assert rows(db, "SELECT seq, to_state, actor, surface FROM agb.basket_event ORDER BY seq") == [
@@ -207,8 +208,9 @@ def test_a_proposal_already_made_is_kept_when_the_job_is_redone(db, tmp_path):
     conn = db.connect("pipeline")
     claim = jobs.claim(conn, [schedule.REBALANCE], "pipeline", timedelta(hours=1))
 
-    first = basket.propose(conn, claim, root, RANKER, capital=CAPITAL)
-    again = basket.propose(conn, claim, root, RANKER, capital=CAPITAL)
+    ranker = registry_fake.ranker(db)
+    first = basket.propose(conn, claim, root, ranker, capital=CAPITAL)
+    again = basket.propose(conn, claim, root, ranker, capital=CAPITAL)
 
     assert (again.basket_id, again.existing) == (first.basket_id, True)
     assert rows(db, "SELECT count(*) FROM agb.basket") == [(1,)]
@@ -221,7 +223,7 @@ def test_a_lease_that_expired_mid_proposal_is_reclaimed_and_completed(db, tmp_pa
     root = Market(tmp_path).names(25).land()
     conn = db.connect("pipeline")
     claim = jobs.claim(conn, [schedule.REBALANCE], "pipeline", timedelta(milliseconds=1))
-    basket.propose(conn, claim, root, RANKER, capital=CAPITAL)
+    basket.propose(conn, claim, root, registry_fake.ranker(db), capital=CAPITAL)
     time.sleep(0.05)
 
     run(db, root)

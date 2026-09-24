@@ -271,7 +271,9 @@ def test_a_bare_or_wrong_answer_is_refused_with_the_form_and_recorded(db, asks, 
     assert reply == f"{why}\n\n{FORM}"
     assert state(db, basket_id)[:2] == ("pending", 2)
     [(verb, args, outcome, reason, actor, chat_id)] = rows(
-        db, "SELECT verb, args, outcome, reason, actor, chat_id FROM agb.command"
+        db,
+        "SELECT verb, args, outcome, reason, actor, chat_id FROM agb.command"
+        " WHERE surface = 'telegram'",
     )
     assert (verb, outcome, reason, actor, chat_id) == (
         text.split()[0][1:],
