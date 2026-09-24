@@ -6,10 +6,14 @@
     walkforward  the annual expanding-window test of a configuration
     scan         a vectorbt scan of one signal, costed with the live cost model
     backtest     the NautilusTrader validation backtest of one signal, checking the scan
+    certify      run the validation gates over a configuration and write the artifact
+    import       verify a certification artifact and insert its model_certification row
     trials       list the trial ledger
     reproduce    rerun a trial from its row and compare the results
 
-`sync` needs nothing but the standard library, so it runs on the host outside the image."""
+`sync` needs nothing but the standard library, so it runs on the host outside the image.
+`import` runs on the host too, with the `research` role's PG* environment, since the research
+container has no network: it is the profile's one write to the server's database."""
 
 import argparse
 import json
@@ -72,6 +76,19 @@ def main(argv: list[str] | None = None) -> None:
         help="also run from the first month on or after DATE; repeatable",
     )
 
+    p = commands.add_parser("certify", help="the validation gates, and the artifact")
+    _panel_argument(p)
+    _model_arguments(p)
+    p.add_argument("--model-id", required=True, help="the artifact's name; never reused")
+    p.add_argument("--groups", type=int, default=16)
+    p.add_argument("--test-groups", type=int, default=2)
+    p.add_argument("--embargo-months", type=int, default=1)
+    p.add_argument("--size", type=int, default=rebalance.SIZE)
+    p.add_argument("--hold-through", type=int, default=rebalance.HOLD_THROUGH)
+
+    p = commands.add_parser("import", help="insert a certification artifact's row")
+    p.add_argument("directory", type=Path, help="the artifact directory")
+
     commands.add_parser("trials", help="list the trial ledger")
 
     p = commands.add_parser("reproduce", help="rerun a trial and compare")
@@ -92,6 +109,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if args.command == "trials":
         _list_trials()
+        return
+    if args.command == "import":
+        _import(args.directory)
         return
     run = _run(args)
     print(f"trial {run.trial_id}")
@@ -139,10 +159,49 @@ def _run(args):
             groups=args.groups, test_groups=args.test_groups, embargo_months=args.embargo_months
         )
         return cpcv.run(panel, config, options, ledger)
+    if args.command == "certify":
+        from agb.research import certify
+
+        validation = cpcv.Options(
+            groups=args.groups, test_groups=args.test_groups, embargo_months=args.embargo_months
+        )
+        try:
+            options = certify.Options(
+                model_id=args.model_id, size=args.size, hold_through=args.hold_through
+            )
+            certification = certify.run(
+                panel,
+                config,
+                validation,
+                options,
+                ledger,
+                research_dir=_research_dir(),
+                lake_dir=_lake_dir(),
+            )
+        except (ValueError, certify.CertificationError, backtest.BacktestError) as error:
+            sys.exit(f"certify: {error}")
+        verdict = "PASSED" if certification.passed else "FAILED"
+        print(f"certification {verdict}: {certify.CERTIFIES}; artifact {certification.directory}")
+        from agb.research.trials import Run
+
+        return Run(certification.trial_id, certification.manifest)
     options = walkforward.Options(
         first_test_year=args.first_test_year, last_test_year=args.last_test_year
     )
     return walkforward.run(panel, config, options, ledger)
+
+
+def _import(directory: Path) -> None:
+    import psycopg
+
+    from agb.research import certify
+
+    try:
+        with psycopg.connect() as conn:
+            row_id = certify.import_artifact(conn, directory)
+    except certify.CertificationError as error:
+        sys.exit(f"import: {error}")
+    print(f"model_certification {row_id}: {directory}")
 
 
 def _panel_argument(parser: argparse.ArgumentParser) -> None:
