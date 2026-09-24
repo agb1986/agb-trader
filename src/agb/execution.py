@@ -32,6 +32,15 @@ submitted basket whose session has not reached its cancel deadline, ten minutes 
 close, and halts that basket, then sets `suspend_trade`; a resume unsets it. Either way the
 account is read back, the result recorded against the command, and a confirmation raised for
 the bot to deliver. A broker that refuses leaves the command waiting for the next cycle.
+
+Liquidation, straight after the latch. The bot opens the `liquidation` halt cause in the same
+transaction as the operator's confirmation, so nothing new goes out; execution then cancels
+what a submitted basket has in flight, as a pause does, and calls the broker's close-all,
+which cancels every open order and closes every position at market. Its HTTP 207 answer is
+recorded symbol by symbol, failures included, and raised as an alert. `suspend_trade` is left
+alone, since it would refuse the closing orders, and the `liquidation` cause stays open until
+`/resume`. A confirmation whose cause has been cleared before execution reached it is
+recorded as not carried out.
 """
 
 import logging
@@ -41,9 +50,10 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import psycopg
+from psycopg.types.json import Jsonb
 
 from agb import cost, jobs, nyse, schedule
-from agb.alpaca import AlpacaError, Broker, Order, Quote
+from agb.alpaca import AlpacaError, Broker, Closed, Order, Quote
 from agb.gate import Check
 from agb.roles import EXECUTION
 
@@ -68,6 +78,8 @@ CANCEL_BEFORE = timedelta(minutes=10)
 PAUSE = "pause"
 RESUME = "resume"
 LATCH_FAILED = "latch_failed"
+LIQUIDATION = "liquidation"
+LIQUIDATION_FAILED = "liquidation_failed"
 
 
 class ExecutionError(Exception):
@@ -230,6 +242,11 @@ _INSERT_LATCH = """
     VALUES (%s, %s, %s, %s, %s)
 """
 _PAUSE_OPEN = "SELECT at, actor FROM agb.halt_open WHERE cause = 'pause'"
+_LIQUIDATION_PENDING = "SELECT id, actor, at FROM agb.liquidation_pending"
+_INSERT_RESULT = """
+    INSERT INTO agb.liquidation (kind, follows, symbols, detail, actor)
+    VALUES ('result', %s, %s, %s, %s)
+"""
 _HALTED_SINCE = """
     SELECT b.reference, e.at, e.reason
     FROM agb.basket_event e JOIN agb.basket b ON b.id = e.basket_id
@@ -855,6 +872,106 @@ def apply_latch(
             command.id,
             command.verb,
             observed,
+        )
+        done += 1
+    return done
+
+
+@dataclass(frozen=True)
+class Confirmed:
+    """An operator's liquidation confirmation that execution has not yet carried out."""
+
+    id: int
+    actor: str
+    at: datetime
+
+
+def pending_liquidation(conn: psycopg.Connection) -> list[Confirmed]:
+    """The confirmed liquidations without a result, oldest first."""
+    return [Confirmed(*row) for row in conn.execute(_LIQUIDATION_PENDING).fetchall()]
+
+
+def _closed_line(closed: Closed) -> str:
+    if closed.ok:
+        return f"{closed.symbol}: closing, order {closed.order_id or 'with no id'}"
+    return f"{closed.symbol}: FAILED, HTTP {closed.status}: {closed.message}"
+
+
+def _liquidation_text(confirmed: Confirmed, closed: Sequence[Closed], left: Sequence[str]) -> str:
+    """The message the operator gets once execution has had the broker's answer."""
+    ok = sum(1 for c in closed if c.ok)
+    failed = len(closed) - ok
+    head = f"LIQUIDATION by {confirmed.actor} at {_at(confirmed.at)}"
+    if not closed:
+        summary = "the broker held no positions to close"
+    elif failed:
+        summary = f"{ok} of {len(closed)} positions closing, {failed} FAILED and still held"
+    else:
+        summary = f"all {len(closed)} positions closing"
+    lines = [head, summary, "open orders cancelled by the broker first"]
+    lines += [_closed_line(c) for c in closed]
+    lines += list(left)
+    lines.append("halt cause liquidation: stays open until /resume")
+    return "\n".join(lines)
+
+
+def apply_liquidation(
+    conn: psycopg.Connection, broker: Broker, calendar: nyse.NyseCalendar, now: datetime
+) -> int:
+    """Carry each confirmed liquidation to the broker and record its answer symbol by symbol.
+    A broker error raises a `liquidation_failed` alert once per confirmation and stops,
+    leaving it for the next cycle. Returns how many were carried."""
+    done = 0
+    for confirmed in pending_liquidation(conn):
+        subject = f"liquidation {confirmed.id}"
+        period = confirmed.at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if LIQUIDATION not in open_halts(conn):
+            body = (
+                f"LIQUIDATION by {confirmed.actor} at {_at(confirmed.at)}: not carried out, "
+                "the liquidation cause was cleared before execution reached it\n"
+                "nothing was sent to the broker"
+            )
+            with conn.transaction():
+                conn.execute(_INSERT_RESULT, (confirmed.id, Jsonb([]), body, ACTOR))
+                raise_alert(conn, LIQUIDATION, subject, period, body)
+            log.warning("liquidation %d: cause cleared, not carried out", confirmed.id)
+            done += 1
+            continue
+        try:
+            left = cancel_in_flight(conn, broker, calendar, now)
+            closed = broker.close_all()
+        except AlpacaError as exc:
+            raise_alert(
+                conn,
+                LIQUIDATION_FAILED,
+                subject,
+                period,
+                f"LIQUIDATION by {confirmed.actor} at {_at(confirmed.at)} could not reach the "
+                f"broker: {exc}\nhalt cause liquidation: open. Execution tries again each "
+                "cycle; /resume clears the cause and stops it.",
+            )
+            log.error("liquidation %d: %s", confirmed.id, exc)
+            return done
+        halted = conn.execute(_HALTED_SINCE, (SURFACE, confirmed.at)).fetchall()
+        left = [f"basket {ref} halted at {_at(at)}: {why}" for ref, at, why in halted] + left
+        body = _liquidation_text(confirmed, closed, left)
+        symbols = [
+            {
+                "symbol": c.symbol,
+                "status": c.status,
+                "order_id": c.order_id,
+                "message": c.message,
+            }
+            for c in closed
+        ]
+        with conn.transaction():
+            conn.execute(_INSERT_RESULT, (confirmed.id, Jsonb(symbols), body, ACTOR))
+            raise_alert(conn, LIQUIDATION, subject, period, body)
+        log.warning(
+            "liquidation %d carried to the broker: %d of %d closing",
+            confirmed.id,
+            sum(1 for c in closed if c.ok),
+            len(closed),
         )
         done += 1
     return done

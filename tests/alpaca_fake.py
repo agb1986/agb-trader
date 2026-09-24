@@ -5,8 +5,11 @@ has seen is refused with 422 and Alpaca's duplicate code, a fractional quantity 
 market-on-close order is refused, an order it does not hold is a 404, and a cancel of an order
 that can no longer be cancelled is refused. `close` fills the accepted orders as the closing
 auction would, in as many pieces as the test asks for, and reports each piece as a FILL
-activity. The `on_submit` hook runs before each order is accepted, so a test can look at the
-database at that moment, open the halt latch, or lose the broker's answer.
+activity. `close_all` answers as Alpaca's 207 Multi-Status does, one entry per position, and
+a symbol in `close_fails` is an entry with a failing status and the broker's message rather
+than an error of the call. The `on_submit` hook runs before each order is accepted, so a
+test can look at the database at that moment, open the halt latch, or lose the broker's
+answer; `on_close_all` does the same before a close-all.
 """
 
 from collections.abc import Callable
@@ -20,6 +23,7 @@ from agb.alpaca import (
     Account,
     AlpacaError,
     Asset,
+    Closed,
     Configuration,
     Fill,
     Order,
@@ -64,6 +68,11 @@ class FakeBroker:
     cancel_fails: set[str] = field(default_factory=set)
     # When set, a change to the configuration is refused with this error.
     suspend_fails: AlpacaError | None = None
+    # Symbols a close-all cannot close, with the broker's message for each, and an error
+    # the whole close-all call fails with.
+    close_fails: dict[str, str] = field(default_factory=dict)
+    close_all_fails: AlpacaError | None = None
+    on_close_all: Callable[["FakeBroker"], None] | None = None
     # Called as on_submit(broker, client_order_id) before an order is accepted.
     on_submit: Callable[["FakeBroker", str], None] | None = None
     calls: list[tuple] = field(default_factory=list)
@@ -227,6 +236,29 @@ class FakeBroker:
     def positions(self) -> list[Position]:
         self.calls.append(("positions",))
         return [p for p in self.book.values() if p.qty != 0]
+
+    def close_all(self) -> list[Closed]:
+        """`DELETE /v2/positions?cancel_orders=true`: cancel every open order, then place a
+        market order against each position, or report why it could not."""
+        self.calls.append(("close_all",))
+        if self.on_close_all is not None:
+            self.on_close_all(self)
+        if self.close_all_fails is not None:
+            raise self.close_all_fails
+        for order_id, order in list(self.orders.items()):
+            if not order.terminal:
+                self._set(order_id, status="canceled")
+        closed = []
+        for position in self.positions():
+            if position.symbol in self.close_fails:
+                closed.append(Closed(position.symbol, 403, None, self.close_fails[position.symbol]))
+                continue
+            side = "sell" if position.qty > 0 else "buy"
+            order = self.accept(
+                position.symbol, abs(position.qty), side, f"close-{position.symbol}"
+            )
+            closed.append(Closed(position.symbol, 200, order.id, None))
+        return closed
 
     def fills(self, after: datetime) -> list[Fill]:
         self.calls.append(("fills", after))

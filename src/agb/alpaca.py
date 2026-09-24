@@ -135,6 +135,21 @@ class Position:
     market_value: Decimal | None
 
 
+@dataclass(frozen=True)
+class Closed:
+    """One symbol of a close-all: the HTTP status Alpaca gave it inside the 207 Multi-Status
+    answer, the closing order it placed when it could, and its message when it could not."""
+
+    symbol: str
+    status: int
+    order_id: str | None
+    message: str | None
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self.status < 300
+
+
 class Broker(Protocol):
     """What the execution service asks of the broker. Alpaca answers it; tests fake it."""
 
@@ -149,6 +164,7 @@ class Broker(Protocol):
     def cancel(self, order_id: str) -> None: ...
     def positions(self) -> list[Position]: ...
     def fills(self, after: datetime) -> list[Fill]: ...
+    def close_all(self) -> list[Closed]: ...
 
 
 _FRACTION = re.compile(r"(\.\d{6})\d+")
@@ -166,6 +182,32 @@ def _when(value: Any) -> datetime | None:
         return None
     text = _FRACTION.sub(r"\1", str(value)).replace("Z", "+00:00")
     return datetime.fromisoformat(text).astimezone(UTC)
+
+
+def _closed(raw: Any) -> list[Closed]:
+    """The per-symbol entries of a close-all's 207 Multi-Status answer. Each carries the
+    symbol, its own HTTP status, and a body that is the closing order when the status is a
+    success and Alpaca's error otherwise."""
+    closed = []
+    for entry in raw or []:
+        body = entry.get("body")
+        body = body if isinstance(body, dict) else {}
+        try:
+            status = int(entry.get("status"))
+        except (TypeError, ValueError):
+            status = 0
+        ok = 200 <= status < 300
+        order_id = body.get("id") if ok else None
+        message = None if ok else body.get("message")
+        closed.append(
+            Closed(
+                symbol=str(entry.get("symbol") or body.get("symbol") or "?"),
+                status=status,
+                order_id=str(order_id) if order_id else None,
+                message=str(message) if message else (None if ok else "no message"),
+            )
+        )
+    return closed
 
 
 def _order(raw: dict[str, Any]) -> Order:
@@ -362,6 +404,14 @@ class Alpaca:
             )
             for p in raw
         ]
+
+    def close_all(self) -> list[Closed]:
+        """Close every position at market, cancelling every open order first. Alpaca answers
+        207 Multi-Status with one entry per symbol, and a symbol it could not close (a halted
+        one, say) is an entry with a failing status, not an error of the call."""
+        return _closed(
+            self._call("DELETE", self._trading, "/v2/positions", query={"cancel_orders": "true"})
+        )
 
     def fills(self, after: datetime) -> list[Fill]:
         """Every execution after `after`, oldest first, across as many pages as it takes."""

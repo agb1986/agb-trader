@@ -11,13 +11,21 @@ delivery attempt is an `alert_event`. Alerts notify and never act.
 `/pause` opens the `pause` halt cause and `/resume` clears every open cause, one clear each;
 both are written here, so the database latch holds the moment the reply goes out. The
 broker's `suspend_trade` is execution's to set, since only execution holds the broker's keys:
-it picks up the accepted command, and its confirmation arrives in this chat as an alert. The
-other commands only read.
+it picks up the accepted command, and its confirmation arrives in this chat as an alert.
+
+`/liquidate` is two steps. Bare, it says what closing every position would mean and issues a
+short random token, valid for five minutes. With the token typed back in time, it opens the
+`liquidation` halt cause in the same transaction as the confirmation, so the system is paused
+before execution calls the broker's close-all; the per-symbol result arrives as an alert. A
+wrong or expired token is refused, spends the token, and is not retried. The other commands
+only read.
 """
 
 import logging
 import os
 import re
+import secrets
+import string
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -50,6 +58,10 @@ GATE_HALT = "gate_halt"
 RECENT_BASKETS = 3
 # Telegram refuses a message longer than this; a longer answer goes out in parts.
 MESSAGE_MAX = 4096
+# How long a liquidation token stays valid, and what one is made of.
+TOKEN_VALID = timedelta(minutes=5)
+TOKEN_LENGTH = 6
+TOKEN_ALPHABET = string.ascii_lowercase + string.digits
 
 # The commands this bot answers, and what each shows, in the order /help lists them.
 COMMANDS = {
@@ -61,10 +73,11 @@ COMMANDS = {
     "log": (f"/log [1-{readout.LOG_MAX}]", "the latest events, oldest first"),
     "pause": ("/pause", "open the pause halt cause and suspend trading at the broker"),
     "resume": ("/resume", "clear every open halt cause and lift the broker suspension"),
+    "liquidate": ("/liquidate [token]", "close every position at market, in two steps"),
     "help": ("/help", "this list"),
 }
 # Commands the spec names that later tickets bring. They are refused, and recorded.
-LATER = frozenset({"pending", "approve", "reject", "why", "level", "liquidate"})
+LATER = frozenset({"pending", "approve", "reject", "why", "level"})
 VERB = re.compile(r"^[a-z][a-z_]*$")
 
 Check = Callable[[psycopg.Connection], list[Finding]]
@@ -107,6 +120,9 @@ def parse(text: str) -> Parsed:
             args and not (args[0].isdigit() and 1 <= int(args[0]) <= readout.LOG_MAX)
         ):
             return Parsed(verb, args, f"usage: {usage}")
+    elif verb == "liquidate":
+        if len(args) > 1:
+            return Parsed(verb, args, f"usage: {usage}")
     elif args:
         return Parsed(verb, args, f"usage: {usage}, no arguments")
     return Parsed(verb, args, None)
@@ -147,10 +163,40 @@ def preflight_text(period: str, findings: list[Finding]) -> str:
 
 
 _PAUSE_OPEN = "SELECT at, actor FROM agb.halt_open WHERE cause = 'pause'"
+_LIQUIDATION_OPEN = "SELECT 1 FROM agb.halt_open WHERE cause = 'liquidation'"
 _OPEN_CAUSES = "SELECT cause FROM agb.halt_open ORDER BY at, cause"
 _HALT = """
     INSERT INTO agb.halt_event (cause, action, actor, reason) VALUES (%s, %s, %s, %s)
 """
+
+
+# The latest token no confirmation or refusal has spent yet. Only the latest is ever valid: a
+# fresh `/liquidate` supersedes any earlier one.
+_TOKEN = """
+    SELECT t.id, t.token, t.expires_at FROM agb.liquidation t
+    WHERE t.kind = 'token'
+      AND t.id = (SELECT max(id) FROM agb.liquidation WHERE kind = 'token')
+      AND NOT EXISTS (SELECT 1 FROM agb.liquidation f WHERE f.follows = t.id)
+"""
+_LIQUIDATION = """
+    INSERT INTO agb.liquidation (kind, follows, command_id, token, expires_at, detail, actor)
+    VALUES (%(kind)s, %(follows)s, %(command_id)s, %(token)s, %(expires_at)s, %(detail)s,
+            %(actor)s)
+    RETURNING id
+"""
+# What liquidating would close: the latest positions snapshot, and the account's equity.
+_HELD = """
+    SELECT s.id, s.snapshot_date, count(p.id), coalesce(sum(p.market_value_usd), 0)
+    FROM agb.position_snapshot s
+    LEFT JOIN agb.position p ON p.snapshot_id = s.id
+    WHERE s.id = (SELECT max(id) FROM agb.position_snapshot)
+    GROUP BY s.id
+"""
+_EQUITY = "SELECT equity_usd, observed_at FROM agb.broker_state_now"
+
+
+def token() -> str:
+    return "".join(secrets.choice(TOKEN_ALPHABET) for _ in range(TOKEN_LENGTH))
 
 
 def operator(message: dict[str, Any]) -> str:
@@ -178,6 +224,7 @@ _COMMAND = """
                              telegram_message_id)
     VALUES (%(actor)s, 'telegram', %(text)s, %(verb)s, %(args)s, %(outcome)s, %(reason)s,
             %(chat_id)s, %(message_id)s)
+    RETURNING id
 """
 
 # The latest live baskets that filled or were halted, for the unprompted messages.
@@ -271,6 +318,8 @@ class Bot:
             reply = self.pause(conn, message)
         elif parsed.verb == "resume":
             reply = self.resume(conn, message)
+        elif parsed.verb == "liquidate":
+            reply = self.liquidate(conn, message, parsed.args, now)
         else:
             self._command(conn, message, parsed.verb, {"args": parsed.args})
             reply = self.run(conn, parsed.verb, parsed.args, now)
@@ -332,6 +381,111 @@ class Bot:
             "here.\nA halted rebalance is not resubmitted."
         )
 
+    def liquidate(
+        self, conn: psycopg.Connection, message: dict[str, Any], args: list[str], now: datetime
+    ) -> str:
+        """Bare, issue a token with what liquidating would mean; with a token, confirm and
+        pause, or refuse. Returns the reply."""
+        if args:
+            return self._confirm(conn, message, args[0], now)
+        return self._issue(conn, message, now)
+
+    def _issue(self, conn: psycopg.Connection, message: dict[str, Any], now: datetime) -> str:
+        actor = operator(message)
+        snapshot = conn.execute(_HELD).fetchone()
+        if snapshot is None:
+            held = "positions: no snapshot yet, so the count is unknown"
+        else:
+            _, snapshot_date, count, value = snapshot
+            held = (
+                f"positions: {count} held, worth {readout.dollars(value)} at the "
+                f"{snapshot_date} snapshot"
+            )
+        account = conn.execute(_EQUITY).fetchone()
+        if account is None or account[0] is None:
+            equity = "equity: not read from the broker yet"
+        else:
+            equity = f"equity: about {readout.dollars(account[0])}, read {health.et(account[1])}"
+        expires_at = now + TOKEN_VALID
+        summary = (
+            f"{held}\n{equity}\n"
+            "Open orders are cancelled first, then every position is closed at market.\n"
+            "This cannot be undone.\n"
+            "The system will not re-enter these names until the next scheduled rebalance."
+        )
+        issued = token()
+        with conn.transaction():
+            command_id = self._command(conn, message, "liquidate", {"step": "token"})
+            conn.execute(
+                _LIQUIDATION,
+                {
+                    "kind": "token",
+                    "follows": None,
+                    "command_id": command_id,
+                    "token": issued,
+                    "expires_at": expires_at,
+                    "detail": summary,
+                    "actor": actor,
+                },
+            )
+        log.info("liquidation token issued to %s", actor)
+        minutes = int(TOKEN_VALID.total_seconds() // 60)
+        return (
+            f"LIQUIDATE — step 1 of 2\n{summary}\n\n"
+            f"To go ahead, send this within {minutes} minutes, by {health.et(expires_at)}:\n"
+            f"/liquidate {issued}\n"
+            "A wrong or late token is refused, and you start again from /liquidate."
+        )
+
+    def _confirm(
+        self, conn: psycopg.Connection, message: dict[str, Any], typed: str, now: datetime
+    ) -> str:
+        actor = operator(message)
+        with conn.transaction():
+            outstanding = conn.execute(_TOKEN).fetchone()
+            if outstanding is None:
+                refusal = "no liquidation token is outstanding: send /liquidate first"
+            elif now >= outstanding[2]:
+                refusal = (
+                    f"the liquidation token expired at {health.et(outstanding[2])}; it is spent, "
+                    "send /liquidate to start again"
+                )
+            elif not secrets.compare_digest(typed.lower(), outstanding[1]):
+                refusal = "wrong liquidation token; it is spent, send /liquidate to start again"
+            else:
+                refusal = None
+            args = {"step": "confirm" if refusal is None else "refused"}
+            if outstanding is not None:
+                args["token_row"] = outstanding[0]
+            command_id = self._command(conn, message, "liquidate", args, refusal)
+            if outstanding is not None:
+                if refusal is None:
+                    if conn.execute(_LIQUIDATION_OPEN).fetchone() is None:
+                        conn.execute(_HALT, ("liquidation", "set", actor, "/liquidate"))
+                conn.execute(
+                    _LIQUIDATION,
+                    {
+                        "kind": "confirm" if refusal is None else "refused",
+                        "follows": outstanding[0],
+                        "command_id": command_id,
+                        "token": None,
+                        "expires_at": None,
+                        "detail": refusal or "token confirmed in time; the system is paused",
+                        "actor": actor,
+                    },
+                )
+        if refusal is not None:
+            log.warning("liquidation refused for %s: %s", actor, refusal)
+            return f"LIQUIDATE refused\n{refusal}\nNothing has been done."
+        log.info("liquidation confirmed by %s", actor)
+        return (
+            "LIQUIDATING — step 2 of 2\n"
+            "halt cause liquidation: open. No further order goes out.\n"
+            "Execution now cancels open orders and closes every position at market. The "
+            "broker's answer arrives here symbol by symbol, failures included.\n"
+            "The liquidation cause stays open until /resume."
+        )
+
     def refuse(self, conn: psycopg.Connection, message: dict[str, Any]) -> None:
         """A message from any other chat is never answered, only recorded and logged."""
         chat = message.get("chat", {}).get("id")
@@ -348,9 +502,9 @@ class Bot:
         verb: str | None,
         args: dict[str, Any],
         refusal: str | None = None,
-    ) -> None:
+    ) -> int:
         chat = message.get("chat", {}).get("id")
-        conn.execute(
+        (command_id,) = conn.execute(
             _COMMAND,
             {
                 "actor": operator(message),
@@ -362,7 +516,8 @@ class Bot:
                 "chat_id": str(chat) if chat is not None else None,
                 "message_id": message.get("message_id"),
             },
-        )
+        ).fetchone()
+        return command_id
 
     # Alerts.
 

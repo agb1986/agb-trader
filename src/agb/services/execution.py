@@ -2,11 +2,13 @@
 
 Each cycle it first carries any `/pause` or `/resume` waiting in the database to the broker
 (`agb.execution.apply_latch`): the pause cancels what is in flight and sets `suspend_trade`,
-the resume unsets it. Then it takes the approved live baskets whose trade session is in its
-submission window and sends their orders (`agb.execution.submit`), reads back the orders of
-submitted baskets once the session has closed (`reconcile`), and after the close of each session
-snapshots the broker's positions and account state once (`snapshot`). Between those it
-observes the account's flags every few minutes, so the bot can compare the broker's
+the resume unsets it. A confirmed `/liquidate` follows: the broker's close-all, its answer
+recorded symbol by symbol (`apply_liquidation`). Then it takes the approved live baskets
+whose trade session is in its submission window and sends their orders
+(`agb.execution.submit`), reads back the orders of submitted baskets once the session has
+closed (`reconcile`), and after the close of each session snapshots the broker's positions
+and account state once (`snapshot`). Between those it observes the account's flags every few
+minutes, so the bot can compare the broker's
 `suspend_trade` with the halt latch.
 
 Without keys it beats and does nothing else, so the stack starts whole before the operator
@@ -78,6 +80,9 @@ class Execution:
         now = self.clock()
         calendar = self.calendar(now)
         if execution.apply_latch(conn, self.broker, calendar, now):
+            self._observed_at = now
+        if execution.apply_liquidation(conn, self.broker, calendar, now):
+            execution.record_state(conn, self.broker)
             self._observed_at = now
         if self._observed_at is None or now - self._observed_at >= self.observe_every:
             execution.record_state(conn, self.broker)
