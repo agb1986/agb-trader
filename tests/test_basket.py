@@ -443,7 +443,9 @@ def test_the_transition_table_and_events_are_append_only(db):
         "UPDATE agb.basket_transition SET role = 'pipeline'",
         f"UPDATE agb.basket SET ranker = 'other' WHERE id = {basket_id}",
         "TRUNCATE agb.basket_target",
-        "TRUNCATE agb.basket_order",
+        # broker_order references basket_order, so a truncate must name it too (test_jobs
+        # truncates agb.job the same way); the append-only trigger still refuses it.
+        "TRUNCATE agb.basket_order CASCADE",
     ):
         with pytest.raises(errors.RaiseException, match="append-only"):
             owner.execute(statement)
