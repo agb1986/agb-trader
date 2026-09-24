@@ -28,7 +28,7 @@ from test_execution import (
 from agb import execution, health
 from agb.alpaca import AlpacaError
 from agb.roles import OWNER
-from agb.services.bot import NO_COMMANDS, NOT_YET, Bot
+from agb.services.bot import Bot, help_text
 from agb.services.execution import Execution
 
 CHAT = "4242"
@@ -436,14 +436,17 @@ def test_a_suspend_trade_mismatch_alerts_once_per_episode_in_both_directions(db,
 # -- the command record ----------------------------------------------------------------------
 
 
-def test_every_message_is_a_command_and_the_rest_are_refused(db, operator):
-    assert operator.says("/status") == NO_COMMANDS
-    assert operator.says("hello") == NO_COMMANDS
-    assert operator.says("/approve@agb_bot 2026-10 yes") == NO_COMMANDS
+def test_only_pause_and_resume_reach_the_latches(db, operator):
+    assert operator.says("/status").startswith("agb-trader")
+    assert operator.says("hello") == help_text("not a command")
+    assert operator.says("/approve@agb_bot 2026-10 yes") == help_text(
+        "/approve is not available yet"
+    )
+    assert operator.says("/pause now") == help_text("usage: /pause, no arguments")
 
     assert commands(db) == [
-        (ACTOR, "telegram", "/status", "status", {"args": []}, "refused", NOT_YET),
-        (ACTOR, "telegram", "hello", None, {"args": ["hello"]}, "refused", NOT_YET),
+        (ACTOR, "telegram", "/status", "status", {"args": []}, "accepted", None),
+        (ACTOR, "telegram", "hello", None, {"args": ["hello"]}, "refused", "not a command"),
         (
             ACTOR,
             "telegram",
@@ -451,7 +454,16 @@ def test_every_message_is_a_command_and_the_rest_are_refused(db, operator):
             "approve",
             {"args": ["2026-10", "yes"]},
             "refused",
-            NOT_YET,
+            "/approve is not available yet",
+        ),
+        (
+            ACTOR,
+            "telegram",
+            "/pause now",
+            "pause",
+            {"args": ["now"]},
+            "refused",
+            "usage: /pause, no arguments",
         ),
     ]
     assert execution.pending_latch(db.connect("execution")) == []

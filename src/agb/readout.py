@@ -1,0 +1,453 @@
+"""The bot's answers, read from the database: status, positions, P&L, the basket, the gate
+and the audit log, and the fill confirmation and gate-halt alert. Nothing here writes.
+
+Every message is plain text in one style: a header line, then items of two lines each, the
+first saying what the item is and the second its facts, then an optional footer. The bot
+adds no prose of its own and never recommends.
+"""
+
+import re
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+
+import psycopg
+
+from agb import health
+from agb.health import et
+from agb.nyse import NEW_YORK
+
+# The most `/log` shows at once.
+LOG_MAX = 100
+LOG_DEFAULT = 10
+# A detail longer than this is cut in `/log`.
+DETAIL_MAX = 120
+# A halt's reason is cut to this in /status.
+HALT_MAX = 240
+
+
+@dataclass(frozen=True)
+class Item:
+    what: str
+    facts: str
+
+    def lines(self) -> str:
+        return f"  {self.what}\n    {self.facts}"
+
+
+def message(header: str, items: Sequence[Item], footer: str | None = None) -> str:
+    parts = [header, *(item.lines() for item in items)]
+    if footer:
+        parts.append(footer)
+    return "\n\n".join(parts)
+
+
+def dollars(value: Decimal) -> str:
+    sign = "-" if value < 0 else ""
+    return f"{sign}${abs(value):,.2f}"
+
+
+def shares(qty: Decimal) -> str:
+    return f"{qty.normalize():f}"
+
+
+def percent(value: Decimal, places: int = 2) -> str:
+    return f"{value * 100:.{places}f}%"
+
+
+def signed_percent(value: Decimal) -> str:
+    return f"{value * 100:+.2f}%"
+
+
+def _basket_name(kind: str, reference: str | None, basket_id: int) -> str:
+    return f"rebalance {reference}" if kind == "live" else f"shadow basket {basket_id}"
+
+
+# Status.
+
+_MODE = "SELECT mode, since, actor FROM agb.current_mode"
+_ACCOUNT = """
+    SELECT observed_at, account_status, equity_usd, cash_usd, suspend_trade
+    FROM agb.broker_state_now
+"""
+_SNAPSHOT = """
+    SELECT s.id, s.snapshot_date, count(p.id), coalesce(sum(p.market_value_usd), 0)
+    FROM agb.position_snapshot s
+    LEFT JOIN agb.position p ON p.snapshot_id = s.id
+    WHERE s.id = (SELECT max(id) FROM agb.position_snapshot)
+    GROUP BY s.id
+"""
+_LATEST_BASKET = """
+    SELECT b.id, b.reference, b.period, b.ranker, b.capital_usd, s.state, s.since, s.actor
+    FROM agb.basket b
+    JOIN agb.basket_state s ON s.id = b.id
+    WHERE b.kind = 'live'
+    ORDER BY b.id DESC
+    LIMIT 1
+"""
+_NEXT_SUBMISSION = """
+    SELECT period, due_at FROM agb.expected_event
+    WHERE kind = 'submission' AND due_at > %s
+    ORDER BY due_at
+    LIMIT 1
+"""
+
+
+def status(conn: psycopg.Connection, now: datetime) -> str:
+    mode, _, _ = conn.execute(_MODE).fetchone()
+    halts = health.open_halt_causes(conn)
+    header = f"agb-trader — {mode.upper()} · {'HALTED' if halts else 'ACTIVE'}"
+    # A gate breach carries every failed check in its reason; /gate lists them in full.
+    items = [Item(h.what, _cut(h.facts, HALT_MAX)) for h in halts]
+
+    account = conn.execute(_ACCOUNT).fetchone()
+    if account is None:
+        items.append(Item("account not yet observed", "execution has not read the broker"))
+    else:
+        observed_at, account_status, equity, cash, suspend_trade = account
+        facts = f"observed {et(observed_at)}"
+        if equity is not None:
+            facts = f"equity {dollars(equity)}, cash {dollars(cash)}; {facts}"
+        what = f"account {account_status or 'unknown'}"
+        if suspend_trade:
+            what += ", suspend_trade on"
+        items.append(Item(what, facts))
+
+    snapshot = conn.execute(_SNAPSHOT).fetchone()
+    if snapshot is None:
+        items.append(Item("no positions snapshot yet", "execution snapshots after each close"))
+    else:
+        _, snapshot_date, count, value = snapshot
+        items.append(
+            Item(f"{count} positions held", f"worth {dollars(value)}, snapshot {snapshot_date}")
+        )
+
+    basket = conn.execute(_LATEST_BASKET).fetchone()
+    if basket is None:
+        items.append(Item("no rebalance yet", "no live basket has been proposed"))
+    else:
+        _, reference, _, ranker, _, state, since, actor = basket
+        items.append(
+            Item(f"rebalance {reference} {state}", f"since {et(since)}, by {actor}; model {ranker}")
+        )
+
+    upcoming = conn.execute(_NEXT_SUBMISSION, (now,)).fetchone()
+    if upcoming is None:
+        items.append(Item("no rebalance scheduled", "the scheduler has none due"))
+    else:
+        period, due_at = upcoming
+        items.append(Item(f"next rebalance {period}", f"orders due by {et(due_at)}"))
+    return message(header, items)
+
+
+# Positions.
+
+_POSITIONS = """
+    SELECT symbol, qty, avg_entry_price, market_value_usd
+    FROM agb.position WHERE snapshot_id = %s
+    ORDER BY market_value_usd DESC NULLS LAST, symbol
+"""
+
+
+def positions(conn: psycopg.Connection) -> str:
+    snapshot = conn.execute(_SNAPSHOT).fetchone()
+    if snapshot is None:
+        return message(
+            "POSITIONS — no snapshot yet",
+            [Item("nothing to show", "execution snapshots the broker's positions after a close")],
+        )
+    snapshot_id, snapshot_date, count, total = snapshot
+    header = f"POSITIONS — {count} held, {dollars(total)}, snapshot {snapshot_date}"
+    if not count:
+        return message(header, [Item("no positions", "the broker held nothing at the snapshot")])
+    items = []
+    for symbol, qty, entry, value in conn.execute(_POSITIONS, (snapshot_id,)).fetchall():
+        facts = [dollars(value) if value is not None else "no value"]
+        if value is not None and total:
+            facts.append(percent(value / total, 1))
+        if entry is not None:
+            facts.append(f"entry {dollars(entry)}")
+        items.append(Item(f"{symbol}  {shares(qty)} shares", " · ".join(facts)))
+    return message(header, items)
+
+
+# P&L.
+
+PERIOD = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
+
+_READINGS = """
+    SELECT observed_at, equity_usd FROM agb.broker_state
+    WHERE equity_usd IS NOT NULL
+      AND (%(start)s::timestamptz IS NULL OR observed_at >= %(start)s)
+      AND (%(end)s::timestamptz IS NULL OR observed_at < %(end)s)
+    ORDER BY observed_at
+"""
+_BEFORE = """
+    SELECT observed_at, equity_usd FROM agb.broker_state
+    WHERE equity_usd IS NOT NULL AND observed_at < %s
+    ORDER BY observed_at DESC
+    LIMIT 1
+"""
+_FILLS = """
+    SELECT count(*),
+           coalesce(sum(sec_fee_usd + taf_fee_usd + cat_fee_usd + commission_usd), 0)
+    FROM agb.fill
+    WHERE filled_at > %s AND filled_at <= %s
+"""
+
+
+def month_bounds(period: str) -> tuple[datetime, datetime]:
+    """The New York month `period` names, as its first instant and the next month's."""
+    year, month = (int(part) for part in period.split("-"))
+    start = datetime(year, month, 1, tzinfo=NEW_YORK)
+    end = datetime(year + month // 12, month % 12 + 1, 1, tzinfo=NEW_YORK)
+    return start, end
+
+
+def pnl(conn: psycopg.Connection, period: str | None = None) -> str:
+    """Realised return from the account equity execution observed: from the last reading
+    before the period, or its first reading, to its last reading."""
+    start, end = month_bounds(period) if period else (None, None)
+    header = f"PNL — {period or 'since the first reading'}"
+    readings = conn.execute(_READINGS, {"start": start, "end": end}).fetchall()
+    if not readings:
+        return message(header, [Item("no equity readings", "execution has not read the account")])
+    opening = conn.execute(_BEFORE, (start,)).fetchone() if start else None
+    first_at, first = opening or readings[0]
+    last_at, last = readings[-1]
+    items = [
+        Item(
+            f"return {signed_percent(last / first - 1) if first else 'n/a'}",
+            f"equity {dollars(first)} to {dollars(last)}, {dollars(last - first)}",
+        ),
+        Item("window", f"{et(first_at)} to {et(last_at)}"),
+    ]
+    fills, fees = conn.execute(_FILLS, (first_at, last_at)).fetchone()
+    items.append(Item(f"{fills} fills", f"fees {dollars(fees)}"))
+    items.append(Item("backtest comparison", "not yet available"))
+    return message(header, items)
+
+
+# The basket.
+
+_TARGETS = """
+    SELECT symbol, weight, shares, held, carried, rank FROM agb.basket_target
+    WHERE basket_id = %s
+    ORDER BY weight DESC, symbol
+"""
+
+
+def basket(conn: psycopg.Connection) -> str:
+    latest = conn.execute(_LATEST_BASKET).fetchone()
+    if latest is None:
+        return message("BASKET — none yet", [Item("nothing to show", "no live basket yet")])
+    basket_id, reference, _, ranker, capital, state, since, actor = latest
+    targets = conn.execute(_TARGETS, (basket_id,)).fetchall()
+    header = (
+        f"BASKET {reference} — {state.upper()} · {len(targets)} names · {dollars(capital)}\n"
+        f"{state} {et(since)} by {actor}; model {ranker}"
+    )
+    items = []
+    for symbol, weight, qty, held, carried, rank in targets:
+        facts = [f"{shares(qty)} shares", "held" if held else "new"]
+        if carried:
+            facts.append("carried")
+        if rank is not None:
+            facts.append(f"rank {rank}")
+        items.append(Item(f"{symbol}  {percent(weight)}", " · ".join(facts)))
+    return message(header, items)
+
+
+# The gate.
+
+_LATEST_GATE = """
+    SELECT r.id, r.basket_id, r.at, r.actor, b.kind, b.reference
+    FROM agb.gate_run r
+    JOIN agb.basket b ON b.id = r.basket_id
+    WHERE b.kind = 'live'
+    ORDER BY r.id DESC
+    LIMIT 1
+"""
+_GATE_CHECKS = """
+    SELECT 'gate', c.level, c.name, c.symbol, c.measured, c.threshold, c.passed
+    FROM agb.gate_check c
+    JOIN agb.gate_run r ON r.id = c.run_id
+    WHERE r.basket_id = %(basket)s
+    UNION ALL
+    SELECT 'broker', c.level, c.name, c.symbol, c.measured, c.threshold, c.passed
+    FROM agb.broker_check c
+    JOIN agb.broker_check_run r ON r.id = c.run_id
+    WHERE r.basket_id = %(basket)s
+"""
+_BROKER_RUN = "SELECT at FROM agb.broker_check_run WHERE basket_id = %s"
+
+
+@dataclass(frozen=True)
+class CheckRow:
+    source: str
+    level: str
+    name: str
+    symbol: str | None
+    measured: str
+    threshold: str
+    passed: bool
+
+    @property
+    def label(self) -> str:
+        return f"{self.name} {self.symbol}" if self.symbol else self.name
+
+
+def checks(conn: psycopg.Connection, basket_id: int) -> list[CheckRow]:
+    rows = conn.execute(_GATE_CHECKS, {"basket": basket_id}).fetchall()
+    return [CheckRow(*row) for row in rows]
+
+
+def failed(check: CheckRow) -> str:
+    return f"  FAIL  {check.label}\n          measured {check.measured}, needs {check.threshold}"
+
+
+def _sort_key(value: str) -> tuple:
+    number = re.match(r"^-?[\d,]*\.?\d+", value.lstrip("$"))
+    if number:
+        return (0, float(number.group().replace(",", "")), value)
+    return (1, 0.0, value)
+
+
+def _passed(group: list[CheckRow]) -> str:
+    """Passing checks of one name, one line pair: a single check shows its measurement; a
+    check run on every order shows the range of what was measured."""
+    first = group[0]
+    if len(group) == 1:
+        return f"  ok  {first.label}\n        measured {first.measured}, needs {first.threshold}"
+    values = sorted({c.measured for c in group}, key=_sort_key)
+    measured = values[0] if len(values) == 1 else f"{values[0]} to {values[-1]}"
+    thresholds = {c.threshold for c in group}
+    needs = first.threshold if len(thresholds) == 1 else "per order"
+    return f"  ok  {first.name}, {len(group)} orders\n        measured {measured}, needs {needs}"
+
+
+def gate(conn: psycopg.Connection) -> str:
+    latest = conn.execute(_LATEST_GATE).fetchone()
+    if latest is None:
+        return message("GATE — no run yet", [Item("nothing to show", "the gate has not run")])
+    _, basket_id, at, _, kind, reference = latest
+    rows = checks(conn, basket_id)
+    fails = [c for c in rows if not c.passed]
+    header = f"GATE — {_basket_name(kind, reference, basket_id)}, run {et(at)}"
+    broker_at = conn.execute(_BROKER_RUN, (basket_id,)).fetchone()
+    if broker_at:
+        header += f"; broker checks {et(broker_at[0])}"
+    groups: dict[tuple[str, str], list[CheckRow]] = {}
+    for check in rows:
+        if check.passed:
+            groups.setdefault((check.source, check.name), []).append(check)
+    parts = [header, *(failed(c) for c in fails), *(_passed(g) for g in groups.values())]
+    if fails:
+        footer = f"{len(fails)} of {len(rows)} checks failed. The rebalance was halted."
+    else:
+        footer = f"{len(rows)} of {len(rows)} checks passed."
+    parts.append(footer)
+    return "\n\n".join(parts)
+
+
+# The audit log.
+
+_LOG = """
+    SELECT at, actor, event, subject, detail FROM (
+        SELECT * FROM agb.audit_log ORDER BY at DESC, source, row_id DESC LIMIT %s
+    ) latest
+    ORDER BY at, source, row_id
+"""
+
+
+def _cut(text: str, limit: int = DETAIL_MAX) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def log(conn: psycopg.Connection, n: int = LOG_DEFAULT) -> str:
+    rows = conn.execute(_LOG, (n,)).fetchall()
+    if not rows:
+        return message("LOG — nothing recorded yet", [])
+    items = []
+    for at, actor, event, subject, detail in rows:
+        facts = [f"by {actor}"]
+        if subject:
+            facts.append(_cut(subject))
+        if detail:
+            facts.append(_cut(detail))
+        items.append(Item(f"{et(at)}  {event}", " · ".join(facts)))
+    return message(f"LOG — last {len(rows)} events, oldest first", items)
+
+
+# Unprompted: the fill confirmation and the gate-halt alert.
+
+_ORDERS = """
+    SELECT o.symbol, o.side, o.qty, coalesce(s.filled_qty, 0), s.avg_fill_price,
+           s.shortfall_bps, o.modelled_cost_bps, coalesce(s.fees_usd, 0)
+    FROM agb.broker_order o
+    LEFT JOIN agb.shortfall s ON s.order_id = o.id
+    WHERE o.basket_id = %s
+    ORDER BY o.symbol
+"""
+_APPROVED = """
+    SELECT actor, at FROM agb.basket_event
+    WHERE basket_id = %s AND to_state = 'approved'
+    ORDER BY seq DESC
+    LIMIT 1
+"""
+
+
+def filled_text(conn: psycopg.Connection, basket_id: int, reference: str) -> str:
+    orders = conn.execute(_ORDERS, (basket_id,)).fetchall()
+    sold = [o[0] for o in orders if o[1] == "sell" and o[3] > 0]
+    bought = [o[0] for o in orders if o[1] == "buy" and o[3] > 0]
+    items = [
+        Item(f"sold {len(sold)}", ", ".join(sold) or "nothing"),
+        Item(f"bought {len(bought)}", ", ".join(bought) or "nothing"),
+    ]
+    full = [o for o in orders if o[3] >= o[2]]
+    notional = sum((o[3] * o[4] for o in orders if o[4] is not None), Decimal(0))
+    fees = sum((o[7] for o in orders), Decimal(0))
+    if notional:
+        shortfall = sum((o[5] * o[3] * o[4] for o in orders if o[4] is not None), Decimal(0))
+        modelled = sum((o[6] * o[3] * o[4] for o in orders if o[4] is not None), Decimal(0))
+        facts = (
+            f"shortfall {shortfall / notional:+.1f} bp vs mid, modelled "
+            f"{modelled / notional:.1f} bp; {dollars(notional)} traded, fees {dollars(fees)}"
+        )
+    else:
+        facts = "nothing traded"
+    items.append(Item(f"{len(full)} of {len(orders)} orders filled in full", facts))
+    for symbol, side, qty, filled_qty, *_ in orders:
+        if filled_qty < qty:
+            items.append(
+                Item(
+                    f"filled short: {symbol}", f"{side} {shares(qty)}, filled {shares(filled_qty)}"
+                )
+            )
+    approved = conn.execute(_APPROVED, (basket_id,)).fetchone()
+    if approved:
+        items.append(Item(f"approved by {approved[0]}", f"at {et(approved[1])}"))
+    return message(f"REBALANCE {reference} filled at the close.", items, "/positions")
+
+
+HALT_FOOTER = (
+    "Nothing was sent to the broker and no position was changed. "
+    "The halt stays open until it is cleared."
+)
+
+
+def halted_text(conn: psycopg.Connection, basket_id: int, reference: str) -> str | None:
+    """The gate-halt alert, or None when the basket was halted for no failed check."""
+    fails = [c for c in checks(conn, basket_id) if not c.passed]
+    if not fails:
+        return None
+    parts = [
+        f"HALTED — rebalance {reference} was not submitted.",
+        *(failed(c) for c in fails),
+        HALT_FOOTER,
+        "/gate for every check",
+    ]
+    return "\n\n".join(parts)
