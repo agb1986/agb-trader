@@ -1,8 +1,10 @@
 """The execution service: the only process that holds the broker's keys.
 
-Each cycle it takes the approved live baskets whose trade session is in its submission
-window and sends their orders (`agb.execution.submit`), reads back the orders of submitted
-baskets once the session has closed (`reconcile`), and after the close of each session
+Each cycle it first carries any `/pause` or `/resume` waiting in the database to the broker
+(`agb.execution.apply_latch`): the pause cancels what is in flight and sets `suspend_trade`,
+the resume unsets it. Then it takes the approved live baskets whose trade session is in its
+submission window and sends their orders (`agb.execution.submit`), reads back the orders of
+submitted baskets once the session has closed (`reconcile`), and after the close of each session
 snapshots the broker's positions and account state once (`snapshot`). Between those it
 observes the account's flags every few minutes, so the bot can compare the broker's
 `suspend_trade` with the halt latch.
@@ -75,6 +77,8 @@ class Execution:
     def cycle(self, conn: psycopg.Connection) -> None:
         now = self.clock()
         calendar = self.calendar(now)
+        if execution.apply_latch(conn, self.broker, calendar, now):
+            self._observed_at = now
         if self._observed_at is None or now - self._observed_at >= self.observe_every:
             execution.record_state(conn, self.broker)
             self._observed_at = now

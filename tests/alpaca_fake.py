@@ -62,6 +62,8 @@ class FakeBroker:
     # Symbols whose orders the broker refuses, and broker order ids whose cancel fails.
     refuse: set[str] = field(default_factory=set)
     cancel_fails: set[str] = field(default_factory=set)
+    # When set, a change to the configuration is refused with this error.
+    suspend_fails: AlpacaError | None = None
     # Called as on_submit(broker, client_order_id) before an order is accepted.
     on_submit: Callable[["FakeBroker", str], None] | None = None
     calls: list[tuple] = field(default_factory=list)
@@ -91,6 +93,13 @@ class FakeBroker:
 
     def configuration(self) -> Configuration:
         self.calls.append(("configuration",))
+        return Configuration(self.suspend_trade, self.no_shorting)
+
+    def suspend(self, suspend_trade: bool) -> Configuration:
+        self.calls.append(("suspend", suspend_trade))
+        if self.suspend_fails is not None:
+            raise self.suspend_fails
+        self.suspend_trade = suspend_trade
         return Configuration(self.suspend_trade, self.no_shorting)
 
     def asset(self, symbol: str) -> Asset:
