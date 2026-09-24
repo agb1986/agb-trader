@@ -316,7 +316,12 @@ def test_the_preflight_lists_everything_unhealthy(db, telegram):
 
     Bot(telegram, CHAT, lambda: PREFLIGHT, halts=halts, broker=broker)(db.connect("bot"))
 
-    assert [kind for kind, _, _ in alerts(db)] == ["stale_heartbeat", "overdue", "preflight"]
+    assert [kind for kind, _, _ in alerts(db)] == [
+        "stale_heartbeat",
+        "overdue",
+        "broker",
+        "preflight",
+    ]
     assert telegram.sent[-1] == (
         CHAT,
         "PRE-FLIGHT 2026-10\n"

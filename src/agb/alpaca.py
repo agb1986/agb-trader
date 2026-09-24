@@ -140,6 +140,7 @@ class Broker(Protocol):
 
     def account(self) -> Account: ...
     def configuration(self) -> Configuration: ...
+    def suspend(self, suspend_trade: bool) -> Configuration: ...
     def asset(self, symbol: str) -> Asset: ...
     def latest_quotes(self, symbols: Sequence[str]) -> dict[str, Quote]: ...
     def submit(self, symbol: str, qty: Decimal, side: str, client_order_id: str) -> Order: ...
@@ -280,6 +281,19 @@ class Alpaca:
 
     def configuration(self) -> Configuration:
         raw = self._call("GET", self._trading, "/v2/account/configurations")
+        return Configuration(
+            suspend_trade=bool(raw.get("suspend_trade")), no_shorting=bool(raw.get("no_shorting"))
+        )
+
+    def suspend(self, suspend_trade: bool) -> Configuration:
+        """Set or unset the account's `suspend_trade`, which blocks new orders at the broker.
+        Returns the configuration the broker answers with."""
+        raw = self._call(
+            "PATCH",
+            self._trading,
+            "/v2/account/configurations",
+            body={"suspend_trade": suspend_trade},
+        )
         return Configuration(
             suspend_trade=bool(raw.get("suspend_trade")), no_shorting=bool(raw.get("no_shorting"))
         )

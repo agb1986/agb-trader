@@ -91,6 +91,21 @@ def test_a_pull_lands_the_session_records_it_and_fulfils_it(db, tmp_path):
         assert sha256 == lake.file_hash(tmp_path / partition / lake.FILE)
 
 
+def test_ingestion_continues_while_paused(db, tmp_path):
+    """A pause stops orders, not data: the pull lands with the pause cause open."""
+    db.connect("bot").execute(
+        "INSERT INTO agb.halt_event (cause, action, actor, reason)"
+        " VALUES ('pause', 'set', 'telegram:77', '/pause')"
+    )
+    plan_pull(db)
+
+    Pipeline(tmp_path, KEY, opener=sample())(db.connect("pipeline"))
+
+    assert db.connect("cli").execute("SELECT cause FROM agb.halt_open").fetchall() == [("pause",)]
+    assert pull_state(db) == "completed"
+    assert "sep/date=2026-09-14" in landed(tmp_path)
+
+
 def test_rerunning_a_landed_pull_changes_nothing(db, tmp_path):
     vendor = sample()
     plan_pull(db)
