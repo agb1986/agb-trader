@@ -464,7 +464,9 @@ class Bot:
                     f"the liquidation token expired at {health.et(outstanding[2])}; it is spent, "
                     "send /liquidate to start again"
                 )
-            elif not secrets.compare_digest(typed.lower(), outstanding[1]):
+            # Bytes, not str: secrets.compare_digest refuses a str with non-ASCII characters,
+            # and what the operator typed is whatever they typed.
+            elif not secrets.compare_digest(typed.lower().encode(), outstanding[1].encode()):
                 refusal = "wrong liquidation token; it is spent, send /liquidate to start again"
             else:
                 refusal = None
