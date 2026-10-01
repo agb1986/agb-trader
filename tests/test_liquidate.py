@@ -250,6 +250,23 @@ def test_a_wrong_token_is_refused_recorded_and_spends_the_token(db, operator):
     ]
 
 
+def test_a_token_with_non_ascii_characters_is_refused_not_a_crash(db, operator):
+    """What the operator types is whatever they typed. A token comparison that raises takes
+    the bot's process down with it, and the unacknowledged update is read again on restart,
+    so the service never comes back."""
+    token = issued(operator.says("/liquidate"))
+
+    reply = operator.says("/liquidate \u043f\u0430\u0440\u043e\u043b\u044c")
+
+    assert reply.splitlines()[1] == (
+        "wrong liquidation token; it is spent, send /liquidate to start again"
+    )
+    assert operator.says(f"/liquidate {token}").splitlines()[1] == (
+        "no liquidation token is outstanding: send /liquidate first"
+    )
+    assert liquidations(db) == [("token", False, True, ACTOR), ("refused", True, True, ACTOR)]
+
+
 def test_an_expired_token_is_refused_recorded_and_spent(db, operator, clock):
     """Acceptance criterion (b): at five minutes the token has expired."""
     fake = holding()
