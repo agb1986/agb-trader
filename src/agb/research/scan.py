@@ -14,6 +14,16 @@ snapshot, the same numbers the pre-trade gate will apply, so a scan's return is 
 the basket would actually pay. The order's notional is estimated as the name's weight of the
 initial capital, since the cost model's impact term needs it before vectorbt sizes the order.
 
+What the scan leaves out is why it will not agree with `backtest` on real data. A name that
+stops printing keeps its last price here and is sold at the next rebalance that drops it out of
+the ranking, where the engine sells it at its last listed print; a buy the account cannot fund
+whole is trimmed by the engine, and dropped by it if it rounds to no shares, where vectorbt's
+shared cash group does neither; and vectorbt sizes fractional shares at the fill, where the
+engine sizes whole shares at the signal session's close, as the live basket does. All three are
+deliberate: this is the fast filter and the engine is the validation run. On the fake market
+none of them ever fires and the two agree exactly; `tests/test_backtest_live.py` is what bounds
+the divergence on the real lake.
+
 Each scan is a trial, like a model fit: its options, its signal and its results append a
 row."""
 

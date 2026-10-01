@@ -38,11 +38,17 @@ dollar volume), and the same configuration run from several later start dates. G
 score series per combinatorial path, it reports each path's series separately, in the form
 the deflated Sharpe and overfitting gates consume.
 
-Two things separate this backtest from the scan by design, and bound how closely the two can
-agree: orders are sized in whole shares at the signal session's close, as the live basket
-sizes them, where vectorbt sizes fractional shares at the fill; and the engine's capital
-compounds through the account, where the scan's does through vectorbt's cash group. The
-reference-configuration test states the tolerance.
+Four things separate this backtest from the scan by design, and bound how closely the two can
+agree: a name that stops printing is sold here at its last listed print, where the scan carries
+the last price forward and sells at the next rebalance that drops it from the ranking; a buy
+the account cannot fund whole is trimmed here, and dropped if it rounds to no shares, where
+vectorbt's shared cash group does neither; orders are sized in whole shares at the signal
+session's close, as the live basket sizes them, where vectorbt sizes fractional shares at the
+fill; and the engine's capital compounds through the account, where the scan's does through
+vectorbt's cash group. On the fake market the first three never fire, and the
+reference-configuration test states the tolerance the fourth leaves. On the real lake all four
+fire, so `tests/test_backtest_live.py` reconciles the two order sets through the delisting-exit
+and trim counts reported here rather than expecting the two to agree.
 
 Each backtest is a trial, like a scan: its options and its results append a row."""
 
