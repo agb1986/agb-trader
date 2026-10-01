@@ -25,7 +25,6 @@ same functions later.
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import psycopg
@@ -201,56 +200,6 @@ _REQUEST = """
     JOIN agb.gate_run r ON r.basket_id = b.id
     WHERE b.id = %s
 """
-# The book the basket trades from is the last filled live basket; a sold name's old rank is
-# the rank it held there.
-_OUT = """
-    SELECT o.symbol, r.rank, w.rank
-    FROM agb.basket_order o
-    LEFT JOIN agb.basket_rank r ON r.basket_id = o.basket_id AND r.symbol = o.symbol
-    LEFT JOIN agb.basket_target w ON w.symbol = o.symbol AND w.basket_id = (
-        SELECT id FROM agb.basket_state
-        WHERE kind = 'live' AND state = 'filled'
-        ORDER BY session_date DESC, id DESC
-        LIMIT 1
-    )
-    WHERE o.basket_id = %s AND o.side = 'sell'
-    ORDER BY r.rank DESC NULLS FIRST, o.symbol
-"""
-_IN = """
-    SELECT o.symbol, r.rank
-    FROM agb.basket_order o
-    LEFT JOIN agb.basket_rank r ON r.basket_id = o.basket_id AND r.symbol = o.symbol
-    WHERE o.basket_id = %s AND o.side = 'buy'
-    ORDER BY r.rank NULLS LAST, o.symbol
-"""
-_HOLD = "SELECT count(*) FROM agb.basket_target WHERE basket_id = %s AND held"
-_MEASURED = """
-    SELECT c.name, c.measured FROM agb.gate_check c
-    JOIN agb.gate_run r ON r.id = c.run_id
-    WHERE r.basket_id = %s AND c.name IN ('cash', 'turnover') AND c.symbol IS NULL
-"""
-
-
-def _rank(rank: int | None) -> str:
-    return f"rank {rank}" if rank is not None else "not ranked"
-
-
-def _turnover(measured: str | None) -> str:
-    if measured is None:
-        return "turnover not measured"
-    if measured == "no book":
-        return "turnover none, no book yet"
-    try:
-        return f"turnover {Decimal(measured.rstrip('%')):.1f}%"
-    except InvalidOperation:
-        return f"turnover {measured}"
-
-
-def _cash(measured: str | None, capital: Decimal) -> str:
-    try:
-        return f"cash after {readout.percent(Decimal(measured) / capital, 1)}"
-    except (InvalidOperation, TypeError):
-        return f"cash after {measured or 'not measured'}"
 
 
 def request_text(
@@ -263,25 +212,24 @@ def request_text(
     ).fetchone()
     cutoff = cutoff_of(calendar, session)
     by = deadline(cutoff, now)
-    sold = conn.execute(_OUT, (basket_id,)).fetchall()
-    bought = conn.execute(_IN, (basket_id,)).fetchall()
-    (held,) = conn.execute(_HOLD, (basket_id,)).fetchone()
-    measured = dict(conn.execute(_MEASURED, (basket_id,)).fetchall())
-    width = max([6, *(len(row[0]) + 1 for row in (*sold, *bought))])
-
-    out = [f"OUT ({len(sold)})" if sold else "OUT (none)"]
-    for symbol, rank, was in sold:
-        line = f"  x {symbol:<{width}} {_rank(rank)}"
+    diff = readout.diff(conn, basket_id)
+    width = diff.width
+    out = [f"OUT ({len(diff.sold)})" if diff.sold else "OUT (none)"]
+    for symbol, rank, was in diff.sold:
+        line = f"  x {symbol:<{width}} {readout.rank_text(rank)}"
         out.append(line + (f" (was {was})" if was is not None else ""))
-    in_ = [f"IN ({len(bought)})" if bought else "IN (none)"]
-    in_ += [f"  + {symbol:<{width}} {_rank(rank)}" for symbol, rank in bought]
-    numbers = f"{_turnover(measured.get('turnover'))}  ·  {_cash(measured.get('cash'), capital)}"
+    in_ = [f"IN ({len(diff.bought)})" if diff.bought else "IN (none)"]
+    in_ += [f"  + {symbol:<{width}} {readout.rank_text(rank)}" for symbol, rank in diff.bought]
+    numbers = (
+        f"{readout.turnover_text(diff.measured.get('turnover'))}  ·  "
+        f"{readout.cash_text(diff.measured.get('cash'), capital)}"
+    )
     parts = [
         f"REBALANCE {reference} — approval needed\n"
         f"{mode.upper()} · {LEVEL} · deadline {by} (in {countdown(now, cutoff)})",
         "\n".join(out),
         "\n".join(in_),
-        f"HOLD {held} unchanged",
+        f"HOLD {diff.held} unchanged",
         numbers,
         # The panel's flags join here; the gate halts on anything it finds.
         "FLAGS (none)",

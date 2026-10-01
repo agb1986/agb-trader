@@ -121,6 +121,29 @@ def test_the_import_is_the_one_service_that_runs_as_the_research_role(resolved):
     assert "import <model id>" in (ROOT / "scripts/deploy/agb-stack").read_text()
 
 
+def test_the_ui_is_published_on_the_loopback_address_alone(resolved):
+    """T27 criterion (a): the UI answers on 127.0.0.1:8080 of the server itself, so the only
+    way in is an SSH tunnel and SSH is the authentication. It reads the database as the `ui`
+    role, mounts nothing, and holds no broker or Telegram credential."""
+    ui = resolved["services"]["ui"]
+    assert ui["ports"] == [
+        {
+            "mode": "ingress",
+            "host_ip": "127.0.0.1",
+            "target": 8080,
+            "published": "8080",
+            "protocol": "tcp",
+        }
+    ]
+    assert ui["command"] == ["python", "-m", "agb.services.ui"]
+    assert ui["image"] == resolved["services"]["migrate"]["image"]
+    assert set(ui["networks"]) == {"core"}, "no egress: the UI makes no outbound connection"
+    assert not ui.get("volumes")
+    env = ui["environment"]
+    assert (env["PGHOST"], env["PGUSER"]) == ("db", "ui")
+    assert not {key for key in env if key.startswith(("SHARADAR", "TELEGRAM", "ALPACA"))}
+
+
 def test_only_the_pipeline_has_the_vendor_key(resolved):
     # Compose inlines each env file into the service's environment.
     for name, service in resolved["services"].items():
