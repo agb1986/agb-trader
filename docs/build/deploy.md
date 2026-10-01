@@ -121,6 +121,24 @@ On the server, in the deploy directory:
 ./agb-stack agb <command>          # run an agb CLI command
 ```
 
+## The local UI
+
+The `ui` service publishes on the server's loopback address only, so it is reached from the
+workstation over an SSH tunnel:
+
+```sh
+ssh -N -L 8080:127.0.0.1:8080 casaos.local   # then open http://127.0.0.1:8080
+```
+
+SSH is the authentication: there is no login page, and nothing outside the server can open the
+port. The home page is the decision log, one row per rebalance with the health banner above it;
+`Rebalance`, `Positions`, `Gate` and `Alerts` are the views behind it. Nothing on these pages
+writes to the database — the connection is read-only in Postgres — so approving a basket and the
+kill switch stay in Telegram until the write path lands.
+
+Set `AGB_UI_PORT` in the deploy directory's `.env` if 8080 is taken on the server; the container
+still listens on 8080, so the tunnel's right-hand side does not change.
+
 ## Backups
 
 The scheduler plans a backup job for every calendar day. The job becomes claimable at 03:00

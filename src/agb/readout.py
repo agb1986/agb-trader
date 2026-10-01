@@ -10,7 +10,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 import psycopg
 
@@ -225,17 +225,30 @@ def month_bounds(period: str) -> tuple[datetime, datetime]:
     return start, end
 
 
-def pnl(conn: psycopg.Connection, period: str | None = None) -> str:
-    """Realised return from the account equity execution observed: from the last reading
-    before the period, or its first reading, to its last reading."""
+def equity_window(
+    conn: psycopg.Connection, period: str | None = None
+) -> tuple[datetime, Decimal, datetime, Decimal] | None:
+    """The two equity readings a period is measured between, as (first_at, first, last_at,
+    last): from the last reading before the period, or its own first reading, to its last.
+    None if there are no readings in it. The UI's decision log reads a month's realised
+    return from the same two readings `/pnl` does."""
     start, end = month_bounds(period) if period else (None, None)
-    header = f"PNL — {period or 'since the first reading'}"
     readings = conn.execute(_READINGS, {"start": start, "end": end}).fetchall()
     if not readings:
-        return message(header, [Item("no equity readings", "execution has not read the account")])
+        return None
     opening = conn.execute(_BEFORE, (start,)).fetchone() if start else None
     first_at, first = opening or readings[0]
     last_at, last = readings[-1]
+    return first_at, first, last_at, last
+
+
+def pnl(conn: psycopg.Connection, period: str | None = None) -> str:
+    """Realised return from the account equity execution observed, over `equity_window`."""
+    header = f"PNL — {period or 'since the first reading'}"
+    window = equity_window(conn, period)
+    if window is None:
+        return message(header, [Item("no equity readings", "execution has not read the account")])
+    first_at, first, last_at, last = window
     items = [
         Item(
             f"return {signed_percent(last / first - 1) if first else 'n/a'}",
@@ -277,6 +290,86 @@ def basket(conn: psycopg.Connection) -> str:
             facts.append(f"rank {rank}")
         items.append(Item(f"{symbol}  {percent(weight)}", " · ".join(facts)))
     return message(header, items)
+
+
+# A rebalance's diff: the names it sells, the names it buys, the incumbents it keeps, and the
+# two aggregate numbers the gate measured. The approval request and the local UI both read it
+# from here, so the two surfaces cannot describe the same basket differently.
+
+# The book the basket trades from is the last filled live basket; a sold name's old rank is
+# the rank it held there.
+_SOLD = """
+    SELECT o.symbol, r.rank, w.rank
+    FROM agb.basket_order o
+    LEFT JOIN agb.basket_rank r ON r.basket_id = o.basket_id AND r.symbol = o.symbol
+    LEFT JOIN agb.basket_target w ON w.symbol = o.symbol AND w.basket_id = (
+        SELECT id FROM agb.basket_state
+        WHERE kind = 'live' AND state = 'filled'
+        ORDER BY session_date DESC, id DESC
+        LIMIT 1
+    )
+    WHERE o.basket_id = %s AND o.side = 'sell'
+    ORDER BY r.rank DESC NULLS FIRST, o.symbol
+"""
+_BOUGHT = """
+    SELECT o.symbol, r.rank
+    FROM agb.basket_order o
+    LEFT JOIN agb.basket_rank r ON r.basket_id = o.basket_id AND r.symbol = o.symbol
+    WHERE o.basket_id = %s AND o.side = 'buy'
+    ORDER BY r.rank NULLS LAST, o.symbol
+"""
+_KEPT = "SELECT count(*) FROM agb.basket_target WHERE basket_id = %s AND held"
+_MEASURED = """
+    SELECT c.name, c.measured FROM agb.gate_check c
+    JOIN agb.gate_run r ON r.id = c.run_id
+    WHERE r.basket_id = %s AND c.name IN ('cash', 'turnover') AND c.symbol IS NULL
+"""
+
+
+@dataclass(frozen=True)
+class Diff:
+    """What a basket changes about the book, as the decider saw it."""
+
+    sold: list[tuple[str, int | None, int | None]]
+    bought: list[tuple[str, int | None]]
+    held: int
+    measured: dict[str, str]
+
+    @property
+    def width(self) -> int:
+        """The symbol column, wide enough for every name on both sides."""
+        return max([6, *(len(symbol) + 1 for symbol, *_ in (*self.sold, *self.bought))])
+
+
+def diff(conn: psycopg.Connection, basket_id: int) -> Diff:
+    return Diff(
+        sold=conn.execute(_SOLD, (basket_id,)).fetchall(),
+        bought=conn.execute(_BOUGHT, (basket_id,)).fetchall(),
+        held=conn.execute(_KEPT, (basket_id,)).fetchone()[0],
+        measured=dict(conn.execute(_MEASURED, (basket_id,)).fetchall()),
+    )
+
+
+def rank_text(rank: int | None) -> str:
+    return f"rank {rank}" if rank is not None else "not ranked"
+
+
+def turnover_text(measured: str | None) -> str:
+    if measured is None:
+        return "turnover not measured"
+    if measured == "no book":
+        return "turnover none, no book yet"
+    try:
+        return f"turnover {Decimal(measured.rstrip('%')):.1f}%"
+    except InvalidOperation:
+        return f"turnover {measured}"
+
+
+def cash_text(measured: str | None, capital: Decimal) -> str:
+    try:
+        return f"cash after {percent(Decimal(measured) / capital, 1)}"
+    except (InvalidOperation, TypeError):
+        return f"cash after {measured or 'not measured'}"
 
 
 # The gate.
