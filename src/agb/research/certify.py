@@ -31,60 +31,49 @@ the ledger, the artifact and the database: a failed certification is a fact abou
 model, not something that never happened. Promotion is a separate step that must require
 `passed`.
 
-`import_artifact` is the research profile's one write to the server's database. It runs on
-the host with the `research` role's PG* environment (the research container has no network),
-verifies every digest and the trial count against the shipped ledger, and inserts the row.
-An altered file, an unlisted file, a ledger whose row count disagrees with the declared count
-and a model already certified are each refused, and nothing is written.
+Reading an artifact back and inserting its row is `agb.research.artifact`, which is separate
+because the import has to run where the server's database is reachable and nothing there may
+import this module's dependencies. The manifest carries `certified_path` so the row records
+where the certification ran rather than where the artifact was read from.
 
 These gates certify stage 1 of the ranker only, the classical LightGBM ranker. The LLM panel
 and the blend are unbacktested by construction, and every output of this module says so."""
 
-import hashlib
 import json
 import re
 import shutil
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import duckdb
 import numpy as np
 import pandas as pd
-import psycopg
-from psycopg import errors
-from psycopg.types.json import Jsonb
 
 from agb import lake, rebalance
 from agb.research import backtest, cpcv, gates, train
+from agb.research.artifact import (
+    CERTIFIED_PATH,
+    KIND,
+    MANIFEST,
+    MODEL,
+    CertificationError,
+    artifact_sha256,
+    file_sha256,
+)
 from agb.research.panel import Panel
 from agb.research.trials import FILE as LEDGER_FILE
-from agb.research.trials import Ledger, LedgerError, Run, code_version
+from agb.research.trials import Ledger, Run, code_version
 
-KIND = "certification"
 CERTIFIES = gates.CERTIFIES
 CAPITAL = 100_000.0
 DIRECTORY = "certifications"
-MANIFEST = "manifest.json"
 PATHS = "paths.json"
 REPORT = "report.md"
-MODEL = "model.txt"
-ACTOR = "research"
 MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # The trial kinds whose results carry monthly net returns the overfitting gate can read.
 CANDIDATE_KINDS = ("backtest",)
-# What the manifest carries, in the order the row and the report show them.
-FIELDS = (
-    "model_id", "certifies", "passed", "features", "train_start", "train_end",
-    "declared_trials", "dsr", "pbo", "sharpe_net", "dsr_2x", "break_even_multiple",
-    "sharpe_gross", "gross_sharpe_flag", "participation_max", "participation_mean",
-    "cost_model_version", "certified_capital", "path_quantiles", "gates", "certified_at",
-)  # fmt: skip
-
-
-class CertificationError(Exception):
-    pass
 
 
 @dataclass(frozen=True)
@@ -293,6 +282,7 @@ def _write(
             "candidates": results["overfitting"]["candidates"],
         },
         "certified_at": datetime.now(UTC).isoformat(),
+        CERTIFIED_PATH: str(directory.resolve()),
         "trial_id": run.trial_id,
         "cpcv_trial_id": results["cpcv_trial_id"],
         "backtest_trial_id": results["backtest_trial_id"],
@@ -302,21 +292,15 @@ def _write(
     }
     (directory / REPORT).write_text(report(manifest))
     files = {
-        path.name: _sha256(path) for path in sorted(directory.iterdir()) if path.name != MANIFEST
+        path.name: file_sha256(path)
+        for path in sorted(directory.iterdir())
+        if path.name != MANIFEST
     }
     manifest["files"] = files
     manifest["ledger_sha256"] = files[LEDGER_FILE]
     manifest["artifact_sha256"] = artifact_sha256(files)
     (directory / MANIFEST).write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n")
     return Certification(run.trial_id, directory, manifest)
-
-
-def artifact_sha256(files: dict[str, str]) -> str:
-    """One digest over every file's name and digest, in name order."""
-    hasher = hashlib.sha256()
-    for name in sorted(files):
-        hasher.update(f"{name}\0{files[name]}\n".encode())
-    return hasher.hexdigest()
 
 
 def report(manifest: dict[str, Any]) -> str:
@@ -371,108 +355,6 @@ def report(manifest: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-# The import -----------------------------------------------------------------------------------
-
-
-def load(directory: Path) -> dict[str, Any]:
-    """The manifest of the artifact at `directory`, after every check: each listed file is
-    present and unaltered, nothing unlisted is there, the digest over the digests matches,
-    the booster is among the files, and the shipped ledger holds exactly the declared number
-    of trials, among them this certification's own row saying the same."""
-    path = directory / MANIFEST
-    if not path.is_file():
-        raise CertificationError(f"{directory} holds no {MANIFEST}")
-    manifest = json.loads(path.read_text())
-    missing = [name for name in (*FIELDS, "files", "ledger_sha256", "artifact_sha256", "trial_id")
-               if name not in manifest]  # fmt: skip
-    if missing:
-        raise CertificationError(f"{MANIFEST} lacks {', '.join(missing)}")
-    files = manifest["files"]
-    for name, digest in files.items():
-        file = directory / name
-        if not file.is_file():
-            raise CertificationError(f"{name} is missing from {directory}")
-        if _sha256(file) != digest:
-            raise CertificationError(f"{name} has been altered since certification")
-    unlisted = sorted(
-        p.name for p in directory.iterdir() if p.name not in files and p.name != MANIFEST
-    )
-    if unlisted:
-        raise CertificationError(f"{directory} holds unlisted files: {', '.join(unlisted)}")
-    if MODEL not in files:
-        raise CertificationError(f"{directory} holds no {MODEL}")
-    if files.get(LEDGER_FILE) != manifest["ledger_sha256"]:
-        raise CertificationError(f"{LEDGER_FILE} is not the ledger the manifest names")
-    if artifact_sha256(files) != manifest["artifact_sha256"]:
-        raise CertificationError("the artifact digest does not match its files")
-    ledger = Ledger(directory / LEDGER_FILE)
-    count = ledger.count()
-    if count != manifest["declared_trials"]:
-        raise CertificationError(
-            f"{LEDGER_FILE} holds {count} trials; the certification declared"
-            f" {manifest['declared_trials']}"
-        )
-    try:
-        row = ledger.get(manifest["trial_id"])
-    except LedgerError as error:
-        raise CertificationError(
-            f"the shipped ledger lacks the certification's trial: {error}"
-        ) from None
-    results = json.loads(row["results"] or "null") or {}
-    if row["kind"] != KIND or row["status"] != "succeeded":
-        raise CertificationError(f"trial {row['trial_id']} is not a succeeded certification")
-    if results.get("declared_trials") != count or results.get("passed") != manifest["passed"]:
-        raise CertificationError("the manifest disagrees with the certification's own trial row")
-    return manifest
-
-
-def import_artifact(conn: psycopg.Connection, directory: Path, *, actor: str = ACTOR) -> int:
-    """Verify the artifact at `directory` and insert its `model_certification` row, as the
-    `research` role. Returns the row's id."""
-    manifest = load(directory)
-    columns = {
-        "model_id": manifest["model_id"],
-        "certifies": manifest["certifies"],
-        "passed": manifest["passed"],
-        "artifact_sha256": manifest["artifact_sha256"],
-        "artifact_path": str(directory.resolve()),
-        "ledger_sha256": manifest["ledger_sha256"],
-        "features": Jsonb(manifest["features"]),
-        "train_start": date.fromisoformat(manifest["train_start"]),
-        "train_end": date.fromisoformat(manifest["train_end"]),
-        "declared_trials": manifest["declared_trials"],
-        "dsr": manifest["dsr"],
-        "pbo": manifest["pbo"],
-        "sharpe_net": manifest["sharpe_net"],
-        "dsr_2x": manifest["dsr_2x"],
-        "break_even_multiple": manifest["break_even_multiple"],
-        "sharpe_gross": manifest["sharpe_gross"],
-        "gross_sharpe_flag": manifest["gross_sharpe_flag"],
-        "participation_max": manifest["participation_max"],
-        "participation_mean": manifest["participation_mean"],
-        "cost_model_version": manifest["cost_model_version"],
-        "certified_capital": manifest["certified_capital"],
-        "path_quantiles": Jsonb(manifest["path_quantiles"]),
-        "gates": Jsonb(manifest["gates"]),
-        "certified_at": datetime.fromisoformat(manifest["certified_at"]),
-        "actor": actor,
-    }
-    names = ", ".join(columns)
-    holes = ", ".join(f"%({name})s" for name in columns)
-    try:
-        with conn.transaction():
-            row = conn.execute(
-                f"INSERT INTO agb.model_certification ({names}) VALUES ({holes}) RETURNING id",
-                columns,
-            ).fetchone()
-    except errors.UniqueViolation:
-        raise CertificationError(
-            f"model {manifest['model_id']!r} is already certified; a certification is never"
-            " replaced"
-        ) from None
-    return row[0]
-
-
 # Helpers --------------------------------------------------------------------------------------
 
 
@@ -482,11 +364,3 @@ def _config(options: Options) -> dict[str, Any]:
 
 def _matrix(paths: list[dict[str, Any]], key: str) -> np.ndarray:
     return np.array([[month[key] for month in path["monthly"]] for path in paths], dtype="float64")
-
-
-def _sha256(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()

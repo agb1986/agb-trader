@@ -140,6 +140,28 @@ def _models_dir() -> Path:
     return Path(os.environ.get(registry.MODELS_ENV, registry.DEFAULT_MODELS_DIR))
 
 
+def _import_certification(args: argparse.Namespace) -> int:
+    from psycopg import errors
+
+    from agb.research import artifact
+
+    directory = _models_dir() / args.model_id
+    try:
+        with psycopg.connect(application_name="agb-cli") as conn:
+            row_id = artifact.import_artifact(conn, directory)
+    except artifact.CertificationError as exc:
+        print(f"agb: {exc}", file=sys.stderr)
+        return 1
+    except errors.InsufficientPrivilege:
+        print(
+            "agb: only the research role may insert a certification; use PGUSER=research",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"model_certification {row_id}: {directory}")
+    return 0
+
+
 def _promote(args: argparse.Namespace) -> int:
     from agb import registry
 
@@ -237,6 +259,17 @@ def main(argv: list[str] | None = None) -> int:
     rerun.add_argument("reference", help="the missed rebalance, e.g. 2026-10")
     rerun.add_argument("--actor", **actor)
     rerun.set_defaults(run=_rerun)
+    certification = commands.add_parser(
+        "import-certification",
+        help="insert a certified model's row from its artifact under AGB_MODELS_DIR",
+        description="The research profile certifies on the workstation and the artifact is "
+        "copied to the models directory; this records it. Only the research role may insert, "
+        "so run it with PGUSER=research. The artifact is verified first: an altered or "
+        "unlisted file, a ledger whose trial count disagrees with the certification's, and a "
+        "model already certified are each refused, and nothing is written.",
+    )
+    certification.add_argument("model_id", help="the artifact's directory under AGB_MODELS_DIR")
+    certification.set_defaults(run=_import_certification)
     promote = commands.add_parser(
         "promote",
         help="make a certified model the one the pipeline ranks with",

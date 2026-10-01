@@ -22,7 +22,7 @@ from psycopg import errors
 from psycopg.rows import dict_row
 
 from agb.research import __main__ as cli
-from agb.research import backtest, certify, cpcv, train, trials
+from agb.research import artifact, backtest, certify, cpcv, train, trials
 from agb.research.panel import Panel
 from agb.research.trials import Ledger
 from agb.roles import RESEARCH
@@ -110,7 +110,7 @@ class Artifact:
 
     @property
     def manifest(self) -> dict:
-        return json.loads((self.directory / certify.MANIFEST).read_text())
+        return json.loads((self.directory / artifact.MANIFEST).read_text())
 
     def ledger(self) -> Ledger:
         return Ledger(self.directory / trials.FILE)
@@ -123,14 +123,14 @@ class Artifact:
         """Rewrite the manifest as a forger would who knows the digest scheme."""
         manifest = {**self.manifest, **changes}
         files = {
-            p.name: certify._sha256(p)
+            p.name: artifact.file_sha256(p)
             for p in sorted(self.directory.iterdir())
-            if p.name != certify.MANIFEST
+            if p.name != artifact.MANIFEST
         }
         manifest["files"] = files
         manifest["ledger_sha256"] = files[trials.FILE]
-        manifest["artifact_sha256"] = certify.artifact_sha256(files)
-        (self.directory / certify.MANIFEST).write_text(json.dumps(manifest))
+        manifest["artifact_sha256"] = artifact.artifact_sha256(files)
+        (self.directory / artifact.MANIFEST).write_text(json.dumps(manifest))
 
 
 def compounded(returns) -> float:
@@ -142,7 +142,7 @@ def compounded(returns) -> float:
 
 def imported(db, directory) -> dict:
     conn = db.connect(RESEARCH)
-    row_id = certify.import_artifact(conn, directory)
+    row_id = artifact.import_artifact(conn, directory)
     conn.row_factory = dict_row
     return conn.execute("SELECT * FROM agb.model_certification WHERE id = %s", (row_id,)).fetchone()
 
@@ -158,18 +158,18 @@ def test_a_passing_run_leaves_the_artifact_directory(certified, prior):
         "manifest.json", "model.txt", "paths.json", "report.md", "trials.parquet",
     ]  # fmt: skip
     manifest = certified.manifest
-    assert json.loads((certified.directory / certify.MANIFEST).read_text()) == manifest
+    assert json.loads((certified.directory / artifact.MANIFEST).read_text()) == manifest
     assert manifest["files"] == {
-        name: certify._sha256(certified.directory / name)
+        name: artifact.file_sha256(certified.directory / name)
         for name in ("model.txt", "paths.json", "report.md", "trials.parquet")
     }
-    assert manifest["artifact_sha256"] == certify.artifact_sha256(manifest["files"])
+    assert manifest["artifact_sha256"] == artifact.artifact_sha256(manifest["files"])
     assert manifest["ledger_sha256"] == manifest["files"]["trials.parquet"]
 
 
 def test_the_artifact_carries_every_field_the_row_needs(certified, panel):
     manifest = certified.manifest
-    assert set(certify.FIELDS) <= set(manifest)
+    assert set(artifact.FIELDS) <= set(manifest)
     assert manifest["model_id"] == OPTIONS.model_id
     assert manifest["certifies"] == STAGE_1
     assert manifest["features"] == list(MODEL.features)
@@ -242,7 +242,7 @@ def test_the_report_says_what_the_gates_certify(certified):
 def test_a_certification_is_never_overwritten(certified, prior, panel, research_lake):
     ledger, _ = prior
     before = ledger.count()
-    with pytest.raises(certify.CertificationError, match="never overwritten"):
+    with pytest.raises(artifact.CertificationError, match="never overwritten"):
         certify.run(
             panel, MODEL, VALIDATION, OPTIONS, ledger,
             research_dir=ledger.path.parent, lake_dir=research_lake,
@@ -263,7 +263,7 @@ def test_the_import_writes_the_row_with_every_field(db, certified):
     manifest = certified.manifest
     row = imported(db, certified.directory)
     assert row["actor"] == "research" and row["at"] is not None
-    assert row["artifact_path"] == str(certified.directory.resolve())
+    assert row["artifact_path"] == manifest[artifact.CERTIFIED_PATH]
     assert row["certified_capital"] == 100_000
     assert row["certified_at"] == datetime.fromisoformat(manifest["certified_at"])
     assert row["train_start"].isoformat() == manifest["train_start"]
@@ -280,8 +280,8 @@ def test_the_import_writes_the_row_with_every_field(db, certified):
 
 def test_a_model_is_certified_once(db, certified):
     imported(db, certified.directory)
-    with pytest.raises(certify.CertificationError, match="already certified"):
-        certify.import_artifact(db.connect(RESEARCH), certified.directory)
+    with pytest.raises(artifact.CertificationError, match="already certified"):
+        artifact.import_artifact(db.connect(RESEARCH), certified.directory)
     assert db.connect(RESEARCH).execute(
         "SELECT count(*) FROM agb.model_certification"
     ).fetchone() == (1,)
@@ -301,15 +301,40 @@ def test_only_research_imports_and_the_services_read(db, certified):
         assert db.connect(role).execute(
             "SELECT model_id, certifies FROM agb.model_certification"
         ).fetchall() == [(OPTIONS.model_id, STAGE_1)]
-    with pytest.raises(errors.InsufficientPrivilege):
-        certify.import_artifact(db.connect("pipeline"), certified.directory, actor="pipeline")
+    # The `cli` role among them: the stack's cli service runs as `cli`, which is why the import
+    # is a service of its own running as `research`.
+    for role in ("pipeline", "cli"):
+        with pytest.raises(errors.InsufficientPrivilege):
+            artifact.import_artifact(db.connect(role), certified.directory, actor=role)
+
+
+def test_the_row_records_where_the_certification_ran_not_where_it_was_read(db, certified, tmp_path):
+    """On the server the artifact is a copy under the models directory and the import reads it
+    there, but the column is provenance: the workstation path the certification wrote. The
+    manifest carries it, so the copy records the same path the original would."""
+    copy = copied(certified, tmp_path)
+    assert copy.directory != certified.directory
+    row = imported(db, copy.directory)
+    assert row["artifact_path"] == certified.manifest[artifact.CERTIFIED_PATH]
+    assert row["artifact_path"] == str(certified.directory.resolve())
+
+
+def test_an_artifact_that_does_not_say_where_it_was_certified_is_refused(db, certified, tmp_path):
+    """An artifact from before the manifest carried the path. Refusing it is the point: the
+    alternative is a row whose provenance is the server's own copy."""
+    copy = copied(certified, tmp_path)
+    manifest = copy.manifest
+    del manifest[artifact.CERTIFIED_PATH]
+    (copy.directory / artifact.MANIFEST).write_text(json.dumps(manifest))
+    with pytest.raises(artifact.CertificationError, match=f"lacks {artifact.CERTIFIED_PATH}"):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
 
 def test_a_row_must_say_what_it_certifies(db, certified, tmp_path):
-    artifact = copied(certified, tmp_path)
-    artifact.rewrite(certifies="stage 1 and the blend")
+    copy = copied(certified, tmp_path)
+    copy.rewrite(certifies="stage 1 and the blend")
     with pytest.raises(errors.CheckViolation):
-        certify.import_artifact(db.connect(RESEARCH), artifact.directory)
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
 
 # A failed certification ------------------------------------------------------------------------
@@ -364,73 +389,73 @@ def test_a_run_that_raises_leaves_a_failed_trial_and_no_artifact(
 
 
 def test_a_tampered_ledger_is_detected(db, certified, tmp_path):
-    artifact = copied(certified, tmp_path)
-    artifact.drop_last_trial()
-    with pytest.raises(certify.CertificationError, match="trials.parquet has been altered"):
-        certify.import_artifact(db.connect(RESEARCH), artifact.directory)
+    copy = copied(certified, tmp_path)
+    copy.drop_last_trial()
+    with pytest.raises(artifact.CertificationError, match="trials.parquet has been altered"):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
 
 def test_a_ledger_that_disagrees_with_the_declared_count_is_refused(db, certified, tmp_path):
-    artifact = copied(certified, tmp_path)
-    artifact.drop_last_trial()
-    artifact.rewrite()
+    copy = copied(certified, tmp_path)
+    copy.drop_last_trial()
+    copy.rewrite()
     with pytest.raises(
-        certify.CertificationError, match="holds 7 trials; the certification declared 8"
+        artifact.CertificationError, match="holds 7 trials; the certification declared 8"
     ):
-        certify.import_artifact(db.connect(RESEARCH), artifact.directory)
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
 
 def test_a_declared_count_the_trial_row_disagrees_with_is_refused(db, certified, tmp_path):
-    artifact = copied(certified, tmp_path)
-    artifact.rewrite(declared_trials=7)
+    copy = copied(certified, tmp_path)
+    copy.rewrite(declared_trials=7)
     with pytest.raises(
-        certify.CertificationError, match="holds 8 trials; the certification declared 7"
+        artifact.CertificationError, match="holds 8 trials; the certification declared 7"
     ):
-        certify.import_artifact(db.connect(RESEARCH), artifact.directory)
-    artifact = copied(certified, tmp_path / "again")
-    artifact.drop_last_trial()
-    artifact.rewrite(declared_trials=7)
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
+    copy = copied(certified, tmp_path / "again")
+    copy.drop_last_trial()
+    copy.rewrite(declared_trials=7)
     with pytest.raises(
-        certify.CertificationError, match="disagrees with the certification's own trial row"
+        artifact.CertificationError, match="disagrees with the certification's own trial row"
     ):
-        certify.import_artifact(db.connect(RESEARCH), artifact.directory)
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
 
 def test_a_verdict_the_trial_row_disagrees_with_is_refused(db, certified, tmp_path):
-    artifact = copied(certified, tmp_path)
-    artifact.rewrite(passed=False)
-    with pytest.raises(certify.CertificationError, match="disagrees"):
-        certify.import_artifact(db.connect(RESEARCH), artifact.directory)
+    copy = copied(certified, tmp_path)
+    copy.rewrite(passed=False)
+    with pytest.raises(artifact.CertificationError, match="disagrees"):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
 
 def test_an_altered_report_or_an_extra_file_is_refused(db, certified, tmp_path):
-    artifact = copied(certified, tmp_path)
-    (artifact.directory / certify.REPORT).write_text("# all good\n")
-    with pytest.raises(certify.CertificationError, match="report.md has been altered"):
-        certify.import_artifact(db.connect(RESEARCH), artifact.directory)
-    artifact = copied(certified, tmp_path / "again")
-    (artifact.directory / "notes.txt").write_text("trust me\n")
-    with pytest.raises(certify.CertificationError, match="unlisted files: notes.txt"):
-        certify.import_artifact(db.connect(RESEARCH), artifact.directory)
-    (artifact.directory / "notes.txt").unlink()
-    (artifact.directory / certify.PATHS).unlink()
-    with pytest.raises(certify.CertificationError, match="paths.json is missing"):
-        certify.import_artifact(db.connect(RESEARCH), artifact.directory)
+    copy = copied(certified, tmp_path)
+    (copy.directory / certify.REPORT).write_text("# all good\n")
+    with pytest.raises(artifact.CertificationError, match="report.md has been altered"):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
+    copy = copied(certified, tmp_path / "again")
+    (copy.directory / "notes.txt").write_text("trust me\n")
+    with pytest.raises(artifact.CertificationError, match="unlisted files: notes.txt"):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
+    (copy.directory / "notes.txt").unlink()
+    (copy.directory / certify.PATHS).unlink()
+    with pytest.raises(artifact.CertificationError, match="paths.json is missing"):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
 
 def test_a_manifest_whose_digest_was_edited_is_refused(db, certified, tmp_path):
-    artifact = copied(certified, tmp_path)
-    manifest = artifact.manifest
+    copy = copied(certified, tmp_path)
+    manifest = copy.manifest
     manifest["artifact_sha256"] = "0" * 64
-    (artifact.directory / certify.MANIFEST).write_text(json.dumps(manifest))
-    with pytest.raises(certify.CertificationError, match="digest does not match"):
-        certify.import_artifact(db.connect(RESEARCH), artifact.directory)
+    (copy.directory / artifact.MANIFEST).write_text(json.dumps(manifest))
+    with pytest.raises(artifact.CertificationError, match="digest does not match"):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
     del manifest["dsr"]
-    (artifact.directory / certify.MANIFEST).write_text(json.dumps(manifest))
-    with pytest.raises(certify.CertificationError, match="lacks dsr"):
-        certify.import_artifact(db.connect(RESEARCH), artifact.directory)
-    with pytest.raises(certify.CertificationError, match="holds no manifest.json"):
-        certify.import_artifact(db.connect(RESEARCH), tmp_path)
+    (copy.directory / artifact.MANIFEST).write_text(json.dumps(manifest))
+    with pytest.raises(artifact.CertificationError, match="lacks dsr"):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
+    with pytest.raises(artifact.CertificationError, match="holds no manifest.json"):
+        artifact.import_artifact(db.connect(RESEARCH), tmp_path)
     assert db.connect(RESEARCH).execute(
         "SELECT count(*) FROM agb.model_certification"
     ).fetchone() == (0,)
@@ -454,7 +479,7 @@ def test_the_cli_certifies_and_imports(
     out = capsys.readouterr().out
     assert f"certification PASSED: {STAGE_1}; artifact " in out
     directory = research_dir / "certifications" / "cli-ranker"
-    assert (directory / certify.MANIFEST).exists()
+    assert (directory / artifact.MANIFEST).exists()
     assert json.loads(out.split("\n", 2)[2])["model_id"] == "cli-ranker"
     for name, value in db.pg_env(RESEARCH).items():
         monkeypatch.setenv(name, value)

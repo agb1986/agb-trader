@@ -12,8 +12,13 @@
     reproduce    rerun a trial from its row and compare the results
 
 `sync` needs nothing but the standard library, so it runs on the host outside the image.
-`import` runs on the host too, with the `research` role's PG* environment, since the research
-container has no network: it is the profile's one write to the server's database."""
+
+`import` is the profile's one write to the server's database, and the server's Postgres is
+reachable only from the `core` Compose network, so it runs on the server as
+`./agb-stack import <model id>`, which is the same code: `agb import-certification` and this
+command both call `agb.research.artifact.import_artifact`. Running it here needs a reachable
+database and the `research` role's PG* environment, which the workstation has for its own
+database only."""
 
 import argparse
 import json
@@ -194,12 +199,12 @@ def _run(args):
 def _import(directory: Path) -> None:
     import psycopg
 
-    from agb.research import certify
+    from agb.research import artifact
 
     try:
         with psycopg.connect() as conn:
-            row_id = certify.import_artifact(conn, directory)
-    except certify.CertificationError as error:
+            row_id = artifact.import_artifact(conn, directory)
+    except artifact.CertificationError as error:
         sys.exit(f"import: {error}")
     print(f"model_certification {row_id}: {directory}")
 

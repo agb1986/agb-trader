@@ -226,6 +226,29 @@ services:
     restart: "no"
     mem_limit: 256m
 
+  # The one service that runs as `research`: recording a certification is the research
+  # profile's only write to this database, and only that role may insert into
+  # agb.model_certification. It reads the artifact from /models, where the operator has copied
+  # it, and writes nothing else. Everything else the research profile does runs on the
+  # workstation, in the `research` service below, which has no network at all.
+  certification-import:
+    <<: *app-image
+    profiles: [cli]
+    entrypoint: ["agb", "import-certification"]
+    environment:
+      <<: *pg
+      PGUSER: research
+      PGPASSWORD: ${RESEARCH_DB_PASSWORD:?set in env/db.env}
+      AGB_MODELS_DIR: /models
+    volumes:
+      - ${AGB_MODELS_DIR:-./models}:/models:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [core]
+    restart: "no"
+    mem_limit: 256m
+
   # Workstation research: `make research CMD="cpcv"`. It reads a lake `make sync-lake` has
   # pulled from the server and writes only its trial ledger and models under /research. It has
   # no network at all: the workstation never pulls from the vendor, and the rsync that fetches
