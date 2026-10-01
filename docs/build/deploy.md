@@ -194,13 +194,25 @@ job fails and no basket is proposed. `./agb-stack status` says which model is li
 A model is certified on the workstation by the research profile, which writes its artifact
 directory under `research/certifications/<model id>/`. Getting it live takes three steps:
 
-1. Import its `model_certification` row into the server's database, as the research docs
-   describe (`python -m agb.research import`).
-2. Copy the artifact directory, unchanged, to `models/<model id>/` in the deploy directory:
+1. Copy the artifact directory, unchanged, to `models/<model id>/` in the deploy directory:
 
    ```sh
    rsync -a research/certifications/<model id> <server>:/mnt/data/AppData/agb-trader/models/
    ```
+
+2. Record its certification, on the server:
+
+   ```sh
+   ./agb-stack import <model id>
+   ```
+
+   This runs on the server because the database is reachable only from the stack's own
+   network, and in its own container because only the `research` role may insert into
+   `agb.model_certification`. It verifies the artifact before it writes: a missing, altered
+   or unlisted file, a shipped ledger whose row count is not the trial count the
+   certification declared, and a model that is already certified are each refused, and
+   nothing is written. The row's `artifact_path` records where the model was certified, from
+   the manifest, not the path the import read.
 
 3. Promote it on the server:
 

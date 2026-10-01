@@ -3,6 +3,7 @@ conventions every later ticket inherits."""
 
 import json
 import os
+import re
 import shutil
 import subprocess
 
@@ -12,8 +13,10 @@ from conftest import ROOT
 
 from agb.roles import PASSWORD_VARS
 
-ONE_SHOT = {"migrate", "cli", "research"}
+ONE_SHOT = {"migrate", "cli", "certification-import", "research"}
 ENV_NAMES = {"db", "pipeline", "execution", "bot", "vpn", "research"}
+# Every service that mounts the models directory, each of them read-only.
+MODEL_READERS = {"pipeline", "cli", "certification-import"}
 
 
 @pytest.fixture(scope="module")
@@ -87,17 +90,35 @@ def test_pipeline_writes_the_lake_and_panel_store_to_host_directories_as_their_o
     assert set(pipeline["networks"]) == {"core"}
 
 
-def test_the_pipeline_and_the_cli_only_read_the_certified_models(resolved):
-    """T21: the pipeline ranks with the promoted artifact and `agb promote` verifies it, and
-    neither can change it."""
-    for name in ("pipeline", "cli"):
+def test_the_services_that_see_the_certified_models_only_read_them(resolved):
+    """T21: the pipeline ranks with the promoted artifact, `agb promote` verifies it and the
+    import records the one the operator copied in. None of the three may change it."""
+    for name in MODEL_READERS:
         service = resolved["services"][name]
         [models] = [v for v in service["volumes"] if v["target"] == "/models"]
         assert (models["type"], models.get("read_only")) == ("bind", True), name
         assert service["environment"]["AGB_MODELS_DIR"] == "/models", name
     for name, service in resolved["services"].items():
-        if name not in ("pipeline", "cli"):
+        if name not in MODEL_READERS:
             assert "/models" not in {v["target"] for v in service.get("volumes", [])}, name
+
+
+def test_the_import_is_the_one_service_that_runs_as_the_research_role(resolved):
+    """Issue #81: recording a certification is the research profile's only write to the
+    server's database, only that role may insert the row, and the database is reachable from
+    the stack's own network alone. So the import is a service of its own, on core, from the
+    app image, which carries the source without the research dependencies."""
+    services = resolved["services"]
+    importer = services["certification-import"]
+    assert importer["environment"]["PGUSER"] == "research"
+    assert [
+        name for name, s in services.items() if s.get("environment", {}).get("PGUSER") == "research"
+    ] == ["certification-import"]
+    assert importer["image"] == services["migrate"]["image"], "the app image, not the research one"
+    assert importer["entrypoint"] == ["agb", "import-certification"]
+    assert set(importer["networks"]) == {"core"}
+    assert importer["profiles"] == ["cli"], "it runs only when the operator asks for it"
+    assert "import <model id>" in (ROOT / "scripts/deploy/agb-stack").read_text()
 
 
 def test_only_the_pipeline_has_the_vendor_key(resolved):
@@ -216,7 +237,13 @@ def test_research_runs_only_on_the_workstation_with_a_read_only_lake(resolved):
     """The research profile starts only on the workstation, off the network, and its lake is a
     read-only mount of what the host-side rsync pulled."""
     assert "research" not in server_env(), "deploy.sh never ships research.env"
-    assert "research" not in (ROOT / "scripts/deploy/agb-stack").read_text()
+    # The server runs nothing of the research profile. Its one server-side piece is recording a
+    # certification, which is a service of its own in the `cli` profile, so what agb-stack may
+    # not do is enable the profile or run the `research` service, not name the role in a comment.
+    stack = (ROOT / "scripts/deploy/agb-stack").read_text()
+    profiles = re.findall(r"COMPOSE_PROFILES=(\S+)", stack)
+    assert profiles and all("research" not in value for value in profiles)
+    assert not re.search(r"(run|up|--profile)\s+(--\S+\s+)*research\b", stack)
     deploy = (ROOT / "scripts/deploy/deploy.sh").read_text()
     assert "--target app" in deploy and "--target research" not in deploy
     services = yaml.safe_load((ROOT / "compose.yaml").read_text())["services"]

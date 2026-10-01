@@ -29,7 +29,7 @@ import registry_fake
 from agb import cli, cost, gate, lake, registry, schedule, universe
 from agb.approval import Source
 from agb.rebalance import SIZE
-from agb.research import backtest, certify, cpcv, train, trials
+from agb.research import artifact, backtest, certify, cpcv, train, trials
 from agb.research.trials import Ledger
 from agb.roles import RESEARCH
 from agb.schedule import Expected, Planned
@@ -56,7 +56,7 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "agb"
 
 
 @pytest.fixture(scope="module")
-def artifact(research_panel, research_lake, tmp_path_factory) -> certify.Certification:
+def certified(research_panel, research_lake, tmp_path_factory) -> certify.Certification:
     research_dir = tmp_path_factory.mktemp("research")
     ledger = Ledger(research_dir / trials.FILE)
     for signal in PRIORS:
@@ -75,17 +75,17 @@ def artifact(research_panel, research_lake, tmp_path_factory) -> certify.Certifi
 
 
 @pytest.fixture
-def models(artifact, tmp_path) -> Path:
+def models(certified, tmp_path) -> Path:
     """A models directory holding a copy of the artifact, as on the server."""
     directory = tmp_path / "models"
-    shutil.copytree(artifact.directory, directory / MODEL_ID)
+    shutil.copytree(certified.directory, directory / MODEL_ID)
     return directory
 
 
 @pytest.fixture
-def certification_id(db, artifact) -> int:
+def certification_id(db, certified) -> int:
     """The artifact's row, imported as the research profile imports it."""
-    return certify.import_artifact(db.connect(RESEARCH), artifact.directory)
+    return artifact.import_artifact(db.connect(RESEARCH), certified.directory)
 
 
 def source(verb: str, actor: str = "operator") -> Source:
@@ -133,10 +133,10 @@ def rebalance(db, lake_dir: Path, models: Path, **kwargs) -> None:
     Pipeline(lake_dir, "", models_dir=models, **kwargs)(db.connect("pipeline"))
 
 
-def test_the_registry_reads_the_layout_certify_writes():
+def test_the_registry_reads_the_layout_the_research_profile_writes():
     assert (registry.MANIFEST, registry.MODEL, registry.LEDGER) == (
-        certify.MANIFEST,
-        certify.MODEL,
+        artifact.MANIFEST,
+        artifact.MODEL,
         trials.FILE,
     )
 
@@ -145,9 +145,9 @@ def test_the_registry_reads_the_layout_certify_writes():
 
 
 def test_promote_makes_the_certification_live_and_records_the_promotion(
-    db, models, certification_id, artifact
+    db, models, certification_id, certified
 ):
-    digest = artifact.manifest["artifact_sha256"]
+    digest = certified.manifest["artifact_sha256"]
 
     message = promote(db, models)
 
@@ -174,7 +174,7 @@ def test_promote_makes_the_certification_live_and_records_the_promotion(
     ) == [(certification_id, MODEL_ID, digest, False, "operator")]
 
 
-def test_the_promoted_model_loads_as_the_certified_booster(db, models, certification_id, artifact):
+def test_the_promoted_model_loads_as_the_certified_booster(db, models, certification_id, certified):
     promote(db, models)
 
     ranker = registry.load_promoted(db.connect("pipeline"), models)
@@ -182,7 +182,7 @@ def test_the_promoted_model_loads_as_the_certified_booster(db, models, certifica
     assert (ranker.certification_id, ranker.name, ranker.artifact_sha256) == (
         certification_id,
         MODEL_ID,
-        artifact.manifest["artifact_sha256"],
+        certified.manifest["artifact_sha256"],
     )
     assert ranker.features == tuple(MODEL.features)
     assert ranker.booster.feature_name() == list(MODEL.features)
@@ -409,6 +409,41 @@ def test_promotion_voids_stale_certifications_first(db, models, certification_id
     ]
 
 
+def test_the_cli_records_the_certification_the_operator_copied_in(db, models, monkeypatch, capsys):
+    """Issue #81: on the server the row is inserted by `agb import-certification <model id>`,
+    which reads the artifact from the models directory. It runs as `research`, the one role
+    granted the insert, which is why it is a Compose service of its own."""
+    for key, value in db.pg_env(RESEARCH).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv(registry.MODELS_ENV, str(models))
+
+    assert cli.main(["import-certification", MODEL_ID]) == 0
+    assert capsys.readouterr().out == f"model_certification 1: {models / MODEL_ID}\n"
+    assert rows(db, "SELECT model_id, actor FROM agb.model_certification") == [(MODEL_ID, RESEARCH)]
+
+    # A certification is never replaced, so a second run of the same command refuses.
+    assert cli.main(["import-certification", MODEL_ID]) == 1
+    assert "is already certified" in capsys.readouterr().err
+    assert len(rows(db, "SELECT id FROM agb.model_certification")) == 1
+
+    # And the promotion the import unblocks, which is the ordinary `cli` service again.
+    for key, value in db.pg_env("cli").items():
+        monkeypatch.setenv(key, value)
+    assert cli.main(["promote", MODEL_ID, "--actor", "alice"]) == 0
+
+
+def test_the_cli_role_cannot_record_a_certification(db, models, monkeypatch, capsys):
+    """The ordinary `cli` service runs as `cli`, which holds no insert on the table. The error
+    names the role the operator needs rather than leaving a privilege message to read."""
+    for key, value in db.pg_env("cli").items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv(registry.MODELS_ENV, str(models))
+
+    assert cli.main(["import-certification", MODEL_ID]) == 1
+    assert "use PGUSER=research" in capsys.readouterr().err
+    assert rows(db, "SELECT id FROM agb.model_certification") == []
+
+
 def test_the_cli_promotes_voids_and_voids_the_stale(
     db, models, certification_id, monkeypatch, capsys
 ):
@@ -447,7 +482,7 @@ def test_the_cli_promotes_voids_and_voids_the_stale(
 
 
 def test_a_paper_rebalance_runs_end_to_end_on_the_promoted_model(
-    db, research_lake, models, certification_id, artifact
+    db, research_lake, models, certification_id, certified
 ):
     plan_rebalance(db)
     promote(db, models)
@@ -462,7 +497,7 @@ def test_a_paper_rebalance_runs_end_to_end_on_the_promoted_model(
     assert (ranker, certification, digest, snapshot) == (
         MODEL_ID,
         certification_id,
-        artifact.manifest["artifact_sha256"],
+        certified.manifest["artifact_sha256"],
         SIGNAL,
     )
     failed = rows(db, "SELECT name, measured, threshold FROM agb.gate_check WHERE NOT passed")
@@ -547,7 +582,7 @@ def test_the_pipeline_refuses_a_promoted_model_certified_under_an_old_cost_model
 
 
 def test_the_gate_halts_a_basket_ranked_by_anything_but_the_promoted_artifact(
-    db, research_lake, models, certification_id, artifact
+    db, research_lake, models, certification_id, certified
 ):
     plan_rebalance(db)
     promote(db, models)
@@ -557,7 +592,7 @@ def test_the_gate_halts_a_basket_ranked_by_anything_but_the_promoted_artifact(
 
     rebalance(db, research_lake, models, ranker=impostor)
 
-    digest = artifact.manifest["artifact_sha256"]
+    digest = certified.manifest["artifact_sha256"]
     assert rows(db, "SELECT name, measured, threshold FROM agb.gate_check WHERE NOT passed") == [
         ("model", f"{MODEL_ID} {'ef' * 6}", f"{MODEL_ID} {digest[:12]}")
     ]

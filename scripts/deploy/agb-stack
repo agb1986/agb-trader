@@ -8,7 +8,8 @@
 #   lake/              the Parquet lake the pipeline lands the vendor's data in
 #   panel/             the panel store: filing texts, prompts and responses by sha256
 #   models/<model id>/ certified model artifacts, copied from the workstation;
-#                      `agb-stack agb promote <model id>` makes one live
+#                      `agb-stack import <model id>` records the certification and
+#                      `agb-stack agb promote <model id>` makes the model live
 #   releases/<tag>/    compose.yaml and agb-stack as of commit <tag>
 #   current, previous  links to the release running now and to the one it replaced
 #   agb-stack          link to current/agb-stack
@@ -23,6 +24,7 @@ usage: agb-stack <command>
 
   status                          each service's last heartbeat
   agb <args...>                   run an agb CLI command
+  import <model id>               record the certification of the artifact in models/<model id>
   tags                            the current and previous release
   activate <tag>                  run the stack on release <tag>; the running one becomes previous
   rollback                        activate the previous release
@@ -192,6 +194,11 @@ restore)
     restore "$@"
     ;;
 status) compose run --rm cli status ;;
+import)
+    [ $# -eq 2 ] || die "usage: agb-stack import <model id>"
+    # Its own service: only the `research` role may insert a certification.
+    compose run --rm certification-import "$2"
+    ;;
 agb)
     shift
     compose run --rm cli "$@"
