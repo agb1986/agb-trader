@@ -119,8 +119,9 @@ services:
   # gluetun's firewall drops anything else. It is not on core and publishes nothing.
   #
   # vpn and bot are in the `telegram` profile. The server's agb-stack enables it; `make up`
-  # leaves both out unless COMPOSE_PROFILES=telegram, because only one process may poll a
-  # bot token, and the workstation has no VPN key.
+  # leaves both out unless COMPOSE_PROFILES=telegram, because only one process may poll a bot
+  # token at a time, and the server's bot is the one that should hold it. The workstation can
+  # run the profile for a live check, with the server's bot stopped first.
   vpn:
     image: qmcgaw/gluetun:v3
     profiles: [telegram]
