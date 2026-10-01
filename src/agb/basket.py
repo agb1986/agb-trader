@@ -5,11 +5,12 @@ Given a claimed `rebalance` job, `propose` builds the universe as of the signal 
 last session before the job's trade session), asks the ranker for its stage-1 ranking, applies
 agb.rebalance to the current book, prices the orders and freezes each one's modelled cost
 under the current cost model, and writes the lot in one transaction: the basket with its
-provenance (snapshot date, lake partition hash, universe size, ranker identity), every rank,
-the twenty targets, the order plan and the basket's first event, `proposed`. The basket's
-reference is the job's period, so October 2026's basket is `2026-10`. The proposal also
-carries the universe and each name's mark, which the pre-trade gate (agb.gate) checks the
-basket against before it can move on.
+provenance (snapshot date, lake partition hash, universe size, ranker identity, and the
+certification and artifact digest the ranker was loaded from), every rank, the twenty
+targets, the order plan and the basket's first event, `proposed`. The basket's reference is
+the job's period, so October 2026's basket is `2026-10`. The proposal also carries the
+universe and each name's mark, which the pre-trade gate (agb.gate) checks the basket against
+before it can move on.
 
 Proposing is safe to redo. A job whose lease expired mid-proposal is reclaimed and proposed
 again; the second attempt finds the reference taken, writes nothing and completes the job with
@@ -81,8 +82,9 @@ _BARS_FOR = """
 _INSERT_BASKET = """
     INSERT INTO agb.basket
         (reference, period, job_id, session_date, signal_date, snapshot_date, partition_hash,
-         universe_size, ranker, cost_model_version, capital_usd, actor)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         universe_size, ranker, model_certification_id, model_sha256, cost_model_version,
+         capital_usd, actor)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (reference) DO NOTHING
     RETURNING id
 """
@@ -119,9 +121,11 @@ _BOOK = """
 _INSERT_RERUN = """
     INSERT INTO agb.basket
         (reference, period, deviation_of, job_id, session_date, signal_date, snapshot_date,
-         partition_hash, universe_size, ranker, cost_model_version, capital_usd, actor)
+         partition_hash, universe_size, ranker, model_certification_id, model_sha256,
+         cost_model_version, capital_usd, actor)
     SELECT %(reference)s, period, id, NULL, %(session)s, signal_date, snapshot_date,
-           partition_hash, universe_size, ranker, cost_model_version, capital_usd, %(actor)s
+           partition_hash, universe_size, ranker, model_certification_id, model_sha256,
+           cost_model_version, capital_usd, %(actor)s
     FROM agb.basket WHERE id = %(original)s
     ON CONFLICT (reference) DO NOTHING
     RETURNING id
@@ -256,6 +260,8 @@ def propose(
                 snapshot.partition_hash,
                 snapshot.size,
                 ranker.name,
+                ranker.certification_id,
+                ranker.artifact_sha256,
                 cost.CURRENT.version,
                 capital,
                 PIPELINE,

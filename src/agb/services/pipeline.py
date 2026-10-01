@@ -5,12 +5,13 @@
     the job, which fulfils the pull's expected event. A pull that fails, or never runs, leaves
     that event unfulfilled, so it shows in the overdue view like any other missed work.
   * `rebalance`: proposes the month's basket (agb.basket) from the universe as of the signal
-    session, ranked by the ranker the service was built with, runs the pre-trade gate on it
-    (agb.gate), and completes the job, which fulfils the proposal's expected event. The gate
-    halts a basket that fails any check and opens the halt latch; in paper mode it approves
-    one that passes, and in live mode (or in paper mode set to ask) leaves it for the human.
-    The ranker is the placeholder until the classical model is certified; swapping it is a
-    change to `from_env` alone.
+    session, ranked by the promoted certification's model (agb.registry, loaded from
+    AGB_MODELS_DIR and checked against its certified digest on every rebalance), runs the
+    pre-trade gate on it (agb.gate), and completes the job, which fulfils the proposal's
+    expected event. The gate halts a basket that fails any check and opens the halt latch; in
+    paper mode it approves one that passes, and in live mode (or in paper mode set to ask)
+    leaves it for the human. With no model promoted, or the promoted one voided or altered,
+    the job fails and no basket is proposed.
 
 Before taking a job it builds any rerun the operator asked for (`agb rerun`, agb.approval):
 a copy of the missed basket under its new reference, for the next session, gated like any
@@ -40,13 +41,13 @@ import duckdb
 import psycopg
 import pyarrow as pa
 
-from agb import basket, gate, jobs, lake, nyse, schedule
+from agb import basket, gate, jobs, lake, nyse, registry, schedule
 from agb.basket import BasketError, NotReady
 from agb.gate import GateError
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.lake import LakeError, NotYet, Partition, Sharadar
-from agb.placeholder_ranker import PlaceholderMomentum
 from agb.ranker import Ranker
+from agb.registry import RegistryError
 from agb.roles import PIPELINE
 from agb.universe import UniverseError
 
@@ -95,8 +96,10 @@ def capital_from_env() -> Decimal:
 
 
 class Pipeline:
-    """One pipeline cycle, run by `serve`. The URL opener, the ranker, the capital, the gate's
-    limits and the clock the gate reads are injectable for tests."""
+    """One pipeline cycle, run by `serve`. The URL opener, the capital, the gate's limits and
+    the clock the gate reads are injectable for tests. A ranker given here is used instead of
+    the promoted model, for tests only; otherwise each rebalance loads the promoted model
+    from `models_dir`."""
 
     def __init__(
         self,
@@ -105,6 +108,7 @@ class Pipeline:
         *,
         opener: lake.Opener = lake.urlopen,
         ranker: Ranker | None = None,
+        models_dir: Path = registry.DEFAULT_MODELS_DIR,
         capital: Decimal = basket.DEFAULT_CAPITAL,
         lease: timedelta = LEASE,
         retry: timedelta = RETRY,
@@ -114,7 +118,8 @@ class Pipeline:
         self.lake_dir = lake_dir
         self.api_key = api_key
         self.opener = opener
-        self.ranker = ranker if ranker is not None else PlaceholderMomentum()
+        self.ranker = ranker
+        self.models_dir = models_dir
         self.capital = capital
         self.lease = lease
         self.retry = retry
@@ -126,6 +131,7 @@ class Pipeline:
         return cls(
             Path(os.environ.get("AGB_LAKE_DIR", lake.DEFAULT_DIR)),
             os.environ.get("SHARADAR_API_KEY", ""),
+            models_dir=Path(os.environ.get(registry.MODELS_ENV, registry.DEFAULT_MODELS_DIR)),
             capital=capital_from_env(),
         )
 
@@ -151,7 +157,8 @@ class Pipeline:
 
     def rebalance(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
         try:
-            proposal = basket.propose(conn, claim, self.lake_dir, self.ranker, capital=self.capital)
+            ranker = self.ranker or registry.load_promoted(conn, self.models_dir)
+            proposal = basket.propose(conn, claim, self.lake_dir, ranker, capital=self.capital)
             verdict = gate.run(
                 conn,
                 proposal.basket_id,
@@ -167,6 +174,7 @@ class Pipeline:
         except (
             BasketError,
             GateError,
+            RegistryError,
             UniverseError,
             LakeError,
             OSError,

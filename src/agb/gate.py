@@ -6,7 +6,8 @@ The gate runs every check that does not need the broker, in three groups:
 
   * **Provenance.** The universe's snapshot is the month-end before the basket's period, the
     universe's size is inside the band agb.universe expects, and the ranks came from the
-    model the pipeline is meant to run.
+    promoted model: the basket's artifact digest is the live certification's, and that
+    certification has not been voided (agb.registry).
   * **The basket.** Twenty positions whose weights sum to one, no symbol twice, cash left
     over after the targets are bought, and turnover below 60% of the book.
   * **Each order.** Its symbol is in the universe, its side agrees with the book (a buy opens
@@ -31,14 +32,13 @@ a rebalance job reclaimed after the gate ran reads the recorded verdict back.
 
 from collections import Counter
 from collections.abc import Collection, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import psycopg
 
 from agb import basket, jobs, nyse, rebalance, schedule, universe
-from agb.placeholder_ranker import PlaceholderMomentum
 from agb.roles import PIPELINE
 
 SYSTEM = "system"
@@ -53,12 +53,10 @@ class GateError(Exception):
 
 @dataclass(frozen=True)
 class Limits:
-    """The gate's thresholds. `model` is the placeholder ranker's identity until the model
-    registry records a promoted certification."""
+    """The gate's thresholds."""
 
     universe_min: int = universe.MIN_SIZE
     universe_max: int = universe.MAX_SIZE
-    model: str = field(default_factory=lambda: PlaceholderMomentum().name)
     positions: int = rebalance.SIZE
     weight_tolerance: Decimal = Decimal("0.0001")
     turnover: Decimal = Decimal("0.60")
@@ -94,9 +92,20 @@ class Basket:
     snapshot_date: date
     universe_size: int
     ranker: str
+    model_sha256: str | None  # the artifact the ranker was loaded from; None before the registry
     capital: Decimal
     targets: tuple[Target, ...]
     orders: tuple[Order, ...]
+
+
+@dataclass(frozen=True)
+class Promoted:
+    """The live model, as `agb.promoted_model` has it."""
+
+    certification_id: int
+    model_id: str
+    artifact_sha256: str
+    voided: bool
 
 
 @dataclass(frozen=True)
@@ -135,19 +144,20 @@ def evaluate(
     marks: Mapping[str, Decimal],
     book: Mapping[str, Decimal],
     now: datetime,
+    promoted: Promoted | None,
     limits: Limits = LIMITS,
     calendar: nyse.NyseCalendar | None = None,
 ) -> list[Check]:
     """Every check on `target`, in order: provenance, the basket, then each order.
 
     `members` is the universe the basket was ranked from, `marks` each name's last as-traded
-    close on or before the signal session, `book` the positions before the rebalance and
-    `now` the moment the gate runs."""
+    close on or before the signal session, `book` the positions before the rebalance, `now`
+    the moment the gate runs and `promoted` the live model, None if nothing is promoted."""
     year, month = (int(part) for part in target.period.split("-"))
     first = date(year, month, 1)
     calendar = calendar or nyse.NyseCalendar(first - timedelta(days=40), target.session_date)
     return [
-        *_provenance(target, limits, calendar, first),
+        *_provenance(target, promoted, limits, calendar, first),
         *_basket(target, marks, book, limits),
         *(
             check
@@ -158,7 +168,11 @@ def evaluate(
 
 
 def _provenance(
-    target: Basket, limits: Limits, calendar: nyse.NyseCalendar, first: date
+    target: Basket,
+    promoted: Promoted | None,
+    limits: Limits,
+    calendar: nyse.NyseCalendar,
+    first: date,
 ) -> list[Check]:
     before = first - timedelta(days=1)
     month_end = calendar.last_session_of_month(before.year, before.month)
@@ -180,10 +194,22 @@ def _provenance(
             f"{limits.universe_min} to {limits.universe_max}",
             limits.universe_min <= size <= limits.universe_max,
         ),
-        Check(
-            PROVENANCE, "model", None, target.ranker, limits.model, target.ranker == limits.model
-        ),
+        _model(target, promoted),
     ]
+
+
+def _model(target: Basket, promoted: Promoted | None) -> Check:
+    """The basket was ranked by the live model: its artifact digest is the promoted
+    certification's, and that certification has not been voided since."""
+    digest = target.model_sha256
+    measured = f"{target.ranker} {digest[:12]}" if digest else f"{target.ranker}, uncertified"
+    if promoted is None:
+        return Check(PROVENANCE, "model", None, measured, "a promoted model", False)
+    threshold = f"{promoted.model_id} {promoted.artifact_sha256[:12]}"
+    if promoted.voided:
+        threshold += ", which has been voided"
+    passed = not promoted.voided and digest == promoted.artifact_sha256
+    return Check(PROVENANCE, "model", None, measured, threshold, passed)
 
 
 def _basket(
@@ -320,9 +346,11 @@ def _eastern(at: datetime) -> str:
 
 
 _BASKET = """
-    SELECT id, period, session_date, snapshot_date, universe_size, ranker, capital_usd
+    SELECT id, period, session_date, snapshot_date, universe_size, ranker, model_sha256,
+           capital_usd
     FROM agb.basket WHERE id = %s
 """
+_PROMOTED = "SELECT certification_id, model_id, artifact_sha256, voided FROM agb.promoted_model"
 _TARGETS = "SELECT symbol, weight, shares FROM agb.basket_target WHERE basket_id = %s ORDER BY id"
 _ORDERS = """
     SELECT symbol, side, qty, tif, notional_usd FROM agb.basket_order
@@ -390,12 +418,14 @@ def run(
         seq = current[1] + 1
 
         target = load(conn, basket_id)
+        live = conn.execute(_PROMOTED).fetchone()
         checks = evaluate(
             target,
             members=members,
             marks=marks,
             book=basket.book(conn),
             now=now,
+            promoted=Promoted(*live) if live is not None else None,
             limits=limits,
             calendar=calendar,
         )

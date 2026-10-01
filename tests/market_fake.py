@@ -1,7 +1,7 @@
 """A lake built a name at a time, over real NYSE sessions, with every column the universe, the
-placeholder ranker and the cost model read. Prices follow a per-name growth rate, so a test
-chooses a name's rank by choosing its growth, and every name's last close is its `price`, so
-order sizes are easy to predict."""
+tests' stand-in ranker (tests/registry_fake.py) and the cost model read. Prices follow a
+per-name growth rate, so a test chooses a name's rank by choosing its growth, and every name's
+last close is its `price`, so order sizes are easy to predict."""
 
 from datetime import date, timedelta
 

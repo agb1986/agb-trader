@@ -3,22 +3,28 @@ it alone, then the gate in the database. Each check is recorded with what it mea
 failure halts the basket and opens the halt latch's `gate_breach` until a human clears it, the
 gated basket and its result are frozen, the mode starts in paper, and only a basket that passed
 every check in paper mode is approved, by the system. tests/test_basket.py runs the gate from
-the pipeline end to end."""
+the pipeline end to end, and tests/test_registry.py on a basket ranked by a real promoted
+model."""
 
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
+import registry_fake
 from market_fake import PERIOD, SIGNAL, TRADE
 from psycopg import errors
+from registry_fake import ARTIFACT
 
 from agb import gate
 from agb.gate import GateError
 
 NAMES = [f"N{i:02d}" for i in range(1, 21)]
 HELD = [f"H{i:02d}" for i in range(1, 11)]
-MODEL = gate.LIMITS.model
+MODEL = registry_fake.MODEL_ID
+# The live model, as agb.promoted_model has it, and the same model voided.
+PROMOTED = gate.Promoted(1, MODEL, ARTIFACT, False)
+VOIDED = replace(PROMOTED, voided=True)
 ZERO_HASH = "0" * 64
 # The evening of the signal session, well before the trade session's MOC cutoff.
 EVENING = datetime(2026, 9, 30, 22, 0, tzinfo=UTC)
@@ -46,6 +52,7 @@ BASE = gate.Basket(
     snapshot_date=SIGNAL,
     universe_size=2000,
     ranker=MODEL,
+    model_sha256=ARTIFACT,
     capital=Decimal(100000),
     targets=targets(NAMES),
     orders=tuple(buy(s) for s in NAMES),
@@ -63,6 +70,7 @@ class Case:
     marks: dict[str, Decimal] = field(default_factory=lambda: dict(MARKS))
     book: dict[str, Decimal] = field(default_factory=dict)
     now: datetime = EVENING
+    promoted: gate.Promoted | None = PROMOTED
 
 
 SOUND = Case()
@@ -70,7 +78,12 @@ SOUND = Case()
 
 def evaluate(case=SOUND):
     return gate.evaluate(
-        case.target, members=case.members, marks=case.marks, book=case.book, now=case.now
+        case.target,
+        members=case.members,
+        marks=case.marks,
+        book=case.book,
+        now=case.now,
+        promoted=case.promoted,
     )
 
 
@@ -91,7 +104,10 @@ FAILURES = [
                  id="snapshot_date"),
     pytest.param(Case(replace(BASE, universe_size=1499)), "universe_size", id="universe_small"),
     pytest.param(Case(replace(BASE, universe_size=3501)), "universe_size", id="universe_large"),
-    pytest.param(Case(replace(BASE, ranker="another-model")), "model", id="model"),
+    pytest.param(Case(replace(BASE, model_sha256="cd" * 32)), "model", id="model_hash"),
+    pytest.param(Case(replace(BASE, model_sha256=None)), "model", id="model_uncertified"),
+    pytest.param(Case(promoted=None), "model", id="model_unpromoted"),
+    pytest.param(Case(promoted=VOIDED), "model", id="model_voided"),
     pytest.param(
         Case(replace(BASE, targets=targets(NAMES[:19], Decimal(1) / 19),
                      orders=tuple(buy(s) for s in NAMES[:19]))),
@@ -132,7 +148,7 @@ def test_a_sound_basket_passes_every_check_and_each_says_what_it_measured():
     assert [(c.level, c.name, c.symbol, c.measured, c.threshold) for c in checks[:8]] == [
         ("provenance", "snapshot_date", None, "2026-09-30", "2026-09-30"),
         ("provenance", "universe_size", None, "2000", "1500 to 3500"),
-        ("provenance", "model", None, MODEL, MODEL),
+        ("provenance", "model", None, f"{MODEL} {ARTIFACT[:12]}", f"{MODEL} {ARTIFACT[:12]}"),
         ("basket", "positions", None, "20", "20"),
         ("basket", "weight_sum", None, "1.00", "1 within 0.0001"),
         ("basket", "duplicates", None, "none", "none"),
@@ -206,14 +222,17 @@ def rows(db, query, *params):
 
 
 def insert(db, target=BASE, reference=None, proposed=True):
-    """Write `target` as the pipeline does, and propose it unless told otherwise."""
+    """Write `target` as the pipeline does, and propose it unless told otherwise. A basket with
+    a model digest names the stand-in model's certification, which this records."""
+    certification_id = registry_fake.certify(db) if target.model_sha256 else None
     conn = db.connect("pipeline")
     reference = reference or target.period
     with conn.transaction():
         [(basket_id,)] = conn.execute(
             "INSERT INTO agb.basket (reference, period, session_date, signal_date, snapshot_date,"
-            " partition_hash, universe_size, ranker, cost_model_version, capital_usd, actor)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '1', %s, 'pipeline') RETURNING id",
+            " partition_hash, universe_size, ranker, model_certification_id, model_sha256,"
+            " cost_model_version, capital_usd, actor)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, '1', %s, 'pipeline') RETURNING id",
             (
                 reference,
                 target.period,
@@ -223,6 +242,8 @@ def insert(db, target=BASE, reference=None, proposed=True):
                 ZERO_HASH,
                 target.universe_size,
                 target.ranker,
+                certification_id,
+                target.model_sha256,
                 target.capital,
             ),
         ).fetchall()
@@ -279,6 +300,11 @@ def hold(db, positions):
 
 
 def run(db, basket_id, case=SOUND):
+    """Gate the basket, with the stand-in model promoted (and voided) as `case` says."""
+    if case.promoted is not None:
+        registry_fake.promote(db)
+        if case.promoted.voided:
+            registry_fake.void(db)
     return gate.run(
         db.connect("pipeline"), basket_id, members=case.members, marks=case.marks, now=case.now
     )

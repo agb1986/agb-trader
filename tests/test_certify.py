@@ -155,13 +155,13 @@ def test_a_passing_run_leaves_the_artifact_directory(certified, prior):
     assert certified.passed
     assert certified.directory == ledger.path.parent / "certifications" / OPTIONS.model_id
     assert sorted(p.name for p in certified.directory.iterdir()) == [
-        "manifest.json", "paths.json", "report.md", "trials.parquet",
+        "manifest.json", "model.txt", "paths.json", "report.md", "trials.parquet",
     ]  # fmt: skip
     manifest = certified.manifest
     assert json.loads((certified.directory / certify.MANIFEST).read_text()) == manifest
     assert manifest["files"] == {
         name: certify._sha256(certified.directory / name)
-        for name in ("paths.json", "report.md", "trials.parquet")
+        for name in ("model.txt", "paths.json", "report.md", "trials.parquet")
     }
     assert manifest["artifact_sha256"] == certify.artifact_sha256(manifest["files"])
     assert manifest["ledger_sha256"] == manifest["files"]["trials.parquet"]

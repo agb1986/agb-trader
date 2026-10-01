@@ -1,10 +1,11 @@
 """The interface between a ranking model and the rebalance.
 
 The pipeline asks a `Ranker` for the universe's stage-1 ranking and hands the result to
-agb.rebalance. The certified classical model, the placeholder before it and any research
-model all implement this one protocol, so swapping the model is a change to which class the
-pipeline constructs and nothing else. A ranker names itself, and the basket records that name
-as its ranker identity.
+agb.rebalance. The pipeline's ranker is the promoted certification's model
+(agb.registry.CertifiedRanker); the tests' fakes implement the same protocol. A ranker names
+itself and the certification it was loaded from, with that certification's artifact digest,
+and the basket records all three, which the pre-trade gate checks against the live
+certification.
 
 This module imports only the standard library. The protocol's arguments are typed against
 the universe and the lake for the reader; nothing here imports them at runtime.
@@ -34,9 +35,12 @@ class Ranked:
 
 class Ranker(Protocol):
     """A stage-1 ranking model. `name` identifies the model and its version; a change to
-    either is a new name."""
+    either is a new name. `certification_id` is its `model_certification` row and
+    `artifact_sha256` the digest of the artifact it was loaded from, as verified."""
 
     name: str
+    certification_id: int
+    artifact_sha256: str
 
     def rank(self, universe: Universe, lake: duckdb.DuckDBPyConnection) -> list[Ranked]:
         """Every member of `universe`, best first, from data on or before its snapshot date."""

@@ -8,6 +8,8 @@ env/*.env
 /lake/
 # The panel store from `make up`'s pipeline service.
 /panel/
+# The certified model artifacts the pipeline ranks with.
+/models/
 # The research profile's trial ledger and models.
 /research/
 

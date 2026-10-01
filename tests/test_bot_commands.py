@@ -124,8 +124,12 @@ def test_each_command_answers_from_the_database_after_a_paper_rebalance(db, pape
     assert blocks(status)[2] == "  20 positions held\n    worth $96,000.00, snapshot 2026-10-01"
     assert re.fullmatch(
         rf"  rebalance {PERIOD} filled\n    since {ET}, by execution;"
-        r" model placeholder-momentum-252-21",
+        r" model momentum-fake",
         blocks(status)[3],
+    )
+    assert re.fullmatch(
+        rf"  model momentum-fake live\n    certification \d+, promoted {ET} by operator",
+        blocks(status)[4],
     )
 
     assert blocks(positions)[0] == "POSITIONS — 20 held, $96,000.00, snapshot 2026-10-01"
@@ -142,7 +146,7 @@ def test_each_command_answers_from_the_database_after_a_paper_rebalance(db, pape
     header, *targets = blocks(basket)
     assert re.fullmatch(
         rf"BASKET {PERIOD} — FILLED · 20 names · \$100,000.00\n"
-        rf"filled {ET} by execution; model placeholder-momentum-252-21",
+        rf"filled {ET} by execution; model momentum-fake",
         header,
     )
     assert targets[0] == "  N01  5.00%\n    240 shares · new"
@@ -212,6 +216,7 @@ def test_before_anything_has_run_each_command_says_so(db):
         "  account not yet observed\n    execution has not read the broker",
         "  no positions snapshot yet\n    execution snapshots after each close",
         "  no rebalance yet\n    no live basket has been proposed",
+        "  no model promoted\n    rebalances fail until `agb promote` runs",
         "  no rebalance scheduled\n    the scheduler has none due",
     ]
 

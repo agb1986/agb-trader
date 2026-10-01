@@ -80,11 +80,24 @@ def test_pipeline_writes_the_lake_and_panel_store_to_host_directories_as_their_o
     pipeline = resolved["services"]["pipeline"]
     assert pipeline.get("user"), "the lake must belong to the host user that owns the directory"
     volumes = {volume["target"]: volume["type"] for volume in pipeline["volumes"]}
-    assert volumes == {"/lake": "bind", "/panel": "bind"}
+    assert volumes == {"/lake": "bind", "/panel": "bind", "/models": "bind"}
     assert pipeline["environment"]["AGB_LAKE_DIR"] == "/lake"
     assert pipeline["environment"]["AGB_PANEL_DIR"] == "/panel"
     assert pipeline["environment"]["PGUSER"] == "pipeline"
     assert set(pipeline["networks"]) == {"core"}
+
+
+def test_the_pipeline_and_the_cli_only_read_the_certified_models(resolved):
+    """T21: the pipeline ranks with the promoted artifact and `agb promote` verifies it, and
+    neither can change it."""
+    for name in ("pipeline", "cli"):
+        service = resolved["services"][name]
+        [models] = [v for v in service["volumes"] if v["target"] == "/models"]
+        assert (models["type"], models.get("read_only")) == ("bind", True), name
+        assert service["environment"]["AGB_MODELS_DIR"] == "/models", name
+    for name, service in resolved["services"].items():
+        if name not in ("pipeline", "cli"):
+            assert "/models" not in {v["target"] for v in service.get("volumes", [])}, name
 
 
 def test_only_the_pipeline_has_the_vendor_key(resolved):

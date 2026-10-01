@@ -517,9 +517,9 @@ def test_a_scan_signal_is_a_feature_or_a_supplied_score(research_panel, research
 
 
 def test_a_lake_without_the_cost_columns_is_refused(tmp_path, ledger):
-    from market_fake import Market as PlaceholderMarket
+    from market_fake import Market as ServiceMarket
 
-    root = PlaceholderMarket(tmp_path / "lake").names(3).land()
+    root = ServiceMarket(tmp_path / "lake").names(3).land()
     frame = pd.DataFrame(columns=["as_of", "ticker", "mom_12_1"])
     panel = Panel(frame=frame, partition_hash="x")
     from agb import lake as lake_module
