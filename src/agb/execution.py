@@ -67,6 +67,11 @@ SURFACE = ROLE
 SUBMIT_WINDOW = timedelta(minutes=15)
 # How long after the close the broker is given before fills and positions are read back.
 SETTLE = timedelta(minutes=5)
+# How far before the first order of a basket the fills are read. The broker's clock is not this
+# database's clock, so a fill stamped a moment before the row that caused it would be dropped for
+# good by an exact window. Re-reading a day costs nothing: a fill row is keyed by the broker's
+# execution id, so a fill already recorded is recognised and skipped.
+FILL_LOOKBACK = timedelta(days=1)
 # The gate's levels for the broker checks.
 ACCOUNT = "account"
 ORDER = "order"
@@ -675,7 +680,7 @@ def reconcile(conn: psycopg.Connection, broker: Broker, basket: Basket, now: dat
             _event(conn, order.id, "status", latest)
     (earliest,) = conn.execute(_EARLIEST_ORDER, (basket.id,)).fetchone()
     if earliest is not None:
-        ingest_fills(conn, broker, earliest)
+        ingest_fills(conn, broker, earliest - FILL_LOOKBACK)
     orders = sent(conn, basket.id)
     if not all(o.done for o in orders):
         pending = [o.symbol for o in orders if not o.done]
