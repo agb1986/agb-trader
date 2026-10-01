@@ -104,6 +104,10 @@ services:
       PGUSER: ui
       PGPASSWORD: ${UI_DB_PASSWORD:?set in env/db.env}
       AGB_HEARTBEAT_SECONDS: ${AGB_HEARTBEAT_SECONDS:-30}
+      # Every interface of this container, which is only reachable through the publication
+      # below: the host's loopback address. A loopback bind here would answer nothing, since
+      # the published port arrives on the container's own address.
+      AGB_UI_HOST: 0.0.0.0
     ports:
       - "127.0.0.1:${AGB_UI_PORT:-8080}:8080"
     depends_on:
