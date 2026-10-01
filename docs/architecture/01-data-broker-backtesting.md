@@ -39,6 +39,14 @@ NautilusTrader is the event-driven backtesting engine, chosen for execution real
 
 NautilusTrader provides no cross-sectional ranking or rebalancing abstraction. Universe ranking, the rank buffer, tie-breaks and the forced-event handling in [02 — Classical ranker](02-classical-ranker.md) are hand-rolled in the strategy layer, and that document is written concretely enough to hand-roll against. vectorbt is used for fast scans alongside; the NautilusTrader run is the validation run.
 
+**The scan and the validation run are not expected to agree on real data, and the scan is the one that is wrong on purpose.** The scan exists to be fast, so it models three frictions fewer than the engine, each of which the engine models because the live basket has it:
+
+- **Delisting exits.** The engine sells a held name at its last listed print, the forced exit [02 — Classical ranker](02-classical-ranker.md) requires. The scan carries the last price forward and sells the name at the next rebalance that drops it out of the ranking.
+- **Trims.** The engine trims a buy the account cannot fund whole, and drops one that rounds to no shares at all. vectorbt's shared cash group does neither.
+- **Whole shares.** The engine sizes whole shares at the signal session's close, as the live basket sizes them; vectorbt sizes fractional shares at the fill.
+
+On a synthetic market none of the three ever fires and the two agree exactly, which is what `tests/test_backtest.py` asserts. On the real lake they fire tens of times over a few dozen months, so what is checked there is that the divergence is only those frictions: `tests/test_backtest_live.py` reconciles the two order sets through the engine's own delisting-exit and trim counts and bounds the gap in the scale-free return statistics. Teaching the scan about delistings and trims would make it a second engine and remove the reason it exists. How large a gap can be tolerated before the scan stops being a usable filter on candidates is open, and is tracked separately.
+
 Both use the same feature definitions and the same cost function from the shared library (see [07 — Services and deployment](07-services-deployment.md)), which is what keeps the backtest and the live path from drifting.
 
 ## The transaction cost model
