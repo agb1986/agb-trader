@@ -7,7 +7,10 @@ The gate runs every check that does not need the broker, in three groups:
   * **Provenance.** The universe's snapshot is the month-end before the basket's period, the
     universe's size is inside the band agb.universe expects, and the ranks came from the
     promoted model: the basket's artifact digest is the live certification's, and that
-    certification has not been voided (agb.registry).
+    certification has not been voided (agb.registry). On a basket the panel blended
+    (agb.blend), every shortlisted name was scored, and the scores are spread: a panel that
+    scores every name alike is useless whatever each score is, because stage 2 ranks its
+    output into percentiles and a flat distribution ranks to noise.
   * **The basket.** Twenty positions whose weights sum to one, no symbol twice, cash left
     over after the targets are bought, and turnover below 60% of the book.
   * **Each order.** Its symbol is in the universe, its side agrees with the book (a buy opens
@@ -38,7 +41,7 @@ from decimal import Decimal
 
 import psycopg
 
-from agb import basket, jobs, nyse, rebalance, schedule, universe
+from agb import basket, blend, jobs, nyse, rebalance, schedule, universe
 from agb.roles import PIPELINE
 
 SYSTEM = "system"
@@ -61,6 +64,7 @@ class Limits:
     weight_tolerance: Decimal = Decimal("0.0001")
     turnover: Decimal = Decimal("0.60")
     notional: Decimal = Decimal("0.08")
+    dispersion: float = blend.DISPERSION_MIN
 
 
 LIMITS = Limits()
@@ -83,6 +87,18 @@ class Order:
 
 
 @dataclass(frozen=True)
+class Panel:
+    """The blend behind a basket, as `agb.basket_blend` records it: how many of the shortlist
+    the panel scored, and how far apart those scores are."""
+
+    run_id: int
+    w: Decimal
+    scored: int
+    shortlisted: int
+    spread: float | None  # the population standard deviation of the scores, None under two
+
+
+@dataclass(frozen=True)
 class Basket:
     """What the gate reads of a proposed basket."""
 
@@ -96,6 +112,7 @@ class Basket:
     capital: Decimal
     targets: tuple[Target, ...]
     orders: tuple[Order, ...]
+    panel: Panel | None = None  # None on a basket proposed with no panel at all
 
 
 @dataclass(frozen=True)
@@ -195,6 +212,32 @@ def _provenance(
             limits.universe_min <= size <= limits.universe_max,
         ),
         _model(target, promoted),
+        *_panel(target.panel, limits),
+    ]
+
+
+def _panel(panel: Panel | None, limits: Limits) -> list[Check]:
+    """The panel's coverage and spread. A basket no panel scored has neither check: there is
+    nothing to measure, and the stage-1 ranking is what it traded."""
+    if panel is None:
+        return []
+    return [
+        Check(
+            PROVENANCE,
+            "panel_coverage",
+            None,
+            f"{panel.scored} of {panel.shortlisted} scored",
+            f"all {panel.shortlisted}",
+            panel.scored == panel.shortlisted,
+        ),
+        Check(
+            PROVENANCE,
+            "panel_dispersion",
+            None,
+            "fewer than two names scored" if panel.spread is None else f"{panel.spread:.4f}",
+            f">= {limits.dispersion}",
+            panel.spread is not None and panel.spread >= limits.dispersion,
+        ),
     ]
 
 
@@ -350,6 +393,17 @@ _BASKET = """
            capital_usd
     FROM agb.basket WHERE id = %s
 """
+# The blend behind the basket, if a panel scored it. stddev_pop is NULL for no scored rows
+# and 0 for one, so the count decides whether there is a spread to read at all.
+_PANEL = """
+    SELECT b.panel_run_id, b.panel_w,
+           count(*) FILTER (WHERE NOT l.neutral), count(*),
+           stddev_pop(l.llm_score) FILTER (WHERE NOT l.neutral)
+    FROM agb.basket b
+    JOIN agb.basket_blend l ON l.basket_id = b.id
+    WHERE b.id = %s AND b.panel_run_id IS NOT NULL
+    GROUP BY b.panel_run_id, b.panel_w
+"""
 _PROMOTED = "SELECT certification_id, model_id, artifact_sha256, voided FROM agb.promoted_model"
 _TARGETS = "SELECT symbol, weight, shares FROM agb.basket_target WHERE basket_id = %s ORDER BY id"
 _ORDERS = """
@@ -388,7 +442,12 @@ def load(conn: psycopg.Connection, basket_id: int) -> Basket:
         raise GateError(f"basket {basket_id} does not exist")
     targets = tuple(Target(*t) for t in conn.execute(_TARGETS, (basket_id,)).fetchall())
     orders = tuple(Order(*o) for o in conn.execute(_ORDERS, (basket_id,)).fetchall())
-    return Basket(*row, targets, orders)
+    blended = conn.execute(_PANEL, (basket_id,)).fetchone()
+    panel = None
+    if blended is not None:
+        run_id, w, scored, shortlisted, spread = blended
+        panel = Panel(run_id, w, scored, shortlisted, None if scored < 2 else float(spread))
+    return Basket(*row, targets, orders, panel)
 
 
 def run(

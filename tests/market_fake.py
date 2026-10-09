@@ -15,6 +15,8 @@ SIGNAL = date(2026, 9, 30)
 TRADE = date(2026, 10, 1)
 PERIOD = "2026-10"
 COMMON = "Domestic Common Stock"
+# The sector the debate roles are told, which the panel reads from the lake.
+SECTOR = "Technology"
 SESSIONS = 90
 
 _SEP = pa.schema([
@@ -28,7 +30,8 @@ _SF1 = pa.schema([
 ])  # fmt: skip
 _TICKERS = pa.schema([
     ("table", pa.string()), ("permaticker", pa.int64()), ("ticker", pa.string()),
-    ("category", pa.string()), ("industry", pa.string()), ("siccode", pa.string()),
+    ("category", pa.string()), ("sector", pa.string()), ("industry", pa.string()),
+    ("siccode", pa.string()),
 ])  # fmt: skip
 
 
@@ -58,6 +61,7 @@ class Market:
         halted=(),
         shares=100_000_000.0,
         category=COMMON,
+        sector=SECTOR,
     ):
         """A name whose close grows by `growth` per session to end at `price`, with no print on
         any session in `halted`."""
@@ -72,7 +76,7 @@ class Market:
         self.rows["sf1"].append((ticker, "ARQ", self.sessions[0], self.end, shares, 1.0))
         self.permaticker += 1
         self.rows["tickers"].append(
-            ("stocks", self.permaticker, ticker, category, "Software", "7372")
+            ("stocks", self.permaticker, ticker, category, sector, "Software", "7372")
         )
         return self
 

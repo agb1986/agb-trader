@@ -6,7 +6,10 @@
     that event unfulfilled, so it shows in the overdue view like any other missed work.
   * `rebalance`: proposes the month's basket (agb.basket) from the universe as of the signal
     session, ranked by the promoted certification's model (agb.registry, loaded from
-    AGB_MODELS_DIR and checked against its certified digest on every rebalance), runs the
+    AGB_MODELS_DIR and checked against its certified digest on every rebalance), blended with
+    the LLM panel's safety scores when a panel configuration exists (agb.panel, agb.blend:
+    the newest `panel_config`, the EDGAR client from EDGAR_USER_AGENT, the Anthropic model
+    from ANTHROPIC_API_KEY and the store under AGB_PANEL_DIR), runs the
     pre-trade gate on it (agb.gate), and completes the job, which fulfils the proposal's
     expected event. The gate halts a basket that fails any check and opens the halt latch; in
     paper mode it approves one that passes, and in live mode (or in paper mode set to ask)
@@ -41,11 +44,25 @@ import duckdb
 import psycopg
 import pyarrow as pa
 
-from agb import basket, gate, jobs, lake, nyse, registry, schedule
+from agb import (
+    analyst,
+    basket,
+    edgar,
+    gate,
+    jobs,
+    lake,
+    nyse,
+    panel,
+    panel_store,
+    registry,
+    schedule,
+)
 from agb.basket import BasketError, NotReady
 from agb.gate import GateError
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.lake import LakeError, NotYet, Partition, Sharadar
+from agb.panel import PanelError
+from agb.panel_store import PanelStore
 from agb.ranker import Ranker
 from agb.registry import RegistryError
 from agb.roles import PIPELINE
@@ -109,6 +126,8 @@ class Pipeline:
         opener: lake.Opener = lake.urlopen,
         ranker: Ranker | None = None,
         models_dir: Path = registry.DEFAULT_MODELS_DIR,
+        panel_dir: Path = panel_store.DEFAULT_DIR,
+        runner: basket.Stage2 | None = None,
         capital: Decimal = basket.DEFAULT_CAPITAL,
         lease: timedelta = LEASE,
         retry: timedelta = RETRY,
@@ -120,6 +139,8 @@ class Pipeline:
         self.opener = opener
         self.ranker = ranker
         self.models_dir = models_dir
+        self.panel_dir = panel_dir
+        self.runner = runner
         self.capital = capital
         self.lease = lease
         self.retry = retry
@@ -132,11 +153,27 @@ class Pipeline:
             Path(os.environ.get("AGB_LAKE_DIR", lake.DEFAULT_DIR)),
             os.environ.get("SHARADAR_API_KEY", ""),
             models_dir=Path(os.environ.get(registry.MODELS_ENV, registry.DEFAULT_MODELS_DIR)),
+            panel_dir=Path(os.environ.get(panel_store.DIR_ENV, panel_store.DEFAULT_DIR)),
             capital=capital_from_env(),
         )
 
     def client(self) -> Sharadar:
         return Sharadar(self.api_key, self.opener)
+
+    def stage2(self, conn: psycopg.Connection) -> basket.Stage2 | None:
+        """The panel the month's basket is blended with: the newest `panel_config`, driven by
+        the real EDGAR client, model and store. None when no configuration has been made,
+        which leaves the rebalance stage-1 only. A configuration made for other prompts, rubric
+        or scrubber raises, so the month fails loudly rather than blending with a stale panel."""
+        if self.runner is not None:
+            return self.runner
+        config = panel.newest_config(conn)
+        if config is None:
+            return None
+        panel.check(config)
+        return panel.Runner(
+            config, edgar.Edgar.from_env(), analyst.AnthropicModel(), PanelStore(self.panel_dir)
+        )
 
     def __call__(self, conn: psycopg.Connection) -> None:
         for row in conn.execute(_RERUNS).fetchall():
@@ -158,7 +195,14 @@ class Pipeline:
     def rebalance(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
         try:
             ranker = self.ranker or registry.load_promoted(conn, self.models_dir)
-            proposal = basket.propose(conn, claim, self.lake_dir, ranker, capital=self.capital)
+            proposal = basket.propose(
+                conn,
+                claim,
+                self.lake_dir,
+                ranker,
+                capital=self.capital,
+                panel=self.stage2(conn),
+            )
             verdict = gate.run(
                 conn,
                 proposal.basket_id,
@@ -174,6 +218,7 @@ class Pipeline:
         except (
             BasketError,
             GateError,
+            PanelError,
             RegistryError,
             UniverseError,
             LakeError,
@@ -186,12 +231,13 @@ class Pipeline:
             return
         jobs.complete(conn, claim)
         log.info(
-            "rebalance %s proposed basket %d%s: %d names, %d orders",
+            "rebalance %s proposed basket %d%s: %d names, %d orders%s",
             claim.period,
             proposal.basket_id,
             " (already proposed by an earlier attempt)" if proposal.existing else "",
             proposal.names,
             proposal.orders,
+            f", shadow basket {proposal.shadow_id}" if proposal.shadow_id else "",
         )
         if verdict.failed:
             log.error(

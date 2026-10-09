@@ -23,21 +23,36 @@ reference such as `2026-10r1` whose `deviation_of` names the original, and propo
 the new session. The signal and the provenance are the original's, so the gate checks the
 same universe and marks.
 
+Stage 2 joins here when a panel configuration exists (agb.panel, agb.blend): the top N of
+the stage-1 ranking is shortlisted, the panel scores it, and the basket is selected from
+`stage1_rank_pct + w * llm_score_pct` instead of the stage-1 order alone. One
+`basket_blend` row per shortlisted name records both terms and the blend, and the basket
+names the panel run, its configuration and the weight it was blended at. A name the panel
+could not score takes the neutral half. With no panel configuration the rebalance is
+stage-1 only, as it was before.
+
+Every month also writes the shadow basket: the same shortlist blended at the weight the
+live basket does not trade, selected against the shadow's own previous book, with its own
+targets and no orders. It is a record of the counterfactual, never a position, so it has no
+reference, nothing to type at it, and the `basket_event` trigger refuses to move it on.
+
 The book is what the last filled live basket holds. Until the execution ticket lands there is
 no filled basket, so the book is empty and the first proposal buys twenty names. Execution
 replaces `book` with the broker's positions; the rules that consume it do not change.
 """
 
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Protocol
 
 import duckdb
 import psycopg
 
-from agb import cost, lake, nyse, rebalance, universe
+from agb import blend, cost, lake, nyse, rebalance, universe
 from agb.jobs import Claim
 from agb.ranker import Ranked, Ranker
 from agb.roles import PIPELINE
@@ -45,6 +60,9 @@ from agb.roles import PIPELINE
 CAPITAL_ENV = "AGB_CAPITAL_USD"
 DEFAULT_CAPITAL = Decimal("100000")
 SURFACE = "pipeline"
+# The weight the shadow basket is blended at when the live basket trades the pure stage-1
+# ranking. When the live basket trades a blend, the shadow is the stage-1 ranking instead.
+SHADOW_W = 0.2
 
 _PERIOD = re.compile(r"^\d{4}-\d{2}$")
 # The daily bars the cost model reads, plus the one day the two-day spread needs.
@@ -79,13 +97,39 @@ _BARS_FOR = """
     ORDER BY date DESC LIMIT ?
 """
 
+# Each shortlisted name's sector, which the debate roles are told. One row per ticker: the
+# tickers table carries a name's history, and the newest permaticker is the live one.
+_SECTORS = """
+    SELECT ticker, sector FROM tickers
+    WHERE "table" = 'stocks' AND list_contains(?, ticker) AND sector IS NOT NULL
+    QUALIFY row_number() OVER (PARTITION BY ticker ORDER BY permaticker DESC) = 1
+"""
+
 _INSERT_BASKET = """
     INSERT INTO agb.basket
         (reference, period, job_id, session_date, signal_date, snapshot_date, partition_hash,
          universe_size, ranker, model_certification_id, model_sha256, cost_model_version,
-         capital_usd, actor)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         capital_usd, actor, panel_config_id, panel_run_id, panel_w)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (reference) DO NOTHING
+    RETURNING id
+"""
+_INSERT_BLEND = """
+    INSERT INTO agb.basket_blend
+        (basket_id, symbol, stage1_rank, stage1_rank_pct, panel_score_id, llm_total, llm_score,
+         llm_score_pct, neutral, final_score)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+"""
+# The counterfactual: the live basket's provenance and panel run at the other weight.
+_INSERT_SHADOW = """
+    INSERT INTO agb.basket
+        (kind, period, deviation_of, job_id, session_date, signal_date, snapshot_date,
+         partition_hash, universe_size, ranker, model_certification_id, model_sha256,
+         cost_model_version, capital_usd, actor, panel_config_id, panel_run_id, panel_w)
+    SELECT 'shadow', period, id, NULL, session_date, signal_date, snapshot_date,
+           partition_hash, universe_size, ranker, model_certification_id, model_sha256,
+           cost_model_version, capital_usd, %(actor)s, panel_config_id, panel_run_id, %(w)s
+    FROM agb.basket WHERE id = %(live)s
     RETURNING id
 """
 _INSERT_RANK = (
@@ -111,6 +155,17 @@ _BOOK = """
     WHERE t.basket_id = (
         SELECT id FROM agb.basket_state
         WHERE kind = 'live' AND state = 'filled'
+        ORDER BY session_date DESC, id DESC
+        LIMIT 1
+    )
+"""
+# The shadow's own book: what the last shadow basket holds. It is never filled, because it is
+# never traded, so what it was proposed to hold is what it holds.
+_SHADOW_BOOK = """
+    SELECT t.symbol, t.shares
+    FROM agb.basket_target t
+    WHERE t.basket_id = (
+        SELECT id FROM agb.basket WHERE kind = 'shadow'
         ORDER BY session_date DESC, id DESC
         LIMIT 1
     )
@@ -181,12 +236,56 @@ class Proposal:
     orders: int
     members: frozenset[str] = frozenset()
     marks: dict[str, Decimal] = field(default_factory=dict)
+    shadow_id: int | None = None  # the counterfactual written beside it, when a panel ran
+
+
+class Stage2(Protocol):
+    """The panel as the rebalance drives it (agb.panel's `Runner`): the immutable
+    configuration the basket records, and one call that scores the shortlist and returns its
+    panel run. The weight is the configuration's; nothing here is fitted."""
+
+    @property
+    def config_id(self) -> int: ...
+
+    @property
+    def shortlist_n(self) -> int: ...
+
+    @property
+    def w(self) -> float: ...
+
+    def __call__(
+        self,
+        conn: psycopg.Connection,
+        shortlist: Sequence[str],
+        sectors: Mapping[str, str],
+        as_of: date,
+        job_id: int | None = None,
+    ) -> int: ...
+
+
+@dataclass(frozen=True)
+class _Shadow:
+    """The counterfactual, before it is written: the same shortlist blended at the weight the
+    live basket does not trade, selected against the shadow's own book."""
+
+    w: float
+    blended: list[blend.Blended]
+    selection: rebalance.Selection
+    weight: dict[str, Decimal]
+    plan: list[rebalance.Order]
+    held: dict[str, Decimal]
 
 
 def book(conn: psycopg.Connection) -> dict[str, Decimal]:
     """The positions the rebalance starts from: the targets of the last filled live basket,
     in shares. Empty until a basket has filled."""
     return {symbol: Decimal(shares) for symbol, shares in conn.execute(_BOOK).fetchall()}
+
+
+def shadow_book(conn: psycopg.Connection) -> dict[str, Decimal]:
+    """The positions the shadow basket starts from: what the last shadow basket holds, in
+    shares. Empty until one has been written."""
+    return {symbol: Decimal(shares) for symbol, shares in conn.execute(_SHADOW_BOOK).fetchall()}
 
 
 def signal_session(session_date: date, calendar: nyse.NyseCalendar | None = None) -> date:
@@ -206,9 +305,11 @@ def propose(
     ranker: Ranker,
     *,
     capital: Decimal = DEFAULT_CAPITAL,
+    panel: Stage2 | None = None,
     calendar: nyse.NyseCalendar | None = None,
 ) -> Proposal:
-    """Propose the basket for a claimed rebalance job, and return what was written."""
+    """Propose the basket for a claimed rebalance job, and return what was written. With a
+    panel the shortlist is scored and the basket is blended; with none it is stage-1 only."""
     if not _PERIOD.match(claim.period):
         raise BasketError(f"rebalance period {claim.period!r} is not a month")
     if capital <= 0:
@@ -220,6 +321,11 @@ def propose(
     signal = signal_session(session_date, calendar)
 
     held = book(conn)
+    shadow_held = shadow_book(conn)
+    # The panel costs money and an hour of model calls. A reference an earlier attempt already
+    # proposed is kept, so there is nothing for a panel run to be written against: skip it.
+    if panel is not None and _basket_for(conn, claim.period) is not None:
+        panel = None
     lake_db = lake.connect(lake_dir)
     try:
         _require_bars(lake_db)
@@ -237,8 +343,29 @@ def propose(
             if n >= _BARS
         }
         marks = prints | _last_closes(lake_db, [s for s in held if s not in prints], signal)
-        untradeable = {s for s in (*held, *snapshot.tickers) if s not in prints or s not in counted}
-        selection = rebalance.select([r.symbol for r in ranking], held, untradeable=untradeable)
+        untradeable = {
+            s
+            for s in (*held, *shadow_held, *snapshot.tickers)
+            if s not in prints or s not in counted
+        }
+        ranked_order = [r.symbol for r in ranking]
+        blended: list[blend.Blended] = []
+        shadow: _Shadow | None = None
+        run_id: int | None = None
+        if panel is not None:
+            shortlist = list(ranking[: panel.shortlist_n])
+            tail = list(ranking[panel.shortlist_n :])
+            # Alphabetical, because the order the shortlist was ranked in is itself the
+            # stage-1 rank, and the panel is never told a name's rank.
+            symbols = sorted(r.symbol for r in shortlist)
+            run_id = panel(conn, symbols, _sectors(lake_db, symbols), signal, claim.job_id)
+            scores = blend.scores(conn, run_id)
+            blended = blend.blend(shortlist, scores, panel.w)
+            ranked_order = blend.ranking(blended, tail)
+            shadow = _shadow(
+                shortlist, tail, scores, panel.w, shadow_held, prints, untradeable, capital
+            )
+        selection = rebalance.select(ranked_order, held, untradeable=untradeable)
         weight = rebalance.weights(selection.names)
         plan = rebalance.orders(selection, weight, prints, held, capital)
         costs = [_cost(lake_db, order, signal) for order in plan]
@@ -265,12 +392,14 @@ def propose(
                 cost.CURRENT.version,
                 capital,
                 PIPELINE,
+                panel.config_id if panel is not None else None,
+                run_id,
+                panel.w if panel is not None else None,
             ),
         ).fetchone()
         if row is None:
-            existing = conn.execute(
-                "SELECT id FROM agb.basket WHERE reference = %s", (claim.period,)
-            ).fetchone()[0]
+            existing = _basket_for(conn, claim.period)
+            assert existing is not None
             return Proposal(existing, claim.period, True, 0, 0, members, marks)
         basket_id = row[0]
         with conn.cursor() as cur:
@@ -304,8 +433,97 @@ def propose(
                     for order, modelled in zip(plan, costs, strict=True)
                 ],
             )
+            cur.executemany(_INSERT_BLEND, [_blend_row(basket_id, b) for b in blended])
         conn.execute(_INSERT_EVENT, (basket_id, PIPELINE, SURFACE))
-    return Proposal(basket_id, claim.period, False, len(selection.names), len(plan), members, marks)
+        shadow_id = None if shadow is None else _write_shadow(conn, basket_id, shadow, rank_of)
+    return Proposal(
+        basket_id,
+        claim.period,
+        False,
+        len(selection.names),
+        len(plan),
+        members,
+        marks,
+        shadow_id,
+    )
+
+
+def _basket_for(conn: psycopg.Connection, reference: str) -> int | None:
+    row = conn.execute("SELECT id FROM agb.basket WHERE reference = %s", (reference,)).fetchone()
+    return None if row is None else row[0]
+
+
+def _sectors(db: duckdb.DuckDBPyConnection, symbols: Sequence[str]) -> dict[str, str]:
+    if not symbols:
+        return {}
+    rows = db.execute(_SECTORS, [list(symbols)]).fetchall()
+    return {str(ticker): str(sector) for ticker, sector in rows}
+
+
+def _blend_row(basket_id: int, b: blend.Blended) -> tuple:
+    return (
+        basket_id,
+        b.symbol,
+        b.stage1_rank,
+        b.stage1_rank_pct,
+        b.scored.score_id if b.scored else None,
+        b.scored.total if b.scored else None,
+        b.scored.score if b.scored else None,
+        b.llm_score_pct,
+        b.neutral,
+        b.final_score,
+    )
+
+
+def _shadow(
+    shortlist: Sequence[Ranked],
+    tail: Sequence[Ranked],
+    scores: Mapping[str, blend.Scored],
+    traded_w: float,
+    held: dict[str, Decimal],
+    prints: dict[str, Decimal],
+    untradeable: set[str],
+    capital: Decimal,
+) -> _Shadow:
+    """What the month would have held at the other weight: SHADOW_W against a live basket
+    that trades the stage-1 ranking, and the stage-1 ranking against one that trades a blend.
+    The picks are its own, because they are taken against its own previous book, which the
+    twenty buys and thirty holds make a different book from the live one."""
+    w = SHADOW_W if traded_w == 0 else 0.0
+    blended = blend.blend(shortlist, scores, w)
+    selection = rebalance.select(blend.ranking(blended, tail), held, untradeable=untradeable)
+    weight = rebalance.weights(selection.names)
+    plan = rebalance.orders(selection, weight, prints, held, capital)
+    return _Shadow(w, blended, selection, weight, plan, held)
+
+
+def _write_shadow(
+    conn: psycopg.Connection, live_id: int, shadow: _Shadow, rank_of: dict[str, Ranked]
+) -> int:
+    """Record the counterfactual beside the basket that was traded: the same provenance and
+    the same panel run at the other weight, with its own blend and its own targets. It has no
+    orders, no reference and no way on: the `basket_event` trigger refuses to move it."""
+    row = conn.execute(
+        _INSERT_SHADOW, {"live": live_id, "w": shadow.w, "actor": PIPELINE}
+    ).fetchone()
+    assert row is not None
+    basket_id = row[0]
+    with conn.cursor() as cur:
+        cur.executemany(_INSERT_BLEND, [_blend_row(basket_id, b) for b in shadow.blended])
+        cur.executemany(
+            _INSERT_TARGET,
+            [
+                (
+                    basket_id,
+                    *_target(
+                        symbol, shadow.selection, shadow.weight, shadow.held, shadow.plan, rank_of
+                    ),
+                )
+                for symbol in shadow.selection.names
+            ],
+        )
+    conn.execute(_INSERT_EVENT, (basket_id, PIPELINE, SURFACE))
+    return basket_id
 
 
 def _bps(value: float) -> Decimal:
