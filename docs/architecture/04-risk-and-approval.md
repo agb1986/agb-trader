@@ -126,7 +126,7 @@ Mechanically: reminders at roughly 60 and 20 minutes before the cutoff. At the c
 Three levels, with movement up by human act and movement down automatic.
 
 - **L0** — live start. Explicit approval every rebalance. Timeout means no trade.
-- **L1** — explicit approval required only when the gate raises a flag or turnover is unusual. Otherwise the basket is notified with a countdown and proceeds unless rejected inside the window. The default inverts from opt-in to opt-out; the veto survives.
+- **L1** — explicit approval required only when the gate raises a flag or turnover is unusual. Otherwise the basket is notified with a countdown and proceeds unless rejected inside the window. The default inverts from opt-in to opt-out; the veto survives. As built, unusual turnover means selling more than 30% of the book, well below the gate's own 60% limit, and the countdown is the fifteen minutes before the 15:45 submission cutoff, so the window closes exactly as execution would otherwise have nothing to send.
 - **L2** — notification only, no approval path.
 
 The pre-trade gate and the kill-switch are not part of the ladder. They apply at every level, permanently.
@@ -186,11 +186,13 @@ A monthly rebalance produces twelve observations a year. No feasible paper perio
 Criteria:
 
 - At least twelve completed paper rebalances, each either executed cleanly or halted for a reason that was diagnosed and fixed (the diagnosis is a human attestation on the promotion event).
-- Realised fills matching the official closing price within tolerance. This is the assumption the entire backtest rests on, and one of the few things paper trading genuinely does validate.
+- Realised fills matching the official closing price within tolerance. This is the assumption the entire backtest rests on, and one of the few things paper trading genuinely does validate. As built, every fill within 5 basis points of the session's close, measured over at least twenty fills so a pass means something.
 - The fee arithmetic, computed from the schedule and paper fills, is correct, and partial fills are handled correctly. (Alpaca paper simulates neither impact nor slippage nor regulatory fees, so cost itself cannot be validated in paper; it is validated live by the cost alert above.)
 - Zero undiagnosed gate breaches. Diagnosed breaches are fine, and are in fact evidence the gate works.
 - The panel's pre-flight checks passed, including the dispersion gate.
 - Pause, liquidate and the approval flow each deliberately exercised at least once in paper, so the first live use is not the first use. This is a query over the `command` table.
+
+Each criterion is measured from the recorded history by a view, and one nobody has measured reads as unmet rather than passing by default: the three arithmetic criteria stay unmet until `agb paper-check` has recorded a pass, and the pre-flight criterion until the panel pre-flight suite has. A check with too little to measure refuses rather than recording a pass.
 
 Promotion is then a human act through `agb mode`, like every other rung of the ladder, and the CLI refuses unless the eligibility view is satisfied.
 

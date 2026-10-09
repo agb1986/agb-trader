@@ -520,13 +520,28 @@ def pending_basket(db, asks):
     return basket_id
 
 
-@pytest.mark.parametrize("to_state", ["approved", "rejected"])
-@pytest.mark.parametrize("role", ["scheduler", "pipeline", "execution"])
+# The scheduler's approval of a pending basket is the one the autonomy ladder adds, for the
+# clean basket that proceeds at L1; tests/test_ladder.py covers it, and the pair below covers
+# the approval it is still refused below L1.
+@pytest.mark.parametrize(
+    ("role", "to_state"),
+    [
+        (role, to_state)
+        for role in ("scheduler", "pipeline", "execution")
+        for to_state in ("approved", "rejected")
+        if (role, to_state) != ("scheduler", "approved")
+    ],
+)
 def test_no_service_but_the_bot_and_the_ui_decides_a_pending_basket(
     db, pending_basket, role, to_state
 ):
     with pytest.raises(errors.InsufficientPrivilege, match="basket_transition"):
         move(db, pending_basket, 3, "pending", to_state, role)
+
+
+def test_the_scheduler_proceeds_with_a_pending_basket_only_at_l1_in_live(db, pending_basket):
+    with pytest.raises(errors.InsufficientPrivilege, match="only at L1 in live"):
+        move(db, pending_basket, 3, "pending", "approved", "scheduler", actor="system")
 
 
 def test_the_cli_writes_no_basket_event(db, pending_basket):
@@ -535,7 +550,11 @@ def test_the_cli_writes_no_basket_event(db, pending_basket):
 
 
 def test_the_system_never_decides_a_pending_basket(db, pending_basket):
-    with pytest.raises(errors.InsufficientPrivilege, match="basket_policy.*only a human decides"):
+    # A rejection is the human's word at every level. An approval is the human's too until
+    # the ladder reaches L1, where the gate's own check holds the system to live and L1.
+    with pytest.raises(errors.InsufficientPrivilege, match="basket_policy.*only a human rejects"):
+        move(db, pending_basket, 3, "pending", "rejected", "bot", "telegram", actor="system")
+    with pytest.raises(errors.InsufficientPrivilege, match="basket_gate.*only at L1 in live"):
         move(db, pending_basket, 3, "pending", "approved", "bot", "telegram", actor="system")
 
 

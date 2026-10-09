@@ -332,6 +332,72 @@ def _panel_preflight_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def _level(args: argparse.Namespace) -> int:
+    from agb import approval, ladder
+
+    with psycopg.connect(application_name="agb-cli") as conn:
+        if args.level is None:
+            print(ladder.level_text(conn))
+            return 0
+        text = f"agb level {args.level}" + (
+            f" --attest {shlex.quote(args.attest)}" if args.attest else ""
+        )
+        source = approval.Source(args.actor, "cli", text)
+        try:
+            print(ladder.raise_to(conn, args.level, args.attest, source))
+        except ladder.Refused as exc:
+            # The refusal is recorded; leaving the block commits it.
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+    return 0
+
+
+def _mode(args: argparse.Namespace) -> int:
+    from agb import approval, ladder
+
+    with psycopg.connect(application_name="agb-cli") as conn:
+        if args.mode is None:
+            print(ladder.live_text(conn))
+            return 0
+        text = f"agb mode {args.mode}" + (
+            f" --attest {shlex.quote(args.attest)}" if args.attest else ""
+        )
+        source = approval.Source(args.actor, "cli", text)
+        try:
+            print(ladder.set_mode(conn, args.mode, args.attest, source))
+        except ladder.Refused as exc:
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+    return 0
+
+
+def _lake_dir() -> Path:
+    from agb import lake
+
+    return Path(os.environ.get("AGB_LAKE_DIR", lake.DEFAULT_DIR))
+
+
+def _paper_check(args: argparse.Namespace) -> int:
+    from agb import lake, mechanics
+
+    with psycopg.connect(application_name="agb-cli") as conn:
+        try:
+            if args.check_name == "fill_tolerance":
+                result = mechanics.fill_tolerance(conn, lake.connect(_lake_dir()))
+            else:
+                result = getattr(mechanics, args.check_name)(conn)
+        except mechanics.MechanicsError as exc:
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+        print(result)
+        detail = mechanics.detail_text(result)
+        if detail:
+            print(detail)
+        row_id = mechanics.record(conn, result, args.actor)
+    print(f"paper_check {row_id}: {result.name} recorded")
+    return 0 if result.passed else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agb", description="agb-trader operator CLI")
     parser.add_argument("--version", action="version", version=os.environ.get("AGB_VERSION", "dev"))
@@ -482,6 +548,45 @@ def main(argv: list[str] | None = None) -> int:
     )
     show.add_argument("config", type=int, metavar="CONFIG", help="the panel_config to read")
     show.set_defaults(run=_panel_preflight_show)
+    level = commands.add_parser(
+        "level",
+        help="the autonomy level, and the one deliberate way to move it",
+        description="With no argument, the level in force and the progress towards the next "
+        "one. With a level, moves to it: an up-move is refused unless the eligibility view "
+        "is satisfied and needs --attest, a statement that the move is warranted, which is "
+        "recorded with it. Moving down needs neither. The ladder tightens by itself: a "
+        "rejection or a gate breach above L0 drops to L0 without anyone asking.",
+    )
+    level.add_argument("level", nargs="?", choices=("L0", "L1", "L2"), help="the level to move to")
+    level.add_argument("--attest", help="why the move is warranted, recorded with it")
+    level.add_argument("--actor", **actor)
+    level.set_defaults(run=_level)
+    mode = commands.add_parser(
+        "mode",
+        help="paper or live, and the criteria between them",
+        description="With no argument, every paper-to-live criterion as met or unmet. With a "
+        "mode, switches to it: live is refused until every criterion is met and needs "
+        "--attest; paper is always allowed.",
+    )
+    mode.add_argument("mode", nargs="?", choices=("paper", "live"), help="the mode to trade in")
+    mode.add_argument("--attest", help="why going live is warranted, recorded with it")
+    mode.add_argument("--actor", **actor)
+    mode.set_defaults(run=_mode)
+    paper_checks = commands.add_parser(
+        "paper-check",
+        help="the paper record's arithmetic checks, three of the paper-to-live criteria",
+        description="Measures one check over the settled paper rebalances and records the "
+        "result. A check with too little to measure is refused rather than recorded, which "
+        "leaves its criterion unmet until paper has produced the evidence.",
+    ).add_subparsers(dest="action", required=True)
+    for command, name, helptext in (
+        ("fill-tolerance", "fill_tolerance", "every paper fill against the official close"),
+        ("fee-arithmetic", "fee_arithmetic", "each fill's fees against the schedule"),
+        ("partial-fills", "partial_fills", "short fills, and whether each one alerted"),
+    ):
+        check = paper_checks.add_parser(command, help=helptext)
+        check.add_argument("--actor", **actor)
+        check.set_defaults(run=_paper_check, check_name=name)
     args = parser.parse_args(argv)
     try:
         return args.run(args)

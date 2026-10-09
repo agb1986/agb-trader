@@ -38,7 +38,7 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
-from agb import approval, health, jobs, readout, schedule
+from agb import approval, health, jobs, ladder, readout, schedule
 from agb.health import Finding
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.nyse import NEW_YORK, NyseCalendar, trading_date
@@ -77,6 +77,7 @@ COMMANDS = {
     "basket": ("/basket", "the full target of the current or most recent rebalance"),
     "why": ("/why <TICKER>", "why a name scored as it did: rank, safety score, rubric, sources"),
     "gate": ("/gate", "every check of the latest gate run, with what it measured"),
+    "level": ("/level", "the autonomy level, what it means, and the progress towards the next"),
     "log": (f"/log [1-{readout.LOG_MAX}]", "the latest events, oldest first"),
     "pause": ("/pause", "open the pause halt cause and suspend trading at the broker"),
     "resume": ("/resume", "clear every open halt cause and lift the broker suspension"),
@@ -84,7 +85,7 @@ COMMANDS = {
     "help": ("/help", "this list"),
 }
 # Commands the spec names that later tickets bring. They are refused, and recorded.
-LATER = frozenset({"level"})
+LATER: frozenset[str] = frozenset()
 # Commands whose arguments `agb.approval` checks, against what is pending.
 DECISIONS = frozenset({"approve", "reject"})
 VERB = re.compile(r"^[a-z][a-z_]*$")
@@ -360,6 +361,8 @@ class Bot:
             return readout.basket(conn)
         if verb == "gate":
             return readout.gate(conn)
+        if verb == "level":
+            return ladder.level_text(conn)
         if verb == "why":
             return readout.why(conn, args[0])
         if verb == "log":
@@ -589,8 +592,11 @@ class Bot:
 
     def approvals(self, conn: psycopg.Connection, now: datetime) -> None:
         """Put each gated rebalance to the human, and raise the reminder due for each one
-        still pending. One the cutoff has passed is left for the scheduler to mark missed."""
+        still pending. One the cutoff has passed is left for the scheduler to mark missed.
+        At L2 nothing is asked: the notification goes out for what the gate approved."""
         calendar = self.calendar(trading_date(now))
+        for reference in approval.notify(conn, now, calendar):
+            log.info("rebalance %s: proceeding at L2, notification raised", reference)
         for basket in approval.waiting(conn):
             if basket.state == "proposed":
                 if now >= approval.cutoff_of(calendar, basket.session_date):

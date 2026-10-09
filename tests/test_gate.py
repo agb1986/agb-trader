@@ -429,10 +429,22 @@ def test_the_halt_history_is_append_only(db):
     assert rows(db, "SELECT cause FROM agb.halt_open") == [("gate_breach",)]
 
 
-def test_once_the_gate_has_run_the_basket_and_its_result_are_frozen(db):
-    db.connect("agb_owner").execute(
-        "INSERT INTO agb.mode_event (mode, actor) VALUES ('live', 'cli')"
+def go_live(db, reason="promoted"):
+    """Move the mode to live as `agb mode live` records it: a command and an attestation."""
+    conn = db.connect("agb_owner")
+    [(command_id,)] = conn.execute(
+        "INSERT INTO agb.command (actor, surface, raw_text, verb, outcome)"
+        " VALUES ('ada', 'cli', 'agb mode live', 'mode', 'accepted') RETURNING id"
+    ).fetchall()
+    conn.execute(
+        "INSERT INTO agb.mode_event (mode, actor, reason, attestation, command_id)"
+        " VALUES ('live', 'cli', %s, 'the paper record is sound', %s)",
+        (reason, command_id),
     )
+
+
+def test_once_the_gate_has_run_the_basket_and_its_result_are_frozen(db):
+    go_live(db)
     basket_id = insert(db)
     run(db, basket_id)
     assert state(db, basket_id)[0] == "proposed"
@@ -510,6 +522,8 @@ def test_the_system_starts_in_paper(db):
     ]
 
 
+# The CLI's own move up to live, which needs an attestation and the command that asked for
+# it, is tested in tests/test_ladder.py.
 def test_only_the_system_moves_the_mode_and_only_down_to_paper(db):
     for role in ("scheduler", "execution"):
         conn = db.connect(role)
@@ -522,7 +536,7 @@ def test_only_the_system_moves_the_mode_and_only_down_to_paper(db):
                 conn.execute(
                     "INSERT INTO agb.mode_event (mode, actor) VALUES (%s, %s)", (mode, actor)
                 )
-    for role in ("pipeline", "bot", "ui", "cli"):
+    for role in ("pipeline", "bot", "ui"):
         with pytest.raises(errors.InsufficientPrivilege):
             db.connect(role).execute(
                 "INSERT INTO agb.mode_event (mode, actor) VALUES ('paper', 'system')"
@@ -531,9 +545,7 @@ def test_only_the_system_moves_the_mode_and_only_down_to_paper(db):
 
 
 def test_in_live_mode_a_pass_waits_for_the_human(db):
-    db.connect("agb_owner").execute(
-        "INSERT INTO agb.mode_event (mode, actor, reason) VALUES ('live', 'cli', 'promoted')"
-    )
+    go_live(db)
     basket_id = insert(db)
 
     verdict = run(db, basket_id)
@@ -542,7 +554,8 @@ def test_in_live_mode_a_pass_waits_for_the_human(db):
     assert rows(db, "SELECT mode FROM agb.gate_run") == [("live",)]
     assert state(db, basket_id) == ("proposed", 1, "pipeline", "pipeline")
     assert rows(db, "SELECT cause FROM agb.halt_open") == []
-    with pytest.raises(errors.InsufficientPrivilege, match="only in paper, and the mode is live"):
+    unasked = "unasked only at L2, and the level is L0"
+    with pytest.raises(errors.InsufficientPrivilege, match=unasked):
         approve(db, basket_id)
 
     move(db, basket_id, 2, "proposed", "pending", "bot", "telegram")
