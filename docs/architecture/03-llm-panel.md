@@ -120,6 +120,8 @@ The panel is committed to forward-only return validation, which is honest but sl
 
 Explicitly **not evidence**: scoring the panel against subsequent returns on historical names. That is the contaminated historical-outcome test, and it would measure the model's memory.
 
+**Results belong to the configuration that produced them.** Each check records what it measured against what it required, append-only and with an actor, under one `panel_config`; the newest result per check is the one that counts, so a re-run after a rubric fix replaces nothing and still lifts the gate. A configuration nobody has pre-flighted reads as not yet pre-flighted rather than as passed, which is why changing a model or a prompt means flying the suite again. The operator drives all four from the CLI (`agb panel-preflight`), and the spot-check presents one name at a time with its scores, its reasons and the quotes the debate saw, recording a verdict per name with the operator's own name on it.
+
 Passing these pre-flight checks, including the dispersion gate, is one of the paper-to-live criteria.
 
 ## Running the w=0 vs w>0 comparison
