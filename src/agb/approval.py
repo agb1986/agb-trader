@@ -31,7 +31,7 @@ import psycopg
 from psycopg.errors import CheckViolation, UniqueViolation
 from psycopg.types.json import Jsonb
 
-from agb import jobs, readout, schedule
+from agb import blend, jobs, readout, schedule
 from agb.health import et
 from agb.nyse import NEW_YORK, NyseCalendar, trading_date
 
@@ -206,7 +206,9 @@ def request_text(
     conn: psycopg.Connection, basket_id: int, now: datetime, calendar: NyseCalendar
 ) -> str:
     """The approval request: the diff first, then the aggregate numbers, the flags, the gate
-    and the prompt, which states what no answer means."""
+    and the prompt, which states what no answer means. A name the panel scored is bought with
+    its safety score beside it, and whatever the panel flagged about the basket's names is
+    listed under FLAGS."""
     reference, session, capital, mode, checks, passed = conn.execute(
         _REQUEST, (basket_id,)
     ).fetchone()
@@ -218,8 +220,12 @@ def request_text(
     for symbol, rank, was in diff.sold:
         line = f"  x {symbol:<{width}} {readout.rank_text(rank)}"
         out.append(line + (f" (was {was})" if was is not None else ""))
+    scores = blend.safety(conn, basket_id)
     in_ = [f"IN ({len(diff.bought)})" if diff.bought else "IN (none)"]
-    in_ += [f"  + {symbol:<{width}} {readout.rank_text(rank)}" for symbol, rank in diff.bought]
+    for symbol, rank in diff.bought:
+        score = blend.safety_text(scores, symbol)
+        line = f"  + {symbol:<{width}} {readout.rank_text(rank)}"
+        in_.append(line + (f"  ·  {score}" if score else ""))
     numbers = (
         f"{readout.turnover_text(diff.measured.get('turnover'))}  ·  "
         f"{readout.cash_text(diff.measured.get('cash'), capital)}"
@@ -231,13 +237,23 @@ def request_text(
         "\n".join(in_),
         f"HOLD {diff.held} unchanged",
         numbers,
-        # The panel's flags join here; the gate halts on anything it finds.
-        "FLAGS (none)",
+        flags_text(blend.flags(conn, basket_id)),
         f"GATE  {passed} of {checks} passed  /gate",
         f"/approve {reference}   /reject {reference}   /basket\n"
         f"No answer by {by} means no trades this month.",
     ]
     return "\n\n".join(parts)
+
+
+def flags_text(flags: list[tuple[str, str]]) -> str:
+    """What the panel flagged about the names this basket holds, one line each. Each is a
+    fact about a filing or a rubric score, never a recommendation: the human decides."""
+    if not flags:
+        return "FLAGS (none)"
+    width = max(len(symbol) + 1 for symbol, _ in flags)
+    lines = [f"FLAGS ({len(flags)})"]
+    lines += [f"  ! {symbol:<{width}} {flag}" for symbol, flag in flags]
+    return "\n".join(lines)
 
 
 def reminder_text(reference: str, now: datetime, cutoff: datetime) -> str:

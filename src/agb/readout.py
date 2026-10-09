@@ -14,7 +14,7 @@ from decimal import Decimal, InvalidOperation
 
 import psycopg
 
-from agb import health
+from agb import analyst, blend, debate, health
 from agb.health import et
 from agb.nyse import NEW_YORK
 
@@ -461,6 +461,141 @@ def gate(conn: psycopg.Connection) -> str:
     else:
         footer = f"{len(rows)} of {len(rows)} checks passed."
     parts.append(footer)
+    return "\n\n".join(parts)
+
+
+# Why a name is in the basket: the panel's output contract (docs/architecture/05).
+
+# The month's blended basket: the latest live one a panel scored.
+_WHY_BASKET = """
+    SELECT b.id, b.reference, b.universe_size, b.panel_run_id, b.panel_w
+    FROM agb.basket b
+    WHERE b.kind = 'live' AND b.panel_run_id IS NOT NULL
+    ORDER BY b.session_date DESC, b.id DESC
+    LIMIT 1
+"""
+# The name's two terms, with its place among the shortlist: how many names were shortlisted,
+# and how many the panel scored at least as safe as this one.
+_WHY_BLEND = """
+    SELECT l.stage1_rank, l.llm_total, l.llm_score, l.neutral,
+           (SELECT count(*) FROM agb.basket_blend o WHERE o.basket_id = l.basket_id),
+           (SELECT count(*) FROM agb.basket_blend o
+            WHERE o.basket_id = l.basket_id AND NOT o.neutral AND o.llm_score >= l.llm_score)
+    FROM agb.basket_blend l
+    WHERE l.basket_id = %s AND l.symbol = %s
+"""
+_WHY_RETRIEVAL = """
+    SELECT r.id, r.outcome, r.detail, r.delinquent, r.ipo, s.id, s.outcome, s.detail
+    FROM agb.panel_retrieval r
+    LEFT JOIN agb.panel_score s ON s.retrieval_id = r.id
+    WHERE r.run_id = %s AND r.symbol = %s
+"""
+_WHY_DIMENSIONS = """
+    SELECT d.dimension, d.score, d.reason, d.source, d.judge_score
+    FROM agb.panel_dimension d
+    WHERE d.score_id = %s
+    ORDER BY d.dimension
+"""
+# What the Analyst read, as it was cited: one line per section of one filing.
+_WHY_SOURCES = """
+    SELECT f.document, f.form, f.filed, f.section, f.sent_chars, f.chars
+    FROM agb.panel_filing f
+    WHERE f.retrieval_id = %s
+    ORDER BY f.filed DESC, f.document
+"""
+
+# What every /why ends with, because the score cannot be weighed without it.
+SCRUBBED = (
+    "The panel scored a name-scrubbed extract of the filings above. It was not told which "
+    "company it was looking at, or its ticker, industry or market value."
+)
+
+
+def _ordinal(n: int) -> str:
+    if n % 100 in (11, 12, 13):
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
+
+
+def _dimension_lines(rows: Sequence[tuple], width: int) -> list[str]:
+    """The six rubric dimensions, each with its 0-4 score. A dimension scoring at or below
+    `blend.REASON_MAX` carries the Judge's one-sentence reason: a bare integer explains
+    nothing, and the low ones are what the reader is deciding about. A score a filing rule
+    set, rather than the Judge, says so and gives what the Judge had scored."""
+    lines = []
+    for dimension, score, reason, source, judge_score in rows:
+        title = analyst.RUBRIC[dimension][0]
+        lines.append(f"  {dimension}. {title:<{width}} {score}/{debate.DIMENSION_MAX}")
+        if source == "rule":
+            lines.append(f"       set by a filing rule; the Judge scored {judge_score}")
+        if score <= blend.REASON_MAX:
+            lines.append(f"       {reason}")
+    return lines
+
+
+def why(conn: psycopg.Connection, symbol: str) -> str:
+    """Why a name scored as it did: its stage-1 rank, the panel's safety score with its place
+    among the shortlist, every rubric dimension, the filings the panel read, and the fact that
+    it read them scrubbed of the name. Nothing here is a recommendation."""
+    symbol = symbol.upper()
+    basket_row = conn.execute(_WHY_BASKET).fetchone()
+    if basket_row is None:
+        return message(
+            f"WHY {symbol}", [Item("no panel has scored a basket", "there is nothing to explain")]
+        )
+    basket_id, reference, universe, run_id, w = basket_row
+    header = f"WHY {symbol} — rebalance {reference}, blended at w = {w}"
+    blended = conn.execute(_WHY_BLEND, (basket_id, symbol)).fetchone()
+    if blended is None:
+        return message(
+            header,
+            [Item(f"{symbol} was not shortlisted", "the panel scored only the shortlist")],
+        )
+    rank, total, score, neutral, shortlisted, safer = blended
+    parts = [
+        header,
+        f"  stage-1 rank {rank} of {universe} ranked, shortlisted with {shortlisted} names",
+    ]
+    if neutral:
+        parts.append(
+            "  safety not scored: the blend gave it the neutral middle, so the panel moved it "
+            "neither way"
+        )
+    else:
+        parts.append(
+            f"  safety {total}/{blend.MAX_TOTAL} ({score:.2f}), "
+            f"{_ordinal(safer)} safest of the {shortlisted} shortlisted"
+        )
+
+    retrieval = conn.execute(_WHY_RETRIEVAL, (run_id, symbol)).fetchone()
+    if retrieval is None:
+        parts.append("  the panel has no record of this name in that run")
+        return "\n\n".join(parts)
+    retrieval_id, outcome, detail, delinquent, ipo, score_id, score_outcome, score_detail = (
+        retrieval
+    )
+    if delinquent:
+        parts.append(f"  delinquent filer ({delinquent}), which caps dimensions 1 and 2")
+    if ipo:
+        parts.append("  listed within the year, which sets dimension 6 to a neutral 2")
+    if outcome != "retrieved":
+        parts.append(f"  EDGAR: {outcome}, {detail}")
+    elif score_outcome != "scored":
+        parts.append(f"  the debate failed: {score_detail}")
+
+    if score_id is not None and score_outcome == "scored":
+        rows = conn.execute(_WHY_DIMENSIONS, (score_id,)).fetchall()
+        width = max(len(analyst.RUBRIC[d][0]) for d, *_ in rows) + 1 if rows else 0
+        parts.append("\n".join(["RUBRIC", *_dimension_lines(rows, width)]))
+
+    sources = conn.execute(_WHY_SOURCES, (retrieval_id,)).fetchall()
+    if sources:
+        lines = [f"SOURCES ({len(sources)})"]
+        for document, form, filed, section, sent, chars in sources:
+            read = "in full" if sent >= chars else f"first {sent:,} of {chars:,} characters"
+            lines.append(f"  {document}  {form} filed {filed}, {section}, {read}")
+        parts.append("\n".join(lines))
+    parts.append(SCRUBBED)
     return "\n\n".join(parts)
 
 

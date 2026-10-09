@@ -75,6 +75,7 @@ COMMANDS = {
     "approve": ("/approve <reference>", "approve the pending rebalance, e.g. /approve 2026-10"),
     "reject": ("/reject <reference> [reason]", "reject the pending rebalance: no trades"),
     "basket": ("/basket", "the full target of the current or most recent rebalance"),
+    "why": ("/why <TICKER>", "why a name scored as it did: rank, safety score, rubric, sources"),
     "gate": ("/gate", "every check of the latest gate run, with what it measured"),
     "log": (f"/log [1-{readout.LOG_MAX}]", "the latest events, oldest first"),
     "pause": ("/pause", "open the pause halt cause and suspend trading at the broker"),
@@ -83,10 +84,12 @@ COMMANDS = {
     "help": ("/help", "this list"),
 }
 # Commands the spec names that later tickets bring. They are refused, and recorded.
-LATER = frozenset({"why", "level"})
+LATER = frozenset({"level"})
 # Commands whose arguments `agb.approval` checks, against what is pending.
 DECISIONS = frozenset({"approve", "reject"})
 VERB = re.compile(r"^[a-z][a-z_]*$")
+# A ticker as the lake holds it, which is what `/why` takes.
+TICKER = re.compile(r"^[A-Za-z][A-Za-z0-9.\-]{0,9}$")
 
 Check = Callable[[psycopg.Connection], list[Finding]]
 
@@ -127,6 +130,9 @@ def parse(text: str) -> Parsed:
         if len(args) > 1 or (
             args and not (args[0].isdigit() and 1 <= int(args[0]) <= readout.LOG_MAX)
         ):
+            return Parsed(verb, args, f"usage: {usage}")
+    elif verb == "why":
+        if len(args) != 1 or not TICKER.match(args[0]):
             return Parsed(verb, args, f"usage: {usage}")
     elif verb == "liquidate":
         if len(args) > 1:
@@ -354,6 +360,8 @@ class Bot:
             return readout.basket(conn)
         if verb == "gate":
             return readout.gate(conn)
+        if verb == "why":
+            return readout.why(conn, args[0])
         if verb == "log":
             return readout.log(conn, int(args[0]) if args else readout.LOG_DEFAULT)
         return help_text()

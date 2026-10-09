@@ -21,6 +21,8 @@ from pathlib import Path
 import zstandard
 
 DEFAULT_DIR = Path("panel")
+# Where the store lives, which the pipeline service reads.
+DIR_ENV = "AGB_PANEL_DIR"
 LEVEL = 10
 
 

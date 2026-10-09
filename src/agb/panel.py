@@ -146,6 +146,61 @@ def check(config: Config) -> None:
         )
 
 
+def newest_config(conn: psycopg.Connection) -> Config | None:
+    """The configuration a rebalance runs the panel under: the newest row `agb panel-config
+    create` has made, or None when there is none. With none the rebalance is stage-1 only."""
+    row = conn.execute("SELECT id FROM agb.panel_config ORDER BY id DESC LIMIT 1").fetchone()
+    return None if row is None else load_config(conn, row[0])
+
+
+@dataclass(frozen=True)
+class Runner:
+    """The panel as the monthly rebalance drives it: `run` to retrieve and extract, then
+    `score` to debate, both under one immutable configuration. The rebalance holds one of
+    these and knows nothing else of the panel."""
+
+    config: Config
+    client: edgar.Edgar
+    model: analyst.Model
+    store: PanelStore
+    workers: int = WORKERS
+
+    @property
+    def config_id(self) -> int:
+        return self.config.id
+
+    @property
+    def shortlist_n(self) -> int:
+        return self.config.shortlist_n
+
+    @property
+    def w(self) -> float:
+        return self.config.w
+
+    def __call__(
+        self,
+        conn: psycopg.Connection,
+        shortlist: Sequence[str],
+        sectors: Mapping[str, str],
+        as_of: date,
+        job_id: int | None = None,
+    ) -> int:
+        """Score `shortlist` as of `as_of`; returns the run the scores belong to."""
+        run_id = run(
+            conn,
+            self.config.id,
+            shortlist,
+            as_of,
+            self.client,
+            self.model,
+            self.store,
+            job_id,
+            self.workers,
+        )
+        score(conn, run_id, sectors, self.model, self.store, self.workers)
+        return run_id
+
+
 @dataclass
 class Name:
     """One name's work, from retrieval to extract, before it is written."""
