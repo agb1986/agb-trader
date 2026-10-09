@@ -136,6 +136,9 @@ def test_the_ui_is_published_on_the_loopback_address_alone(resolved):
         }
     ]
     assert ui["command"] == ["python", "-m", "agb.services.ui"]
+    # Inside the container the socket binds every interface, since the published port arrives on
+    # the container's own address; the publication above is what keeps it off the network.
+    assert ui["environment"]["AGB_UI_HOST"] == "0.0.0.0"
     assert ui["image"] == resolved["services"]["migrate"]["image"]
     assert set(ui["networks"]) == {"core"}, "no egress: the UI makes no outbound connection"
     assert not ui.get("volumes")

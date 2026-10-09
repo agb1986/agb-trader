@@ -1,8 +1,12 @@
 """The local UI service: an HTTP server on 127.0.0.1 that renders the pages in `agb.ui`.
 
-It binds the loopback address only, so nothing on the network can reach it; the operator
-views it over an SSH tunnel, and SSH is the authentication. There is no login page, no
-session cookie and no outbound connection of any kind.
+The operator views it over an SSH tunnel, and SSH is the authentication: there is no login page,
+no session cookie and no outbound connection of any kind. What keeps it off the network is where
+the port is published, not where the socket binds — Compose publishes it on the server's
+127.0.0.1 alone. Inside a container the socket must bind every interface, because the published
+port arrives on the container's own address and nothing would be listening there; the container's
+network namespace is the boundary a loopback bind would be asking for. Run outside a container it
+binds the loopback address, which is what a bare process on the workstation wants.
 
 Every request opens its own read-only connection as the `ui` role and closes it again, which
 is both what a threaded server needs — a psycopg connection is not safe to share between
@@ -16,6 +20,7 @@ down, so `docker stop` ends it cleanly.
 """
 
 import logging
+import os
 import threading
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,11 +32,16 @@ from agb.heartbeat import interval_from_env, serve, stop_on_signals
 
 log = logging.getLogger(__name__)
 
-# Loopback only. The port is fixed: the operator's tunnel and docs/architecture/06-local-ui.md
-# both name it, and there is nothing to configure on a machine that serves one operator.
+# The port is fixed: the operator's tunnel and docs/architecture/06-local-ui.md both name it, and
+# there is nothing to configure on a machine that serves one operator. The bind address is not:
+# the container sets AGB_UI_HOST=0.0.0.0 and Compose decides who may reach the published port.
 HOST = "127.0.0.1"
 PORT = 8080
 ACTOR = "ui"
+
+
+def host_from_env() -> str:
+    return os.environ.get("AGB_UI_HOST", HOST)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -74,7 +84,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def server() -> ThreadingHTTPServer:
-    httpd = ThreadingHTTPServer((HOST, PORT), Handler)
+    httpd = ThreadingHTTPServer((host_from_env(), PORT), Handler)
     httpd.daemon_threads = True
     return httpd
 
@@ -86,7 +96,7 @@ def main() -> None:
     stop = stop_on_signals()
     httpd = server()
     threading.Thread(target=httpd.serve_forever, name="agb-ui", daemon=True).start()
-    log.info("ui listening on http://%s:%d", HOST, PORT)
+    log.info("ui listening on http://%s:%d", *httpd.server_address[:2])
     try:
         serve(ACTOR, interval_from_env(), stop)
     finally:

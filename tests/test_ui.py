@@ -371,11 +371,21 @@ def test_the_pages_carry_no_javascript_and_nothing_builds_any(conn, traded):
 # -- the server ----------------------------------------------------------------------------
 
 
+def test_the_server_binds_the_loopback_address_unless_a_container_says_otherwise(monkeypatch):
+    """Where the socket binds: the loopback address by default, which is what a bare process on
+    the workstation wants, and every interface when the container asks for it, because there the
+    published port arrives on the container's own address and Compose decides who reaches it."""
+    assert service.host_from_env() == "127.0.0.1"
+    monkeypatch.setenv("AGB_UI_HOST", "0.0.0.0")
+    assert service.host_from_env() == "0.0.0.0"
+
+
 def test_the_server_answers_on_the_loopback_address_alone(db, monkeypatch, traded):
     """Acceptance criterion (a): the socket binds 127.0.0.1, every view answers a GET over it,
     an unknown path is a 404 and nothing but GET and HEAD is answered at all. The port is
     taken from the module so the operator's own 8080 is left alone."""
     assert (service.HOST, service.PORT) == ("127.0.0.1", 8080)
+    monkeypatch.delenv("AGB_UI_HOST", raising=False)
     for key, value in db.pg_env("ui").items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(service, "PORT", 0)
