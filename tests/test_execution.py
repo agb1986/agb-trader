@@ -533,6 +533,22 @@ def test_a_fill_the_broker_stamps_before_its_own_order_row_is_still_recorded(db)
     assert execution.ingest_fills(conn, fake, created - execution.FILL_LOOKBACK) == 0
 
 
+def test_a_fill_is_read_over_the_session_reconciled_not_the_day_the_rows_were_written(db):
+    """The window reaches back from the reconcile's own clock as well, because that clock is the
+    session being read back and the fills belong to it. A session reconciled long after its rows
+    were written -- a fixture's, or a day replayed from the record -- still has its fills read."""
+    conn = db.connect("execution")
+    fake = broker()
+    target = submitted(db, conn, fake, SOUND)
+    session = CLOSE_AT - timedelta(days=30)
+
+    fake.close(session)
+    outcome = execution.reconcile(conn, fake, target, session + execution.SETTLE)
+
+    assert outcome.state == "filled"
+    assert rows(db, "SELECT count(*) FROM agb.fill") == [(20,)]
+
+
 def test_an_order_filled_short_is_named_in_a_partial_rebalance_alert(db):
     conn = db.connect("execution")
     fake = broker()
