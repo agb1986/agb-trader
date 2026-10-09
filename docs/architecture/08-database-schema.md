@@ -140,6 +140,7 @@ Rejected: everything in Postgres, which grows the dump by hundreds of megabytes 
 | `ladder_event`, `mode_event` | cli (up), scheduler or execution as `system` (down) | no |
 | `panel_config` | cli | no |
 | panel structured output | pipeline | no |
+| panel pre-flight results, spot-check verdicts | cli (all four checks, verdicts), pipeline (recall runs) | no |
 | `heartbeat` | every service | upsert |
 | `expected_event` | scheduler (create), fulfilling service (completion reference) | completion by append or reference, never rewrite |
 | `alert`, `alert_event` | bot, ui, execution, scheduler | no |

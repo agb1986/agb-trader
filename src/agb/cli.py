@@ -204,6 +204,134 @@ def _void_stale(args: argparse.Namespace) -> int:
     return 0
 
 
+def _panel_dir() -> Path:
+    from agb import panel_store
+
+    return Path(os.environ.get(panel_store.DIR_ENV, panel_store.DEFAULT_DIR))
+
+
+def _record(conn: psycopg.Connection, config_id: int, result, actor: str) -> int:
+    """Print a check's result and append it to the configuration's record."""
+    from agb import preflight
+
+    print(result)
+    detail = preflight.detail_text(result)
+    if detail:
+        print(detail)
+    row_id = preflight.record(conn, config_id, result, actor)
+    print(f"panel_preflight {row_id} recorded for panel_config {config_id}")
+    return 0 if result.passed else 1
+
+
+def _panel_preflight_measure(args: argparse.Namespace) -> int:
+    from agb import preflight
+
+    with psycopg.connect(application_name="agb-cli") as conn:
+        try:
+            config_id = preflight.config_of(conn, args.run_id)
+            result = getattr(preflight, args.check_name)(conn, args.run_id)
+        except preflight.PreflightError as exc:
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+        return _record(conn, config_id, result, args.actor)
+
+
+def _panel_preflight_recall(args: argparse.Namespace) -> int:
+    from psycopg import errors
+
+    from agb import analyst, edgar, preflight
+    from agb.panel_store import PanelStore
+
+    store = PanelStore(_panel_dir())
+    with psycopg.connect(application_name="agb-cli") as conn:
+        try:
+            runs = preflight.recall_runs(
+                conn, args.config, edgar.Edgar.from_env(), analyst.AnthropicModel(), store
+            )
+            result = preflight.recall(conn, store, runs)
+        except errors.InsufficientPrivilege:
+            print(
+                "agb: only the pipeline role may run the panel; use PGUSER=pipeline",
+                file=sys.stderr,
+            )
+            return 1
+        except preflight.PreflightError as exc:
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+        return _record(conn, args.config, result, args.actor)
+
+
+_RECALL_RUNS = """
+    SELECT detail -> 'runs'
+    FROM agb.panel_preflight
+    WHERE panel_config_id = %s AND name = 'disclosure_recall'
+    ORDER BY id DESC
+    LIMIT 1
+"""
+
+
+def _panel_preflight_fixtures(args: argparse.Namespace) -> int:
+    from datetime import date
+
+    from agb import preflight
+    from agb.panel_store import PanelStore
+
+    with psycopg.connect(application_name="agb-cli") as conn:
+        row = conn.execute(_RECALL_RUNS, (args.config,)).fetchone()
+        runs = {date.fromisoformat(k): v for k, v in (row[0] if row else {}).items()}
+        if not runs:
+            print(
+                f"agb: panel_config {args.config} has no recall run; each fixture's standing is "
+                "read from the runs that measured it, so run `agb panel-preflight recall` first",
+                file=sys.stderr,
+            )
+            return 1
+        print(preflight.fixtures_text(conn, PanelStore(_panel_dir()), runs))
+    return 0
+
+
+def _panel_preflight_spot_check(args: argparse.Namespace) -> int:
+    from agb import preflight
+
+    if args.symbol and not args.verdict:
+        print("agb: refused: --symbol needs a --verdict", file=sys.stderr)
+        return 1
+    with psycopg.connect(application_name="agb-cli") as conn:
+        try:
+            config_id = preflight.config_of(conn, args.run_id)
+            if args.symbol:
+                reviewed = preflight.review(
+                    conn, args.run_id, args.symbol, args.verdict, args.note, args.actor
+                )
+                print(f"{reviewed.symbol}: {args.verdict} recorded")
+            reviews = preflight.sample(conn, args.run_id)
+            pending = preflight.pending(reviews)
+            if pending is not None:
+                print()
+                print(preflight.review_text(conn, args.run_id, pending, reviews))
+                return 0
+            result = preflight.spot_check(conn, args.run_id)
+        except preflight.PreflightError as exc:
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+        if preflight.recorded(conn, config_id, result.name, args.run_id):
+            print(result)
+            return 0 if result.passed else 1
+        return _record(conn, config_id, result, args.actor)
+
+
+def _panel_preflight_show(args: argparse.Namespace) -> int:
+    from agb import preflight
+
+    with psycopg.connect(application_name="agb-cli") as conn:
+        try:
+            print(preflight.status_text(conn, args.config))
+        except preflight.PreflightError as exc:
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agb", description="agb-trader operator CLI")
     parser.add_argument("--version", action="version", version=os.environ.get("AGB_VERSION", "dev"))
@@ -300,6 +428,60 @@ def main(argv: list[str] | None = None) -> int:
     )
     stale.add_argument("--actor", **actor)
     stale.set_defaults(run=_void_stale)
+    preflight_commands = commands.add_parser(
+        "panel-preflight",
+        help="the panel pre-flight suite: four checks, recorded per panel_config",
+        description="Whether the panel can be trusted under one configuration: retrieval "
+        "fidelity, known-disclosure recall, the operator's spot check and the dispersion "
+        "gate. Results belong to the panel_config they were measured under, so a new "
+        "configuration starts with none of them and has to be pre-flighted again.",
+    ).add_subparsers(dest="action", required=True)
+    for name, helptext in (
+        ("fidelity", "every quote of a run found verbatim in the document it cites"),
+        ("dispersion", "the spread of a run's scores, against the gate's floor"),
+    ):
+        measure = preflight_commands.add_parser(name, help=helptext)
+        measure.add_argument("run_id", type=int, metavar="RUN", help="the panel_run to measure")
+        measure.add_argument("--actor", **actor)
+        measure.set_defaults(run=_panel_preflight_measure, check_name=name)
+    recall = preflight_commands.add_parser(
+        "recall",
+        help="the committed fixture set of known disclosures, by dimension",
+        description="Runs the panel over agb.disclosures as of each fixture's date and reports "
+        "what it found. This spends model calls and inserts panel runs, so it runs as the "
+        "pipeline role: PGUSER=pipeline agb panel-preflight recall N.",
+    )
+    recall.add_argument("config", type=int, metavar="CONFIG", help="the panel_config to measure")
+    recall.add_argument("--actor", **actor)
+    recall.set_defaults(run=_panel_preflight_recall)
+    fixtures = preflight_commands.add_parser(
+        "fixtures",
+        help="each fixture's standing in the last recall run",
+        description="A fixture whose phrase is not in the text the Analyst was given is "
+        "unusable, not a miss: fix or drop the entry in agb.disclosures.",
+    )
+    fixtures.add_argument("config", type=int, metavar="CONFIG", help="the panel_config to read")
+    fixtures.set_defaults(run=_panel_preflight_fixtures)
+    spot = preflight_commands.add_parser(
+        "spot-check",
+        help="read about 20 of a run's names and record a verdict on each",
+        description="Presents the next name awaiting a verdict, with the panel's score, its "
+        "reasons and the quotes it read. Record one with --symbol and --verdict; the check is "
+        "recorded once every name in the sample has a verdict.",
+    )
+    spot.add_argument("run_id", type=int, metavar="RUN", help="the panel_run under review")
+    spot.add_argument("--symbol", help="the name being judged (default: show the next one)")
+    spot.add_argument(
+        "--verdict", choices=("agree", "disagree"), help="whether the panel's reading holds up"
+    )
+    spot.add_argument("--note", help="why, which a 'disagree' requires")
+    spot.add_argument("--actor", **actor)
+    spot.set_defaults(run=_panel_preflight_spot_check)
+    show = preflight_commands.add_parser(
+        "show", help="the four checks under one panel_config, newest result each"
+    )
+    show.add_argument("config", type=int, metavar="CONFIG", help="the panel_config to read")
+    show.set_defaults(run=_panel_preflight_show)
     args = parser.parse_args(argv)
     try:
         return args.run(args)

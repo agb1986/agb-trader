@@ -113,9 +113,14 @@ def coverage(blended: Sequence[Blended]) -> tuple[int, int]:
 
 
 def dispersion(blended: Sequence[Blended]) -> float | None:
-    """How far apart the panel's scores are: the standard deviation of the normalised scores
-    of the names it scored. None when it scored fewer than two, which has no spread."""
-    scores = [b.scored.score for b in blended if b.scored is not None]
+    """How far apart the panel's scores are over a blended shortlist. None when it scored
+    fewer than two names, which has no spread."""
+    return spread([b.scored.score for b in blended if b.scored is not None])
+
+
+def spread(scores: Sequence[float]) -> float | None:
+    """The measure the dispersion gate reads, here and in the pre-flight suite: the standard
+    deviation of the panel's normalised scores. None under two scores, which has no spread."""
     if len(scores) < 2:
         return None
     return statistics.pstdev(scores)
