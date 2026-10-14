@@ -68,6 +68,26 @@ def test_the_rebalance_trades_on_the_session_after_the_month_end(cal):
     assert not expected["submission"].by_job
 
 
+def test_the_submission_job_is_claimable_a_quarter_hour_before_the_cutoff(cal):
+    """Execution holds this job's lease while it sends the basket, which is what makes a crash
+    mid-submission visible as an expired lease rather than a silent retry."""
+    planned = by_key(schedule.plan(cal, date(2026, 9, 15)))
+
+    submission = planned[("submission", "2026-10")]
+    assert submission.session_date == date(2026, 10, 1)
+    assert submission.not_before == utc(2026, 10, 1, 19, 30)  # 15:30 EDT, cutoff less 15 min
+    # The expected event stays on the rebalance: this job exists for its lease alone.
+    assert submission.expected == ()
+    assert expected_of(planned[("rebalance", "2026-10")])["submission"].due_at == utc(
+        2026, 10, 1, 19, 45
+    )
+
+
+def test_the_submission_job_is_planned_until_its_session_passes(cal):
+    assert ("submission", "2026-10") in by_key(schedule.plan(cal, date(2026, 10, 1)))
+    assert ("submission", "2026-10") not in by_key(schedule.plan(cal, date(2026, 10, 2)))
+
+
 def test_a_month_end_on_a_holiday(cal):
     # 31 May 2027 is Memorial Day: the signal comes from Friday the 28th.
     rebalance = by_key(schedule.plan(cal, date(2027, 5, 20)))[("rebalance", "2027-06")]

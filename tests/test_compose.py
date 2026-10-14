@@ -13,7 +13,7 @@ from conftest import ROOT
 
 from agb.roles import PASSWORD_VARS
 
-ONE_SHOT = {"migrate", "cli", "certification-import", "research"}
+ONE_SHOT = {"migrate", "cli", "certification-import", "reconcile", "research"}
 ENV_NAMES = {"db", "pipeline", "execution", "bot", "vpn", "research"}
 # Every service that mounts the models directory, each of them read-only.
 MODEL_READERS = {"pipeline", "cli", "certification-import"}

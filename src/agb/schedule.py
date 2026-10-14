@@ -17,6 +17,11 @@ The work:
     - an **approval_request** shortly after, which the bot fulfils when it sends one;
     - a **submission** by R's MOC cutoff, which execution fulfils. It is also the row the
       overdue view looks ahead for: no submission within the horizon means no rebalance.
+- **submission**, one per rebalance period, claimable SUBMIT_WINDOW before R's MOC cutoff.
+  Execution holds it while it sends the basket's orders, so a crash mid-submission leaves an
+  expired lease behind; that lease is never reclaimed, and the halt it opens is what stops
+  the system from guessing what reached the broker. It carries no expected event of its own:
+  the submission expected above belongs to the rebalance, and execution still fulfils it.
 - **backup**, one per calendar day D, weekends and holidays included, period `YYYY-MM-DD`.
   Claimable from 03:00 New York time on D and expected done BACKUP_GRACE later. Planning
   starts from tomorrow, so the scheduler never writes a backup that is already late.
@@ -35,6 +40,11 @@ PROPOSAL = "proposal"
 APPROVAL_REQUEST = "approval_request"
 SUBMISSION = "submission"
 BACKUP = "backup"
+
+# Orders go in during this window before the session's MOC cutoff. It is also when the
+# submission job becomes claimable, and how long execution's lease on it runs: the lease
+# expires as the window closes, which is the moment a crash should be visible.
+SUBMIT_WINDOW = timedelta(minutes=15)
 
 # Poll intervals and lease durations are tuned against measured runs; these are first guesses.
 PULL_DELAY = timedelta(hours=2)
@@ -110,7 +120,8 @@ def plan(calendar: NyseCalendar, today: date, *, approval_required: bool = True)
                 expected.append(
                     Expected(APPROVAL_REQUEST, period, proposal_due + APPROVAL_REQUEST_GRACE, False)
                 )
-            expected.append(Expected(SUBMISSION, period, calendar.moc_cutoff(trade), False))
+            cutoff = calendar.moc_cutoff(trade)
+            expected.append(Expected(SUBMISSION, period, cutoff, False))
             planned.append(
                 Planned(
                     REBALANCE,
@@ -120,6 +131,10 @@ def plan(calendar: NyseCalendar, today: date, *, approval_required: bool = True)
                     tuple(expected),
                 )
             )
+            # The submission expected event above stays on the rebalance, where it has always
+            # been: execution fulfils it by kind and period, not by completing this job. The
+            # job is here for its lease.
+            planned.append(Planned(SUBMISSION, period, trade, cutoff - SUBMIT_WINDOW, ()))
         year, month = (year, month + 1) if month < 12 else (year + 1, 1)
 
     day = today + timedelta(days=1)

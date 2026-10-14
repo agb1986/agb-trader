@@ -1,7 +1,8 @@
 """Checks against Alpaca paper with the operator's keys: the account is reachable
 and can trade, its configuration is readable, and the asset and quote endpoints answer
 the questions the broker checks ask, and `suspend_trade` can be set and unset, as `/pause`
-and `/resume` do. Nothing is submitted.
+and `/resume` do, and an unused `client_order_id` answers 404, which is what crash
+recovery reads as an order that never reached the broker. Nothing is submitted.
 
 Opt in with AGB_LIVE_ALPACA=1 and the keys in the shell environment (ALPACA_API_KEY,
 ALPACA_SECRET_KEY, and ALPACA_BASE_URL pointing at paper); the keys are read from the
@@ -9,11 +10,12 @@ environment only, never from a file in the repository.
 """
 
 import os
+import uuid
 from decimal import Decimal
 
 import pytest
 
-from agb.alpaca import Alpaca
+from agb.alpaca import Alpaca, AlpacaError
 
 pytestmark = [
     pytest.mark.live,
@@ -75,3 +77,11 @@ def test_suspend_trade_is_set_read_back_and_unset(alpaca):
         assert alpaca.configuration().suspend_trade is False
     finally:
         alpaca.suspend(before)
+
+
+def test_an_unused_client_order_id_is_not_found(alpaca):
+    """What the reconcile leans on to tell a written order from a sent one: an order the
+    broker has never seen answers 404, not an empty order."""
+    with pytest.raises(AlpacaError) as caught:
+        alpaca.order_by_client_id(f"recovery-probe-{uuid.uuid4()}")
+    assert caught.value.not_found

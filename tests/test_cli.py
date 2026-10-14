@@ -69,3 +69,26 @@ def test_main_reports_connection_errors(db, monkeypatch, capsys):
 
     assert cli.main(["status"]) == 1
     assert "password authentication failed" in capsys.readouterr().err
+
+
+def test_main_reconcile_refuses_without_the_brokers_keys(db, monkeypatch, capsys):
+    for key, value in db.pg_env("execution").items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_SECRET_KEY", raising=False)
+
+    assert cli.main(["reconcile", "2026-10"]) == 1
+    assert "refused: ALPACA_API_KEY and ALPACA_SECRET_KEY are not set" in capsys.readouterr().err
+
+
+def test_main_reconcile_reports_an_unknown_basket_before_it_asks_the_broker(
+    db, monkeypatch, capsys
+):
+    """The basket is looked up first, so a mistyped reference costs no call and says so."""
+    for key, value in db.pg_env("execution").items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("ALPACA_API_KEY", "key")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+
+    assert cli.main(["reconcile", "2026-09"]) == 1
+    assert "agb: no live basket 2026-09" in capsys.readouterr().err

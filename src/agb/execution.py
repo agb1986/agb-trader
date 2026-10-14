@@ -63,8 +63,12 @@ ROLE = EXECUTION
 ACTOR = ROLE
 SURFACE = ROLE
 # Orders go in during this window before the session's MOC cutoff, which the calendar puts
-# fifteen minutes before the close: never earlier, never after.
-SUBMIT_WINDOW = timedelta(minutes=15)
+# fifteen minutes before the close: never earlier, never after. The scheduler owns the figure
+# because the submission job becomes claimable at the same moment.
+SUBMIT_WINDOW = schedule.SUBMIT_WINDOW
+# How long execution holds the submission job. The lease runs out as the window closes, so a
+# crash mid-submission is visible by the time the orders could no longer have gone in.
+SUBMISSION_LEASE = schedule.SUBMIT_WINDOW
 # How long after the close the broker is given before fills and positions are read back.
 SETTLE = timedelta(minutes=5)
 # How far before a basket's first order, or before the reconcile itself, the fills are read. The
@@ -77,6 +81,10 @@ FILL_LOOKBACK = timedelta(days=1)
 # The gate's levels for the broker checks.
 ACCOUNT = "account"
 ORDER = "order"
+# The two order events a reconcile appends: the broker's own view of an order, or the fact
+# that it has never seen it. Neither is a trading decision; both are only what was found.
+RECONCILED = "reconciled"
+UNSENT = "unsent"
 # Broker order states from which nothing more will come.
 DONE = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
 PARTIAL_REBALANCE = "partial_rebalance"
@@ -84,6 +92,8 @@ PARTIAL_REBALANCE = "partial_rebalance"
 CANCEL_BEFORE = timedelta(minutes=10)
 PAUSE = "pause"
 RESUME = "resume"
+# The halt cause an expired submission lease opens. Only a human clears it.
+LEASE_EXPIRED = "execution_lease_expired"
 LATCH_FAILED = "latch_failed"
 LIQUIDATION = "liquidation"
 LIQUIDATION_FAILED = "liquidation_failed"
@@ -135,8 +145,12 @@ class Sent:
 
     @property
     def answered(self) -> bool:
-        """The broker has acknowledged, been found holding, or refused this order."""
-        return self.kind is not None
+        """The broker has acknowledged, been found holding, or refused this order.
+
+        An `unsent` event is the opposite: a reconcile asked and the broker had never seen
+        the order. Once the operator clears the halt, that order is still to send.
+        """
+        return self.kind is not None and self.kind != UNSENT
 
     @property
     def live(self) -> bool:

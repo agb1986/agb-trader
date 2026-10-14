@@ -204,6 +204,39 @@ def _void_stale(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reconcile(args: argparse.Namespace) -> int:
+    from psycopg import errors
+
+    from agb import recovery
+    from agb.alpaca import Alpaca
+
+    if not Alpaca.configured():
+        print("agb: refused: ALPACA_API_KEY and ALPACA_SECRET_KEY are not set", file=sys.stderr)
+        return 1
+    # Autocommit, so every order's event is committed as the broker answers for it: a
+    # reconcile interrupted halfway keeps what it has already learned.
+    try:
+        with psycopg.connect(application_name="agb-cli", autocommit=True) as conn:
+            report = recovery.recover(conn, Alpaca.from_env(), args.reference, args.actor)
+    except recovery.RecoveryError as exc:
+        print(f"agb: {exc}", file=sys.stderr)
+        return 1
+    except errors.InsufficientPrivilege:
+        print(
+            "agb: only the execution role may reconcile orders; use PGUSER=execution",
+            file=sys.stderr,
+        )
+        return 1
+    for walked in report.walked:
+        print(
+            f"{walked.client_order_id}  {walked.side} {walked.qty} {walked.symbol}: "
+            f"{walked.outcome} - {walked.detail}"
+        )
+    print(f"basket {report.reference}: {report.detail}")
+    print("appended as events; nothing was sent, cancelled or changed")
+    return 0
+
+
 def _panel_dir() -> Path:
     from agb import panel_store
 
@@ -494,6 +527,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     stale.add_argument("--actor", **actor)
     stale.set_defaults(run=_void_stale)
+    reconcile = commands.add_parser(
+        "reconcile",
+        help="ask the broker what it knows about every order of a basket, by client_order_id",
+        description="After a submission died mid-flight. It walks every planned order of the "
+        "basket and reports each one as filled, still open at the broker, written but never "
+        "reached the broker, or never written. What it learns is appended as order events and "
+        "one reconcile_run row: no history row is changed, and no order is sent or cancelled. "
+        "Deciding what to do next is yours, as is clearing the halt with /resume. Only the "
+        "execution role holds the broker's keys, so run it with `make reconcile`.",
+    )
+    reconcile.add_argument("reference", help="the basket to walk, e.g. 2026-10")
+    reconcile.add_argument("--actor", **actor)
+    reconcile.set_defaults(run=_reconcile)
     preflight_commands = commands.add_parser(
         "panel-preflight",
         help="the panel pre-flight suite: four checks, recorded per panel_config",
