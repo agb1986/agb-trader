@@ -23,7 +23,7 @@ from datetime import UTC, date, datetime, timedelta
 
 import psycopg
 
-from agb import execution, nyse, schedule
+from agb import execution, jobs, nyse, recovery, schedule
 from agb.alpaca import Alpaca, AlpacaError, Broker
 from agb.execution import ROLE, ExecutionError
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
@@ -46,11 +46,13 @@ class Execution:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         settle: timedelta = execution.SETTLE,
         observe_every: timedelta = OBSERVE_EVERY,
+        lease: timedelta = execution.SUBMISSION_LEASE,
     ) -> None:
         self.broker = broker
         self.clock = clock
         self.settle = settle
         self.observe_every = observe_every
+        self.lease = lease
         self._calendar: NyseCalendar | None = None
         self._observed_at: datetime | None = None
         self._warned = False
@@ -87,6 +89,33 @@ class Execution:
         if self._observed_at is None or now - self._observed_at >= self.observe_every:
             execution.record_state(conn, self.broker)
             self._observed_at = now
+        recovery.halt_expired_submissions(conn)
+        if execution.LEASE_EXPIRED in execution.open_halts(conn):
+            # A submission died with orders possibly at the broker. Nothing goes in until the
+            # operator has reconciled by client_order_id and cleared the cause by hand. The
+            # loops below this one only read and record, so they carry on.
+            log.error(
+                "%s is open: no basket submits until it is reconciled and cleared by hand",
+                execution.LEASE_EXPIRED,
+            )
+        else:
+            self.submit_due(conn, calendar, now)
+        for basket in execution.waiting(conn, "submitted"):
+            if now < calendar.close_at(basket.session_date) + self.settle:
+                continue
+            execution.reconcile(conn, self.broker, basket, now)
+        session = self.closed_session(calendar, now)
+        if session is not None:
+            execution.snapshot(conn, self.broker, session, calendar)
+
+    def submit_due(self, conn: psycopg.Connection, calendar: NyseCalendar, now: datetime) -> None:
+        """Send the orders of every approved basket whose submission window is open.
+
+        The period's submission job is held while its basket goes in, and completed when the
+        submission is over however it ended. A worker that finds the job held by someone
+        else, or held on a lease that has run out, leaves the basket alone: an expired lease
+        is for a human, not for another attempt.
+        """
         for basket in execution.waiting(conn, "approved"):
             start, end = execution.submit_window(calendar, basket.session_date)
             if now < start:
@@ -98,14 +127,16 @@ class Execution:
                     end.astimezone(nyse.NEW_YORK).strftime("%Y-%m-%d %H:%M ET"),
                 )
                 continue
-            execution.submit(conn, self.broker, basket, now)
-        for basket in execution.waiting(conn, "submitted"):
-            if now < calendar.close_at(basket.session_date) + self.settle:
+            claim = jobs.hold(conn, schedule.SUBMISSION, basket.period, execution.ROLE, self.lease)
+            if claim is None:
+                log.error(
+                    "basket %s: no submission job to hold for %s; leaving it approved",
+                    basket.reference,
+                    basket.period,
+                )
                 continue
-            execution.reconcile(conn, self.broker, basket, now)
-        session = self.closed_session(calendar, now)
-        if session is not None:
-            execution.snapshot(conn, self.broker, session, calendar)
+            execution.submit(conn, self.broker, basket, now)
+            jobs.complete(conn, claim)
 
     def closed_session(self, calendar: NyseCalendar, now: datetime) -> date | None:
         """The latest session whose close is at least `settle` behind `now`."""

@@ -63,7 +63,18 @@ def approved(db, case=SOUND) -> execution.Basket:
     basket_id = insert(db, case.target)
     run(db, basket_id, case)
     assert state(db, basket_id)[:2] == ("approved", 2)
+    plan_submission(db)
     return basket(db, basket_id)
+
+
+def plan_submission(db, period=PERIOD):
+    """The period's submission job, as `schedule.write` plans it: the service holds its lease
+    while the basket goes in. No `created` event, so the audit counts stay what they were."""
+    db.connect("scheduler").execute(
+        "INSERT INTO agb.job (kind, period, session_date, not_before, created_by)"
+        " VALUES ('submission', %s, %s, %s, 'scheduler') ON CONFLICT (kind, period) DO NOTHING",
+        (period, TRADE, CALENDAR.moc_cutoff(TRADE) - execution.SUBMIT_WINDOW),
+    )
 
 
 def basket(db, basket_id, state="approved") -> execution.Basket:
@@ -807,8 +818,11 @@ def test_only_the_execution_env_file_names_the_alpaca_keys():
         for name, service in services.items()
         if any(os.path.basename(f) == "execution.env" for f in env_files(service))
     ]
-    assert readers == ["execution"]
+    # The operator's `agb reconcile` reads the file too: it asks the broker what it holds, so
+    # it needs the keys, and it runs as the same role rather than lending them to `cli`.
+    assert readers == ["execution", "reconcile"]
     assert services["execution"]["environment"]["PGUSER"] == "execution"
+    assert services["reconcile"]["environment"]["PGUSER"] == "execution"
     assert not any(
         "ALPACA" in key
         for service in services.values()

@@ -16,9 +16,9 @@ Scheduler work is a `job` row, unique on `(kind, period)`, so a second monthly r
 What happens when a lease expires depends on the stage, because running twice has different consequences:
 
 - **Pipeline stages** (pull, features, rank, panel, gate) write only to the database and are deterministic. An expired lease is simply reclaimed and the stage reruns. A panel rerun costs API calls, which is acceptable.
-- **Execution submission** has side effects at the broker that the database cannot see, so it is **never reclaimed automatically**. An expired submission lease sets the halt cause `execution_lease_expired`. Every order carries a deterministic `client_order_id` built from the basket reference and symbol, well inside Alpaca's 128-character limit. The human-triggered reconcile therefore looks up what the broker actually holds (`GET /v2/orders:by_client_order_id`) before anything is resent. The broker adds a second guard: Alpaca rejects a duplicate `client_order_id` on an active order with HTTP 422, and an MOC order stays active until the close, so an accidental resubmission before the close is refused broker-side as well.
+- **Execution submission** has side effects at the broker that the database cannot see, so it is **never reclaimed automatically**. An expired submission lease sets the halt cause `execution_lease_expired`. Every order carries a deterministic `client_order_id` built from the basket reference and symbol, well inside Alpaca's 128-character limit. The human-triggered reconcile therefore looks up what the broker actually holds (`GET /v2/orders:by_client_order_id`) before anything is resent. The broker adds a second guard: Alpaca rejects a duplicate `client_order_id` on an active order with HTTP 422, and an MOC order stays active until the close, so an accidental resubmission before the close is refused broker-side as well. The reconcile appends what it learns per order and one `reconcile_run` row summarising the walk; it updates nothing, and clearing the cause stays a separate human act — that clear is also what releases the held lease (a `released` job event), so until it happens no later cycle can take the submission.
 
-The lease columns on `job` are **mutable exception 1**. The job's lifecycle (created, claimed, completed, failed, lease expired, reclaimed) is append-only `job_event`.
+The lease columns on `job` are **mutable exception 1**. The job's lifecycle (created, claimed, completed, failed, lease expired, reclaimed, released) is append-only `job_event`.
 
 Rejected: a session-scoped advisory lock. It releases when the connection dies, so a crash in the middle of submission is picked up and resubmitted automatically, which is the one outcome that must never happen silently. Rejected: halting on every stale claim, which lets a container restart during feature construction cost the month if nobody is around before the cutoff.
 
@@ -136,6 +136,7 @@ Rejected: everything in Postgres, which grows the dump by hundreds of megabytes 
 | `liquidation` | bot, ui (token, confirm), execution (result) | no |
 | `halt_event`, `broker_state` | pipeline (gate_breach), execution (lease, broker_state), bot / ui (pause, resume, liquidation) | no |
 | `order`, `order_event`, `fill`, position snapshots | execution | no |
+| `reconcile_run` | execution (the operator's `agb reconcile`) | no |
 | `model_certification`, `certification_event`, `promotion_event` | research (certification, via artifact import), cli (promotion, voiding) | no |
 | `ladder_event`, `mode_event` | cli (up), scheduler or execution as `system` (down) | no |
 | `panel_config` | cli | no |
@@ -145,7 +146,7 @@ Rejected: everything in Postgres, which grows the dump by hundreds of megabytes 
 | `expected_event` | scheduler (create), fulfilling service (completion reference) | completion by append or reference, never rewrite |
 | `alert`, `alert_event` | bot, ui, execution, scheduler | no |
 
-Views: current basket state, open halt causes, audit log, shortfall, eligibility (ladder and mode), overdue expected events.
+Views: current basket state, open halt causes, audit log, shortfall, eligibility (ladder and mode), overdue expected events, reconcile state (each planned order beside what the broker last said about it).
 
 ## Conventions
 

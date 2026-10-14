@@ -79,6 +79,10 @@ Trading is blocked while *any* cause is open, and the open set is a database vie
 
 **An expired execution lease is never retried automatically.** Pipeline stages write only to the database and are reclaimed and rerun when a lease expires; execution submission has side effects at the broker the database cannot see, so an expired submission lease sets `execution_lease_expired` instead. A human-triggered reconcile looks up what the broker actually holds by deterministic `client_order_id` before anything is resent.
 
+The reconcile is `agb reconcile REFERENCE`, run as the `execution` role because that is the role holding the broker's keys. It walks every planned order of the basket and reports each one as sent and filled, sent and still open, written but never reached the broker, or never written at all. What it learns is appended as `order_event` rows and one `reconcile_run` row; no history row is updated, nothing is sent and nothing is cancelled. The operator then decides what to do, and the cause stays open until `/resume` clears it by hand.
+
+**Clearing the cause is also what releases the lease.** Until then the submission job stays held by the process that died, so no later cycle can pick the submission up: the halt and the held lease are the same fact seen from two places. The clear releases it (a `released` job event, attributed), after which the period can be worked again — the same basket if its submission window is somehow still open, otherwise a `rerun` at the next session's close. An order the reconcile found at the broker is answered and never sent twice; one it found written but unsent is looked up again and sent once.
+
 Positions are untouched throughout. Halt stops new orders; it never liquidates.
 
 ## Approval unit: the basket

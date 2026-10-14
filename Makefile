@@ -26,8 +26,8 @@ export AGB_RESEARCH_USER := $(shell id -u):$(shell id -g)
 COMPOSE := docker compose --env-file $(ENV_DIR)/db.env
 
 .DEFAULT_GOAL := help
-.PHONY: help env up down status logs agb backfill lake sync-lake research deploy rollback \
-	test test-fast lint
+.PHONY: help env up down status logs agb reconcile backfill lake sync-lake research deploy \
+	rollback test test-fast lint
 
 help: ## List the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-9s %s\n", $$1, $$2}'
@@ -54,6 +54,9 @@ logs: ## Follow the service logs
 
 agb: ## Run an agb CLI command, e.g. make agb CMD=status
 	$(COMPOSE) run --rm cli $(CMD)
+
+reconcile: ## Ask the broker about a basket's orders after a crash, e.g. make reconcile REF=2026-10
+	$(COMPOSE) run --rm reconcile $(REF)
 
 backfill: ## Land the vendor's SEP, SF1 and TICKERS history from 1998 in the lake
 	@mkdir -p $(AGB_LAKE_DIR)

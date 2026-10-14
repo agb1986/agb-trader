@@ -5,7 +5,7 @@
 #
 # Conventions, checked by tests/test_compose.py:
 #   - Every long-running service sets `restart: unless-stopped`. The only one-shots are
-#     `migrate`, `cli`, `certification-import` and `research`.
+#     `migrate`, `cli`, `certification-import`, `reconcile` and `research`.
 #   - Every service sets an explicit `mem_limit`.
 #   - No service mounts the Docker socket, and `db` publishes no host port.
 #   - No `container_name`, so several copies of the stack can run side by side under
@@ -268,6 +268,26 @@ services:
       AGB_MODELS_DIR: /models
     volumes:
       - ${AGB_MODELS_DIR:-./models}:/models:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [core]
+    restart: "no"
+    mem_limit: 256m
+
+  # `make reconcile REF=2026-10`, after a submission died mid-flight. It asks the broker what
+  # it knows about each of the basket's orders by client_order_id and appends what it learns.
+  # It runs as `execution` because that is the role holding the broker's keys and the one that
+  # owns the order events; the `cli` service is never given those keys.
+  reconcile:
+    <<: *app-image
+    profiles: [cli]
+    entrypoint: ["agb", "reconcile"]
+    env_file: ["${AGB_ENV_DIR:-env}/execution.env"]
+    environment:
+      <<: *pg
+      PGUSER: execution
+      PGPASSWORD: ${EXECUTION_DB_PASSWORD:?set in env/db.env}
     depends_on:
       db:
         condition: service_healthy

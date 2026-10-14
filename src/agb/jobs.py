@@ -8,7 +8,8 @@ lease while it works and releases it by completing or failing the job.
 What happens when a lease expires depends on the kind. A pipeline stage is deterministic and
 writes only to the database, so its expired lease is simply reclaimed (`reclaim_expired`).
 Execution submission has side effects at the broker, so it is never reclaimed: its expired
-lease stays visible in `agb.job_state` until a human reconciles.
+lease stays visible in `agb.job_state` until a human reconciles, and is given up
+(`release_expired`) only once they have cleared the halt cause the expiry opened.
 
 Every state change appends a `job_event` with an actor, in the same transaction as the lease
 change it records.
@@ -127,6 +128,52 @@ def claim(
             return Claim(job_id, kind, period, worker, lease_until, reclaimed)
 
 
+# One named job, locked so that the decision below is made against the row as it stands.
+_HELD = """
+    SELECT j.id, j.claimed_by, j.lease_until, j.lease_until >= now() AS live
+    FROM agb.job j
+    WHERE j.kind = %(kind)s AND j.period = %(period)s
+      AND j.not_before <= now()
+      AND NOT EXISTS (
+          SELECT 1 FROM agb.job_event e
+          WHERE e.job_id = j.id AND e.event IN ('completed', 'failed'))
+    FOR UPDATE OF j SKIP LOCKED
+"""
+
+
+def hold(
+    conn: psycopg.Connection, kind: str, period: str, worker: str, lease: timedelta
+) -> Claim | None:
+    """Hold one named job, or return None if this worker may not have it.
+
+    Unlike `claim`, which takes whatever is due, this asks for the job of one (kind, period):
+    the work is tied to that period, so there is nothing else to pick up instead. A worker
+    that already holds the job and whose lease is still live gets it extended, without a
+    second `claimed` event, so a process that restarted inside its own live lease carries on
+    where it left off rather than halting.
+
+    An expired lease is not one of those cases. It returns None, and the lease stays expired
+    for a human to see: whoever held it may have left side effects behind, and continuing
+    would be a retry. It becomes holdable again only when someone releases it, which for a
+    submission is the operator clearing the halt cause its expiry opened.
+    """
+    with conn.transaction():
+        row = conn.execute(_HELD, {"kind": kind, "period": period}).fetchone()
+        if row is None:
+            return None
+        job_id, holder, _, live = row
+        if holder is not None and not (holder == worker and live):
+            return None
+        (lease_until,) = conn.execute(
+            "UPDATE agb.job SET claimed_by = %s, lease_until = now() + %s "
+            "WHERE id = %s RETURNING lease_until",
+            (worker, lease, job_id),
+        ).fetchone()
+        if holder is None:
+            _event(conn, job_id, "claimed", worker, lease_until)
+        return Claim(job_id, kind, period, worker, lease_until, False)
+
+
 def renew(conn: psycopg.Connection, claim: Claim, lease: timedelta) -> Claim:
     """Extend a lease the worker still holds. An expired lease cannot be renewed."""
     row = conn.execute(
@@ -193,6 +240,35 @@ def fulfil(
         (ref_table, ref_id, actor, kind, period),
     )
     return done.rowcount == 1
+
+
+def record_expiry(conn: psycopg.Connection, job_id: int, lease_until: datetime, actor: str) -> bool:
+    """Append the `lease_expired` event for one expired lease. Returns False if it was there.
+
+    For a worker that wants its own expiry on the record under its own name, rather than
+    whichever service happened to sweep first.
+    """
+    return conn.execute(_EXPIRY, (job_id, actor, lease_until)).rowcount == 1
+
+
+def release_expired(conn: psycopg.Connection, job_id: int, actor: str, detail: str) -> bool:
+    """Give up an expired lease nobody is going to renew, so the job can be worked again.
+
+    Only for a lease that has run out: a live one belongs to whoever holds it. Returns False
+    if the lease was not expired after all, in which case nothing is written. The `released`
+    event says who decided it and why, because an expired submission lease is only ever given
+    up on a human's say-so.
+    """
+    with conn.transaction():
+        released = conn.execute(
+            "UPDATE agb.job SET claimed_by = NULL, lease_until = NULL "
+            "WHERE id = %s AND claimed_by IS NOT NULL AND lease_until < now()",
+            (job_id,),
+        )
+        if released.rowcount != 1:
+            return False
+        _event(conn, job_id, "released", actor, detail=detail)
+        return True
 
 
 def record_expiries(conn: psycopg.Connection, actor: str) -> int:
