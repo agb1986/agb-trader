@@ -25,6 +25,7 @@ same functions later.
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import psycopg
@@ -40,8 +41,14 @@ APPROVAL_REMINDER = "approval_reminder"
 APPROVAL_EXPIRED = "approval_expired"
 # The reminders go out this long before the cutoff, the earlier first.
 REMINDERS = (timedelta(minutes=60), timedelta(minutes=20))
-# Every basket asks the human first until the autonomy ladder exists.
-LEVEL = "L0"
+# At L1 the opt-out window closes this long before the cutoff, which is when the submission
+# window opens: a clean basket is approved then, leaving the same time to send it as an
+# answer at the cutoff would.
+OPT_OUT = timedelta(minutes=15)
+# Turnover above this fraction is unusual enough to ask about at L1, however clean the
+# basket is otherwise. It is half the gate's halting limit, so the gate still stops a basket
+# that this lets through.
+UNUSUAL_TURNOVER = Decimal("0.30")
 SYSTEM = "system"
 SCHEDULER = "scheduler"
 BOT = "bot"
@@ -111,12 +118,34 @@ _COMMAND = """
             %(chat_id)s, %(message_id)s)
     RETURNING id
 """
+_LEVEL = "SELECT level FROM agb.current_level"
+_TRADING_MODE = "SELECT mode FROM agb.current_mode"
+_APPROVED = """
+    SELECT s.id, s.reference, s.period, s.session_date, s.state, s.seq, s.since
+    FROM agb.basket_state s
+    WHERE s.kind = 'live' AND s.state = 'approved'
+      AND EXISTS (SELECT 1 FROM agb.gate_run r WHERE r.basket_id = s.id)
+    ORDER BY s.session_date, s.id
+"""
 _RAISE = """
     INSERT INTO agb.alert (kind, subject, period, body, raised_by)
     VALUES (%s, %s, %s, %s, %s)
     ON CONFLICT (kind, subject, period) DO NOTHING
     RETURNING id
 """
+
+
+def level(conn: psycopg.Connection) -> str:
+    """The autonomy level the system is at. The ladder itself lives in `agb.ladder`, which
+    reads this module, so the approval loop reads the view instead of importing it."""
+    row = conn.execute(_LEVEL).fetchone()
+    return row[0] if row is not None else "L0"
+
+
+def trading_mode(conn: psycopg.Connection) -> str:
+    """The trading mode, `paper` or `live`, read from the view for the same reason."""
+    row = conn.execute(_TRADING_MODE).fetchone()
+    return row[0] if row is not None else "paper"
 
 
 def waiting(conn: psycopg.Connection) -> list[Waiting]:
@@ -213,7 +242,6 @@ def request_text(
         _REQUEST, (basket_id,)
     ).fetchone()
     cutoff = cutoff_of(calendar, session)
-    by = deadline(cutoff, now)
     diff = readout.diff(conn, basket_id)
     width = diff.width
     out = [f"OUT ({len(diff.sold)})" if diff.sold else "OUT (none)"]
@@ -230,19 +258,99 @@ def request_text(
         f"{readout.turnover_text(diff.measured.get('turnover'))}  ·  "
         f"{readout.cash_text(diff.measured.get('cash'), capital)}"
     )
+    flags = blend.flags(conn, basket_id)
+    level_now = level(conn)
+    reason = ask_reason(flags, diff.measured.get("turnover")) if level_now == "L1" else None
     parts = [
-        f"REBALANCE {reference} — approval needed\n"
-        f"{mode.upper()} · {LEVEL} · deadline {by} (in {countdown(now, cutoff)})",
+        _header(reference, mode, level_now, reason, now, cutoff),
         "\n".join(out),
         "\n".join(in_),
         f"HOLD {diff.held} unchanged",
         numbers,
-        flags_text(blend.flags(conn, basket_id)),
+        flags_text(flags),
         f"GATE  {passed} of {checks} passed  /gate",
-        f"/approve {reference}   /reject {reference}   /basket\n"
-        f"No answer by {by} means no trades this month.",
+        _prompt(reference, level_now, reason, now, cutoff),
     ]
     return "\n\n".join(parts)
+
+
+def ask_reason(flags: list[tuple[str, str]], turnover: str | None) -> str | None:
+    """Why a basket must ask the human at L1: the panel flagged one of the names it holds,
+    or its turnover is unusual. None when the basket is clean, and so may proceed after the
+    countdown unless it is rejected inside the window."""
+    if flags:
+        names = len({symbol for symbol, _ in flags})
+        return f"the panel flagged {names} of its names"
+    ratio = _fraction(turnover)
+    if ratio is not None and ratio > UNUSUAL_TURNOVER:
+        return (
+            f"turnover {ratio:.1%} is above the {UNUSUAL_TURNOVER:.0%} a clean basket proceeds on"
+        )
+    return None
+
+
+def asks(conn: psycopg.Connection, basket_id: int) -> str | None:
+    """`ask_reason` for a basket, from the panel's flags and the gate's turnover."""
+    measured = readout.diff(conn, basket_id).measured
+    return ask_reason(blend.flags(conn, basket_id), measured.get("turnover"))
+
+
+def _fraction(measured: str | None) -> Decimal | None:
+    """The gate records turnover as it measured it, `42.00%`. Anything else it may record,
+    such as `no book`, is not a number and not unusual."""
+    if measured is None or not measured.endswith("%"):
+        return None
+    try:
+        return Decimal(measured.rstrip("%")) / 100
+    except InvalidOperation:
+        return None
+
+
+def _header(
+    reference: str,
+    mode: str,
+    level_now: str,
+    reason: str | None,
+    now: datetime,
+    cutoff: datetime,
+) -> str:
+    """The first two lines: what the message is, the mode and level, and the time that
+    matters at this level — the cutoff when the basket waits for an answer, the close of the
+    opt-out window when it proceeds without one."""
+    by = deadline(cutoff, now)
+    if level_now == "L2":
+        return f"REBALANCE {reference} — proceeding\n{mode.upper()} · L2 · sending at {by}"
+    if level_now == "L1" and reason is None:
+        close = cutoff - OPT_OUT
+        return (
+            f"REBALANCE {reference} — proceeding unless you reject it\n"
+            f"{mode.upper()} · L1 · proceeds {deadline(close, now)} "
+            f"(in {countdown(now, close)})"
+        )
+    return (
+        f"REBALANCE {reference} — approval needed\n"
+        f"{mode.upper()} · {level_now} · deadline {by} (in {countdown(now, cutoff)})"
+    )
+
+
+def _prompt(
+    reference: str, level_now: str, reason: str | None, now: datetime, cutoff: datetime
+) -> str:
+    """The last lines: the prompt and what no answer means. At L2 there is no prompt, only
+    the kill-switch, which applies at every level."""
+    if level_now == "L2":
+        return (
+            "/basket   /level\nNothing is needed from you: the trades are sent at the "
+            "close. To stop them: /pause"
+        )
+    if level_now == "L1" and reason is None:
+        close = deadline(cutoff - OPT_OUT, now)
+        return f"/reject {reference}   /basket\nNo answer by {close} means these trades are sent."
+    asking = f"ASKING  {reason}\n" if reason is not None else ""
+    return (
+        f"{asking}/approve {reference}   /reject {reference}   /basket\n"
+        f"No answer by {deadline(cutoff, now)} means no trades this month."
+    )
 
 
 def flags_text(flags: list[tuple[str, str]]) -> str:
@@ -335,6 +443,59 @@ def remind(
     body = reminder_text(basket.reference, now, cutoff)
     raised = conn.execute(_RAISE, (APPROVAL_REMINDER, subject, basket.period, body, BOT)).fetchone()
     return raised is not None
+
+
+def proceed_all(conn: psycopg.Connection, now: datetime, calendar: NyseCalendar) -> list[str]:
+    """At L1 in live, approve as the system every clean pending basket whose opt-out window
+    has closed: the human was told and did not reject it inside the window, so the rebalance
+    proceeds. A flagged basket, or one with unusual turnover, is left to the human and
+    `sweep` marks it missed at the cutoff if no answer comes. Returns what it approved."""
+    if level(conn) != "L1" or trading_mode(conn) != "live":
+        return []
+    proceeded = []
+    for basket in pending(conn):
+        cutoff = cutoff_of(calendar, basket.session_date)
+        if now < cutoff - OPT_OUT or now >= cutoff:
+            continue
+        if asks(conn, basket.id) is not None:
+            continue
+        try:
+            with conn.transaction():
+                conn.execute(
+                    _MOVE,
+                    {
+                        "basket": basket.id,
+                        "seq": basket.seq + 1,
+                        "from": "pending",
+                        "to": "approved",
+                        "actor": SYSTEM,
+                        "surface": SCHEDULER,
+                        "reason": f"no rejection by {clock(cutoff - OPT_OUT)}, proceeding at L1",
+                        "command": None,
+                    },
+                )
+        except (UniqueViolation, CheckViolation):
+            continue
+        proceeded.append(basket.reference)
+    return proceeded
+
+
+def notify(conn: psycopg.Connection, now: datetime, calendar: NyseCalendar) -> list[str]:
+    """At L2 the approval message is a notification: the gate approves the basket as the
+    system and this tells the human what is being sent, with no prompt. The unique
+    `(kind, subject, period)` on `alert` raises it once. Returns what it told them about."""
+    if level(conn) != "L2":
+        return []
+    told = []
+    for row in conn.execute(_APPROVED).fetchall():
+        basket = Waiting(*row)
+        body = request_text(conn, basket.id, now, calendar)
+        raised = conn.execute(
+            _RAISE, (APPROVAL_REQUEST, basket.reference, basket.period, body, BOT)
+        ).fetchone()
+        if raised is not None:
+            told.append(basket.reference)
+    return told
 
 
 # The human's answer.

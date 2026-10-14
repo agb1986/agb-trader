@@ -67,6 +67,7 @@ def _basket_name(kind: str, reference: str | None, basket_id: int) -> str:
 # Status.
 
 _MODE = "SELECT mode, since, actor FROM agb.current_mode"
+_LEVEL = "SELECT level FROM agb.current_level"
 _ACCOUNT = """
     SELECT observed_at, account_status, equity_usd, cash_usd, suspend_trade
     FROM agb.broker_state_now
@@ -101,7 +102,11 @@ _NEXT_SUBMISSION = """
 def status(conn: psycopg.Connection, now: datetime) -> str:
     mode, _, _ = conn.execute(_MODE).fetchone()
     halts = health.open_halt_causes(conn)
-    header = f"agb-trader — {mode.upper()} · {'HALTED' if halts else 'ACTIVE'}"
+    # The autonomy level stands beside the mode in live, where it decides what a rebalance
+    # asks of the human. In paper it decides nothing, so it is not shown.
+    level = conn.execute(_LEVEL).fetchone()
+    badge = mode.upper() if mode != "live" or level is None else f"{mode.upper()} · {level[0]}"
+    header = f"agb-trader — {badge} · {'HALTED' if halts else 'ACTIVE'}"
     # A gate breach carries every failed check in its reason; /gate lists them in full.
     items = [Item(h.what, _cut(h.facts, HALT_MAX)) for h in halts]
 

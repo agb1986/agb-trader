@@ -1,7 +1,13 @@
 """The scheduler service. It owns the calendar: each cycle it beats its heartbeat, writes the
 jobs and expected events due from today's session through the lookahead, records any lease
 that has expired, and marks missed every rebalance still waiting for the human at its
-session's MOC cutoff."""
+session's MOC cutoff.
+
+It also moves the autonomy ladder down and lets a clean rebalance through: a rejection or a
+gate breach at L1 or L2 drops the system back to L0, and at L1 a clean basket the human has
+not rejected by the close of its opt-out window is approved as the system. Whether the month
+expects an approval message at all follows from the level, so the plan is read from it each
+cycle rather than fixed when the service starts."""
 
 import logging
 from collections.abc import Callable
@@ -9,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 
 import psycopg
 
-from agb import approval, jobs, schedule
+from agb import approval, jobs, ladder, schedule
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.nyse import NyseCalendar, trading_date
 
@@ -26,11 +32,9 @@ class Scheduler:
         self,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         *,
-        approval_required: bool = True,
         replan_every: timedelta = REPLAN_EVERY,
     ) -> None:
         self.clock = clock
-        self.approval_required = approval_required
         self.replan_every = replan_every
         self._calendar: NyseCalendar | None = None
         self._planned_at: datetime | None = None
@@ -43,9 +47,14 @@ class Scheduler:
 
     def __call__(self, conn: psycopg.Connection) -> None:
         now = self.clock()
+        dropped = ladder.demote(conn)
+        if dropped is not None:
+            log.warning("%s", dropped)
         if self._planned_at is None or now - self._planned_at >= self.replan_every:
             planned = schedule.plan(
-                self.calendar(now), trading_date(now), approval_required=self.approval_required
+                self.calendar(now),
+                trading_date(now),
+                approval_required=ladder.approval_required(conn),
             )
             created = schedule.write(conn, planned)
             if created:
@@ -54,6 +63,8 @@ class Scheduler:
         expired = jobs.record_expiries(conn, schedule.ACTOR)
         if expired:
             log.warning("recorded %d expired job leases", expired)
+        for reference in approval.proceed_all(conn, now, self.calendar(now)):
+            log.info("rebalance %s: no rejection in the opt-out window, proceeding", reference)
         for reference in approval.sweep(conn, now, self.calendar(now)):
             log.warning("rebalance %s: no answer by the cutoff, marked missed", reference)
 

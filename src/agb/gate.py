@@ -24,7 +24,10 @@ rebalance: the basket moves to halted and the halt latch's `gate_breach` cause o
 nothing trades and the book stays as last month left it until a human clears it. A basket
 that passes waits for the human in live mode; in paper mode the system approves it, unless
 the operator has set paper mode to ask the human too (`agb.paper_approval`), when it waits
-as in live mode.
+as in live mode. At L2 of the autonomy ladder the system approves a live basket too, and the
+approval message becomes the notification `agb.approval.notify` raises.
+
+The gate itself is not part of the ladder: it runs, and halts what fails, at every level.
 
 Equity is the capital the basket was sized against until execution reads the broker's
 account, and the book is `basket.book`. Both change source later; the checks do not.
@@ -46,6 +49,9 @@ from agb.roles import PIPELINE
 
 SYSTEM = "system"
 PAPER = "paper"
+LIVE = "live"
+# The level at which a rebalance proceeds unasked, told to the human afterwards.
+UNASKED = "L2"
 
 PROVENANCE, BASKET, ORDER = "provenance", "basket", "order"
 
@@ -490,6 +496,7 @@ def run(
         )
         (mode,) = conn.execute("SELECT mode FROM agb.current_mode").fetchone()
         (asks,) = conn.execute("SELECT required FROM agb.paper_approval").fetchone()
+        (level,) = conn.execute("SELECT level FROM agb.current_level").fetchone()
         (run_id,) = conn.execute(_INSERT_RUN, (basket_id, len(checks), mode, PIPELINE)).fetchone()
         with conn.cursor() as cur:
             cur.executemany(
@@ -514,6 +521,12 @@ def run(
             jobs.fulfil(
                 conn, schedule.APPROVAL_REQUEST, target.period, "basket_event", event_id, PIPELINE
             )
+            state = "approved"
+        elif mode == LIVE and level == UNASKED:
+            # At L2 the rebalance proceeds; the month's approval is the notification the bot
+            # sends afterwards, which fulfils it when it goes out.
+            reason = f"passed the pre-trade gate at {UNASKED}, which proceeds unasked"
+            conn.execute(_MOVE, (basket_id, seq, "approved", SYSTEM, basket.SURFACE, reason))
             state = "approved"
         else:
             state = "proposed"
