@@ -129,7 +129,7 @@ No discretionary intra-month action. Positions are held until the next rebalance
 
 Stop-losses were rejected. `rev_1m` carries a negative expected sign, meaning the strategy explicitly bets that recent losers rebound; a stop-loss sells precisely those names at the local bottom, fighting the model. It is also a free parameter with no supporting prior. Event-driven exits on bankruptcy filings or going-concern warnings were rejected as largely redundant: such news is in the price before the system could act, and the name drops out of the next month's ranking anyway.
 
-Forced-event handling is required and must be built, in both the backtest and live:
+Forced-event handling is built, and the same rules serve the backtest and live:
 
 - **Cash acquisition** — the position terminates at the deal price; hold cash until the next rebalance rather than redeploying mid-month, since redeployment is an off-cadence decision with no signal behind it.
 - **Stock-for-stock merger** — acquirer shares are received and sold at the next rebalance regardless of the acquirer's rank, because that position was never chosen.
@@ -137,6 +137,8 @@ Forced-event handling is required and must be built, in both the backtest and li
 - **Trading halt spanning a rebalance date** — carry the position, skip its replacement, and run 19 names that month.
 
 The last case implies a requirement that is easy to miss: **position-count logic must tolerate holding fewer than 20 names**, or the strategy fails at the worst possible moment.
+
+As built, an event is a row the operator files through `agb corporate record` before the rebalance runs, carrying the human and the command behind it, and `agb/corporate.py` turns the record into the few rules both paths read: which names cannot be traded this month, which must be sold whatever they rank, the price a terminated position settles at, and the holding the event leaves. A cash acquisition and a merger end the position on the effective date and are charged nothing, since neither was a decision of ours; the acquirer shares land in the book and are sold at the next rebalance. A delisting and a halt leave the holding alone and differ only in what the next rebalance does with it: the delisted name is sold at its last listed print, and the halted one is carried, which drops that month's slot count by one and leaves 19 names to trade. Nothing else moves off cadence. An event nobody filed is not inferred from the book: the rebalance halts instead, because an unexplained change in a holding is exactly what the operator should see.
 
 Live positions are taken from daily broker snapshots rather than summed fills, precisely because corporate actions change holdings without a fill (see [08 — Database schema](08-database-schema.md)).
 

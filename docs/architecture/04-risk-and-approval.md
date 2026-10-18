@@ -40,7 +40,7 @@ Checks span three levels, because a basket can be perfectly self-consistent and 
 - The panel returned scores for the entire shortlist, with dispersion above the gate specified in [03 — LLM panel](03-llm-panel.md).
 
 **Basket invariants.**
-- Exactly 20 target positions (or fewer only through the forced-event cases the ranker defines).
+- Exactly 20 target positions (or fewer only through the forced-event cases the ranker defines). As built, a short basket passes only when a recorded forced event explains each missing name; a name carried with nothing on the record, or a shortfall the record does not cover, breaches. The weight-sum check scales its expectation to the names the basket actually holds, so a legitimate 19-name basket does not breach it as well.
 - Weights sum to 100% within tolerance.
 - No duplicate symbols.
 - Projected cash non-negative.

@@ -16,7 +16,8 @@ from market_fake import PERIOD, SIGNAL, TRADE, Market
 from psycopg import errors
 from registry_fake import ARTIFACT, MODEL_ID
 
-from agb import basket, gate, jobs, lake, schedule
+from agb import approval, basket, corporate, gate, jobs, lake, schedule
+from agb.corporate import Event, Kind
 from agb.rebalance import SIZE
 from agb.schedule import Expected, Planned
 from agb.services.pipeline import RETRY, Pipeline, capital_from_env
@@ -61,6 +62,24 @@ def job_state(db):
 
 def late_proposals(db, at):
     return rows(db, "SELECT period FROM agb.overdue_at(%s) WHERE kind = 'proposal'", at)
+
+
+def file_event(db, symbol, kind, shares, **extra):
+    """A forced corporate event on the record, as `agb corporate record` writes it."""
+    event = Event(PERIOD, symbol, kind, SIGNAL, Decimal(shares), "broker statement", **extra)
+    source = approval.Source("ada", "cli", f"agb corporate record {kind} {symbol}")
+    corporate.record(db.connect("cli"), event, source)
+    return event
+
+
+def gate_check(db, name):
+    [(measured, passed)] = rows(
+        db,
+        "SELECT measured, passed FROM agb.gate_check c JOIN agb.gate_run r ON r.id = c.run_id"
+        f" WHERE r.basket_id = {LATEST} AND c.name = %s AND c.symbol IS NULL",
+        name,
+    )
+    return measured, passed
 
 
 LATEST = "(SELECT max(id) FROM agb.basket)"
@@ -149,6 +168,7 @@ def test_the_basket_is_the_book_and_the_order_plan_moves_it(db, tmp_path):
     root = market.name("OLD", growth=-0.01).name("HALT", halted={SIGNAL}, price=50).land()
     book = {"N01": 100, "N04": 200, "N30": 300, "OLD": 400, "HALT": 50}
     filled_basket(db, "2026-09", book)
+    file_event(db, "HALT", Kind.HALT, 50)  # the carry is only legitimate on the record
     plan_rebalance(db)
 
     run(db, root)
@@ -179,6 +199,113 @@ def test_the_basket_is_the_book_and_the_order_plan_moves_it(db, tmp_path):
     assert turnover == "35.56%"
     # The book is the last filled basket, so the proposal has not moved it yet.
     assert basket.book(db.connect("pipeline")) == book
+
+
+# The four forced corporate events, down the live path. Each is recorded against the period
+# first, and the pipeline then rebalances through the same `rebalance.select` the backtest
+# calls (tests/test_backtest.py runs the same four through a simulation).
+
+
+def test_a_cash_acquisition_terminates_the_position_and_its_cash_waits_for_the_rebalance(
+    db, tmp_path
+):
+    """GONE was taken out for cash mid-month. The position is gone from the book before
+    anything is ranked, no sell of ours stands behind it, and its weight is spent at the
+    rebalance like any other cash rather than mid-month."""
+    root = Market(tmp_path).names(25).land()
+    filled_basket(db, "2026-09", {"N01": 100, "GONE": 400})
+    file_event(db, "GONE", Kind.CASH_ACQUISITION, 400, price_usd=Decimal("31.50"))
+    plan_rebalance(db)
+
+    run(db, root)
+
+    assert job_state(db) == "completed"
+    by_symbol = {t[0]: t[1:] for t in targets(db)}
+    assert len(by_symbol) == SIZE and "GONE" not in by_symbol
+    # Nineteen buys fill the slots N01 did not already hold, and nothing sells GONE.
+    assert [(o[0], o[1], o[2]) for o in orders(db)] == [
+        (f"N{i:02d}", "buy", 250) for i in range(2, SIZE + 1)
+    ]
+    assert gate_check(db, "positions") == ("20", True)
+
+
+def test_a_stock_merger_sells_the_acquirer_shares_whatever_their_rank(db, tmp_path):
+    """OLDCO was bought with ACQ stock, 200 shares for its 400. ACQ ranks first in the
+    market, and is sold anyway: that position was never chosen."""
+    root = Market(tmp_path).names(25).name("ACQ", growth=0.012).land()
+    filled_basket(db, "2026-09", {"N01": 100, "OLDCO": 400})
+    file_event(
+        db,
+        "OLDCO",
+        Kind.STOCK_MERGER,
+        400,
+        into_symbol="ACQ",
+        into_shares=Decimal(200),
+    )
+    plan_rebalance(db)
+
+    run(db, root)
+
+    assert job_state(db) == "completed"
+    by_symbol = {t[0]: t[1:] for t in targets(db)}
+    assert len(by_symbol) == SIZE
+    assert "ACQ" not in by_symbol and "OLDCO" not in by_symbol
+    assert ("ACQ", "sell", 200) in [(o[0], o[1], o[2]) for o in orders(db)]
+    assert gate_check(db, "positions") == ("20", True)
+
+
+def test_a_delisting_exits_at_the_last_listed_print_rather_than_being_dropped(db, tmp_path):
+    """DARK left the listed market and has no print on the signal session. The exit is
+    modelled at the price the operator recorded, not quietly forgotten."""
+    root = Market(tmp_path).names(25).name("DARK", growth=0.005, halted={SIGNAL}).land()
+    filled_basket(db, "2026-09", {"N01": 100, "DARK": 400})
+    file_event(db, "DARK", Kind.DELISTING, 400, price_usd=Decimal("12.25"))
+    plan_rebalance(db)
+
+    run(db, root)
+
+    assert job_state(db) == "completed"
+    assert "DARK" not in {t[0] for t in targets(db)}
+    [sell] = [o for o in orders(db) if o[1] == "sell"]
+    assert (sell[0], sell[2], sell[4], sell[5]) == ("DARK", 400, Decimal("12.25"), Decimal("4900"))
+    assert gate_check(db, "positions") == ("20", True)
+
+
+def test_a_halt_across_the_rebalance_carries_the_position_and_skips_its_replacement(db, tmp_path):
+    """STUCK is suspended across the signal session. It keeps its slot with no order of its
+    own, its replacement is skipped, so nineteen names trade, and the basket still holds
+    twenty because the record explains the carry."""
+    root = Market(tmp_path).names(25).name("STUCK", growth=0.011, halted={SIGNAL}).land()
+    filled_basket(db, "2026-09", {"STUCK": 50})
+    file_event(db, "STUCK", Kind.HALT, 50)
+    plan_rebalance(db)
+
+    run(db, root)
+
+    assert job_state(db) == "completed"
+    by_symbol = {t[0]: t[1:] for t in targets(db)}
+    assert len(by_symbol) == SIZE
+    assert by_symbol["STUCK"] == (Decimal("0.05"), 50, True, True, None)
+    plan = [(o[0], o[1], o[2]) for o in orders(db)]
+    assert plan == [(f"N{i:02d}", "buy", 250) for i in range(1, SIZE)]
+    assert gate_check(db, "positions") == ("20", True)
+    assert gate_check(db, "weight_sum") == ("1.00", True)
+
+
+def test_an_unrecorded_carry_halts_the_rebalance(db, tmp_path):
+    """The same halt with nothing on the record. A name that has quietly stopped printing
+    looks exactly like a suspended one, so the gate stops and asks for a human."""
+    root = Market(tmp_path).names(25).name("STUCK", growth=0.011, halted={SIGNAL}).land()
+    filled_basket(db, "2026-09", {"STUCK": 50})
+    plan_rebalance(db)
+
+    run(db, root)
+
+    assert rows(db, "SELECT state FROM agb.basket_state WHERE reference = %s", PERIOD) == [
+        ("halted",)
+    ]
+    assert gate_check(db, "positions") == ("20, carrying STUCK with nothing on the record", False)
+    assert rows(db, "SELECT cause FROM agb.halt_open") == [("gate_breach",)]
 
 
 def test_a_rebalance_that_fails_the_gate_is_halted_and_opens_the_latch(db, tmp_path):

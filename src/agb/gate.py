@@ -12,7 +12,12 @@ The gate runs every check that does not need the broker, in three groups:
     scores every name alike is useless whatever each score is, because stage 2 ranks its
     output into percentiles and a flat distribution ranks to noise.
   * **The basket.** Twenty positions whose weights sum to one, no symbol twice, cash left
-    over after the targets are bought, and turnover below 60% of the book.
+    over after the targets are bought, and turnover below 60% of the book. Fewer than twenty
+    passes only where a recorded forced corporate event (agb.corporate) explains it, and a
+    name the rebalance carried with no event on the record halts the month: a name that has
+    quietly stopped printing looks exactly like a halted one, and the difference is a human's
+    judgement. A basket short a slot keeps the same weight per name and leaves the missing
+    slot's weight in cash, so its weights sum to its share of the twenty.
   * **Each order.** Its symbol is in the universe, its side agrees with the book (a buy opens
     a position, a sell closes one it holds), its notional is at most 8% of equity, it is
     market-on-close, and the clock is before the session's MOC cutoff (15:45 ET on a full
@@ -44,7 +49,7 @@ from decimal import Decimal
 
 import psycopg
 
-from agb import basket, blend, jobs, nyse, rebalance, schedule, universe
+from agb import basket, blend, corporate, jobs, nyse, rebalance, schedule, universe
 from agb.roles import PIPELINE
 
 SYSTEM = "system"
@@ -81,6 +86,8 @@ class Target:
     symbol: str
     weight: Decimal
     shares: Decimal
+    # An incumbent the rebalance could not trade, kept in place with no order of its own.
+    carried: bool = False
 
 
 @dataclass(frozen=True)
@@ -119,6 +126,9 @@ class Basket:
     targets: tuple[Target, ...]
     orders: tuple[Order, ...]
     panel: Panel | None = None  # None on a basket proposed with no panel at all
+    # The forced corporate events the operator recorded against the period (agb.corporate):
+    # what the positions check reads a short basket against.
+    forced: tuple[corporate.Event, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -175,7 +185,14 @@ def evaluate(
 
     `members` is the universe the basket was ranked from, `marks` each name's last as-traded
     close on or before the signal session, `book` the positions before the rebalance, `now`
-    the moment the gate runs and `promoted` the live model, None if nothing is promoted."""
+    the moment the gate runs and `promoted` the live model, None if nothing is promoted.
+
+    The book is read through the forced events on the record (agb.corporate), because that is
+    the book the broker actually has: a position an acquisition terminated is gone, and the
+    shares a merger paid in stand where it stood. The price an event settled at marks a name
+    the lake has no print for, such as a delisted stub the plan has to sell."""
+    book = corporate.applied(book, target.forced)
+    marks = {**corporate.exits(target.forced), **marks}
     year, month = (int(part) for part in target.period.split("-"))
     first = date(year, month, 1)
     calendar = calendar or nyse.NyseCalendar(first - timedelta(days=40), target.session_date)
@@ -264,29 +281,59 @@ def _model(target: Basket, promoted: Promoted | None) -> Check:
 def _basket(
     target: Basket, marks: Mapping[str, Decimal], book: Mapping[str, Decimal], limits: Limits
 ) -> list[Check]:
-    positions = len(target.targets)
-    total = sum((t.weight for t in target.targets), Decimal(0))
     return [
-        Check(
-            BASKET,
-            "positions",
-            None,
-            str(positions),
-            str(limits.positions),
-            positions == limits.positions,
-        ),
-        Check(
-            BASKET,
-            "weight_sum",
-            None,
-            str(total),
-            f"1 within {limits.weight_tolerance}",
-            abs(total - 1) <= limits.weight_tolerance,
-        ),
+        _positions(target, limits),
+        _weight_sum(target, limits),
         _duplicates(target),
         _cash(target, marks),
         _turnover(target, marks, book, limits),
     ]
+
+
+def _positions(target: Basket, limits: Limits) -> Check:
+    """Twenty positions, or fewer where the record explains the shortfall.
+
+    A recorded forced corporate event (agb.corporate) is the only thing that may take a slot
+    out of a basket: a halt spanning the rebalance carries its incumbent with no order, and a
+    position an acquisition terminated cannot be bought back. So every name the rebalance
+    carried has to be on the record, and the basket may be short by no more than the number
+    of names the record accounts for. A basket short for any other reason — a name that has
+    quietly stopped printing, a ranking that came back thin — still halts, because the
+    difference between that and a halt is a human's judgement and not an inference."""
+    positions = len(target.targets)
+    threshold = f"{limits.positions}, or fewer where a recorded forced event explains each one"
+    explained = corporate.explained(target.forced)
+    names = {t.symbol for t in target.targets}
+    unexplained = sorted(
+        t.symbol for t in target.targets if t.carried and t.symbol not in explained
+    )
+    spare = sorted(s for s in explained if s not in names)
+    missing = limits.positions - positions
+    measured = str(positions)
+    if unexplained:
+        measured = f"{positions}, carrying {', '.join(unexplained)} with nothing on the record"
+    elif missing:
+        measured = f"{positions}, short {missing} against {len(spare)} on the record"
+    passed = not unexplained and 0 <= missing <= len(spare)
+    return Check(BASKET, "positions", None, measured, threshold, passed)
+
+
+def _weight_sum(target: Basket, limits: Limits) -> Check:
+    """The weights sum to the share of the twenty slots the basket filled, which is one for a
+    full basket. A slot a forced event took out leaves its weight in cash rather than being
+    spread over the rest (agb.rebalance), so a nineteen-name basket sums to 0.95 by
+    construction, and one whose weights were rescaled to one would be a different portfolio
+    at a weight nobody chose."""
+    total = sum((t.weight for t in target.targets), Decimal(0))
+    expected = Decimal(len(target.targets)) / limits.positions
+    return Check(
+        BASKET,
+        "weight_sum",
+        None,
+        str(total),
+        f"{expected} within {limits.weight_tolerance}",
+        abs(total - expected) <= limits.weight_tolerance,
+    )
 
 
 def _duplicates(target: Basket) -> Check:
@@ -411,7 +458,10 @@ _PANEL = """
     GROUP BY b.panel_run_id, b.panel_w
 """
 _PROMOTED = "SELECT certification_id, model_id, artifact_sha256, voided FROM agb.promoted_model"
-_TARGETS = "SELECT symbol, weight, shares FROM agb.basket_target WHERE basket_id = %s ORDER BY id"
+_TARGETS = """
+    SELECT symbol, weight, shares, carried FROM agb.basket_target
+    WHERE basket_id = %s ORDER BY id
+"""
 _ORDERS = """
     SELECT symbol, side, qty, tif, notional_usd FROM agb.basket_order
     WHERE basket_id = %s ORDER BY id
@@ -453,7 +503,7 @@ def load(conn: psycopg.Connection, basket_id: int) -> Basket:
     if blended is not None:
         run_id, w, scored, shortlisted, spread = blended
         panel = Panel(run_id, w, scored, shortlisted, None if scored < 2 else float(spread))
-    return Basket(*row, targets, orders, panel)
+    return Basket(*row, targets, orders, panel, corporate.for_period(conn, row[1]))
 
 
 def run(

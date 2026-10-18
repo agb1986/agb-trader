@@ -16,6 +16,9 @@ docs/architecture/02-classical-ranker.md:
     the signal session (a halt spanning the rebalance) is carried: it keeps its slot, gets no
     order and is not replaced, so the basket runs nineteen names that month. A ranking with
     too few tradeable names leaves slots empty.
+  * **A name a forced event divests leaves whatever its rank.** A delisted stub and the
+    acquirer shares a merger paid in were never chosen, so they are sold at the next
+    rebalance even where the ranking would have kept them (`agb.corporate`).
 
 Orders take a name in or out whole. Incumbents kept are not traded back to weight; drift is
 left alone between rebalances, which is the spec's no-intra-month-action rule applied at the
@@ -73,6 +76,7 @@ def select(
     held: Iterable[str],
     *,
     untradeable: Iterable[str] = (),
+    divest: Iterable[str] = (),
     size: int = SIZE,
     hold_through: int = HOLD_THROUGH,
 ) -> Selection:
@@ -81,6 +85,10 @@ def select(
     `held` is the names in the book before the rebalance, `untradeable` those with no print
     on the signal session. An untradeable incumbent is carried; an untradeable name that is
     not held cannot be bought and is passed over. An empty book buys the top `size`.
+
+    `divest` is the names a forced event sells whatever their rank: they are never kept,
+    carried or bought, and one that is held is sold. A name in both is sold, because a stub
+    with no print still has to leave the book at the price the event settled at.
     """
     if size > hold_through:
         raise ValueError(f"size {size} exceeds the hold-through rank {hold_through}")
@@ -89,14 +97,16 @@ def select(
     position = {symbol: i for i, symbol in enumerate(ranking)}
     by_rank = _by_rank(position)
     held, untradeable = frozenset(held), frozenset(untradeable)
+    divest = frozenset(divest)
+    passed_over = untradeable | divest
 
-    carry = sorted(held & untradeable, key=by_rank)
+    carry = sorted((held & untradeable) - divest, key=by_rank)
     slots = max(size - len(carry), 0)
-    keep = [s for s in ranking[:hold_through] if s in held and s not in untradeable]
+    keep = [s for s in ranking[:hold_through] if s in held and s not in passed_over]
     while len(keep) > slots:
         keep.pop()  # the lowest-ranked incumbent goes first
     sell = sorted(held - set(keep) - set(carry), key=by_rank)
-    buy = [s for s in ranking if s not in held and s not in untradeable][: slots - len(keep)]
+    buy = [s for s in ranking if s not in held and s not in passed_over][: slots - len(keep)]
     return Selection(tuple(keep), tuple(buy), tuple(sell), tuple(carry))
 
 

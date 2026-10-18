@@ -76,6 +76,8 @@ Rejected: a single boolean latch with a free-text reason, where a second cause a
 
 **Positions are daily broker snapshots**, not a sum of fills. Splits, mergers and spin-offs change holdings without any fill, and a fill-derived book drifts silently from the first corporate action. A daily check compares each snapshot against the previous snapshot plus the day's fills and alerts on any mismatch. A split will trigger it, which is correct: it is a real change the operator should see. Like every alert, it notifies and never acts.
 
+`forced_event` is the record of the four forced corporate actions the ranker defines, one append-only row per period, symbol and kind, written by a human with the `command` row that carried it. It holds the holding before the event and the holding it leaves, the deal price or last listed print where there is one, and the acquirer and the shares a merger paid. The mismatch check folds those share deltas into what it expects, so a filed event keeps the alert quiet while an unrecorded corporate action still raises it; the same rows are what let the pre-trade gate accept a basket of fewer than 20 names.
+
 Rejected: mutable order status updated in place from the broker stream, which loses the status history.
 
 ## Certified-model registry

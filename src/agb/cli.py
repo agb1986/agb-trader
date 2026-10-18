@@ -404,6 +404,63 @@ def _mode(args: argparse.Namespace) -> int:
     return 0
 
 
+def _corporate(args: argparse.Namespace) -> int:
+    from datetime import date
+    from decimal import Decimal, InvalidOperation
+
+    from agb import approval, corporate
+
+    with psycopg.connect(application_name="agb-cli") as conn:
+        if args.action == "show":
+            events = corporate.for_period(conn, args.period)
+            if not events:
+                print(f"no forced events recorded for {args.period}")
+                return 0
+            print("\n".join(corporate.line(event) for event in events))
+            return 0
+        text = " ".join(
+            shlex.quote(part)
+            for part in [
+                "agb",
+                "corporate",
+                "record",
+                args.kind,
+                args.symbol,
+                "--period",
+                args.period,
+                "--effective",
+                args.effective,
+                "--shares",
+                args.shares,
+                "--detail",
+                args.detail,
+                *(["--price", args.price] if args.price else []),
+                *(["--into", args.into] if args.into else []),
+                *(["--into-shares", args.into_shares] if args.into_shares else []),
+            ]
+        )
+        source = approval.Source(args.actor, "cli", text)
+        try:
+            event = corporate.Event(
+                period=args.period,
+                symbol=args.symbol,
+                kind=args.kind,
+                effective_date=date.fromisoformat(args.effective),
+                shares=Decimal(args.shares),
+                detail=args.detail,
+                price_usd=None if args.price is None else Decimal(args.price),
+                into_symbol=args.into,
+                into_shares=None if args.into_shares is None else Decimal(args.into_shares),
+            )
+            row_id = corporate.record(conn, event, source)
+        except (corporate.CorporateError, InvalidOperation, ValueError) as exc:
+            # A refusal that reached the database is recorded; leaving the block commits it.
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+    print(f"forced_event {row_id}: {corporate.line(event)}")
+    return 0
+
+
 def _lake_dir() -> Path:
     from agb import lake
 
@@ -618,6 +675,57 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--attest", help="why going live is warranted, recorded with it")
     mode.add_argument("--actor", **actor)
     mode.set_defaults(run=_mode)
+    corporate_commands = commands.add_parser(
+        "corporate",
+        help="record a forced corporate event, and read the ones a rebalance carries",
+        description="The four events the market forces on a holding: a cash acquisition, a "
+        "stock-for-stock merger, a delisting and a halt spanning a rebalance. Nothing here is "
+        "inferred, because a name that has quietly stopped printing looks exactly like a "
+        "halted one. The record is what lets the pre-trade gate accept a basket of fewer than "
+        "twenty names and what keeps the snapshot mismatch alert quiet for the share change "
+        "the event caused, so record it once the broker's statement or the exchange notice is "
+        "in hand.",
+    ).add_subparsers(dest="action", required=True)
+    corporate_record = corporate_commands.add_parser(
+        "record",
+        help="record one forced event against the rebalance it bears on",
+        description="File the event against the rebalance period it bears on, not the period "
+        "it happened in: a delisting in October that the November rebalance has to sell out "
+        "of is a November event with an October effective date. A cash acquisition needs its "
+        "deal price and a delisting its last listed print; a stock-for-stock merger needs the "
+        "acquirer and the shares it paid; a halt settles at no price. A second event of the "
+        "same kind for the same name and period is refused.",
+    )
+    corporate_record.add_argument(
+        "kind",
+        choices=[str(kind) for kind in ("cash_acquisition", "stock_merger", "delisting", "halt")],
+        help="which of the four it is",
+    )
+    corporate_record.add_argument("symbol", help="the name the event happened to")
+    corporate_record.add_argument(
+        "--period", required=True, metavar="YYYY-MM", help="the rebalance it bears on"
+    )
+    corporate_record.add_argument(
+        "--effective", required=True, metavar="DATE", help="the session it took effect on"
+    )
+    corporate_record.add_argument(
+        "--shares", required=True, help="the holding the event found, before it"
+    )
+    corporate_record.add_argument(
+        "--detail", required=True, help="where the fact came from, kept for the audit"
+    )
+    corporate_record.add_argument(
+        "--price", help="the deal price, or the last listed print of a delisting"
+    )
+    corporate_record.add_argument("--into", metavar="SYMBOL", help="the acquirer, for a merger")
+    corporate_record.add_argument("--into-shares", help="the acquirer shares the merger paid")
+    corporate_record.add_argument("--actor", **actor)
+    corporate_record.set_defaults(run=_corporate)
+    corporate_show = corporate_commands.add_parser(
+        "show", help="the forced events recorded against one rebalance period"
+    )
+    corporate_show.add_argument("period", metavar="YYYY-MM", help="the rebalance to read")
+    corporate_show.set_defaults(run=_corporate)
     paper_checks = commands.add_parser(
         "paper-check",
         help="the paper record's arithmetic checks, three of the paper-to-live criteria",

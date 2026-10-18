@@ -16,7 +16,7 @@ from market_fake import PERIOD, SIGNAL, TRADE
 from psycopg import errors
 from registry_fake import ARTIFACT
 
-from agb import gate
+from agb import approval, corporate, gate
 from agb.gate import GateError
 
 NAMES = [f"N{i:02d}" for i in range(1, 21)]
@@ -109,7 +109,7 @@ FAILURES = [
     pytest.param(Case(promoted=None), "model", id="model_unpromoted"),
     pytest.param(Case(promoted=VOIDED), "model", id="model_voided"),
     pytest.param(
-        Case(replace(BASE, targets=targets(NAMES[:19], Decimal(1) / 19),
+        Case(replace(BASE, targets=targets(NAMES[:19]),
                      orders=tuple(buy(s) for s in NAMES[:19]))),
         "positions", id="positions",
     ),
@@ -149,7 +149,13 @@ def test_a_sound_basket_passes_every_check_and_each_says_what_it_measured():
         ("provenance", "snapshot_date", None, "2026-09-30", "2026-09-30"),
         ("provenance", "universe_size", None, "2000", "1500 to 3500"),
         ("provenance", "model", None, f"{MODEL} {ARTIFACT[:12]}", f"{MODEL} {ARTIFACT[:12]}"),
-        ("basket", "positions", None, "20", "20"),
+        (
+            "basket",
+            "positions",
+            None,
+            "20",
+            "20, or fewer where a recorded forced event explains each one",
+        ),
         ("basket", "weight_sum", None, "1.00", "1 within 0.0001"),
         ("basket", "duplicates", None, "none", "none"),
         ("basket", "cash", None, "4000.00", ">= 0"),
@@ -198,6 +204,85 @@ def test_a_sell_may_close_no_more_than_the_book_holds():
     case = replace(TURNOVER, target=replace(TURNOVER.target, orders=orders))
     [side] = [c for c in evaluate(case) if c.name == "side" and c.symbol == "H04"]
     assert (side.measured, side.passed) == ("sell 301, holding 300", False)
+
+
+# A forced corporate event, recorded (agb.corporate): the halt whose incumbent the rebalance
+# carried, and the cash acquisition that terminated a position and left the basket a name short.
+HALTED = corporate.Event(
+    PERIOD, "N20", corporate.Kind.HALT, SIGNAL, Decimal(240), "exchange notice, still suspended"
+)
+ACQUIRED = corporate.Event(
+    PERIOD,
+    "N20",
+    corporate.Kind.CASH_ACQUISITION,
+    SIGNAL,
+    Decimal(240),
+    "deal closed at $20",
+    price_usd=Decimal(20),
+)
+# Twenty names, one of them carried through a halt with no order of its own.
+CARRIED = Case(
+    replace(
+        BASE,
+        targets=targets(NAMES[:19]) + (gate.Target("N20", Decimal("0.05"), Decimal(240), True),),
+        orders=tuple(buy(s) for s in NAMES[:19]),
+        forced=(HALTED,),
+    ),
+    book={"N20": Decimal(240)},
+)
+# Nineteen names, the twentieth terminated by the acquisition: its weight stays in cash.
+SHORT = Case(
+    replace(
+        BASE,
+        targets=targets(NAMES[:19]),
+        orders=tuple(buy(s) for s in NAMES[:19]),
+        forced=(ACQUIRED,),
+    )
+)
+
+
+def test_a_carried_name_the_record_explains_keeps_the_basket_at_twenty():
+    checks = {c.name: c for c in evaluate(CARRIED) if c.symbol is None}
+
+    assert [c.name for c in evaluate(CARRIED) if not c.passed] == []
+    assert checks["positions"].measured == "20"
+
+
+def test_a_carried_name_with_nothing_on_the_record_halts_the_rebalance():
+    """The judgement is a human's: a name that has quietly stopped printing looks exactly
+    like a halted one, so an unexplained carry fails rather than being taken on trust."""
+    case = replace(CARRIED, target=replace(CARRIED.target, forced=()))
+
+    failed = [(c.name, c.measured) for c in evaluate(case) if not c.passed]
+
+    assert failed == [("positions", "20, carrying N20 with nothing on the record")]
+
+
+def test_a_short_basket_the_record_explains_passes_and_leaves_the_slot_in_cash():
+    checks = {c.name: c for c in evaluate(SHORT) if c.symbol is None}
+
+    assert [c.name for c in evaluate(SHORT) if not c.passed] == []
+    assert (checks["positions"].measured, checks["weight_sum"].measured) == (
+        "19, short 1 against 1 on the record",
+        "0.95",
+    )
+    assert checks["weight_sum"].threshold == "0.95 within 0.0001"
+    assert checks["cash"].measured == "8800.00"
+
+
+def test_a_basket_shorter_than_the_record_accounts_for_fails():
+    case = replace(
+        SHORT,
+        target=replace(
+            SHORT.target,
+            targets=targets(NAMES[:18]),
+            orders=tuple(buy(s) for s in NAMES[:18]),
+        ),
+    )
+
+    failed = [(c.name, c.measured) for c in evaluate(case) if not c.passed]
+
+    assert failed == [("positions", "18, short 2 against 1 on the record")]
 
 
 def test_the_cutoff_moves_with_an_early_close():
@@ -249,9 +334,12 @@ def insert(db, target=BASE, reference=None, proposed=True):
         ).fetchall()
         with conn.cursor() as cur:
             cur.executemany(
-                "INSERT INTO agb.basket_target (basket_id, symbol, weight, shares, held)"
-                " VALUES (%s, %s, %s, %s, false)",
-                [(basket_id, t.symbol, t.weight, t.shares) for t in target.targets],
+                "INSERT INTO agb.basket_target (basket_id, symbol, weight, shares, held,"
+                " carried) VALUES (%s, %s, %s, %s, %s, %s)",
+                [
+                    (basket_id, t.symbol, t.weight, t.shares, t.carried, t.carried)
+                    for t in target.targets
+                ],
             )
             cur.executemany(
                 "INSERT INTO agb.basket_order (basket_id, client_order_id, symbol, side, qty,"
@@ -610,3 +698,52 @@ def test_the_system_approves_only_a_basket_that_passed_every_recorded_check(db):
         "proposed",
         "approved",
     ]
+
+
+def file_event(db, event):
+    """A forced event on the record, as `agb corporate record` writes it."""
+    source = approval.Source("ada", "cli", f"agb corporate record {event.kind} {event.symbol}")
+    return corporate.record(db.connect("cli"), event, source)
+
+
+def test_the_gate_reads_the_record_behind_a_short_basket(db):
+    """Acceptance: the gate accepts nineteen names when a recorded forced event explains the
+    missing one. The record is read from the database, not from the proposal."""
+    file_event(db, ACQUIRED)
+    basket_id = insert(db, SHORT.target)
+
+    verdict = run(db, basket_id, SHORT)
+
+    assert (verdict.state, verdict.passed) == ("approved", True)
+    assert rows(
+        db,
+        "SELECT measured, threshold FROM agb.gate_check c JOIN agb.gate_run r ON r.id = c.run_id"
+        " WHERE r.basket_id = %s AND c.name = 'positions'",
+        basket_id,
+    ) == [
+        (
+            "19, short 1 against 1 on the record",
+            "20, or fewer where a recorded forced event explains each one",
+        )
+    ]
+
+
+def test_a_short_basket_with_nothing_on_the_record_halts_in_the_database(db):
+    basket_id = insert(db, SHORT.target)
+
+    verdict = run(db, basket_id, SHORT)
+
+    assert (verdict.state, verdict.passed) == ("halted", False)
+    [(cause, halted, reason)] = rows(db, "SELECT cause, basket_id, reason FROM agb.halt_open")
+    assert (cause, halted) == ("gate_breach", basket_id)
+    assert reason.startswith("pre-trade gate failed: positions")
+
+
+def test_a_carried_name_passes_the_gate_once_its_halt_is_on_the_record(db):
+    hold(db, {"N20": Decimal(240)})
+    file_event(db, HALTED)
+    basket_id = insert(db, CARRIED.target)
+
+    verdict = run(db, basket_id, CARRIED)
+
+    assert (verdict.state, verdict.passed) == ("approved", True)
