@@ -39,6 +39,12 @@ reference, nothing to type at it, and the `basket_event` trigger refuses to move
 The book is what the last filled live basket holds. Until the execution ticket lands there is
 no filled basket, so the book is empty and the first proposal buys twenty names. Execution
 replaces `book` with the broker's positions; the rules that consume it do not change.
+
+A forced corporate event the operator recorded against the period (agb.corporate) is folded
+into that book first, so the rebalance starts from the holdings the broker actually has, and
+is then handed to the selection as untradeable or divest. Nothing else in the proposal
+changes: the same selection, the same weights and the same order plan, which is what keeps
+the backtest and the live path identical through a merger or a halt.
 """
 
 import re
@@ -52,7 +58,7 @@ from typing import Protocol
 import duckdb
 import psycopg
 
-from agb import blend, cost, lake, nyse, rebalance, universe
+from agb import blend, corporate, cost, lake, nyse, rebalance, universe
 from agb.jobs import Claim
 from agb.ranker import Ranked, Ranker
 from agb.roles import PIPELINE
@@ -322,6 +328,20 @@ def propose(
 
     held = book(conn)
     shadow_held = shadow_book(conn)
+    # What the market did to the book without being asked (agb.corporate), as the operator
+    # recorded it. The events are folded into the book before anything is selected, so the
+    # rebalance sees the holdings the broker actually has: a terminated position gone, and
+    # the shares a merger paid in standing where it stood.
+    forced = corporate.for_period(conn, claim.period)
+    for event in forced:
+        shares = held.get(event.symbol)
+        if shares is not None and shares != event.shares:
+            raise BasketError(
+                f"{event.symbol}: the recorded {event.kind} is against {event.shares} shares,"
+                f" but the book holds {shares}"
+            )
+    held = corporate.applied(held, forced)
+    shadow_held = corporate.applied(shadow_held, forced)
     # The panel costs money and an hour of model calls. A reference an earlier attempt already
     # proposed is kept, so there is nothing for a panel run to be written against: skip it.
     if panel is not None and _basket_for(conn, claim.period) is not None:
@@ -347,7 +367,21 @@ def propose(
             s
             for s in (*held, *shadow_held, *snapshot.tickers)
             if s not in prints or s not in counted
-        }
+        } | corporate.untradeable(forced)
+        # A name a forced event divests is sold whatever its rank and whether or not it still
+        # prints, so the plan needs a price for it: its print if it has one, else the price
+        # the event settled at, else its last close inside the mark window.
+        divest = corporate.divest(forced)
+        settled = corporate.exits(forced)
+        quotes = dict(prints)
+        for symbol in sorted((divest & (held.keys() | shadow_held.keys())) - prints.keys()):
+            price = settled.get(symbol) or marks.get(symbol)
+            if price is None:
+                raise BasketError(
+                    f"{symbol}: a forced event divests it, and it has no price on or before"
+                    f" {signal} to sell it at"
+                )
+            quotes[symbol] = price
         ranked_order = [r.symbol for r in ranking]
         blended: list[blend.Blended] = []
         shadow: _Shadow | None = None
@@ -363,12 +397,12 @@ def propose(
             blended = blend.blend(shortlist, scores, panel.w)
             ranked_order = blend.ranking(blended, tail)
             shadow = _shadow(
-                shortlist, tail, scores, panel.w, shadow_held, prints, untradeable, capital
+                shortlist, tail, scores, panel.w, shadow_held, quotes, untradeable, divest, capital
             )
-        selection = rebalance.select(ranked_order, held, untradeable=untradeable)
+        selection = rebalance.select(ranked_order, held, untradeable=untradeable, divest=divest)
         weight = rebalance.weights(selection.names)
-        plan = rebalance.orders(selection, weight, prints, held, capital)
-        costs = [_cost(lake_db, order, signal) for order in plan]
+        plan = rebalance.orders(selection, weight, quotes, held, capital)
+        costs = [_cost(lake_db, order, signal, forced=order.symbol in divest) for order in plan]
     finally:
         lake_db.close()
 
@@ -481,8 +515,9 @@ def _shadow(
     scores: Mapping[str, blend.Scored],
     traded_w: float,
     held: dict[str, Decimal],
-    prints: dict[str, Decimal],
+    quotes: dict[str, Decimal],
     untradeable: set[str],
+    divest: frozenset[str],
     capital: Decimal,
 ) -> _Shadow:
     """What the month would have held at the other weight: SHADOW_W against a live basket
@@ -491,9 +526,11 @@ def _shadow(
     twenty buys and thirty holds make a different book from the live one."""
     w = SHADOW_W if traded_w == 0 else 0.0
     blended = blend.blend(shortlist, scores, w)
-    selection = rebalance.select(blend.ranking(blended, tail), held, untradeable=untradeable)
+    selection = rebalance.select(
+        blend.ranking(blended, tail), held, untradeable=untradeable, divest=divest
+    )
     weight = rebalance.weights(selection.names)
-    plan = rebalance.orders(selection, weight, prints, held, capital)
+    plan = rebalance.orders(selection, weight, quotes, held, capital)
     return _Shadow(w, blended, selection, weight, plan, held)
 
 
@@ -564,8 +601,29 @@ def _last_closes(
     return {str(t): Decimal(str(p)) for t, p in rows}
 
 
-def _cost(db: duckdb.DuckDBPyConnection, order: rebalance.Order, signal: date) -> cost.TradeCost:
+def _cost(
+    db: duckdb.DuckDBPyConnection,
+    order: rebalance.Order,
+    signal: date,
+    *,
+    forced: bool = False,
+) -> cost.TradeCost:
     bars = db.execute(_BARS_FOR, [order.symbol, signal, _BARS]).fetchall()[::-1]
+    if forced and len(bars) < _BARS:
+        # A name a forced event divests may have stopped printing part-way through the cost
+        # model's window, which leaves the model no spread and no ADV to read. The leg is not
+        # a choice of ours and it settles at whatever the event settled at, so the market
+        # cost is recorded as nothing rather than the rebalance refusing to run. The
+        # regulatory fees stand: they are a published schedule, not a model.
+        side = cost.Side(str(order.side))
+        return cost.TradeCost(
+            model_version=cost.CURRENT.version,
+            side=side,
+            order_usd=float(order.notional),
+            floor_bps=0.0,
+            impact_bps=0.0,
+            fees=cost.fees(side, order.notional, order.qty, cost.CURRENT),
+        )
     high, low, close, volume = ([float(bar[i]) for bar in bars] for i in range(4))
     liq = cost.liquidity(high, low, close, volume)
     return cost.trade_cost(cost.Side(str(order.side)), order.notional, order.qty, liq)

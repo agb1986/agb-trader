@@ -10,13 +10,14 @@ fills kept; the other tests run a few months each."""
 import json
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 
 import numpy as np
 import pytest
 from research_fake import PANEL_START, Market
 
 import agb.rebalance
-from agb import cost, lake, rebalance
+from agb import corporate, cost, lake, rebalance
 from agb.research import __main__ as cli
 from agb.research import backtest, reproduce, scan
 from agb.research import panel as panel_module
@@ -54,8 +55,8 @@ def capturing(monkeypatch, captured: list) -> None:
     """Keep every simulation the run makes: the full run first, then any start-date runs."""
     real = backtest.simulate
 
-    def spy(feed, months, rankings, options):
-        outcome = real(feed, months, rankings, options)
+    def spy(feed, months, rankings, options, forced=()):
+        outcome = real(feed, months, rankings, options, forced)
         captured.append((list(months), outcome))
         return outcome
 
@@ -242,6 +243,245 @@ def test_a_delisted_name_is_traded_and_exited_at_its_last_print(tmp_path, ledger
     assert run.results["final_value"] == pytest.approx(
         options.init_cash * (1 + run.results["total_return"])
     )
+
+
+# Forced corporate events ----------------------------------------------------------------------
+
+# Three months is enough for any of the four: the position is taken in the first month, the
+# event falls between the second and the third, and the third's rebalance deals with what it
+# left. The ranking is set by hand in these tests, so what each month selects is the test's
+# own, and the only thing left to read is what the record did to it.
+FORCED_END = date(2024, 3, 31)
+
+
+def forced_panel(tmp_path, *extra: str):
+    """A small market and its panel: twelve ordinary names plus any the test names."""
+    market = Market(tmp_path / "lake").names(12)
+    for ticker in extra:
+        market.name(ticker, drift=0.0005)
+    root = market.land()
+    return panel_module.build(root, PANEL_START, FORCED_END), root
+
+
+def by_hand(panel: Panel, picks: list[list[str]]) -> np.ndarray:
+    """A score column that ranks each month's `picks` best first and leaves every other name
+    out of the ranking, so each month's selection is exactly the one the test asked for."""
+    chosen = {month.as_of: list(names) for month, names in zip(panel.months, picks, strict=True)}
+    return np.array(
+        [
+            len(chosen[as_of]) - chosen[as_of].index(ticker) if ticker in chosen[as_of] else np.nan
+            for as_of, ticker in zip(panel.frame["as_of"], panel.frame["ticker"], strict=True)
+        ],
+        dtype="float64",
+    )
+
+
+def between(root, ticker: str, after: date, before: date) -> tuple[date, float]:
+    """The name's first session in the gap between two months, and its adjusted close there:
+    when a corporate action takes effect, and what the holding is worth when it does."""
+    with lake.connect(root) as conn:
+        [(day, close)] = conn.execute(
+            "SELECT date, closeadj FROM sep WHERE ticker = ? AND date > ? AND date < ?"
+            " ORDER BY date LIMIT 1",
+            [ticker, after, before],
+        ).fetchall()
+    return day, close
+
+
+def filed(kind, symbol: str, day: date, period: str, **extra) -> corporate.Event:
+    """One event as the operator would have filed it. `shares` is the holding the record
+    names; a merger's ratio is applied to the position the engine actually holds, so the
+    tests read the shares a conversion paid off the fills rather than out of the record."""
+    return corporate.Event(
+        period, symbol, kind, day, Decimal(100), "the broker's statement", **extra
+    )
+
+
+def traded_on(simulation: backtest.Simulation, day: date) -> list[tuple[str, str]]:
+    """What the simulation traded on one session, by name and side."""
+    return sorted((fill.ticker, fill.side.name) for fill in simulation.fills if fill.day == day)
+
+
+def test_a_recorded_cash_acquisition_ends_the_position_and_the_cash_waits(
+    tmp_path, ledger, monkeypatch
+):
+    """A cash acquisition ends the holding on its effective date at the deal price, charged no
+    commission because a corporate action is not a trade of ours, and nothing else happens
+    that session: the cash waits for the next rebalance, which spends it on the name the
+    ranking wants and never buys the acquired name back."""
+    panel, root = forced_panel(tmp_path)
+    months = panel.months
+    picks = [["N01", "N02", "N03", "N04", "N05"]] * len(months)
+    day, close = between(root, "N01", months[1].entry, months[2].snapshot_date)
+    # The deal price is that session's close to the cent: a deal that is certain prints at the
+    # price it pays.
+    event = filed(
+        corporate.Kind.CASH_ACQUISITION,
+        "N01",
+        day,
+        months[2].as_of.strftime("%Y-%m"),
+        price_usd=Decimal(str(round(close, 2))),
+    )
+    options = backtest.Options(**SMALL)
+    captured: list = []
+    capturing(monkeypatch, captured)
+
+    run = backtest.run(
+        panel,
+        options,
+        ledger,
+        lake_dir=root,
+        scores=by_hand(panel, picks),
+        forced=[event],
+    )
+
+    _, simulation = captured[0]
+    fills = [fill for fill in simulation.fills if fill.ticker == "N01"]
+    assert [fill.side for fill in fills] == [cost.Side.BUY, cost.Side.SELL]
+    bought, ended = fills
+    assert bought.day == months[0].entry
+    assert ended.day == day and day not in {month.entry for month in months}
+    assert ended.qty == bought.qty
+    assert ended.price == pytest.approx(float(event.price_usd), abs=0.005), "the deal price"
+    assert (ended.fee, ended.participation) == (0.0, 0.0), "no trade of ours, no charge"
+    assert "N01" not in simulation.positions
+    assert traded_on(simulation, day) == [("N01", "SELL")], "the cash is not redeployed here"
+    assert traded_on(simulation, months[2].entry) == [("N04", "BUY")], "it is redeployed here"
+    assert run.results["cash_acquisition_events"] == 1
+    assert run.results["cash_acquisition_exits"] == 1
+    assert run.results["final_value"] == pytest.approx(
+        options.init_cash * (1 + run.results["total_return"])
+    )
+
+
+def test_a_recorded_merger_pays_in_shares_the_next_rebalance_sells(tmp_path, ledger, monkeypatch):
+    """A stock-for-stock merger ends the holding and the acquirer's shares arrive in its
+    place, neither leg charged a commission, and the next rebalance sells them however the
+    acquirer ranks: that position was never chosen. Here it ranks first and is sold anyway."""
+    panel, root = forced_panel(tmp_path, "ACQ")
+    months = panel.months
+    picks = [["N01", "N02", "N03", "N04", "N05"]] * 2 + [["ACQ", "N02", "N03", "N04", "N05"]]
+    day, _ = between(root, "N01", months[1].entry, months[2].snapshot_date)
+    event = filed(
+        corporate.Kind.STOCK_MERGER,
+        "N01",
+        day,
+        months[2].as_of.strftime("%Y-%m"),
+        into_symbol="ACQ",
+        into_shares=Decimal(40),
+    )
+    captured: list = []
+    capturing(monkeypatch, captured)
+
+    run = backtest.run(
+        panel,
+        backtest.Options(**SMALL),
+        ledger,
+        lake_dir=root,
+        scores=by_hand(panel, picks),
+        forced=[event],
+    )
+
+    _, simulation = captured[0]
+    legs = [fill for fill in simulation.fills if fill.day == day]
+    assert [(leg.ticker, leg.side) for leg in legs] == [
+        ("N01", cost.Side.SELL),
+        ("ACQ", cost.Side.BUY),
+    ]
+    ended, paid = legs
+    assert all(leg.fee == 0.0 for leg in legs), "a conversion is not a trade of ours"
+    assert paid.qty == int(ended.qty * event.ratio), "the recorded exchange ratio, whole shares"
+    assert paid.price == pytest.approx(simulation.fills[0].price, rel=1), "the acquirer's close"
+    sells = [f for f in simulation.fills if f.ticker == "ACQ" and f.side is cost.Side.SELL]
+    assert len(sells) == 1 and sells[0].day == months[2].entry
+    assert sells[0].qty == paid.qty
+    assert sells[0].fee > 0, "an ordinary sell at the rebalance, charged like one"
+    assert picks[2][0] == "ACQ" and "ACQ" not in simulation.positions
+    assert run.results["stock_merger_events"] == 1
+    assert run.results["stock_merger_exits"] == 1
+
+
+def test_a_recorded_delisting_exits_the_position_whatever_the_name_ranks(
+    tmp_path, ledger, monkeypatch
+):
+    """A name the operator recorded as delisted to OTC is sold at the next rebalance however
+    it ranks, and it is the record that sells it: the vendor is still printing the name, so
+    nothing in the bars would have exited it."""
+    panel, root = forced_panel(tmp_path, "DARK")
+    months = panel.months
+    picks = [["DARK", "N02", "N03", "N04", "N05"]] * len(months)
+    day, close = between(root, "DARK", months[1].entry, months[2].snapshot_date)
+    event = filed(
+        corporate.Kind.DELISTING,
+        "DARK",
+        day,
+        months[2].as_of.strftime("%Y-%m"),
+        price_usd=Decimal(str(round(close, 2))),  # the last listed print
+    )
+    captured: list = []
+    capturing(monkeypatch, captured)
+
+    run = backtest.run(
+        panel,
+        backtest.Options(**SMALL),
+        ledger,
+        lake_dir=root,
+        scores=by_hand(panel, picks),
+        forced=[event],
+    )
+
+    _, simulation = captured[0]
+    fills = [fill for fill in simulation.fills if fill.ticker == "DARK"]
+    assert [fill.side for fill in fills] == [cost.Side.BUY, cost.Side.SELL]
+    bought, exited = fills
+    assert exited.day == months[2].entry and exited.qty == bought.qty
+    assert exited.fee > 0, "an ordinary sell at the rebalance, charged like one"
+    assert picks[2][0] == "DARK" and "DARK" not in simulation.positions
+    with lake.connect(root) as conn:
+        [(last,)] = conn.execute("SELECT max(date) FROM sep WHERE ticker = 'DARK'").fetchall()
+    assert last > exited.day, "the bars run on; the record is what ends the position"
+    assert run.results["delisting_events"] == 1
+    assert run.results["delisting_exits"] == 0, "no bar went missing"
+
+
+def test_a_recorded_halt_carries_the_position_and_skips_its_replacement(
+    tmp_path, ledger, monkeypatch
+):
+    """A halt spanning a rebalance carries the position: it keeps its slot, gets no order, and
+    its replacement is not bought, so one fewer name trades that month. The same month without
+    the record sells the halted name and buys the replacement."""
+    panel, root = forced_panel(tmp_path)
+    months = panel.months
+    picks = [["N01", "N02", "N03", "N04", "N05"]] * 2 + [["N01", "N06", "N07", "N08", "N05"]]
+    scores = by_hand(panel, picks)
+    day, _ = between(root, "N03", months[1].entry, months[2].snapshot_date)
+    event = filed(corporate.Kind.HALT, "N03", day, months[2].as_of.strftime("%Y-%m"))
+    options = backtest.Options(**SMALL)
+    captured: list = []
+    capturing(monkeypatch, captured)
+
+    run = backtest.run(panel, options, ledger, lake_dir=root, scores=scores, forced=[event])
+    backtest.run(panel, options, ledger, lake_dir=root, scores=scores)
+
+    (_, carried), (_, unrecorded) = captured
+    entry = months[2].entry
+    # N02 and N03 both fall out of the ranking in the third month. Without the record both are
+    # sold and both replacements are bought; with it N03 keeps its slot, one of the two
+    # replacements is skipped, and one fewer name trades.
+    assert traded_on(unrecorded, entry) == [
+        ("N02", "SELL"),
+        ("N03", "SELL"),
+        ("N06", "BUY"),
+        ("N07", "BUY"),
+    ]
+    assert traded_on(carried, entry) == [("N02", "SELL"), ("N06", "BUY")]
+    assert "N07" not in carried.positions, "the replacement is skipped, not deferred"
+    held = [fill for fill in carried.fills if fill.ticker == "N03"]
+    assert [fill.side for fill in held] == [cost.Side.BUY]
+    assert carried.positions["N03"] == held[0].qty, "the holding is untouched"
+    assert len(carried.positions) == options.size, "the slot is kept, not left empty"
+    assert "N03" not in unrecorded.positions
+    assert run.results["halt_events"] == 1
 
 
 # The report -----------------------------------------------------------------------------------

@@ -32,6 +32,17 @@ signal session, or without the bars the cost model needs, or whose bars stop by 
 session, is untradeable at that rebalance: carried if held and never bought, exactly as
 `basket.propose` treats it.
 
+`forced` passes the recorded corporate events (`agb.corporate`) a period's rebalance must
+account for, and they are applied by the same rules the live basket applies, from the same
+module: a cash acquisition and a stock-for-stock merger end the position on their effective
+date, without a decision of the strategy's and without a commission, and a merger's acquirer
+shares are bought with what the subject's shares raised; the cash either leaves raised sits
+until the next rebalance, which is the specification's no-mid-month-redeployment rule; a
+halted incumbent is carried and its replacement skipped, so nineteen names trade; and a
+delisted or converted name is divested at the next rebalance whatever its rank. Events are
+passed in rather than put in `Options` because the options are serialised into the trial row,
+and because they are a fact about a month rather than a knob of the configuration.
+
 Every run reports gross and net returns, monthly and in total, the two-sided turnover of each
 rebalance, the maximum and mean participation (order dollars over the name's median daily
 dollar volume), and the same configuration run from several later start dates. Given one
@@ -58,7 +69,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Any
 
@@ -76,7 +87,7 @@ from nautilus_trader.model.instruments import Equity
 from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.trading.strategy import Strategy
 
-from agb import cost, features, lake, rebalance
+from agb import corporate, cost, features, lake, rebalance
 from agb.research import scan
 from agb.research.panel import Month, Panel
 from agb.research.trials import Ledger, Run
@@ -138,10 +149,12 @@ def run(
     lake_dir: Path = lake.DEFAULT_DIR,
     db: duckdb.DuckDBPyConnection | None = None,
     scores: pd.Series | Mapping[str, pd.Series] | None = None,
+    forced: Sequence[corporate.Event] = (),
 ) -> Run:
     """Backtest `options.signal` over the panel. `scores`, aligned to the panel's rows, stands
     in for a signal that is not a feature; a mapping of them, one per combinatorial path, runs
-    each path and reports them side by side."""
+    each path and reports them side by side. `forced` is the recorded corporate events the
+    months must account for, each applied at the rebalance its period names."""
     frame = panel.frame
     months = panel.months
     if not months:
@@ -163,15 +176,17 @@ def run(
         partition_hash=panel.partition_hash,
         cost_model_version=panel.cost_model_version,
     ) as trial:
-        feed = _feed(runs, months, options, lake_dir=lake_dir, db=db)
+        feed = _feed(runs, months, options, lake_dir=lake_dir, db=db, forced=forced)
         if isinstance(scores, Mapping):
-            paths = _paths(feed, months, runs, options)
+            paths = _paths(feed, months, runs, options, forced)
             trial.results = {"months": len(months), "paths": paths, "summary": _summary(paths)}
         else:
             ranked = runs[""]
-            results = _report(simulate(feed, months, ranked, options), feed, months, options)
+            outcome = simulate(feed, months, ranked, options, forced)
+            results = _report(outcome, feed, months, options, forced)
             results["start_dates"] = [
-                _sensitivity(feed, months[i:], ranked, options) for i in _starts(months, options)
+                _sensitivity(feed, months[i:], ranked, options, forced)
+                for i in _starts(months, options)
             ]
             trial.results = results
         return Run(trial.trial_id, trial.results)
@@ -184,6 +199,7 @@ def replay(
     *,
     lake_dir: Path = lake.DEFAULT_DIR,
     db: duckdb.DuckDBPyConnection | None = None,
+    forced: Sequence[corporate.Event] = (),
 ) -> list[dict[str, Any]]:
     """Each path's report, as `run` gives them, without a trial: the certification's second
     pass at twice the modelled cost reruns the same paths with a different constant and, as
@@ -194,8 +210,8 @@ def replay(
     if not scores:
         raise BacktestError("no paths to run")
     runs = {str(label): rankings(panel.frame, options, series) for label, series in scores.items()}
-    feed = _feed(runs, months, options, lake_dir=lake_dir, db=db)
-    return _paths(feed, months, runs, options)
+    feed = _feed(runs, months, options, lake_dir=lake_dir, db=db, forced=forced)
+    return _paths(feed, months, runs, options, forced)
 
 
 def _feed(
@@ -205,14 +221,19 @@ def _feed(
     *,
     lake_dir: Path,
     db: duckdb.DuckDBPyConnection | None,
+    forced: Sequence[corporate.Event] = (),
 ) -> "Feed":
-    """The bars of every name any ranking could trade."""
+    """The bars of every name any ranking could trade, and of every name a recorded event
+    names: a subject whose rank has gone and an acquirer that was never ranked both still have
+    to be marked and traded."""
     conn = db if db is not None else lake.connect(lake_dir)
     try:
         _require(conn)
         depth = options.hold_through + options.size
-        tickers = sorted({name for r in runs.values() for m in r.values() for name in m[:depth]})
-        return load(conn, tickers, months)
+        names = {name for r in runs.values() for m in r.values() for name in m[:depth]}
+        names |= {event.symbol for event in forced}
+        names |= {event.into_symbol for event in forced if event.into_symbol is not None}
+        return load(conn, sorted(names), months)
     finally:
         if db is None:
             conn.close()
@@ -223,9 +244,15 @@ def _paths(
     months: Sequence[Month],
     runs: Mapping[str, Mapping[date, list[str]]],
     options: Options,
+    forced: Sequence[corporate.Event] = (),
 ) -> list[dict[str, Any]]:
     return [
-        {"path": label, **_report(simulate(feed, months, ranked, options), feed, months, options)}
+        {
+            "path": label,
+            **_report(
+                simulate(feed, months, ranked, options, forced), feed, months, options, forced
+            ),
+        }
         for label, ranked in runs.items()
     ]
 
@@ -452,11 +479,13 @@ class Fill:
 @dataclass
 class _Book:
     """What the strategy and the fee model share: the liquidity priced for each name at its
-    last decision, and every charge the fee model has made."""
+    last decision, every charge the fee model has made, and the orders that are legs of a
+    corporate action rather than trades of ours, which are charged nothing."""
 
     multiple: float
     liquidity: dict[str, cost.Liquidity] = field(default_factory=dict)
     charges: list[tuple[str, float, float]] = field(default_factory=list)  # ticker, fee, take
+    free: set = field(default_factory=set)  # the client order ids a corporate action forced
 
 
 class _Fees(FeeModel):
@@ -469,6 +498,11 @@ class _Fees(FeeModel):
 
     def get_commission(self, order, fill_qty, fill_px, instrument) -> Money:
         ticker = instrument.id.symbol.value
+        if order.client_order_id in self.book.free:
+            # A cash acquisition or a merger conversion: the position changes without a trade
+            # of ours behind it, so there is no commission and no participation to report.
+            self.book.charges.append((ticker, 0.0, 0.0))
+            return Money(0, USD)
         liq = self.book.liquidity.get(ticker)
         if liq is None:
             raise BacktestError(f"{ticker} filled without its liquidity having been priced")
@@ -491,6 +525,7 @@ class _Rebalancer(Strategy):
         rankings: Mapping[date, list[str]],
         book: _Book,
         options: Options,
+        forced: Sequence[corporate.Event] = (),
     ) -> None:
         super().__init__(StrategyConfig())
         self.feed = feed
@@ -498,6 +533,9 @@ class _Rebalancer(Strategy):
         self.ranked = rankings
         self.book = book
         self.options = options
+        self.forced = tuple(forced)
+        # The events that end a position by themselves, waiting for their effective date.
+        self.terminating = corporate.terminations(self.forced)
         self.alerts: dict[str, tuple[str, Month]] = {}
         self.plans: dict[date, list[rebalance.Order]] = {}
         self.positions: dict[str, int] = {}
@@ -505,7 +543,9 @@ class _Rebalancer(Strategy):
         self.fills: list[Fill] = []
         self.counts: Counter[str] = Counter()
         self.pending: set = set()  # the client order ids of the rebalance's unfilled sells
-        self.queued: list[tuple[date, str, int]] = []  # the buys waiting on those sells
+        # The buys waiting on those sells: session, name, shares, and whether a corporate
+        # action forced the leg, which is charged no commission.
+        self.queued: list[tuple[date, str, int, bool]] = []
         self.seen: date | None = None  # the last session a bar arrived for
         self.account_final: float | None = None
 
@@ -530,19 +570,48 @@ class _Rebalancer(Strategy):
         ticker = bar.bar_type.instrument_id.symbol.value
         day = _day(bar.ts_event)
         self.seen = day
-        if ticker in self.positions and self.feed.last[ticker] == day and day < self.feed.end:
+        if ticker not in self.positions:
+            return
+        event = self.terminating.get(ticker)
+        if event is not None and day >= event.effective_date:
+            self.terminate(ticker, day, event)
+            return
+        if self.feed.last[ticker] == day and day < self.feed.end:
             # The name's last listed print: the forced exit, at this close.
             self.book.liquidity[ticker] = self.feed.liquidity(ticker, day)
             self.submit(ticker, OrderSide.SELL, self.positions[ticker])
             self.counts["delisting_exits"] += 1
+
+    def terminate(self, ticker: str, day: date, event: corporate.Event) -> None:
+        """A recorded cash acquisition or stock-for-stock merger, on its effective date: the
+        position ends with no decision of ours and no commission, because a corporate action
+        is not a trade. A merger's acquirer shares are queued against the proceeds the
+        subject's shares raise, which is what the conversion comes to in cash; the cash a
+        cash acquisition raises simply waits for the next rebalance."""
+        del self.terminating[ticker]
+        qty = self.positions[ticker]
+        if event.kind is corporate.Kind.STOCK_MERGER:
+            shares = int((qty * event.ratio).to_integral_value(rounding=ROUND_FLOOR))
+            if shares <= 0:
+                raise BacktestError(
+                    f"{ticker}: the {event.period} merger converts {qty} shares into"
+                    f" {shares} {event.into_symbol}"
+                )
+            self.queued.append((day, str(event.into_symbol), shares, True))
+        self.pending.add(self.submit(ticker, OrderSide.SELL, qty, free=True))
+        self.counts[f"{event.kind}_exits"] += 1
 
     def decide(self, month: Month) -> None:
         """At the close of the signal session: the live selection and order plan."""
         feed, options, day = self.feed, self.options, month.snapshot_date
         ranking = self.ranked.get(month.as_of, [])
         held = frozenset(self.positions)
+        events = corporate.in_period(self.forced, month.as_of.strftime("%Y-%m"))
+        divest = corporate.divest(events)
         prints: dict[str, Decimal] = {}
-        untradeable: set[str] = set()
+        # A halted incumbent and a terminated position come from the record; the rest is read
+        # from the bars, exactly as `basket.propose` reads them from the lake.
+        untradeable: set[str] = set(corporate.untradeable(events))
         for ticker in {*held, *ranking}:
             if ticker not in feed.series:
                 continue  # never reached by the ranking; checked below if it is
@@ -553,10 +622,23 @@ class _Rebalancer(Strategy):
                 untradeable.add(ticker)
             else:
                 prints[ticker] = Decimal(str(print_))
+        settled = corporate.exits(events)
+        for ticker in sorted((divest & held) - prints.keys()):
+            # A name the record divests has to be priced even where the bars will not price
+            # it: a delisted stub settles at the last listed print the operator recorded.
+            price = settled.get(ticker)
+            if price is None and ticker in feed.series:
+                price = Decimal(str(feed.close_through(ticker, day)))
+            if price is None:
+                raise BacktestError(
+                    f"{ticker}: a forced event divests it at {month.as_of} and it has no price"
+                )
+            prints[ticker] = price
         selection = rebalance.select(
             ranking,
             held,
             untradeable=untradeable,
+            divest=divest,
             size=options.size,
             hold_through=options.hold_through,
         )
@@ -587,9 +669,11 @@ class _Rebalancer(Strategy):
         """At the close of the trade session: the plan's sells, then its buys."""
         day = month.entry
         plan = self.plans.pop(month.as_of, [])
-        self.queued = [
-            (day, order.symbol, order.qty) for order in plan if order.side is rebalance.Side.BUY
-        ]
+        self.queued.extend(
+            (day, order.symbol, order.qty, False)
+            for order in plan
+            if order.side is rebalance.Side.BUY
+        )
         for order in plan:
             if order.side is not rebalance.Side.SELL:
                 continue
@@ -602,26 +686,27 @@ class _Rebalancer(Strategy):
 
     def buy(self) -> None:
         """Submit the queued buys, each trimmed to the cash still free after the ones before
-        it, with the fee it will be charged counted in."""
+        it, with the fee it will be charged counted in. A leg a corporate action forced is
+        charged nothing, and is trimmed only where the proceeds will not cover it."""
         free = self.portfolio.account(VENUE).balance_free(USD).as_double()
         queued, self.queued = self.queued, []
-        for day, ticker, wanted in queued:
+        for day, ticker, wanted, no_fee in queued:
             price = self.feed.close_at(ticker, day)
             if price is None:
                 self.counts["unfilled"] += 1
                 continue
-            liq = self.book.liquidity[ticker]
+            liq = None if no_fee else self.book.liquidity[ticker]
             qty = wanted
-            fee = self.fee(cost.Side.BUY, qty, price, liq)
+            fee = 0.0 if liq is None else self.fee(cost.Side.BUY, qty, price, liq)
             while qty > 0 and qty * price + fee > free:
                 qty = min(qty - 1, int((free - fee) // price))
-                fee = self.fee(cost.Side.BUY, qty, price, liq) if qty > 0 else 0.0
+                fee = self.fee(cost.Side.BUY, qty, price, liq) if qty > 0 and liq else 0.0
             if qty <= 0:
                 self.counts["unfilled"] += 1
                 continue
             if qty < wanted:
                 self.counts["trimmed"] += 1
-            self.submit(ticker, OrderSide.BUY, qty)
+            self.submit(ticker, OrderSide.BUY, qty, free=no_fee)
             free -= qty * price + fee
 
     def fee(self, side: cost.Side, qty: int, price: float, liq: cost.Liquidity) -> float:
@@ -629,13 +714,15 @@ class _Rebalancer(Strategy):
         priced = cost.trade_cost(side, qty * price, qty, liq)
         return Money(priced.total_usd * self.options.cost_multiple, USD).as_double() + 0.01
 
-    def submit(self, ticker: str, side: OrderSide, qty: int):
+    def submit(self, ticker: str, side: OrderSide, qty: int, *, free: bool = False):
         order = self.order_factory.market(
             InstrumentId(Symbol(ticker), VENUE),
             side,
             Quantity.from_int(qty),
             time_in_force=TimeInForce.DAY,
         )
+        if free:
+            self.book.free.add(order.client_order_id)
         self.submit_order(order)
         return order.client_order_id
 
@@ -684,15 +771,20 @@ class Simulation:
 
 
 def simulate(
-    feed: Feed, months: Sequence[Month], rankings: Mapping[date, list[str]], options: Options
+    feed: Feed,
+    months: Sequence[Month],
+    rankings: Mapping[date, list[str]],
+    options: Options,
+    forced: Sequence[corporate.Event] = (),
 ) -> Simulation:
-    """One run of the strategy over `months`, from `options.init_cash`."""
+    """One run of the strategy over `months`, from `options.init_cash`, with the recorded
+    corporate events in `forced` applied as they fall due."""
     start, end = months[0].snapshot_date, months[-1].exit
     bars = feed.bars(start, end)
     if not bars:
         raise BacktestError(f"no bars to replay between {start} and {end}")
     book = _Book(multiple=options.cost_multiple)
-    strategy = _Rebalancer(feed, months, rankings, book, options)
+    strategy = _Rebalancer(feed, months, rankings, book, options, forced)
     config = BacktestEngineConfig(
         logging=LoggingConfig(bypass_logging=True), risk_engine=RiskEngineConfig(bypass=True)
     )
@@ -738,7 +830,11 @@ def simulate(
 
 
 def _report(
-    outcome: Simulation, feed: Feed, months: Sequence[Month], options: Options
+    outcome: Simulation,
+    feed: Feed,
+    months: Sequence[Month],
+    options: Options,
+    forced: Sequence[corporate.Event] = (),
 ) -> dict[str, Any]:
     marks, fees_between, traded = _marks(outcome.fills, feed, months, options)
     net = [marks[i + 1] / marks[i] - 1.0 for i in range(len(months))]
@@ -757,6 +853,11 @@ def _report(
         "unfilled": outcome.counts["unfilled"],
         "trimmed": outcome.counts["trimmed"],
         "delisting_exits": outcome.counts["delisting_exits"],
+        **corporate.counts(forced),
+        **{
+            f"{kind}_exits": outcome.counts[f"{kind}_exits"]
+            for kind in (corporate.Kind.CASH_ACQUISITION, corporate.Kind.STOCK_MERGER)
+        },
         "final_value": marks[-1],
         "monthly": [
             {"as_of": month.as_of.isoformat(), "net": n, "gross": g}
@@ -819,9 +920,13 @@ def _marks(
 
 
 def _sensitivity(
-    feed: Feed, months: Sequence[Month], rankings: Mapping[date, list[str]], options: Options
+    feed: Feed,
+    months: Sequence[Month],
+    rankings: Mapping[date, list[str]],
+    options: Options,
+    forced: Sequence[corporate.Event] = (),
 ) -> dict[str, Any]:
-    outcome = simulate(feed, months, rankings, options)
+    outcome = simulate(feed, months, rankings, options, forced)
     marks, _, _ = _marks(outcome.fills, feed, months, options)
     net = [marks[i + 1] / marks[i] - 1.0 for i in range(len(months))]
     return {"start": months[0].as_of.isoformat(), **_metrics(net, marks, options)}

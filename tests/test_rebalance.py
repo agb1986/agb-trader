@@ -59,9 +59,42 @@ CASES = {
 }  # fmt: skip
 
 
+# The forced events that sell a name whatever its rank (agb.corporate): a delisted stub and
+# the acquirer shares a merger paid in.
+DIVEST_CASES = {
+    "a delisted stub is sold though the buffer would have kept it": (
+        RANKING, names(*range(1, 20), 25), (), names(25),
+        Selection(names(*range(1, 20)), names(20), names(25), ()),
+    ),
+    "acquirer shares are sold though the name ranks top of the book": (
+        RANKING, names(*range(1, 21)), (), names(1),
+        Selection(names(*range(2, 21)), names(21), names(1), ()),
+    ),
+    "a name both untradeable and divested is sold, not carried": (
+        RANKING, names(*range(1, 20), 35), names(35), names(35),
+        Selection(names(*range(1, 20)), names(20), names(35), ()),
+    ),
+    "a divested name outside the book is not bought": (
+        RANKING, (), (), names(3),
+        Selection((), names(1, 2, *range(4, 22)), (), ()),
+    ),
+}  # fmt: skip
+
+
 @pytest.mark.parametrize(("ranking", "held", "untradeable", "expected"), CASES.values(), ids=CASES)
 def test_select(ranking, held, untradeable, expected):
     assert rebalance.select(ranking, held, untradeable=untradeable) == expected
+
+
+@pytest.mark.parametrize(
+    ("ranking", "held", "untradeable", "divest", "expected"),
+    DIVEST_CASES.values(),
+    ids=DIVEST_CASES,
+)
+def test_select_divests_a_name_a_forced_event_sells(ranking, held, untradeable, divest, expected):
+    selection = rebalance.select(ranking, held, untradeable=untradeable, divest=divest)
+    assert selection == expected
+    assert not frozenset(divest) & frozenset(selection.names)
 
 
 def test_a_selection_names_every_position_after_the_rebalance():
