@@ -220,6 +220,15 @@ _FILLS = """
     FROM agb.fill
     WHERE filled_at > %s AND filled_at <= %s
 """
+# The months `/pnl` measures, for the comparison with the backtest: the whole record, or the
+# one month asked for.
+_MONTHS_MEASURED = """
+    SELECT period, total_return_fraction, mode, dividends_usd
+    FROM agb.equity_month
+    WHERE total_return_fraction IS NOT NULL
+      AND (%(period)s::text IS NULL OR period = %(period)s)
+    ORDER BY period
+"""
 
 
 def month_bounds(period: str) -> tuple[datetime, datetime]:
@@ -263,8 +272,52 @@ def pnl(conn: psycopg.Connection, period: str | None = None) -> str:
     ]
     fills, fees = conn.execute(_FILLS, (first_at, last_at)).fetchone()
     items.append(Item(f"{fills} fills", f"fees {dollars(fees)}"))
-    items.append(Item("backtest comparison", "not yet available"))
+    items.extend(comparison(conn, period))
     return message(header, items)
+
+
+def comparison(conn: psycopg.Connection, period: str | None = None) -> list[Item]:
+    """What the backtest expected over the same months, beside what happened. The
+    expectation is the promoted certification's median path month compounded over the months
+    measured, so the realised figure is read against the distribution the model was certified
+    on rather than against nothing. In paper the realised side is restated with the dividends
+    the operator recorded added back, because the paper broker credits none and the backtest
+    assumes them; in live they are already in the equity."""
+    months = conn.execute(_MONTHS_MEASURED, {"period": period}).fetchall()
+    items = []
+    paper = [row for row in months if row[2] == "paper"]
+    credited = sum((row[3] for row in paper), Decimal(0))
+    if credited:
+        compounded = Decimal(1)
+        for _, total_return, _, _ in months:
+            compounded *= 1 + total_return
+        items.append(
+            Item(
+                f"return with dividends {signed_percent(compounded - 1)}",
+                f"{dollars(credited)} recorded over {len(paper)} paper "
+                f"month{'' if len(paper) == 1 else 's'} and added back; "
+                "the paper broker credits none",
+            )
+        )
+    limits = health.thresholds(conn)
+    if limits is None:
+        items.append(Item("backtest expectation", "no model promoted"))
+    elif limits.monthly_return is None:
+        items.append(
+            Item("backtest expectation", f"{limits.model_id} recorded no monthly distribution")
+        )
+    else:
+        expected_month = Decimal(str(limits.monthly_return))
+        over = len(months) or 1
+        expected = (1 + expected_month) ** over - 1
+        items.append(
+            Item(
+                f"backtest expectation {signed_percent(expected)}",
+                f"{signed_percent(expected_month)} a month over {over} "
+                f"month{'' if over == 1 else 's'}, the median of {limits.over_paths()}",
+            )
+        )
+    return items
 
 
 # The basket.

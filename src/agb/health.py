@@ -2,13 +2,24 @@
 rebalance that was never scheduled, open halts, and the broker disagreeing with the database.
 The bot turns these into alerts and the pre-flight.
 
+Then how the account is performing, which is a different question with the same answer:
+nothing. A drawdown deeper than the certified paths reached, a losing run longer than they
+ran, tracking wider than they dispersed, live cost above the modelled cost by more than
+chance, equity beyond the capital the model was certified for — each of those is a reading
+the operator is told about, and none of them moves a share. The thresholds come from the
+promoted certification's own CPCV path distribution, so a figure past one of them means the
+live world is outside the range validation explored, not that a number crossed a line
+someone chose.
+
 Each finding carries the dedupe key of the alert it raises, and two short lines of plain
 text: what is wrong, then the facts behind it.
 """
 
 import os
+import statistics
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 
 import psycopg
 
@@ -18,6 +29,20 @@ from agb.nyse import NEW_YORK
 # A service whose heartbeat is older than this is stale: ten missed beats at the default
 # 30-second interval.
 STALE_AFTER = timedelta(minutes=5)
+
+# The live cost reading is not worth a word before this many fills, and not worth one until
+# the excess over the modelled cost is larger than this many standard errors of itself.
+COST_FILLS = 50
+COST_SIGMAS = 2.0
+
+# The kinds the performance checks raise. The bot alerts on these in its own words, because
+# the thing to say about them is what was not done.
+PERFORMANCE = frozenset({"drawdown", "losing_run", "tracking", "live_cost", "certified_capital"})
+
+# The sentence every performance finding ends on. The figure is not a failure and not a
+# verdict; it is a reading from outside the region the certification measured, which is the
+# one fact that makes it worth the operator's evening.
+OUTSIDE = "live is outside the range validation explored"
 
 
 @dataclass(frozen=True)
@@ -209,4 +234,252 @@ def position_mismatch(conn: psycopg.Connection) -> list[Finding]:
             f" from the previous snapshot plus fills; snapshot {snapshot_date}",
         )
         for snapshot_date, symbol, expected, observed in rows
+    ]
+
+
+# Performance and cost. These read the same two sources: what the account did, and what the
+# promoted certification said a world like this one would do. The formatters are local
+# because agb.readout reads this module and not the other way round.
+
+
+def _percent(value: float, places: int = 2) -> str:
+    return f"{value * 100:.{places}f}%"
+
+
+def _dollars(value: Decimal) -> str:
+    sign = "-" if value < 0 else ""
+    return f"{sign}${abs(value):,.2f}"
+
+
+def _bps(value: float) -> str:
+    return f"{value:.1f} bps"
+
+
+@dataclass(frozen=True)
+class Thresholds:
+    """The promoted certification's alert thresholds. Every quantile is optional: a
+    certification that did not record one leaves the check that needs it silent, which is the
+    right answer, because a threshold nobody validated is worse than no alert at all."""
+
+    model_id: str
+    certified_capital: Decimal
+    paths: int | None
+    drawdown_q05: float | None
+    drawdown_min: float | None
+    losing_run_q95: float | None
+    losing_run_max: float | None
+    tracking_q95: float | None
+    tracking_max: float | None
+    monthly_return: float | None
+
+    def over_paths(self) -> str:
+        return f"{self.paths} certified paths" if self.paths else "the certified paths"
+
+
+@dataclass(frozen=True)
+class Month:
+    """A New York month of the live account, as agb.equity_month reads it. `total_return`
+    includes the dividends the operator recorded when the month was a paper month, because
+    the paper broker credits none and the backtest's expectation assumes them."""
+
+    period: str
+    total_return: float
+    mode: str | None
+    dividends: Decimal
+
+
+_THRESHOLDS = """
+    SELECT model_id, certified_capital, paths, drawdown_q05, drawdown_min,
+           losing_run_q95, losing_run_max, tracking_q95, tracking_max, monthly_return
+    FROM agb.alert_threshold
+"""
+_MONTHS = """
+    SELECT period, total_return_fraction, mode, dividends_usd
+    FROM agb.equity_month
+    WHERE total_return_fraction IS NOT NULL
+    ORDER BY period
+"""
+_LIVE_COST = """
+    SELECT fills, mean_shortfall_bps, mean_modelled_bps, mean_excess_bps, excess_se_bps,
+           last_fill_at
+    FROM agb.live_cost
+"""
+_EQUITY = "SELECT equity_usd, observed_at FROM agb.broker_state_now"
+
+
+def thresholds(conn: psycopg.Connection) -> Thresholds | None:
+    """The promoted model's thresholds, or None when no model is promoted."""
+    row = conn.execute(_THRESHOLDS).fetchone()
+    return None if row is None else Thresholds(*row)
+
+
+def equity_months(conn: psycopg.Connection) -> list[Month]:
+    """Every month the account has a return for, oldest first."""
+    return [
+        Month(period, float(total_return), mode, dividends)
+        for period, total_return, mode, dividends in conn.execute(_MONTHS).fetchall()
+    ]
+
+
+def month_of(at: datetime) -> str:
+    """The New York month `at` falls in, which is how the performance alerts dedupe: one per
+    month per subject, so a drawdown that deepens for a fortnight is said once."""
+    return at.astimezone(NEW_YORK).strftime("%Y-%m")
+
+
+def drawdown(conn: psycopg.Connection) -> list[Finding]:
+    """The account's worst peak-to-trough fall, against the fifth percentile of the certified
+    paths' own worst falls. The peak includes the current month, as the backtest's does, so
+    the two numbers are the same measurement. One alert per trough month."""
+    limits = thresholds(conn)
+    if limits is None or limits.drawdown_q05 is None:
+        return []
+    mark = peak = 1.0
+    worst, trough = 0.0, None
+    for month in equity_months(conn):
+        mark *= 1.0 + month.total_return
+        peak = max(peak, mark)
+        fall = mark / peak - 1.0
+        if fall < worst:
+            worst, trough = fall, month.period
+    if trough is None or worst >= limits.drawdown_q05:
+        return []
+    deepest = (
+        ""
+        if limits.drawdown_min is None
+        else f", and {_percent(limits.drawdown_min)} at their deepest"
+    )
+    return [
+        Finding(
+            "drawdown",
+            "equity",
+            trough,
+            f"drawdown {_percent(worst)}, past the certified range",
+            f"worst fall from peak {_percent(worst)}, through {trough}; "
+            f"{_percent(limits.drawdown_q05)} at the 5th percentile of "
+            f"{limits.over_paths()}{deepest}; {OUTSIDE}.",
+        )
+    ]
+
+
+def losing_run(conn: psycopg.Connection) -> list[Finding]:
+    """The longest run of losing months the account has had, against the 95th percentile of
+    the certified paths' longest runs. One alert per month the run ends in."""
+    limits = thresholds(conn)
+    if limits is None or limits.losing_run_q95 is None:
+        return []
+    run, longest, end = 0, 0, None
+    for month in equity_months(conn):
+        run = run + 1 if month.total_return < 0 else 0
+        if run > longest:
+            longest, end = run, month.period
+    if end is None or longest <= limits.losing_run_q95:
+        return []
+    longest_certified = (
+        "" if limits.losing_run_max is None else f", and {limits.losing_run_max:g} at their longest"
+    )
+    return [
+        Finding(
+            "losing_run",
+            "equity",
+            end,
+            f"losing run {longest} months, past the certified range",
+            f"{longest} consecutive losing months, through {end}; "
+            f"{limits.losing_run_q95:g} at the 95th percentile of "
+            f"{limits.over_paths()}{longest_certified}; {OUTSIDE}.",
+        )
+    ]
+
+
+def tracking(conn: psycopg.Connection) -> list[Finding]:
+    """How far the account's months scatter around the backtest's expected month, against the
+    95th percentile of the certified paths' own dispersion. Needs two months to measure a
+    dispersion at all. One alert per latest month."""
+    limits = thresholds(conn)
+    if limits is None or limits.tracking_q95 is None or limits.monthly_return is None:
+        return []
+    months = equity_months(conn)
+    if len(months) < 2:
+        return []
+    dispersion = statistics.stdev(m.total_return - limits.monthly_return for m in months)
+    if dispersion <= limits.tracking_q95:
+        return []
+    widest = (
+        ""
+        if limits.tracking_max is None
+        else f", and {_percent(limits.tracking_max)} at their widest"
+    )
+    # The paper months were short their dividends until the operator recorded them; say so,
+    # because a reader who knows the paper broker credits none will wonder.
+    paper = [m for m in months if m.mode == "paper"]
+    credited = sum((m.dividends for m in paper), Decimal(0))
+    added = (
+        f" {_dollars(credited)} of recorded dividends added back over {len(paper)} paper months."
+        if credited
+        else ""
+    )
+    return [
+        Finding(
+            "tracking",
+            "equity",
+            months[-1].period,
+            f"tracking {_percent(dispersion)}, past the certified range",
+            f"monthly returns scatter {_percent(dispersion)} around the expected "
+            f"{_percent(limits.monthly_return)} over {len(months)} months; "
+            f"{_percent(limits.tracking_q95)} at the 95th percentile of "
+            f"{limits.over_paths()}{widest}; {OUTSIDE}.{added}",
+        )
+    ]
+
+
+def live_cost(conn: psycopg.Connection) -> list[Finding]:
+    """Live fills costing more than the model said they would, by more than chance: the mean
+    per-fill shortfall against the reference mid at submission, less the cost the model had
+    frozen for the same orders, when that excess is larger than COST_SIGMAS standard errors
+    of itself. Paper fills are not read at all — the paper broker simulates neither impact
+    nor slippage, so a paper shortfall measures its simulator. One alert per month of the
+    last live fill."""
+    fills, shortfall, modelled, excess, error, last_fill_at = conn.execute(_LIVE_COST).fetchone()
+    if fills < COST_FILLS or error is None or error <= 0:
+        return []
+    sigmas = float(excess) / float(error)
+    if sigmas <= COST_SIGMAS:
+        return []
+    return [
+        Finding(
+            "live_cost",
+            "shortfall",
+            month_of(last_fill_at),
+            f"live cost {_bps(float(excess))} above the modelled cost",
+            f"mean shortfall {_bps(float(shortfall))} against {_bps(float(modelled))} "
+            f"modelled, over {fills} live fills; the excess is {sigmas:.1f} standard "
+            f"errors, past the {COST_SIGMAS:g} the cost model is read against; {OUTSIDE}.",
+        )
+    ]
+
+
+def certified_capital(conn: psycopg.Connection) -> list[Finding]:
+    """Account equity beyond the capital the promoted model was certified for. The
+    certification measured participation and cost at that size; above it, the numbers it
+    passed on are no longer the numbers that apply. One alert per month of the observation."""
+    limits = thresholds(conn)
+    if limits is None:
+        return []
+    account = conn.execute(_EQUITY).fetchone()
+    if account is None:
+        return []
+    equity, observed_at = account
+    if equity is None or equity <= limits.certified_capital:
+        return []
+    over = equity / limits.certified_capital - 1
+    return [
+        Finding(
+            "certified_capital",
+            "equity",
+            month_of(observed_at),
+            f"equity {_dollars(equity)}, past the certified capital",
+            f"{_dollars(equity)} observed {et(observed_at)}, against "
+            f"{_dollars(limits.certified_capital)} certified for {limits.model_id}: "
+            f"{_percent(float(over))} above the size validation covered; {OUTSIDE}.",
+        )
     ]

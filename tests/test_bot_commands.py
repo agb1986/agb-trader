@@ -22,6 +22,7 @@ from test_execution import (
     broker,
 )
 from test_gate import BASE, insert, rows, run, state
+from test_health import distribution, dividend, promote
 
 from agb import execution, readout
 from agb.services.bot import MESSAGE_MAX, Bot, help_text, parse, split
@@ -141,7 +142,10 @@ def test_each_command_answers_from_the_database_after_a_paper_rebalance(db, pape
 
     assert blocks(pnl)[0] == "PNL — since the first reading"
     assert blocks(pnl)[1] == "  return +0.00%\n    equity $100,000.00 to $100,000.00, $0.00"
-    assert blocks(pnl)[-1] == "  backtest comparison\n    not yet available"
+    assert (
+        blocks(pnl)[-1]
+        == "  backtest expectation\n    momentum-fake recorded no monthly distribution"
+    )
 
     header, *targets = blocks(basket)
     assert re.fullmatch(
@@ -191,11 +195,43 @@ def test_pnl_for_a_month_runs_from_the_last_reading_before_it(db, paper):
         "  return +2.50%\n    equity $100,000.00 to $102,500.00, $2,500.00",
         "  window\n    2026-09-30 17:00 ET to 2026-10-30 17:00 ET",
         "  20 fills\n    fees $0.00",
-        "  backtest comparison\n    not yet available",
+        "  backtest expectation\n    momentum-fake recorded no monthly distribution",
     ]
     assert blocks(december) == [
         "PNL — 2026-12",
         "  no equity readings\n    execution has not read the account",
+    ]
+
+
+def test_pnl_reads_the_month_against_the_backtest_with_paper_dividends_added_back(db, paper):
+    """The realised return, the same return with the dividends the paper broker never
+    credited, and what the promoted certification's median path expected over as many
+    months: three figures the operator can read against each other."""
+    conn = db.connect("execution")
+    for at, equity in [
+        (datetime(2026, 9, 30, 21, 0, tzinfo=UTC), 100000),
+        (datetime(2026, 10, 30, 21, 0, tzinfo=UTC), 102500),
+    ]:
+        conn.execute(
+            "INSERT INTO agb.broker_state (observed_at, account_status, suspend_trade,"
+            " no_shorting, trading_blocked, account_blocked, equity_usd, actor)"
+            " VALUES (%s, 'ACTIVE', false, false, false, false, %s, 'execution')",
+            (at, equity),
+        )
+    promote(db, distribution(monthly=0.01))
+    dividend(db, "2026-10", "AAA", "400.00", "2026-10-20")
+
+    [october] = ask(db, "/pnl 2026-10")
+
+    assert_style(october)
+    assert blocks(october)[1] == (
+        "  return +2.50%\n    equity $100,000.00 to $102,500.00, $2,500.00"
+    )
+    assert blocks(october)[-2:] == [
+        "  return with dividends +2.90%\n    $400.00 recorded over 1 paper month and added"
+        " back; the paper broker credits none",
+        "  backtest expectation +1.00%\n    +1.00% a month over 1 month, the median of"
+        " 240 certified paths",
     ]
 
 
