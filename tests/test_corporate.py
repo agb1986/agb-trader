@@ -206,9 +206,12 @@ def test_a_second_event_of_the_same_kind_for_the_same_name_and_period_is_refused
         corporate.record(conn, replace(HALTED, detail="filed twice"), SOURCE)
 
     assert rows(db, "SELECT count(*) FROM agb.forced_event") == [(1,)]
+    # The refusal names the day the first filing was recorded, which is the day the test runs,
+    # so it is read back from the row rather than written in here.
+    filed = rows(db, "SELECT at::date FROM agb.forced_event")[0][0]
     assert rows(db, "SELECT outcome, reason FROM agb.command ORDER BY id")[1] == (
         "refused",
-        "N04 already has a halt recorded for 2026-11, by ada on 2026-10-18",
+        f"N04 already has a halt recorded for 2026-11, by ada on {filed:%Y-%m-%d}",
     )
 
 
