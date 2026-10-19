@@ -47,7 +47,11 @@ Every run reports gross and net returns, monthly and in total, the two-sided tur
 rebalance, the maximum and mean participation (order dollars over the name's median daily
 dollar volume), and the same configuration run from several later start dates. Given one
 score series per combinatorial path, it reports each path's series separately, in the form
-the deflated Sharpe and overfitting gates consume.
+the deflated Sharpe and overfitting gates consume. It also reports the approximate UK
+after-tax view of the run (`agb.research.tax`) beside the same treatment of buying `BENCHMARK`
+and holding it, because the operator is a UK tax resident and a monthly rebalance realises its
+gains every year where holding an index defers them; that view is labelled approximate, states
+its simplifications and is read by no gate.
 
 Four things separate this backtest from the scan by design, and bound how closely the two can
 agree: a name that stops printing is sold here at its last listed print, where the scan carries
@@ -88,7 +92,7 @@ from nautilus_trader.model.objects import Money, Price, Quantity
 from nautilus_trader.trading.strategy import Strategy
 
 from agb import corporate, cost, features, lake, rebalance
-from agb.research import scan
+from agb.research import scan, tax
 from agb.research.panel import Month, Panel
 from agb.research.trials import Ledger, Run
 
@@ -99,6 +103,7 @@ LIQUIDITY_BARS = scan.LIQUIDITY_BARS
 # Decimal places of the adjusted prices the engine trades; split-adjusted closes run small.
 PRECISION = 6
 # The session's bars are stamped at this UTC hour, after the New York close all year round.
+BENCHMARK = "SPY"  # the after-tax diagnostic's buy-and-hold comparison
 CLOSE_HOUR_UTC = 21
 # Calendar days of bars loaded before the first signal session, so the cost model has its
 # sixty-one bars from the first rebalance on.
@@ -233,7 +238,7 @@ def _feed(
         names = {name for r in runs.values() for m in r.values() for name in m[:depth]}
         names |= {event.symbol for event in forced}
         names |= {event.into_symbol for event in forced if event.into_symbol is not None}
-        return load(conn, sorted(names), months)
+        return load(conn, sorted(names), months, benchmark=BENCHMARK)
     finally:
         if db is None:
             conn.close()
@@ -310,10 +315,21 @@ class Series:
 
 class Feed:
     """The bars the engine replays and the strategy reads: every fed name's series, the Bar
-    objects in session order, and the last session the lake holds for them."""
+    objects in session order, and the last session the lake holds for them.
 
-    def __init__(self, series: dict[str, Series], bars: list[Bar], end: date) -> None:
+    The benchmark's series is held apart from the fed names and is not streamed to the engine,
+    because the strategy must not be able to trade it and because the lake's end for the fed
+    names, which is what the forced-exit rule reads, must not move with it."""
+
+    def __init__(
+        self,
+        series: dict[str, Series],
+        bars: list[Bar],
+        end: date,
+        benchmark: Series | None = None,
+    ) -> None:
         self.series = series
+        self.benchmark = benchmark  # the buy-and-hold comparison's bars, or None if unlisted
         self.end = end  # the last session in the lake for these names
         self.last = {ticker: s.dates[-1] for ticker, s in series.items()}
         self._bars = bars
@@ -366,16 +382,23 @@ class Feed:
         return [_equity(ticker) for ticker in self.series]
 
 
-def load(conn: duckdb.DuckDBPyConnection, tickers: list[str], months: Sequence[Month]) -> Feed:
+def load(
+    conn: duckdb.DuckDBPyConnection,
+    tickers: list[str],
+    months: Sequence[Month],
+    benchmark: str | None = None,
+) -> Feed:
+    """The feed for `tickers`, and the benchmark's series alongside it if the lake holds one:
+    a lake of equity prices need not carry an index fund, and the diagnostic that reads it
+    reports nothing rather than failing the run."""
     since = months[0].snapshot_date - timedelta(days=HISTORY_DAYS)
     until = months[-1].exit
-    conn.register("_backtest_names", pd.DataFrame({"ticker": tickers}))
+    names = sorted({*tickers, *([benchmark] if benchmark else [])})
+    conn.register("_backtest_names", pd.DataFrame({"ticker": names}))
     try:
         frame = conn.execute(_BARS, {"since": since, "until": until}).df()
     finally:
         conn.unregister("_backtest_names")
-    if frame.empty:
-        raise BacktestError(f"no bars for the ranked names between {since} and {until}")
     frame["date"] = pd.to_datetime(frame["date"]).dt.date
     factor = frame["closeadj"] / frame["close"]
     adjusted = pd.DataFrame(
@@ -400,12 +423,21 @@ def load(conn: duckdb.DuckDBPyConnection, tickers: list[str], months: Sequence[M
         )
         for ticker, group in frame.groupby("ticker", sort=True)
     }
-    streamed = frame[frame["date"] >= months[0].snapshot_date]
+    fed = frame[frame["ticker"].isin(tickers)]
+    if fed.empty:
+        raise BacktestError(f"no bars for the ranked names between {since} and {until}")
+    streamed = fed[fed["date"] >= months[0].snapshot_date]
     bars = [
         _bar(row.ticker, row.date, *adjusted.loc[row.Index], row.volume)
         for row in streamed.sort_values(["date", "ticker"]).itertuples()
     ]
-    return Feed(series, bars, max(frame["date"]))
+    held = set(tickers)
+    return Feed(
+        {ticker: s for ticker, s in series.items() if ticker in held},
+        bars,
+        max(fed["date"]),
+        benchmark=series.get(benchmark) if benchmark else None,
+    )
 
 
 def _bar(ticker: str, day: date, open_, high, low, close, volume) -> Bar:
@@ -859,11 +891,117 @@ def _report(
             for kind in (corporate.Kind.CASH_ACQUISITION, corporate.Kind.STOCK_MERGER)
         },
         "final_value": marks[-1],
+        "after_tax": _after_tax(outcome, feed, months, options, marks[-1]),
         "monthly": [
             {"as_of": month.as_of.isoformat(), "net": n, "gross": g}
             for month, n, g in zip(months, net, gross, strict=True)
         ],
     }
+
+
+def _after_tax(
+    outcome: Simulation,
+    feed: Feed,
+    months: Sequence[Month],
+    options: Options,
+    final_value: float,
+    *,
+    benchmark: str = BENCHMARK,
+) -> dict[str, Any]:
+    """The approximate UK after-tax view of the run, beside the same treatment of buying the
+    benchmark once and holding it.
+
+    The operator is a UK tax resident and this strategy realises nearly all of its gains every
+    year, where holding an index defers the whole bill to one disposal, so the pre-tax return
+    is not the comparison that matters to him. `agb.research.tax` does the arithmetic and
+    states its simplifications; they are carried in the row with the numbers, because a reader
+    who sees a tax figure without them will take it for a computation. It is a diagnostic:
+    certification reads none of it, and the specification is explicit that tax, which depends
+    on the operator's other income and allowance usage rather than on the strategy, cannot
+    enter a gate."""
+    init_cash = Decimal(str(options.init_cash))
+    return {
+        "approximate": True,
+        "basis": "approximate: UK capital gains tax at the higher rate on realised gains, in"
+        " USD, as a diagnostic of what the turnover costs after tax; it certifies nothing and"
+        " no gate reads it",
+        "rate": float(tax.RATE),
+        "annual_exempt_amount": float(tax.EXEMPT_AMOUNT),
+        "simplifications": list(tax.SIMPLIFICATIONS),
+        "strategy": tax.view(
+            _disposed(outcome, feed, months[-1].exit), init_cash, Decimal(str(final_value))
+        ),
+        "benchmark": benchmark,
+        "buy_and_hold": _buy_and_hold(feed, months, init_cash),
+    }
+
+
+def _disposed(outcome: Simulation, feed: Feed, day: date) -> list[tax.Trade]:
+    """The run's fills as trades to be taxed, with whatever is still held on `day` deemed
+    disposed of at that session's close and charged no dealing cost, so the bill covers the
+    same final value the report marks. The fills keep their order within a session, where a
+    sell funds the buys that follow it, because a Section 104 pool is a running average."""
+    trades = [
+        tax.Trade(
+            day=fill.day,
+            ticker=fill.ticker,
+            side=fill.side,
+            qty=fill.qty,
+            price=Decimal(str(fill.price)),
+            fee=Decimal(str(fill.fee)),
+        )
+        for fill in sorted(outcome.fills, key=lambda fill: fill.day)
+    ]
+    return trades + [
+        tax.Trade(
+            day=day,
+            ticker=ticker,
+            side=cost.Side.SELL,
+            qty=qty,
+            price=_mark(feed.series[ticker], day),
+            fee=Decimal(0),
+        )
+        for ticker, qty in sorted(outcome.positions.items())
+        if qty
+    ]
+
+
+def _buy_and_hold(feed: Feed, months: Sequence[Month], init_cash: Decimal) -> dict[str, Any] | None:
+    """The benchmark bought once at the first trade session's close with the same starting
+    cash, in whole shares with the rest left in cash, held to the final exit and deemed
+    disposed of there: one disposal, one year's allowance, and no dealing cost either way.
+
+    None when the lake holds no bars for the benchmark over these months, which a lake of
+    equity prices alone will not: the comparison is a diagnostic and its absence is not a
+    reason to fail a run, so the report says which name it wanted and leaves the row empty."""
+    series = feed.benchmark
+    if series is None:
+        return None
+    entry, exit_day = months[0].entry, months[-1].exit
+    start, end = _mark(series, entry, missing=True), _mark(series, exit_day, missing=True)
+    if start is None or end is None or start <= 0:
+        return None
+    qty = int((init_cash / start).to_integral_value(rounding=ROUND_FLOOR))
+    if qty < 1:
+        return None
+    trades = [
+        tax.Trade(entry, BENCHMARK, cost.Side.BUY, qty, start, Decimal(0)),
+        tax.Trade(exit_day, BENCHMARK, cost.Side.SELL, qty, end, Decimal(0)),
+    ]
+    final_value = init_cash - qty * start + qty * end
+    return {"shares": qty, **tax.view(trades, init_cash, final_value)}
+
+
+def _mark(series: Series, day: date, *, missing: bool = False) -> Decimal | None:
+    """The last adjusted close on or before `day` as a Decimal, for the tax arithmetic, which
+    is in Decimal throughout. `missing` allows a name that had not started printing by `day`,
+    which only the benchmark can be."""
+    n = series.through(day)
+    if n == 0:
+        if missing:
+            return None
+        raise BacktestError(f"{series.dates[0]} is the first bar, after {day}")
+    return Decimal(str(float(series.adjusted[n - 1])))
 
 
 def _metrics(returns: list[float], marks: list[float], options: Options) -> dict[str, Any]:
