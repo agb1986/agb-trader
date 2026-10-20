@@ -1,5 +1,6 @@
 """The Telegram bot service. Each cycle it beats its heartbeat, reads new messages and
-answers the read-only commands, raises an alert for each unhealthy finding, a fill
+answers the read-only commands, raises an alert for each unhealthy finding and for each
+performance reading past the certified range, a fill
 confirmation for each rebalance that filled and a gate-halt alert for each one the checks
 halted, puts each gated rebalance to the human and reminds them before its cutoff, raises the
 pre-flight on the session before a rebalance, and delivers every undelivered alert to the
@@ -55,6 +56,14 @@ RETRY_AFTER = timedelta(minutes=1)
 RETRY_CAP = timedelta(hours=1)
 
 ALERT_HEADER = "HEALTH ALERT — nothing has been done and nothing will be."
+# The performance readings get their own header and a footer, because the question they
+# provoke is "what now?" and the honest answer is "whatever you decide, and nothing else".
+PERFORMANCE_HEADER = "PERFORMANCE ALERT — nothing has been done and nothing will be."
+PERFORMANCE_FOOTER = (
+    "/pause stops the next rebalance and /liquidate closes every position. "
+    "Both are yours to choose; nothing in this message chooses for you, "
+    "and no part of the system will act on it."
+)
 FILL_CONFIRMATION = "fill_confirmation"
 GATE_HALT = "gate_halt"
 # The unprompted rebalance messages look back over this many of the latest live baskets.
@@ -166,6 +175,8 @@ def split(text: str, limit: int = MESSAGE_MAX) -> list[str]:
 
 
 def alert_text(finding: Finding) -> str:
+    if finding.kind in health.PERFORMANCE:
+        return f"{PERFORMANCE_HEADER}\n\n{finding.lines()}\n\n{PERFORMANCE_FOOTER}"
     return f"{ALERT_HEADER}\n\n{finding.lines()}"
 
 
@@ -294,7 +305,7 @@ class Bot:
     def __call__(self, conn: psycopg.Connection) -> None:
         now = self.clock()
         self.poll(conn, now)
-        for finding in [*self.findings(conn, now), *self.broker(conn)]:
+        for finding in [*self.findings(conn, now), *self.broker(conn), *self.performance(conn)]:
             self.raise_alert(
                 conn, finding.kind, finding.subject, finding.period, alert_text(finding)
             )
@@ -572,6 +583,19 @@ class Bot:
             *health.stale_heartbeats(conn, now, self.stale_after),
             *health.overdue(conn, now),
             *health.position_mismatch(conn),
+        ]
+
+    def performance(self, conn: psycopg.Connection) -> list[Finding]:
+        """What the account has done, against what the promoted certification said a world
+        like this one would do. These are alerts and not pre-flight items: the pre-flight
+        asks whether the machinery will work tomorrow, which is a different question from
+        whether the strategy is behaving as it was validated to."""
+        return [
+            *health.drawdown(conn),
+            *health.losing_run(conn),
+            *health.tracking(conn),
+            *health.live_cost(conn),
+            *health.certified_capital(conn),
         ]
 
     def rebalances(self, conn: psycopg.Connection) -> None:

@@ -118,6 +118,10 @@ Rejected: stored counters. Rejected: the shadow as extra columns on the traded b
 
 The bot evaluates the health of every other service and alerts. The UI evaluates everything, including the bot, and shows a banner. The bot's pre-flight message on the session before each rebalance is how a dead bot is noticed with a session to spare.
 
+As built, the performance alerts of [04 — Risk and approval](04-risk-and-approval.md) read four views rather than tables of their own, because each figure is a reading of recorded history and a stored copy could disagree with it. `fill_shortfall` gives each fill's shortfall in basis points, signed by side against the NBBO mid recorded at submission, beside the modelled cost frozen on the order and the trading mode in force when the order was created. `live_cost` aggregates it over live fills alone into a count, the two means, and the standard error of their difference. `equity_month` cuts the `broker_state` equity readings into New York months, opening each at the last reading before it, and reports the month's return both as realised and with recorded dividends added back in paper. `alert_threshold` lifts the promoted certification's `path_quantiles` into one row of thresholds, reading NULL where that certification recorded no such quantile, which is how a check with no validated threshold stays silent.
+
+As built, `dividend` is the one new table: an append-only row per dividend the operator recorded from a broker statement, keyed `(period, symbol, paid_on)` and carrying the command that recorded it. It exists because the paper broker credits no dividends while the backtest assumes them, so a paper month cannot be compared with the backtest without them. Only the operator's surfaces insert; nothing computes it. The certification's `path_quantiles` gained a `monthly_return` distribution in the same change, which is the expectation the tracking alert and `/pnl` read a live month against.
+
 Rejected: staleness from heartbeats alone. It catches a dead process but not a live scheduler that silently never scheduled the rebalance, which is precisely the quiet-month case.
 
 ## Panel logs
@@ -147,8 +151,9 @@ Rejected: everything in Postgres, which grows the dump by hundreds of megabytes 
 | `heartbeat` | every service | upsert |
 | `expected_event` | scheduler (create), fulfilling service (completion reference) | completion by append or reference, never rewrite |
 | `alert`, `alert_event` | bot, ui, execution, scheduler | no |
+| `dividend` | cli, ui (the operator, from a broker statement) | no |
 
-Views: current basket state, open halt causes, audit log, shortfall, eligibility (ladder and mode), overdue expected events, reconcile state (each planned order beside what the broker last said about it).
+Views: current basket state, open halt causes, audit log, shortfall, eligibility (ladder and mode), overdue expected events, reconcile state (each planned order beside what the broker last said about it), per-fill and live cost shortfall, equity by New York month, and the promoted certification's alert thresholds.
 
 ## Conventions
 

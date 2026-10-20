@@ -198,19 +198,23 @@ def start_date_sensitivity(
 
 def path_quantiles(net: np.ndarray) -> dict[str, Any]:
     """The distribution across paths of the maximum drawdown, the longest losing run in
-    months and the tracking dispersion (the standard deviation of a path's monthly return
-    around the paths' mean month), at the standard quantiles plus the extremes."""
+    months, the tracking dispersion (the standard deviation of a path's monthly return around
+    the paths' mean month) and the mean month itself, at the standard quantiles plus the
+    extremes. The live monitoring alerts read these as their thresholds, which is why the
+    mean month is here: it is the expectation a live month is compared against."""
     rows = _paths(net)
     drawdowns = [max_drawdown(row) for row in rows]
     runs = [longest_losing_run(row) for row in rows]
     centre = rows.mean(axis=0)
     dispersion = [float(np.std(row - centre, ddof=1)) if rows.shape[1] > 1 else 0.0 for row in rows]
+    monthly = [float(row.mean()) if rows.shape[1] else 0.0 for row in rows]
     return {
         "paths": len(rows),
         "quantiles": list(QUANTILES),
         "max_drawdown": _distribution(drawdowns),
         "longest_losing_run": _distribution(runs),
         "tracking_dispersion": _distribution(dispersion),
+        "monthly_return": _distribution(monthly),
     }
 
 

@@ -180,7 +180,7 @@ def test_the_artifact_carries_every_field_the_row_needs(certified, panel):
     assert manifest["certified_capital"] == 100_000.0
     assert set(manifest["gates"]) >= {"dsr", "pbo", "sharpe_net", "dsr_2x", "thresholds"}
     assert all(manifest["gates"][g]["passed"] for g in ("dsr", "pbo", "sharpe_net", "dsr_2x"))
-    for name in ("max_drawdown", "longest_losing_run", "tracking_dispersion"):
+    for name in ("max_drawdown", "longest_losing_run", "tracking_dispersion", "monthly_return"):
         assert set(manifest["path_quantiles"][name]) == {
             "min", "max", "q05", "q25", "q50", "q75", "q95",
         }  # fmt: skip

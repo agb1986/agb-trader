@@ -346,7 +346,7 @@ def report(manifest: dict[str, Any]) -> str:
         "## Path distribution",
         "",
     ]
-    for name in ("max_drawdown", "longest_losing_run", "tracking_dispersion"):
+    for name in ("max_drawdown", "longest_losing_run", "tracking_dispersion", "monthly_return"):
         values = manifest["path_quantiles"][name]
         lines.append(
             f"- {name}: "

@@ -132,6 +132,8 @@ The result message reports what the broker returned, per symbol, including failu
 
 The performance alert opens by stating that nothing has been done and nothing will be, gives the live figure against the backtest's own CPCV path distribution, says plainly that live is now outside the range validation explored, and then offers `/pause` and `/liquidate` as the human's levers. It never recommends.
 
+As built, a performance alert carries the one header `PERFORMANCE ALERT — nothing has been done and nothing will be.`, then the reading as a two-line item, then the footer `/pause stops the next rebalance and /liquidate closes every position. Both are yours to choose; nothing in this message chooses for you, and no part of the system will act on it.` The reading's own second line ends with `live is outside the range validation explored`. A health alert keeps its own `HEALTH ALERT` header and carries no footer, because a stale heartbeat is a thing to fix rather than a thing to decide about. A test asserts the footer verbatim and that the words "should", "consider", "recommend", "advise" and "suggest" appear nowhere in the message.
+
 This wording is doing real work. An alert that reads as a recommendation converts a monitoring system into an advisory one, and an operator who acts on it at the bottom of a drawdown has overlaid an unbacktested exit rule on a certified strategy by hand, the exact outcome the standing constraint forbids the software from doing automatically. Saying outright that no action was taken and none will be taken removes the ambiguity about whether the system is asking for something.
 
 ## The audit log carries an actor, and `system` is one
