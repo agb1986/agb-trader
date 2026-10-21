@@ -1,7 +1,8 @@
 """The local UI's pages, rendered from the database by the server beside it
-(docs/architecture/06-local-ui.md). Nothing here writes: every page is a SELECT, and the
-connection the pages read on is read-only in the database too, so a mistake cannot become a
-write.
+(docs/architecture/06-local-ui.md). Every page is a read, and a page renders on a connection
+the database itself holds read-only, so a mistake on a page cannot become a write. The two
+write paths are forms that post to their own routes, each of which takes a connection of its
+own, and `WRITES` is the whole list of them.
 
 The shell is the decision log, one row per rebalance cycle, newest first: the state it
 reached, who decided it and from which surface, the realised return of the month it traded,
@@ -16,21 +17,30 @@ undelivered alert is visible at all, so a Telegram outage cannot hide a month's 
 request. A dead scheduler reads here as a stale heartbeat and a rebalance nothing has
 scheduled, never as an empty page.
 
-The views beside the log — Rebalance, Positions, Gate and Alerts — are the same state read
-four other ways. Each speaks the Telegram bot's vocabulary, from agb.readout, so the two
-surfaces cannot describe one basket in two dialects. Approving, rejecting and the kill switch
-are the write path and arrive with it; until then every page says so.
+The views beside the log — Rebalance, Positions, Gate, Alerts and the kill switch — are the
+same state read five other ways. Each speaks the Telegram bot's vocabulary, from agb.readout,
+so the two surfaces cannot describe one basket in two dialects.
+
+The writes are exactly Telegram's two: answering the rebalance, and the kill switch. Neither
+is written here. Answering goes through `agb.approval` and the switch through
+`agb.killswitch`, the same functions the bot calls, with a source naming this surface, so the
+semantics cannot drift between the two surfaces and the race between them is settled in one
+place. Approving is never one click: the operator types the rebalance's reference, which is
+the friction Telegram's typed command has and the whole reason the landing page is the log
+rather than a basket with a green button. Every write is a `command` row with the actor and
+the surface on it, refused ones included.
 """
 
 import html
-from collections.abc import Iterable, Sequence
-from datetime import datetime
+from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime, timedelta
 from decimal import Decimal, DivisionByZero, InvalidOperation
 
 import psycopg
 
-from agb import health, readout
+from agb import approval, health, killswitch, readout
 from agb.health import et
+from agb.nyse import NyseCalendar, trading_date
 
 # The log and the views, in the order the header shows them.
 VIEWS = (
@@ -39,13 +49,19 @@ VIEWS = (
     ("/positions", "Positions"),
     ("/gate", "Gate"),
     ("/alerts", "Alerts"),
+    ("/killswitch", "Kill switch"),
 )
 # The most cycles the log shows, and the most alerts the Alerts view shows.
 LOG_CYCLES = 24
 ALERT_MAX = 50
 # How the pages connect: as the `ui` role from the PG* environment, and read-only, so the
-# database refuses a write even if a page ever tried one.
+# database refuses a write even if a page ever tried one. The write routes connect without it.
 READ_ONLY = "-c default_transaction_read_only=on"
+# Who a write from this surface is attributed to, and the surface it is attributed to. There is
+# no login here — SSH is the authentication — so there is one operator, named as such, and the
+# audit trail says which surface they were sitting at.
+ACTOR = "ui:operator"
+SURFACE = "ui"
 
 STYLE = """
 :root { color-scheme: light dark; --line: #d6d6d6; --dim: #666; --bad: #a40000;
@@ -87,6 +103,13 @@ details.cycle[open] > summary { font-weight: 600; }
 .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
 .dim { color: var(--dim); }
 footer { color: var(--dim); padding: 0 20px 24px; max-width: 1100px; }
+form.write { border: 1px solid var(--line); padding: 10px 12px; margin: 8px 0;
+             max-width: 620px; }
+form.write label { display: block; margin: 0 0 8px; }
+form.write input { font: inherit; padding: 4px 6px; width: 14em; margin-top: 4px; }
+form.write button { font: inherit; padding: 4px 14px; }
+pre.reply { border: 1px solid var(--line); border-left-width: 4px; padding: 10px 12px;
+            white-space: pre-wrap; max-width: 620px; }
 """
 
 # A basket's state, coloured by what it means for the month: it traded, it is waiting, it
@@ -103,9 +126,13 @@ STATE_CLASS = {
 }
 
 
-def connect() -> psycopg.Connection:
-    """A connection for the pages: the `ui` role from the PG* environment, read-only."""
-    return psycopg.connect(application_name="agb-ui", options=READ_ONLY, autocommit=True)
+def connect(write: bool = False) -> psycopg.Connection:
+    """A connection for one request: the `ui` role from the PG* environment, read-only unless
+    the request is one of the write routes. A page gets the read-only one, so the database
+    itself stands behind the claim that rendering cannot write."""
+    return psycopg.connect(
+        application_name="agb-ui", options="" if write else READ_ONLY, autocommit=True
+    )
 
 
 class Html(str):
@@ -151,6 +178,23 @@ def table(
     return Html(f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
 
 
+def write_form(action: str, button: str, fields: Sequence[tuple[str, str]] = ()) -> Html:
+    """One write as a plain form posting to one of `WRITES`. The fields are what the operator
+    has to type; nothing is filled in for them, because a field that arrives already correct is
+    the one-click button this surface is not allowed to have."""
+    body: list[object] = []
+    for name, label in fields:
+        body.append(
+            Html(
+                f"<label>{esc(label)}<br>"
+                f'<input type="text" name="{esc(name)}" autocomplete="off" spellcheck="false">'
+                "</label>"
+            )
+        )
+    body.append(tag("button", button, type="submit"))
+    return Html(f'<form class="write" method="post" action="{esc(action)}">{join(body)}</form>')
+
+
 def page(title: str, path: str, blocks: Iterable[object]) -> str:
     nav = join(
         tag("a", label, href=href, class_="on" if href == path else "") for href, label in VIEWS
@@ -161,8 +205,10 @@ def page(title: str, path: str, blocks: Iterable[object]) -> str:
         f'<meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>{esc(title)} — agb-trader</title><style>{STYLE}</style></head><body>"
         f"<header><b>agb-trader</b>{nav}</header><main>{join(blocks)}</main>"
-        "<footer>Read-only: nothing on these pages writes to the database. Approving a "
-        "basket and the kill switch arrive with the write path.</footer>"
+        "<footer>Read-mostly: the pages read, and the only writes are answering a "
+        "rebalance and the kill switch, both recorded against this surface. Nothing here "
+        "resizes a position, edits the universe, overrides the ranker, moves the ladder or "
+        "promotes a model.</footer>"
         "</body></html>\n"
     )
 
@@ -395,7 +441,20 @@ def rebalance(conn: psycopg.Connection, now: datetime) -> str:
         note(f"{state} since {et(since)} by {actor} ({surface}) · model {ranker} · {period}"),
     ]
     if waiting:
-        blocks.append(note("No answer by the session's cutoff means no trades this month."))
+        blocks += [
+            note("No answer by the session's cutoff means no trades this month."),
+            tag("h3", "Your answer"),
+            note(
+                f"Type the reference, {reference}, into the box to answer. There is no button "
+                "that answers on its own: typing it is the deliberation."
+            ),
+            write_form("/approve", "Approve", [("reference", "Rebalance reference")]),
+            write_form(
+                "/reject",
+                "Reject",
+                [("reference", "Rebalance reference"), ("reason", "Reason, if you want one")],
+            ),
+        ]
     blocks += [
         tag("h3", "Diff"),
         _diff_blocks(diff, capital),
@@ -612,17 +671,149 @@ def alerts(conn: psycopg.Connection, now: datetime) -> str:
     return page("Alerts", "/alerts", [banner(conn, now), section("Alerts", blocks)])
 
 
-# What the server routes. Reads only, so a GET is the whole protocol.
+# The kill switch.
+
+
+def kill_switch(conn: psycopg.Connection, now: datetime) -> str:
+    """The kill switch as the bot has it: what is latched, pause, resume, and liquidation in two
+    steps. The page shows whether a token is outstanding and until when, never the token
+    itself, because a page that redisplayed it would hand the second step to whoever reloaded
+    it."""
+    latched = killswitch.causes(conn)
+    minutes = int(killswitch.TOKEN_VALID.total_seconds() // 60)
+    expires = killswitch.outstanding(conn, now)
+    blocks: list[object] = [
+        table(
+            ["Open cause", "Since", "By", "Reason"],
+            [(cause, et(at), actor, reason or "") for cause, at, actor, reason in latched],
+        )
+        if latched
+        else note("No halt cause is open."),
+        tag("h3", "Pause"),
+        note(
+            "Opens the pause cause, so no further order goes out, and asks execution to suspend "
+            "trading at the broker. Execution confirms that as an alert."
+        ),
+        write_form("/pause", "Pause"),
+        tag("h3", "Resume"),
+        note(
+            f"Clears every open cause, one clear each: {', '.join(c for c, *_ in latched)}."
+            if latched
+            else "Clears every open cause, one clear each. Nothing is open to clear."
+        ),
+        write_form("/resume", "Resume"),
+        tag("h3", "Liquidate"),
+        note(
+            "Two steps. The first says what closing every position would mean and issues a "
+            f"token good for {minutes} minutes; the second is that token typed back. A wrong or "
+            "late token is refused, spends the token, and you start again."
+        ),
+        write_form("/liquidate", "Ask to liquidate"),
+        note(
+            f"A token is outstanding until {et(expires)}. Type it back to go ahead."
+            if expires
+            else "No token is outstanding."
+        ),
+        write_form("/liquidate", "Liquidate", [("token", "Token")]),
+    ]
+    return page("Kill switch", "/killswitch", [banner(conn, now), section("Kill switch", blocks)])
+
+
+# The write paths. Each takes the fields the form posted and answers with a page carrying the
+# reply the shared module produced, which is the same text the bot sends to Telegram.
+
+
+def _source(text: str) -> approval.Source:
+    """Who the write is attributed to and what they typed, as the shared modules take it. A row
+    written from here differs from the bot's only in the actor and the surface."""
+    return approval.Source(ACTOR, SURFACE, text)
+
+
+def calendar(now: datetime) -> NyseCalendar:
+    """The sessions the approval loop needs to find a rebalance's cutoff. A month either side
+    of today covers every reference that can still be answered."""
+    today = trading_date(now)
+    return NyseCalendar(today - timedelta(days=7), today + timedelta(days=30))
+
+
+def _reply(conn: psycopg.Connection, now: datetime, path: str, heading: str, reply: str) -> str:
+    blocks = [
+        Html(f'<pre class="reply">{esc(reply)}</pre>'),
+        tag("p", tag("a", "Back", href=path)),
+    ]
+    return page(heading, path, [banner(conn, now), section(heading, blocks)])
+
+
+def _answer(conn: psycopg.Connection, verb: str, fields: Mapping[str, str], now: datetime) -> str:
+    """Approve or reject the rebalance whose reference was typed. `agb.approval` checks the
+    reference, refuses a wrong, missing or late one and records that refusal, and settles a race
+    with the bot on the basket's own sequence, so the loser is told who answered and when."""
+    words = [*fields.get("reference", "").split(), *fields.get("reason", "").split()]
+    source = _source(" ".join([f"/{verb}", *words]))
+    reply = approval.decide(conn, verb, words, source, now, calendar(now))
+    return _reply(conn, now, "/rebalance", "Your answer", reply)
+
+
+def approve(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> str:
+    return _answer(conn, "approve", fields, now)
+
+
+def reject(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> str:
+    return _answer(conn, "reject", fields, now)
+
+
+def pause(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> str:
+    return _reply(
+        conn, now, "/killswitch", "Kill switch", killswitch.pause(conn, _source("/pause"))
+    )
+
+
+def resume(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> str:
+    return _reply(
+        conn, now, "/killswitch", "Kill switch", killswitch.resume(conn, _source("/resume"))
+    )
+
+
+def liquidate(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> str:
+    words = fields.get("token", "").split()
+    source = _source(" ".join(["/liquidate", *words]))
+    reply = killswitch.liquidate(conn, source, words[0] if words else None, now)
+    return _reply(conn, now, "/killswitch", "Kill switch", reply)
+
+
+# What the server routes: the pages, which only read, and the writes, which are these five and
+# no others. A page's form posts to one of these and nowhere else, and the server answers a
+# POST to a page with 405.
 ROUTES = {
     "/": log,
     "/rebalance": rebalance,
     "/positions": positions,
     "/gate": gate,
     "/alerts": alerts,
+    "/killswitch": kill_switch,
+}
+WRITES = {
+    "/approve": approve,
+    "/reject": reject,
+    "/pause": pause,
+    "/resume": resume,
+    "/liquidate": liquidate,
 }
 
 
 def not_found(path: str) -> str:
     return page(
         "Not found", path, [note(f"There is no {path} here."), tag("p", tag("a", "Log", href="/"))]
+    )
+
+
+def not_allowed(path: str) -> str:
+    """A POST to a page. The pages read; the writes are the routes in `WRITES`."""
+    return page(
+        "Not allowed",
+        path,
+        [
+            note(f"{path} is a page, and pages are read with GET."),
+            tag("p", tag("a", "Log", href="/")),
+        ],
     )

@@ -1,11 +1,17 @@
-"""The local UI (T27): the decision log, the health banner and the four views, each rendered
-from a seeded database and read on the `ui` role's read-only connection.
+"""The local UI: the decision log, the health banner and the views, each rendered from a
+seeded database and read on the `ui` role's read-only connection (T27), and the two write
+paths the surface is allowed — answering a rebalance and the kill switch (T28).
 
-The pages are the acceptance criteria: the log lists every cycle and expands into what the
+The pages are T27's acceptance criteria: the log lists every cycle and expands into what the
 decider saw (b), the banner shows a stale heartbeat, an overdue event and an undelivered alert
-(c), the four views render from database state (d), nothing writes (e), no page carries
-JavaScript and the repository has no build step for it (f), and the server answers on the
-loopback address alone (a).
+(c), the views render from database state (d), no page writes (e), no page carries JavaScript
+and the repository has no build step for it (f), and the server answers on the loopback
+address alone (a).
+
+The writes are T28's: the routes are enumerated and are the two Telegram has, a wrong or
+missing reference is refused and recorded, the loser of a race is told who answered and when,
+pause, resume and liquidate read the same from either surface because both call
+`agb.killswitch`, and every write leaves a `command` row naming the actor and the surface.
 """
 
 import html
@@ -16,17 +22,20 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from http.client import HTTPConnection
 from pathlib import Path
+from urllib.parse import urlencode
 
 import psycopg
 import pytest
 from conftest import ROOT
 from market_fake import PERIOD, SIGNAL, TRADE
-from test_bot import beat_at, expect
+from test_bot import CHAT, FakeTelegram, beat_at, expect
+from test_bot_commands import ET
 from test_execution import AFTER, CALENDAR, CLOSE_AT, NOW, basket, broker
-from test_gate import HELD, NAMES, SOUND, TURNOVER, hold, insert, run, state
+from test_gate import EVENING, HELD, NAMES, SOUND, TURNOVER, hold, insert, rows, run, state
 
-from agb import execution, panel, ui
+from agb import approval, execution, panel, ui
 from agb.services import ui as service
+from agb.services.bot import Bot
 
 # When the operator is looking: after October's close, with the month still running.
 LATER = datetime(2026, 10, 1, 21, 30, tzinfo=UTC)
@@ -416,8 +425,275 @@ def test_the_server_answers_on_the_loopback_address_alone(db, monkeypatch, trade
         client.close()
         client = HTTPConnection(host, port)
         client.request("POST", "/", body=b"")
-        assert client.getresponse().status == 501, "nothing but a read is answered"
+        answer = client.getresponse()
+        assert answer.status == 405, "a page is read, never posted to"
+        assert answer.getheader("Allow") == "GET, HEAD"
+        answer.read()
         client.close()
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+# -- the two write paths -------------------------------------------------------------------
+
+# A form as a browser posts one.
+FORM = {"Content-Type": "application/x-www-form-urlencoded"}
+
+
+@pytest.fixture
+def writer(db, monkeypatch):
+    """What a write path runs on: the same `ui` role, on the connection the server opens for a
+    POST, which may insert what the role is granted and nothing else."""
+    for key, value in db.pg_env("ui").items():
+        monkeypatch.setenv(key, value)
+    with ui.connect(write=True) as conn:
+        yield conn
+
+
+@pytest.fixture
+def waiting(db):
+    """A gated basket put to the human, which is the only state an answer is taken in: paper
+    mode set to ask, the gate run, and the basket moved to pending as the bot moves it."""
+    approval.set_paper_approval(db.connect("cli"), True, "operator", "rehearse the loop")
+    basket_id = insert(db)
+    run(db, basket_id)
+    conn = db.connect("bot")
+    [basket] = approval.waiting(conn)
+    assert approval.put(conn, basket, EVENING, CALENDAR)
+    assert state(db, basket_id)[:2] == ("pending", 2)
+    return basket_id
+
+
+def reply_of(body):
+    """The reply the shared module produced, as the answering page carries it."""
+    [reply] = re.findall(r'<pre class="reply">(.*?)</pre>', body, re.S)
+    return html.unescape(reply)
+
+
+def commands(db):
+    """Every command either operator surface recorded, oldest first. The operator's own CLI is
+    left out: the fixtures configure the month with it, and what is on trial here is what the
+    two surfaces a human drives write."""
+    return rows(
+        db,
+        "SELECT verb, outcome, reason, actor, surface FROM agb.command"
+        " WHERE surface IN ('ui', 'telegram') ORDER BY id",
+    )
+
+
+def test_the_write_routes_are_the_two_telegram_has_and_nothing_else(conn, waiting):
+    """The acceptance criterion that a test enumerates the UI's write routes. The five are
+    answering a rebalance two ways and the three of the kill switch; a page is never one of
+    them, every form on every page posts to one of them, and the only things a form asks the
+    operator to type are a reference, a reason and a token. No route resizes a position, edits
+    the universe, overrides the ranker, moves the ladder or promotes a model."""
+    assert set(ui.WRITES) == {"/approve", "/reject", "/pause", "/resume", "/liquidate"}
+    assert not set(ui.WRITES) & set(ui.ROUTES), "a page is read, a write path is posted to"
+
+    for path, view in ui.ROUTES.items():
+        page = view(conn, LATER)
+        for attrs in re.findall(r"<form([^>]*)>", page):
+            assert 'method="post"' in attrs, f"{path}: a write is a POST"
+            [action] = re.findall(r'action="([^"]+)"', attrs)
+            assert action in ui.WRITES, f"{action} on {path} is not a declared write"
+        typed = set(re.findall(r'<input type="text" name="([^"]+)"', page))
+        assert typed <= {"reference", "reason", "token"}, f"{path} asks for {typed}"
+        assert 'value="' not in page, f"{path} prefills a field, which is a one-click answer"
+
+
+def test_answering_a_rebalance_needs_the_reference_typed_and_nothing_is_prefilled(conn, waiting):
+    """Not a one-click approval: the page says to type the reference and hands over an empty
+    box, so the deliberation is the typing."""
+    page = ui.rebalance(conn, LATER)
+
+    assert "Your answer" in page
+    assert "Type the reference, 2026-10, into the box to answer." in page
+    assert '<input type="text" name="reference"' in page
+    assert 'action="/approve"' in page and 'action="/reject"' in page
+
+
+def test_an_answer_with_no_reference_is_refused_and_recorded(writer, db, waiting):
+    """The acceptance criterion: a missing reference is refused, and the refusal is a row."""
+    body = ui.approve(writer, {"reference": "   "}, EVENING)
+
+    assert "/approve needs the rebalance's reference" in reply_of(body)
+    assert commands(db) == [
+        ("approve", "refused", "/approve needs the rebalance's reference", "ui:operator", "ui")
+    ]
+    assert state(db, waiting)[:2] == ("pending", 2), "nothing moved"
+
+
+def test_an_answer_naming_the_wrong_rebalance_is_refused_and_recorded(writer, db, waiting):
+    body = ui.reject(writer, {"reference": "2026-12", "reason": "mistyped"}, EVENING)
+
+    assert "no rebalance 2026-12" in reply_of(body)
+    assert commands(db) == [("reject", "refused", "no rebalance 2026-12", "ui:operator", "ui")]
+    assert state(db, waiting)[:2] == ("pending", 2)
+
+
+def test_approving_writes_the_row_and_the_event_the_bot_writes_with_the_ui_surface(
+    writer, db, waiting
+):
+    """The acceptance criterion that every UI write is a `command` row with its actor and
+    surface, and that answering moves the basket exactly as Telegram's answer does."""
+    body = ui.approve(writer, {"reference": "2026-10"}, EVENING)
+
+    assert re.match(rf"APPROVED 2026-10 by ui:operator at {ET}", reply_of(body))
+    assert commands(db) == [("approve", "accepted", None, "ui:operator", "ui")]
+    assert state(db, waiting)[:3] == ("approved", 3, "ui:operator")
+    event = rows(
+        db,
+        "SELECT to_state, actor, surface, reason FROM agb.basket_event"
+        " WHERE basket_id = %s ORDER BY seq",
+        waiting,
+    )[-1]
+    assert event == ("approved", "ui:operator", "ui", "/approve 2026-10")
+
+
+def test_rejecting_carries_the_reason_that_was_typed_with_it(writer, db, waiting):
+    body = ui.reject(writer, {"reference": "2026-10", "reason": "turnover too high"}, EVENING)
+
+    reply = reply_of(body)
+    assert "REJECTED 2026-10 by ui:operator" in reply
+    assert "reason: turnover too high" in reply
+    assert rows(db, "SELECT reason, surface FROM agb.basket_event WHERE to_state = 'rejected'") == [
+        ("turnover too high", "ui")
+    ]
+
+
+def test_the_surface_that_loses_the_race_is_told_who_answered_and_when(
+    writer, db, waiting, monkeypatch
+):
+    """The acceptance criterion that the race is handled on both surfaces. Both read the basket
+    pending; Telegram's answer lands first, and the UI's loses the compare-and-set on the
+    basket's own sequence, so it is told who answered and left as one refused row."""
+    stale = approval.find(writer, "2026-10")
+    first = approval.Source("telegram:7", "telegram", "/approve 2026-10", CHAT, 11)
+    assert "APPROVED" in approval.decide(
+        db.connect("bot"), "approve", ["2026-10"], first, EVENING, CALENDAR
+    )
+    monkeypatch.setattr(approval, "find", lambda conn, reference: stale)
+
+    body = ui.reject(writer, {"reference": "2026-10", "reason": "changed my mind"}, EVENING)
+
+    assert re.match(rf"rebalance 2026-10: already approved by telegram:7 at {ET}", reply_of(body))
+    assert state(db, waiting)[:3] == ("approved", 3, "telegram:7")
+    assert commands(db)[-1][:2] == ("reject", "refused")
+
+
+def test_the_kill_switch_page_shows_what_is_latched_and_what_resume_would_clear(conn, writer, db):
+    assert "No halt cause is open." in ui.kill_switch(conn, LATER)
+    assert "No token is outstanding." in ui.kill_switch(conn, LATER)
+
+    ui.pause(writer, {}, LATER)
+    page = ui.kill_switch(conn, LATER)
+
+    assert "Open cause" in page and "ui:operator" in page
+    assert "Clears every open cause, one clear each: pause." in page
+
+
+def test_pause_resume_and_their_rows_read_the_same_from_either_surface(writer, db):
+    """The acceptance criterion that the kill switch is identical to the bot's. Both surfaces
+    call `agb.killswitch`, so the reply is the same text and the rows differ only in who threw
+    the switch and from where."""
+    from_ui = reply_of(ui.pause(writer, {}, LATER))
+    cleared = reply_of(ui.resume(writer, {}, LATER))
+    message = {"message_id": 11, "chat": {"id": int(CHAT)}, "from": {"id": 7}, "text": "/pause"}
+    from_bot = Bot(FakeTelegram(), CHAT, lambda: LATER).pause(db.connect("bot"), message)
+
+    assert from_ui == from_bot, "one lever, one reply"
+    assert "cleared: pause" in cleared
+    assert commands(db) == [
+        ("pause", "accepted", None, "ui:operator", "ui"),
+        ("resume", "accepted", None, "ui:operator", "ui"),
+        ("pause", "accepted", None, "telegram:7", "telegram"),
+    ]
+    assert rows(db, "SELECT cause, action, actor FROM agb.halt_event ORDER BY id") == [
+        ("pause", "set", "ui:operator"),
+        ("pause", "clear", "ui:operator"),
+        ("pause", "set", "telegram:7"),
+    ]
+
+
+def test_liquidating_from_the_ui_is_two_steps_with_the_token_typed_back(conn, writer, db, traded):
+    """The kill switch's second lever, as the bot has it: what closing the book would mean and
+    a token, then that token typed back. The page says a token is outstanding but never shows
+    it, and a wrong one is refused, recorded and spent."""
+    first = reply_of(ui.liquidate(writer, {}, LATER))
+    assert "LIQUIDATE — step 1 of 2" in first
+    assert "20 held" in first and "This cannot be undone." in first
+    issued = rows(db, "SELECT token FROM agb.liquidation ORDER BY id")[-1][0]
+
+    page = ui.kill_switch(conn, LATER)
+    assert "A token is outstanding until" in page
+    assert issued not in page, "a page that redisplayed the token would be one click"
+
+    refused = reply_of(ui.liquidate(writer, {"token": "nope12"}, LATER))
+    assert "wrong liquidation token" in refused
+    assert [row[:2] for row in commands(db)] == [
+        ("liquidate", "accepted"),
+        ("liquidate", "refused"),
+    ]
+
+    reply_of(ui.liquidate(writer, {}, LATER))
+    issued = rows(db, "SELECT token FROM agb.liquidation WHERE kind = 'token' ORDER BY id")[-1][0]
+    done = reply_of(ui.liquidate(writer, {"token": issued}, LATER))
+
+    assert "LIQUIDATING — step 2 of 2" in done
+    assert ("liquidation", "set", "ui:operator") in rows(
+        db, "SELECT cause, action, actor FROM agb.halt_event ORDER BY id"
+    )
+
+
+def test_the_server_posts_a_form_to_a_write_route_and_refuses_everything_else(db, monkeypatch):
+    """The write paths over HTTP: a form posted to one of them is answered with the reply, a
+    form from another site is refused before it is read and recorded nowhere because it names
+    no operator, a POST to a page is 405 and an unknown path is 404."""
+    for key, value in db.pg_env("ui").items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("AGB_UI_HOST", raising=False)
+    monkeypatch.setattr(service, "PORT", 0)
+    httpd = service.server()
+    host, port = httpd.server_address[:2]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        client = HTTPConnection(host, port)
+        client.request(
+            "POST", "/pause", body="", headers=FORM | {"Origin": f"http://{host}:{port}"}
+        )
+        response = client.getresponse()
+        answer = html.unescape(response.read().decode())
+        assert response.status == 200
+        assert "PAUSED" in answer and "halt cause pause: open." in answer
+        client.close()
+
+        client = HTTPConnection(host, port)
+        client.request(
+            "POST", "/pause", body=urlencode({}), headers=FORM | {"Origin": "http://elsewhere"}
+        )
+        response = client.getresponse()
+        assert response.status == 403
+        assert "That request did not come from here." in response.read().decode()
+        client.close()
+
+        for path in ui.ROUTES:
+            client = HTTPConnection(host, port)
+            client.request("POST", path, body="", headers=FORM)
+            response = client.getresponse()
+            assert response.status == 405, path
+            assert response.getheader("Allow") == "GET, HEAD"
+            assert "is a page, and pages are read with GET." in response.read().decode()
+            client.close()
+
+        client = HTTPConnection(host, port)
+        client.request("POST", "/nowhere", body="", headers=FORM)
+        response = client.getresponse()
+        assert response.status == 404
+        response.read()
+        client.close()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert commands(db) == [("pause", "accepted", None, "ui:operator", "ui")]

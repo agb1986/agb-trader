@@ -159,6 +159,8 @@ Having the lever is not the same as wiring it to a threshold. Automatic liquidat
 
 Both levers are available in paper as well as live. Paper is where the muscle memory is built, and a kill-switch first used in anger is a kill-switch nobody knows how to use.
 
+As built, both levers live in `agb.killswitch`, and Telegram and the local UI call it with nothing but a source of their own — who threw the switch, from which surface, and the text they typed — so the reply the UI shows is the text Telegram sends, word for word, and each step is a `command` row either way. The UI's Kill switch view lists every open halt cause with who opened it, says what a resume would clear before it clears it, and says whether a liquidation token is outstanding and until when, but never shows the token: a page that redisplayed it would hand the second step to whoever reloaded the page, and the second step exists to be typed.
+
 ## Performance monitoring: alerts that never act
 
 Scoping limits to malfunction detection would otherwise leave the system blind to "the strategy is behaving unlike anything tested". A monitoring layer closes that, and it **notifies without acting**. Every alert states what was not done.
