@@ -11,6 +11,7 @@ import json
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -19,7 +20,7 @@ from research_fake import PANEL_START, Market
 import agb.rebalance
 from agb import corporate, cost, lake, rebalance
 from agb.research import __main__ as cli
-from agb.research import backtest, reproduce, scan
+from agb.research import backtest, certify, gates, reproduce, scan, tax
 from agb.research import panel as panel_module
 from agb.research.panel import Panel
 from agb.research.trials import Ledger
@@ -550,6 +551,123 @@ def test_explicit_start_dates_run_from_the_first_month_at_or_after_each(
         ).results["start_dates"]
         == []
     ), "too short for the default sensitivities"
+
+
+# The UK after-tax diagnostic ------------------------------------------------------------------
+
+
+def test_the_report_carries_the_approximate_after_tax_view(reference):
+    """The report states an approximate UK capital gains bill on the run's own disposals, with
+    the rate, the allowance and the simplifications it rests on beside the numbers.
+
+    The reference run's lake is a lake of equity prices with no index fund in it, which is the
+    real lake's shape too, so the buy-and-hold comparison reports nothing and names the ticker
+    it wanted rather than failing the run."""
+    results = reference.run.results
+    view = results["after_tax"]
+
+    assert view["approximate"] is True and "approximate" in view["basis"]
+    assert "no gate reads it" in view["basis"]
+    assert (view["rate"], view["annual_exempt_amount"]) == (0.24, 3000.0)
+    assert view["simplifications"] == list(tax.SIMPLIFICATIONS)
+    assert view["benchmark"] == backtest.BENCHMARK == "SPY"
+    assert view["buy_and_hold"] is None, "the fake lake holds no index fund, as the real one may"
+
+    taxed = view["strategy"]
+    # Everything bought is sold or deemed sold at the final close, so the gains net to exactly
+    # what the account made: the diagnostic taxes the report's own return, not a different one.
+    assert taxed["realised_gains"] - taxed["realised_losses"] == pytest.approx(
+        results["final_value"] - REFERENCE.init_cash, abs=0.05
+    )
+    assert [year["year"] for year in taxed["years"]] == ["2024/25", "2025/26", "2026/27"]
+    assert sum(year["taxable"] for year in taxed["years"]) == pytest.approx(taxed["taxable_gains"])
+    assert taxed["tax"] == pytest.approx(0.24 * taxed["taxable_gains"], abs=0.05)
+    assert taxed["tax"] > 0, "a monthly rebalance realises its gains, so there is a bill"
+    assert taxed["final_value"] == results["final_value"]
+    assert taxed["total_return"] == pytest.approx(results["total_return"])
+    assert taxed["after_tax_final_value"] == pytest.approx(taxed["final_value"] - taxed["tax"])
+    assert taxed["after_tax_return"] == pytest.approx(
+        taxed["after_tax_final_value"] / REFERENCE.init_cash - 1
+    )
+    assert taxed["after_tax_return"] < results["total_return"]
+    # Every sell is a disposal, and whatever is still held at the end is deemed disposed of.
+    sells = sum(1 for fill in reference.simulation.fills if fill.side is cost.Side.SELL)
+    assert taxed["disposals"] == sells + len(
+        [q for q in reference.simulation.positions.values() if q]
+    )
+    json.dumps(view)  # what the ledger holds
+
+
+def benchmark_close(root, day: date) -> Decimal:
+    """The benchmark's adjusted close on one session, at the precision the engine reads it."""
+    with lake.connect(root) as conn:
+        [(close,)] = conn.execute(
+            "SELECT closeadj FROM sep WHERE ticker = ? AND date = ?", [backtest.BENCHMARK, day]
+        ).fetchall()
+    return Decimal(str(round(close, backtest.PRECISION)))
+
+
+def test_the_benchmark_is_taxed_the_same_way_when_the_lake_holds_it(tmp_path, ledger, monkeypatch):
+    """Buy-and-hold under the same treatment: whole shares of the benchmark bought at the first
+    trade session's close with the same starting cash, the rest left in cash, held to the final
+    exit and deemed disposed of there, so one disposal in one tax year takes one allowance and
+    the rest of the gain is still untaxed.
+
+    The benchmark is priced but never traded: it is an index fund, so the universe leaves it
+    out of the panel and the strategy can neither rank nor buy it."""
+    market = Market(tmp_path / "lake").names(12)
+    market.name(backtest.BENCHMARK, drift=0.003, noise=0.001, category="ETF")
+    root = market.land()
+    panel = panel_module.build(root, PANEL_START, FORCED_END)
+    assert backtest.BENCHMARK not in set(panel.frame["ticker"]), "not a domestic common stock"
+    captured: list = []
+    capturing(monkeypatch, captured)
+
+    run = backtest.run(panel, backtest.Options(**SMALL), ledger, lake_dir=root)
+
+    months = panel.months
+    cash = Decimal(str(backtest.Options.init_cash))
+    start, end = benchmark_close(root, months[0].entry), benchmark_close(root, months[-1].exit)
+    shares = int(cash // start)
+    gain = shares * (end - start)
+    assert gain > tax.EXEMPT_AMOUNT, "the one disposal is big enough for the allowance to bite"
+    bill = float(((gain - tax.EXEMPT_AMOUNT) * tax.RATE).quantize(Decimal("0.01")))
+
+    hold = run.results["after_tax"]["buy_and_hold"]
+    assert hold["shares"] == shares and hold["disposals"] == 1
+    assert [year["year"] for year in hold["years"]] == ["2024/25"]
+    assert hold["realised_gains"] == pytest.approx(float(gain), abs=0.05)
+    assert hold["tax"] == pytest.approx(bill, abs=0.05)
+    assert hold["final_value"] == pytest.approx(float(cash + gain), abs=0.05), (
+        "the residual cash the whole shares left over is still there at the end"
+    )
+    assert hold["after_tax_return"] == pytest.approx(hold["total_return"] - bill / float(cash))
+    assert hold["loss_carried_forward"] == 0.0
+    _, simulation = captured[0]
+    assert backtest.BENCHMARK not in {fill.ticker for fill in simulation.fills}
+    assert run.results["after_tax"]["strategy"]["tax"] >= 0
+
+
+def test_no_gate_reads_the_after_tax_view(research_panel, research_lake, ledger, monkeypatch):
+    """The diagnostic certifies nothing: tax depends on the operator's other income, rate band
+    and allowance usage rather than on the strategy, so the specification keeps it out of
+    certification. Under a rate that would change any verdict, every other figure in the report
+    — the monthly net and gross series and the participation the gates read among them — comes
+    out identical, and neither the certification nor the gates module mentions it."""
+    panel = sliced(research_panel, 6)
+    options = backtest.Options(**SMALL)
+
+    plain = backtest.run(panel, options, ledger, lake_dir=research_lake).results
+    monkeypatch.setattr(tax, "RATE", Decimal("0.90"))
+    taxing = backtest.run(panel, options, ledger, lake_dir=research_lake).results
+
+    assert taxing["after_tax"]["rate"] == 0.9
+    assert taxing["after_tax"]["strategy"]["tax"] > plain["after_tax"]["strategy"]["tax"]
+    assert {key: value for key, value in taxing.items() if key != "after_tax"} == {
+        key: value for key, value in plain.items() if key != "after_tax"
+    }
+    for module in (certify, gates):
+        assert "after_tax" not in Path(module.__file__).read_text(), module.__name__
 
 
 # Combinatorial paths --------------------------------------------------------------------------
