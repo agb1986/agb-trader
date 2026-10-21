@@ -20,7 +20,7 @@ The home view is the decision log: one reverse-chronological row per rebalance c
 
 A health banner sits above the log, driven by the overdue-expected-event view and stale heartbeats. The UI evaluates the health of every service, the bot included, and is the one place an undelivered alert is visible. A dead scheduler shows up as a stale "next cycle" line, an explicit warning rather than an absence, because with a monthly rebalance a rebalance that never happens looks exactly like a quiet month.
 
-## The eight views
+## The nine views beside the log
 
 1. **Validation** — DSR, PBO and cost-inclusive Sharpe against their gate thresholds, with DSR at 2× cost, the break-even cost multiple, the declared trial count and the CPCV path count shown next to each, plus the path distribution with the live drawdown marked on it. Carries the standing caveat in the view itself: these gates certify the classical ranker only.
 2. **Promotion** — the backtest / paper / live ladder with the date, actor and evidence for each transition (the `promotion_event`, `mode_event` and `certification_event` history), which model certification is live, and the L0 / L1 / L2 autonomy ladder with progress toward the next level from the eligibility views.
@@ -30,6 +30,7 @@ A health banner sits above the log, driven by the overdue-expected-event view an
 6. **Panel** — the six-dimension rubric for a name, each dimension showing its 0–4 score alongside the Judge's reason string, with the filings it read listed underneath, and the note that the panel scored a name-scrubbed extract.
 7. **Gate** — the pre-trade checks with what each one actually measured, not just pass or fail.
 8. **Alerts** — the notify-never-act log, each entry stating what was not done, with delivery and acknowledgement state.
+9. **Kill switch** — every open halt cause with who opened it and what a resume would clear, and whether a liquidation token is outstanding and until when, never the token itself.
 
 ## Decisions the prototype settled
 
@@ -50,7 +51,7 @@ The UI service holds no broker credentials and no Telegram token, has no outboun
 ## Rejected
 
 - **A, Console, as the landing page**, for the rubber-stamping reason above. Its content survives; its information hierarchy does not.
-- **B, Ledger, as the shell.** Cleanest separation of concerns and the runner-up, but it demotes the decision history to one tab among eight and makes *who decided this* a question you have to navigate to answer.
+- **B, Ledger, as the shell.** Cleanest separation of concerns and the runner-up, but it demotes the decision history to one tab among the rest and makes *who decided this* a question you have to navigate to answer.
 - **A live-updating ticker or streaming position view.** The strategy rebalances monthly and fills at the close. A UI that updates every second would display noise at a resolution the strategy does not act on, and would invite watching.
 - **Charts of the equity curve as the landing view.** An equity curve is the most persuasive and least informative thing this system could show, and the direct route to the discretionary intervention the standing constraint rules out.
 - **Any write path other than approval and the kill-switch.** The UI does not resize positions, edit the universe, override the ranker, move the ladder, or promote a model. As built, every page says so in its footer, and the test that enumerates the write routes is how that sentence stays true.

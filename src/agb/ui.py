@@ -17,9 +17,20 @@ undelivered alert is visible at all, so a Telegram outage cannot hide a month's 
 request. A dead scheduler reads here as a stale heartbeat and a rebalance nothing has
 scheduled, never as an empty page.
 
-The views beside the log — Rebalance, Positions, Gate, Alerts and the kill switch — are the
-same state read five other ways. Each speaks the Telegram bot's vocabulary, from agb.readout,
-so the two surfaces cannot describe one basket in two dialects.
+The views beside the log — Rebalance, Positions, Gate, Validation, Promotion, Performance,
+Panel, Alerts and the kill switch — are the same state read nine other ways. Each speaks the
+Telegram bot's vocabulary, from agb.readout, so the two surfaces cannot describe one basket in
+two dialects.
+
+Four of them are the evidence views, and each is written so that a figure cannot be read out of
+context. Validation states every gate beside the threshold it was applied against and ends by
+naming what the certification covers, which is the classical ranker alone. Promotion is the
+ladder with the date, the actor and the evidence behind every transition it has made. On
+Performance no live figure appears without the backtest expectation beside it, and the page says
+outright that a handful of months cannot tell a model that works from one that has been lucky.
+Panel is the safety panel's own record, name by name, with the Judge's reason on each dimension
+and the note that the panel never learns which company it is reading about. None of the four has
+a write path: nothing on them appears in `WRITES`.
 
 The writes are exactly Telegram's two: answering the rebalance, and the kill switch. Neither
 is written here. Answering goes through `agb.approval` and the switch through
@@ -32,13 +43,14 @@ the surface on it, refused ones included.
 """
 
 import html
+import statistics
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal, DivisionByZero, InvalidOperation
 
 import psycopg
 
-from agb import approval, health, killswitch, readout
+from agb import analyst, approval, debate, health, killswitch, ladder, readout
 from agb.health import et
 from agb.nyse import NyseCalendar, trading_date
 
@@ -48,6 +60,10 @@ VIEWS = (
     ("/rebalance", "Rebalance"),
     ("/positions", "Positions"),
     ("/gate", "Gate"),
+    ("/validation", "Validation"),
+    ("/promotion", "Promotion"),
+    ("/performance", "Performance"),
+    ("/panel", "Panel"),
     ("/alerts", "Alerts"),
     ("/killswitch", "Kill switch"),
 )
@@ -83,6 +99,7 @@ th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var
          white-space: nowrap; }
 th { color: var(--dim); font-weight: 600; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.text, th.text { white-space: normal; min-width: 22em; }
 .pair { display: flex; gap: 32px; flex-wrap: wrap; }
 .pair > div { flex: 1 1 260px; }
 .banner { border: 1px solid var(--line); border-left-width: 4px; padding: 8px 12px;
@@ -163,12 +180,21 @@ def section(heading: str, body: Iterable[object]) -> Html:
 
 
 def table(
-    headers: Sequence[str], rows: Iterable[Sequence[object]], numeric: Sequence[int] = ()
+    headers: Sequence[str],
+    rows: Iterable[Sequence[object]],
+    numeric: Sequence[int] = (),
+    wrap: Sequence[int] = (),
 ) -> Html:
+    """One table. `numeric` is the columns that read as figures, right-aligned on a tabular
+    figure; `wrap` is the columns that carry a sentence, which are the only ones allowed to
+    wrap, since a reason the Judge wrote is prose and not a cell."""
+
     def cell(kind: str, index: int, value: object) -> str:
-        return f'<{kind} class="num">{esc(value)}</{kind}>' if index in numeric else (
-            f"<{kind}>{esc(value)}</{kind}>"
-        )  # fmt: skip
+        if index in numeric:
+            return f'<{kind} class="num">{esc(value)}</{kind}>'
+        if index in wrap:
+            return f'<{kind} class="text">{esc(value)}</{kind}>'
+        return f"<{kind}>{esc(value)}</{kind}>"
 
     head = "".join(cell("th", i, header) for i, header in enumerate(headers))
     body = "".join(
@@ -623,6 +649,721 @@ def gate(conn: psycopg.Connection, now: datetime) -> str:
     return page(heading, "/gate", [banner(conn, now), section(heading, blocks)])
 
 
+# The Validation view.
+
+# The live certification, or no row when nothing has been promoted. `agb.promoted_model` is the
+# latest promotion alone, so this is at most one row.
+_PROMOTED = """
+    SELECT certification_id, model_id, passed, declared_trials, cost_model_version,
+           artifact_sha256, promoted_by, promoted_at, voided, voided_at, voided_reason
+    FROM agb.promoted_model
+"""
+# The certification the Validation view reports on: the promoted one when there is one, and
+# otherwise the newest imported, so a certification that failed its gates is evidence on the page
+# rather than an empty one.
+_CERTIFICATION = """
+    SELECT id, model_id, certifies, passed, certified_at, actor, declared_trials, dsr, pbo,
+           sharpe_net, dsr_2x, break_even_multiple, sharpe_gross, gross_sharpe_flag,
+           certified_capital, cost_model_version, train_start, train_end, gates, path_quantiles
+    FROM agb.model_certification
+    WHERE %(id)s::bigint IS NULL OR id = %(id)s
+    ORDER BY id DESC
+    LIMIT 1
+"""
+# The four gates docs/architecture/08-research.md names, each with the column its measurement is
+# stored in and the decimals that measurement is read at. The threshold, the rule and the verdict
+# come from the `gates` object, which is what the research profile recorded when it applied them:
+# the page states each gate as it was applied, never as this module would reapply it.
+GATES = (
+    ("dsr", "Deflated Sharpe", 3),
+    ("pbo", "Probability of backtest overfitting", 3),
+    ("sharpe_net", "Cost-inclusive Sharpe", 2),
+    ("dsr_2x", "Deflated Sharpe at 2x cost", 3),
+)
+# The CPCV path distribution: what each measure is called, whether it reads as a percentage, and
+# whether a lower live reading is the worse one. The last decides which end of the distribution
+# the live column is marked against.
+PATHS = (
+    ("max_drawdown", "Worst drawdown", True, True),
+    ("longest_losing_run", "Longest losing run", False, False),
+    ("tracking_dispersion", "Tracking dispersion", True, False),
+    ("monthly_return", "Average month", True, True),
+)
+# The quantiles a certification records, in the order they are read.
+QUANTILES = (
+    ("min", "Min"),
+    ("q05", "5th"),
+    ("q25", "25th"),
+    ("q50", "Median"),
+    ("q75", "75th"),
+    ("q95", "95th"),
+    ("max", "Max"),
+)
+
+
+def _as_float(value: object) -> float | None:
+    """One number out of a jsonb object, which carries them as ints, floats or nothing."""
+    return None if value is None else float(value)  # type: ignore[arg-type]
+
+
+def _number(value: float | None, places: int = 3) -> str:
+    return "—" if value is None else f"{value:.{places}f}"
+
+
+def _fraction(value: float | None, places: int = 2) -> str:
+    return "—" if value is None else f"{value * 100:.{places}f}%"
+
+
+def _measure(value: float | None, percent: bool) -> str:
+    """One path measurement, read as a percentage or as a count of months."""
+    if value is None:
+        return "—"
+    return _fraction(value) if percent else f"{value:.2f}"
+
+
+def _live_paths(months: Sequence[health.Month], expected: float | None) -> dict[str, float | None]:
+    """The four certified path measures, measured on the months the account has actually lived.
+    The dispersion is measured around the certified average month, which is what `health.tracking`
+    compares against, so the page and the alert read one number."""
+    if not months:
+        return {}
+    worst, _ = health.worst_drawdown(months)
+    longest, _ = health.longest_losing_run(months)
+    return {
+        "max_drawdown": worst,
+        "longest_losing_run": float(longest),
+        "tracking_dispersion": None if expected is None else health.scatter(months, expected),
+        "monthly_return": statistics.fmean(month.total_return for month in months),
+    }
+
+
+def _path_table(quantiles: Mapping[str, object], live: Mapping[str, float | None]) -> Html:
+    """The path distribution with the live account's own measurement in the first column, marked
+    when it is past the end of the distribution the certification explored. A live figure is never
+    shown here without the distribution it is read against."""
+    rows = []
+    for key, label, percent, low in PATHS:
+        spread = quantiles.get(key) or {}
+        assert isinstance(spread, Mapping)
+        measured = live.get(key)
+        edge = _as_float(spread.get("q05" if low else "q95"))
+        outside = (
+            measured is not None
+            and edge is not None
+            and (measured < edge if low else measured > edge)
+        )
+        text = _measure(measured, percent)
+        rows.append(
+            (
+                label,
+                tag("span", text, class_="bad") if outside else text,
+                *(_measure(_as_float(spread.get(q)), percent) for q, _ in QUANTILES),
+            )
+        )
+    headers = ["Measure", "Live", *(label for _, label in QUANTILES)]
+    return table(headers, rows, numeric=range(1, len(headers)))
+
+
+def validation(conn: psycopg.Connection, now: datetime) -> str:
+    """What the live model's certification says: every gate beside the threshold it was applied
+    against, the same deflated Sharpe at twice the modelled cost, the break-even cost multiple,
+    the trials it was deflated by, and the CPCV path distribution with the account's own drawdown
+    marked on it. It ends where it has to: all of this certifies stage 1."""
+    promoted = conn.execute(_PROMOTED).fetchone()
+    row = conn.execute(_CERTIFICATION, {"id": promoted[0] if promoted else None}).fetchone()
+    if row is None:
+        empty = [note("No model has been certified. Nothing here has been validated yet.")]
+        return page("Validation", "/validation", [banner(conn, now), section("Validation", empty)])
+    (
+        certification_id,
+        model_id,
+        certifies,
+        passed,
+        certified_at,
+        actor,
+        trials,
+        dsr,
+        pbo,
+        sharpe_net,
+        dsr_2x,
+        break_even,
+        sharpe_gross,
+        gross_flag,
+        capital,
+        cost_model,
+        train_start,
+        train_end,
+        gates,
+        quantiles,
+    ) = row
+    measured = {"dsr": dsr, "pbo": pbo, "sharpe_net": sharpe_net, "dsr_2x": dsr_2x}
+    gate_rows = []
+    for key, label, places in GATES:
+        applied = gates.get(key) or {}
+        needs = (
+            f"{applied.get('rule', '')} {_number(_as_float(applied.get('threshold')), places)}"
+            if applied.get("threshold") is not None
+            else "—"
+        )
+        gate_rows.append(
+            (
+                label,
+                _number(_as_float(measured[key]), places),
+                needs.strip(),
+                "pass" if applied.get("passed") else "FAIL" if "passed" in applied else "—",
+            )
+        )
+    for key in sorted(set(gates) - set(measured)):
+        applied = gates[key]
+        # The stored object carries the run's own diagnostics beside its gates — the thresholds it
+        # used, the path and month counts, the start-date sweep — and those are not gates and get
+        # no row. A gate is an object that says whether it passed.
+        if not isinstance(applied, dict) or "passed" not in applied:
+            continue
+        gate_rows.append(
+            (
+                key,
+                _number(_as_float(applied.get("value"))),
+                f"{applied.get('rule', '')} {applied.get('threshold', '')}".strip(),
+                "pass" if applied.get("passed") else "FAIL",
+            )
+        )
+    if promoted is None:
+        standing = (
+            f"Nothing is promoted. This is certification {certification_id}, the newest imported;"
+            " the pipeline refuses to rank until one is promoted."
+        )
+    elif promoted[8]:
+        standing = (
+            f"Promoted {et(promoted[7])} by {promoted[6]}, and voided {et(promoted[9])}: "
+            f"{promoted[10]}. The gate refuses a voided model rather than fall back to another."
+        )
+    else:
+        standing = f"Promoted {et(promoted[7])} by {promoted[6]}, and not voided."
+    paths = quantiles.get("paths")
+    counted = (
+        f"{paths:,} combinatorially purged cross-validation paths."
+        if isinstance(paths, int)
+        else "The certification recorded no path count."
+    )
+    limits = health.thresholds(conn)
+    blocks: list[object] = [
+        note(
+            f"{model_id} {'passed' if passed else 'FAILED'} its gates, certified "
+            f"{et(certified_at)} by {actor} on {train_start}–{train_end} at "
+            f"{readout.dollars(capital)} under cost model {cost_model}."
+        ),
+        note(standing),
+        tag("h3", "Gates"),
+        table(["Gate", "Measured", "Needs", "Result"], gate_rows, numeric=(1, 2)),
+        note(
+            f"Declared trials {trials:,}, which is what the deflated Sharpe is deflated by: the"
+            " figure answers how much of the Sharpe survives having tried that many times."
+            f" Break-even cost multiple {_number(_as_float(break_even), 2)}, the multiple of the"
+            " modelled cost that would erase the edge. Gross Sharpe "
+            f"{_number(_as_float(sharpe_gross), 2)}"
+            + (
+                ", flagged as implausibly high for a strategy of this kind."
+                if gross_flag
+                else ", unflagged."
+            )
+        ),
+        tag("h3", "Path distribution"),
+        note(
+            f"{counted} Each measure below is the distribution across those paths, with what the"
+            " live account has measured so far beside it."
+        ),
+        _path_table(
+            quantiles,
+            _live_paths(health.equity_months(conn), limits.monthly_return if limits else None),
+        ),
+        note(
+            f"These gates certify {certifies}. The LLM safety panel, and the blend that puts its"
+            " score beside the ranker's, are certified by nothing on this page: no gate in the"
+            " table above measures them, and no path in the distribution was run with them in"
+            " it."
+        ),
+    ]
+    return page("Validation", "/validation", [banner(conn, now), section("Validation", blocks)])
+
+
+# The Promotion view.
+
+# The most history rows the Promotion view shows.
+LADDER_MAX = 100
+# Every transition the ladder has made, in one list: the certifications imported, the promotions
+# and voidings of them, the mode changes and the level changes. Each row carries who did it and
+# the evidence they did it on, because a transition without either is not auditable. The newest
+# rows are taken and then read oldest-first, as the log's cycles are.
+_PROMOTION_HISTORY = """
+    SELECT at, what, detail, actor, evidence FROM (
+        SELECT * FROM (
+            SELECT c.certified_at AS at, c.id AS seq, 'certified' AS what,
+                   c.model_id || ' ' || CASE WHEN c.passed THEN 'passed' ELSE 'FAILED' END
+                       || ' its gates' AS detail,
+                   c.actor::text AS actor,
+                   'artifact ' || left(c.artifact_sha256, 12) AS evidence
+            FROM agb.model_certification c
+            UNION ALL
+            SELECT p.at, p.id, 'promoted', c.model_id, p.actor::text, 'certification ' || c.id
+            FROM agb.promotion_event p
+            JOIN agb.model_certification c ON c.id = p.certification_id
+            UNION ALL
+            SELECT e.at, e.id, 'voided', c.model_id || ': ' || e.reason, e.actor::text,
+                   'cost model ' || e.cost_model_version
+            FROM agb.certification_event e
+            JOIN agb.model_certification c ON c.id = e.certification_id
+            UNION ALL
+            SELECT m.at, m.id, 'mode ' || m.mode, coalesce(m.reason, ''), m.actor::text,
+                   coalesce(m.attestation, '')
+            FROM agb.mode_event m
+            UNION ALL
+            SELECT l.at, l.id, 'level ' || l.level, l.reason, l.actor::text,
+                   coalesce(l.attestation, 'rebalance ' || b.reference, '')
+            FROM agb.ladder_event l
+            LEFT JOIN agb.basket b ON b.id = l.basket_id
+        ) events
+        ORDER BY at DESC, seq DESC
+        LIMIT %s
+    ) latest
+    ORDER BY at, seq
+"""
+
+
+def _criteria_block(heading: str, criteria: Sequence[ladder.Criterion], standing: str) -> Html:
+    """One ladder's criteria as its own view measures them, with where it stands above the table.
+    A criterion nothing has measured reads as unmet, which is the honest answer."""
+    return join(
+        [
+            tag("h3", heading),
+            note(standing),
+            table(
+                ["Criterion", "Measured", "Needs", "Result"],
+                [(c.name, c.measured, c.threshold, "met" if c.met else "unmet") for c in criteria],
+                numeric=(1, 2),
+            ),
+        ]
+    )
+
+
+def promotion(conn: psycopg.Connection, now: datetime) -> str:
+    """The ladder from backtest to live: which certification is live and who promoted it on what
+    evidence, which mode and which level the system is at, what the level above still wants, and
+    every transition it has made with the date, the actor and the evidence behind it."""
+    level = ladder.current(conn)
+    mode_row = conn.execute(ladder._MODE).fetchone()
+    assert mode_row is not None, "agb.mode_event starts with a paper event"
+    mode, mode_since, mode_actor = mode_row
+    promoted = conn.execute(_PROMOTED).fetchone()
+    blocks: list[object] = [
+        note(f"Trading {mode} since {et(mode_since)}, set by {mode_actor}."),
+        note(f"Level {level.level} since {et(level.since)}, set by {level.actor}: {level.reason}"),
+        note(f"At {level.level}, {ladder.MEANING[level.level]}."),
+    ]
+    if level.attestation:
+        blocks.append(note(f"Attested: {level.attestation}"))
+    blocks.append(tag("h3", "The live model"))
+    if promoted is None:
+        blocks.append(
+            note(
+                "No certification has been promoted. The pipeline refuses to rank without one, so"
+                " nothing on the backtest side of the ladder has crossed it yet."
+            )
+        )
+    else:
+        (
+            certification_id,
+            model_id,
+            model_passed,
+            trials,
+            cost_model,
+            artifact,
+            promoted_by,
+            promoted_at,
+            voided,
+            voided_at,
+            voided_reason,
+        ) = promoted
+        blocks.append(
+            note(
+                f"{model_id} is live: certification {certification_id}, promoted "
+                f"{et(promoted_at)} by {promoted_by}, "
+                f"{'passed' if model_passed else 'FAILED'} its gates on {trials:,} declared trials"
+                f" under cost model {cost_model}, artifact {artifact[:12]}."
+            )
+        )
+        if voided:
+            blocks.append(
+                note(f"It was voided {et(voided_at)}: {voided_reason}. The gate refuses it.")
+            )
+        blocks.append(
+            tag(
+                "p",
+                join(
+                    [
+                        "Its gates and its path distribution are on the ",
+                        tag("a", "Validation", href="/validation"),
+                        " page.",
+                    ]
+                ),
+                class_="note",
+            )
+        )
+    criteria = ladder.status(conn)
+    if not criteria:
+        blocks.append(join([tag("h3", "The level above"), note("L2 is the top of the ladder.")]))
+    else:
+        eligible = ladder.ready(conn)
+        target = (
+            eligible.target
+            if eligible is not None
+            else ladder.LEVELS[ladder.LEVELS.index(level.level) + 1]
+        )
+        if eligible is not None and eligible.ready:
+            standing = (
+                f"{target} is earned. It is raised at the terminal, with the attestation a human"
+                " types, and never from this page: the ladder loosens only where someone says so"
+                " in their own words."
+            )
+        elif eligible is not None and eligible.outstanding:
+            standing = f"{target} is not earned: {', '.join(eligible.outstanding)}."
+        else:
+            standing = f"{target} is not earned yet."
+        blocks.append(_criteria_block(f"Towards {target}", criteria, standing))
+    live = ladder.live_ready(conn)
+    if mode == "live":
+        standing = "Trading live already. The criteria below are measured as they stand now."
+    elif live.ready:
+        standing = "Paper has earned live. The switch is thrown at the terminal, not here."
+    else:
+        standing = (
+            f"Paper, with {len(live.outstanding)} of these criteria outstanding: "
+            f"{', '.join(live.outstanding)}."
+        )
+    blocks.append(_criteria_block("Towards live", ladder.live_status(conn), standing))
+    history = conn.execute(_PROMOTION_HISTORY, (LADDER_MAX,)).fetchall()
+    blocks.append(tag("h3", "Every transition"))
+    if not history:
+        blocks.append(note("Nothing has been certified, promoted or moved yet."))
+    else:
+        blocks.append(
+            table(
+                ["When", "Event", "What", "Actor", "Evidence"],
+                [
+                    (et(at), what, detail, who, evidence)
+                    for at, what, detail, who, evidence in history
+                ],
+                wrap=(2,),
+            )
+        )
+    return page("Promotion", "/promotion", [banner(conn, now), section("Promotion", blocks)])
+
+
+# The Performance view.
+
+# The promoted model's path distribution, which is what a live figure is read against.
+_PROMOTED_PATHS = """
+    SELECT c.model_id, c.path_quantiles
+    FROM agb.promoted_model p
+    JOIN agb.model_certification c ON c.id = p.certification_id
+"""
+
+
+def performance(conn: psycopg.Connection, now: datetime) -> str:
+    """What the account did, never on its own: every live figure sits beside the certified
+    distribution it is read against, and the page says how many months it is reading. A handful of
+    months cannot tell a model that works from one that has been lucky, and the page says so."""
+    months = health.equity_months(conn)
+    promoted = conn.execute(_PROMOTED_PATHS).fetchone()
+    limits = health.thresholds(conn)
+    blocks: list[object] = []
+    quantiles: Mapping[str, object] = {}
+    if promoted is None:
+        blocks.append(
+            note(
+                "No model is promoted, so there is no certified distribution to read the account"
+                " against. Every figure below would stand alone, which is the one way this page is"
+                " not meant to be read."
+            )
+        )
+    else:
+        model_id, quantiles = promoted
+        paths = quantiles.get("paths")
+        blocks.append(
+            note(
+                f"Read against {model_id}'s "
+                + (f"{paths:,} certified paths." if isinstance(paths, int) else "certified paths.")
+            )
+        )
+    if not months:
+        blocks.append(note("No month has a return yet, so there is nothing to compare."))
+        return page(
+            "Performance", "/performance", [banner(conn, now), section("Performance", blocks)]
+        )
+    expected = limits.monthly_return if limits else None
+    blocks.append(
+        table(["What", "Facts"], [(item.what, item.facts) for item in readout.comparison(conn)])
+    )
+    blocks.append(tag("h3", "Beside the backtest"))
+    blocks.append(_path_table(quantiles, _live_paths(months, expected)))
+    worst = min(months, key=lambda month: month.total_return)
+    average = quantiles.get("monthly_return") or {}
+    assert isinstance(average, Mapping)
+    blocks.append(
+        note(
+            f"Worst month {worst.period} at {_fraction(worst.total_return)}, against a certified"
+            f" median path averaging {_measure(_as_float(average.get('q50')), True)} a month and a"
+            f" fifth-percentile path averaging {_measure(_as_float(average.get('q05')), True)}."
+            " Those certified figures are each path's average month and not its worst one, so a"
+            " single month is a rough reference against them and nothing more."
+        )
+    )
+    blocks.append(tag("h3", "Every month"))
+    blocks.append(
+        table(
+            ["Period", "Mode", "Return", "Dividends added back", "vs certified average month"],
+            [
+                (
+                    month.period,
+                    month.mode or "—",
+                    _fraction(month.total_return),
+                    readout.dollars(month.dividends) if month.dividends else "—",
+                    "—"
+                    if expected is None
+                    else f"{(month.total_return - expected) * 100:+.2f} points",
+                )
+                for month in months
+            ],
+            numeric=(2, 3, 4),
+        )
+    )
+    paper = [month for month in months if month.mode == "paper"]
+    if paper:
+        blocks.append(
+            note(
+                f"{len(paper)} of these {len(months)} months were paper months, restated with the"
+                " dividends the operator recorded added back: the paper broker credits none, and"
+                " the backtest's expectation assumes them. Live equity already holds them."
+            )
+        )
+    blocks.append(
+        note(
+            f"{len(months)} month{'' if len(months) == 1 else 's'} measured. That is far too few"
+            " to tell a model that works from one that has been lucky: the certified distribution"
+            " above is what says which readings are ordinary, and a reading inside it is evidence"
+            " of neither."
+        )
+    )
+    return page("Performance", "/performance", [banner(conn, now), section("Performance", blocks)])
+
+
+# The Panel view.
+
+# The most names the Panel view renders in full.
+PANEL_MAX = 60
+# The shortlist of the latest live basket the panel scored, with both terms of each name's blended
+# score. A name the panel could not score is `neutral` and keeps the middle of the range.
+_PANEL_BLEND = """
+    SELECT symbol, stage1_rank, llm_total, llm_score, neutral
+    FROM agb.basket_blend
+    WHERE basket_id = %s
+    ORDER BY stage1_rank
+    LIMIT %s
+"""
+_PANEL_SHORTLIST = "SELECT count(*) FROM agb.basket_blend WHERE basket_id = %s"
+# What the panel did with each name in that run: what EDGAR returned, the flags its filings set,
+# and the debate's own outcome.
+_PANEL_RETRIEVALS = """
+    SELECT r.symbol, r.id, r.outcome, r.detail, r.delinquent, r.ipo, s.id, s.outcome, s.detail
+    FROM agb.panel_retrieval r
+    LEFT JOIN agb.panel_score s ON s.retrieval_id = r.id
+    WHERE r.run_id = %s
+"""
+# Every dimension of every score in the run, with the Judge's own reason for it.
+_PANEL_DIMENSIONS = """
+    SELECT d.score_id, d.dimension, d.score, d.reason, d.source, d.judge_score
+    FROM agb.panel_dimension d
+    JOIN agb.panel_score s ON s.id = d.score_id
+    WHERE s.run_id = %s
+    ORDER BY d.score_id, d.dimension
+"""
+# What the Analyst read, as it was cited: one row per section of one filing.
+_PANEL_FILINGS = """
+    SELECT f.retrieval_id, f.document, f.form, f.filed, f.section, f.sent_chars, f.chars
+    FROM agb.panel_filing f
+    JOIN agb.panel_retrieval r ON r.id = f.retrieval_id
+    WHERE r.run_id = %s
+    ORDER BY f.retrieval_id, f.filed DESC, f.document
+"""
+
+
+def names_of(dimensions: Iterable[int]) -> str:
+    """Some rubric dimensions, by number and by the rubric's own name for them. The rules that
+    cap a dimension name it by number alone, and a reader should not have to count rows to find
+    out which one a rule touched. The number leads, because that is the column the table below
+    carries, and two of the six names have an "and" of their own."""
+    named = [f"dimension {number} ({analyst.RUBRIC[number][0].lower()})" for number in dimensions]
+    if len(named) < 2:
+        return "".join(named)
+    return f"{', '.join(named[:-1])} and {named[-1]}"
+
+
+def _panel_name(
+    symbol: str,
+    rank: int,
+    total: int | None,
+    score: float | None,
+    neutral: bool,
+    place: int,
+    scored: int,
+    retrieval: Sequence[object] | None,
+    dimensions: Sequence[Sequence[object]],
+    filings: Sequence[Sequence[object]],
+) -> Html:
+    """One name's whole panel record: its two terms, its six rubric dimensions with the Judge's
+    reason on each, the flags its filings set, and the filings themselves."""
+    if neutral or total is None or score is None:
+        safety = "safety not scored, held at the neutral middle"
+    else:
+        safety = (
+            f"safety {total}/{debate.MAX_TOTAL} ({score:.2f}), "
+            f"{readout._ordinal(place)} safest of the {scored} scored"
+        )
+    summary = tag("summary", f"{symbol} — stage-1 rank {rank}; {safety}")
+    body: list[object] = []
+    if retrieval is None:
+        body.append(note("The panel has no record of this name in that run."))
+        return Html(
+            f'<details class="cycle">{summary}<div class="detail">{join(body)}</div></details>'
+        )
+    _, outcome, detail, delinquent, ipo, _, score_outcome, score_detail = retrieval
+    if outcome != "retrieved":
+        body.append(note(f"EDGAR returned {outcome}: {detail}"))
+    elif score_outcome is None:
+        body.append(note("Its filings were read, but the debate left no score."))
+    elif score_outcome != "scored":
+        body.append(note(f"The debate failed ({score_outcome}): {score_detail}"))
+    if delinquent:
+        capped = names_of(debate.DELINQUENT_DIMENSIONS)
+        body.append(
+            note(
+                f"Flagged {delinquent} from its filings: a late or missing annual report caps"
+                f" {capped} at {debate.DELINQUENT_CAP} by rule, whatever the Judge scored them."
+            )
+        )
+    if ipo:
+        body.append(
+            note(
+                f"Flagged as a recent listing: {names_of([debate.IPO_DIMENSION])} is held at a"
+                f" neutral {debate.IPO_SCORE} by rule rather than scored, because a first-time"
+                " filer has no prior annual report to be compared against."
+            )
+        )
+    if dimensions:
+        body.append(
+            table(
+                ["#", "Dimension", "Score", "The Judge's reason"],
+                [
+                    (
+                        number,
+                        analyst.RUBRIC[number][0],
+                        f"{dimension_score}/{debate.DIMENSION_MAX}",
+                        reason
+                        if source != "rule"
+                        else join(
+                            [
+                                esc(reason),
+                                tag(
+                                    "span",
+                                    f" Set by a filing rule; the Judge scored {judge_score}.",
+                                    class_="dim",
+                                ),
+                            ]
+                        ),
+                    )
+                    for number, dimension_score, reason, source, judge_score in dimensions
+                ],
+                numeric=(0, 2),
+                wrap=(3,),
+            )
+        )
+    if filings:
+        body.append(
+            table(
+                ["Document", "Form", "Filed", "Section", "Read"],
+                [
+                    (
+                        document,
+                        form,
+                        filed,
+                        part,
+                        "in full"
+                        if sent is None or chars is None or sent >= chars
+                        else f"first {sent:,} of {chars:,} characters",
+                    )
+                    for document, form, filed, part, sent, chars in filings
+                ],
+            )
+        )
+    elif outcome == "retrieved":
+        body.append(note("No filing section was recorded for this name."))
+    return Html(f'<details class="cycle">{summary}<div class="detail">{join(body)}</div></details>')
+
+
+def panel(conn: psycopg.Connection, now: datetime) -> str:
+    """The safety panel's own evidence for the latest live basket it scored: every shortlisted name
+    with its six-dimension rubric, the score and the Judge's reason on each dimension, the filings
+    the Analyst read and how much of each it sent, and the fact that the panel was never told which
+    company it was reading about."""
+    latest = conn.execute(readout._WHY_BASKET).fetchone()
+    if latest is None:
+        empty = [note("No panel has scored a live basket yet.")]
+        return page("Panel", "/panel", [banner(conn, now), section("Panel", empty)])
+    basket_id, reference, universe, run_id, w = latest
+    shortlisted = conn.execute(_PANEL_SHORTLIST, (basket_id,)).fetchone()
+    blend_rows = conn.execute(_PANEL_BLEND, (basket_id, PANEL_MAX)).fetchall()
+    retrievals = {row[0]: row[1:] for row in conn.execute(_PANEL_RETRIEVALS, (run_id,)).fetchall()}
+    dimensions: dict[int, list[Sequence[object]]] = {}
+    for row in conn.execute(_PANEL_DIMENSIONS, (run_id,)).fetchall():
+        dimensions.setdefault(row[0], []).append(row[1:])
+    filings: dict[int, list[Sequence[object]]] = {}
+    for row in conn.execute(_PANEL_FILINGS, (run_id,)).fetchall():
+        filings.setdefault(row[0], []).append(row[1:])
+    ranked = sorted(
+        (row[3] for row in blend_rows if not row[4] and row[3] is not None), reverse=True
+    )
+    count = shortlisted[0] if shortlisted else len(blend_rows)
+    blocks: list[object] = [
+        note(
+            f"Rebalance {reference}: {count} names shortlisted out of a universe of "
+            f"{universe:,}, each blended at w = {w} between the ranker's place and the panel's"
+            f" safety score. Panel run {run_id}."
+        ),
+        note(readout.SCRUBBED),
+    ]
+    if len(blend_rows) < count:
+        blocks.append(note(f"The {len(blend_rows)} best-ranked of them are below."))
+    for symbol, rank, total, score, neutral in blend_rows:
+        retrieval = retrievals.get(symbol)
+        score_id = retrieval[5] if retrieval else None
+        place = 1 + sum(1 for other in ranked if score is not None and other > score)
+        blocks.append(
+            _panel_name(
+                symbol,
+                rank,
+                total,
+                score,
+                neutral,
+                place,
+                len(ranked),
+                retrieval,
+                dimensions.get(score_id, ()) if score_id is not None else (),
+                filings.get(retrieval[0], ()) if retrieval else (),
+            )
+        )
+    return page("Panel", "/panel", [banner(conn, now), section("Panel", blocks)])
+
+
 # The Alerts view.
 
 _ALERTS = """
@@ -789,6 +1530,10 @@ ROUTES = {
     "/rebalance": rebalance,
     "/positions": positions,
     "/gate": gate,
+    "/validation": validation,
+    "/promotion": promotion,
+    "/performance": performance,
+    "/panel": panel,
     "/alerts": alerts,
     "/killswitch": kill_switch,
 }
