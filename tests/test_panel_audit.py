@@ -19,7 +19,7 @@ from agb import health, jobs, panel, panel_audit, schedule
 from agb.panel_store import PanelStore
 from agb.schedule import Expected, Planned
 from agb.services.bot import ALERT_HEADER, Bot
-from agb.services.pipeline import Pipeline
+from agb.services.pipeline import Pipeline, sample_from_env
 
 PERIOD = "2026-09-14"
 SIGNAL = date(2026, 9, 14)
@@ -275,3 +275,16 @@ def test_a_corrupted_body_completes_the_job_and_raises_one_alert(db, store, tmp_
         "  panel store: 0 missing, 1 corrupt of 10 checked\n"
         f"    checked 10 of 10 referenced bodies on {PERIOD}; first unsound {rewritten}"
     ]
+
+
+def test_the_sample_can_be_set_on_the_deploy_machine(monkeypatch):
+    """The deliberate-corruption check needs a sample that covers the store, without a release."""
+    monkeypatch.delenv(panel_audit.SAMPLE_ENV, raising=False)
+    assert sample_from_env() == panel_audit.SAMPLE
+    monkeypatch.setenv(panel_audit.SAMPLE_ENV, "5000")
+    assert sample_from_env() == 5000
+    assert Pipeline.from_env().sample == 5000
+    for refused in ("all", "0", "-1"):
+        monkeypatch.setenv(panel_audit.SAMPLE_ENV, refused)
+        with pytest.raises(SystemExit, match="not a number"):
+            sample_from_env()

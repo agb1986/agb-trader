@@ -30,8 +30,10 @@ and restoring from one. The server's memory is tight, so each service's limit co
 measured run rather than a guess:
 
 ```sh
-make measure            # sample each container's peak memory until interrupted
-make agb CMD=runtimes   # how long each job kind has actually taken
+make measure                  # sample each container's peak memory until interrupted
+make agb CMD=runtimes         # how long each job kind has actually taken
+make sizing CMD=check         # drive the server's sizing run: check, start, watch, stop
+make panel-check CMD=check    # drive the panel store's corruption check on the server
 ```
 
 [docs/build/measured-limits.md](docs/build/measured-limits.md) is the procedure, the headroom

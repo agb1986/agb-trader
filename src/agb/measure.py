@@ -16,7 +16,12 @@ Docker and a system Python but no project environment:
     ssh casaos.local 'python3 - --out peaks.md' < src/agb/measure.py
 
 It stops on the first interrupt and writes its table then, so the operator starts it before
-the run and interrupts it once the run is over.
+the run and interrupts it once the run is over. With `--out` it rewrites that file after every
+reading as well, so an hour-long run can be read while it is going on and survives being
+killed rather than interrupted.
+
+`scripts/deploy/sizing.sh` drives it against the server, and docs/build/measured-limits.md is
+the procedure it belongs to.
 """
 
 import argparse
@@ -222,18 +227,24 @@ def main(argv: list[str] | None = None) -> int:
     peaks = Peaks()
     stop = Stop()
     taken = 0
+    failed = False
     try:
         while not stop.asked and (args.samples is None or taken < args.samples):
             readings = sample(peaks, run_command, args.project)
             taken += 1
             if not readings:
                 print(f"measure: nothing running in {args.project}", file=sys.stderr)
+            # Written after every reading rather than at the end alone: a sizing run lasts as
+            # long as a rebalance, and the operator reads this file while it is going on. It
+            # also means a run that is killed rather than interrupted still leaves its peaks.
+            if args.out and peaks.seen:
+                Path(args.out).write_text(peaks.table())
             if stop.asked or (args.samples is not None and taken >= args.samples):
                 break
             time.sleep(args.interval)
     except MeasureError as exc:
         print(f"measure: {exc}", file=sys.stderr)
-        return 1
+        failed = True
     if not peaks.seen:
         print("measure: no readings, nothing to report", file=sys.stderr)
         return 1
@@ -241,7 +252,9 @@ def main(argv: list[str] | None = None) -> int:
     print(table, end="")
     if args.out:
         Path(args.out).write_text(table)
-    return 0
+    # Docker stopping answering part way through leaves a measurement, but not the one asked
+    # for, so the readings are reported and the exit code still says the run did not finish.
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ COMPOSE := docker compose --env-file $(ENV_DIR)/db.env
 
 .DEFAULT_GOAL := help
 .PHONY: help env up down status logs agb reconcile backfill lake sync-lake research measure \
-	deploy rollback test test-fast lint
+	sizing panel-check deploy rollback test test-fast lint
 
 help: ## List the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-9s %s\n", $$1, $$2}'
@@ -75,6 +75,12 @@ research: sync-lake ## Sync the lake, then run a research command, e.g. make res
 
 measure: ## Sample each container's memory until interrupted, e.g. make measure OUT=peaks.md
 	uv run python -m agb.measure $(if $(OUT),--out $(OUT),)
+
+sizing: ## Drive the server's sizing run, e.g. make sizing CMD=check|start|watch|stop
+	scripts/deploy/sizing.sh $(CMD)
+
+panel-check: ## Drive the panel store's corruption check, e.g. make panel-check CMD=check
+	scripts/deploy/panel-check.sh $(CMD)
 
 deploy: ## Build this commit's image, ship it to the server and restart the stack there
 	scripts/deploy/deploy.sh

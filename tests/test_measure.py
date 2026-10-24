@@ -166,3 +166,48 @@ def test_docker_failing_is_reported_and_not_sampled_over(capsys, monkeypatch):
 
     assert measure.main(["--samples", "3", "--interval", "0"]) == 1
     assert "measure: docker is not on the path" in capsys.readouterr().err
+
+
+def test_the_table_is_readable_while_the_run_is_still_going_on(tmp_path, monkeypatch):
+    """A sizing run lasts an hour, so the file is current after every reading, not at the end."""
+    readings = [{"agb-trader-db-1": "50MiB / 512MiB"}, {"agb-trader-db-1": "300MiB / 512MiB"}]
+    docker = FakeDocker({"agb-trader-db-1": "db"}, readings)
+    out = tmp_path / "peaks.md"
+    seen = []
+
+    original = measure.sample
+
+    def sampled(*args, **kwargs):
+        taken = original(*args, **kwargs)
+        if out.exists():
+            seen.append(out.read_text())
+        return taken
+
+    monkeypatch.setattr(measure, "run_command", docker)
+    monkeypatch.setattr(measure, "sample", sampled)
+
+    assert measure.main(["--samples", "2", "--interval", "0", "--out", str(out)]) == 0
+
+    # The file was already there for the second reading, holding the first reading's peak.
+    assert len(seen) == 1
+    assert "| db | agb-trader-db-1 | 1 | 50m |" in seen[0]
+    assert "| db | agb-trader-db-1 | 2 | 300m |" in out.read_text()
+
+
+def test_docker_failing_part_way_keeps_the_readings_it_did_give(tmp_path, monkeypatch):
+    """The run did not finish, so the exit code says so, but an hour of readings is not lost."""
+    docker = FakeDocker({"agb-trader-db-1": "db"}, [{"agb-trader-db-1": "300MiB / 512MiB"}])
+    calls = {"n": 0}
+
+    def breaks_after_one(argv):
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise MeasureError("docker stopped answering")
+        return docker(argv)
+
+    monkeypatch.setattr(measure, "run_command", breaks_after_one)
+    out = tmp_path / "peaks.md"
+
+    assert measure.main(["--samples", "3", "--interval", "0", "--out", str(out)]) == 1
+
+    assert "| db | agb-trader-db-1 | 1 | 300m | 512m | 480m |" in out.read_text()

@@ -23,7 +23,7 @@ file records both the measurement and the arithmetic between it and the limit.
 | (a) Peak memory per service during a full rebalance | Tool built and tested; **the sizing run on the server is owed.**          |
 | (b) Every limit derived from its measurement        | Arithmetic fixed and tested; limits move when (a) lands.                  |
 | (c) Poll intervals and leases from measured times   | `agb runtimes` built; current values below are the unmeasured defaults.   |
-| (d) Nightly hash check of a sample of panel bodies  | Done: scheduled job, recorded result, alert on an unsound body.           |
+| (d) Nightly hash check of a sample of panel bodies  | Done in code and tested; the corruption check on the server is scripted.  |
 
 Nothing below invents a number for (a) or (b). The table further down is a workstation
 baseline taken while two services were idle, which is useful only as a demonstration that the
@@ -95,38 +95,67 @@ lake query running says nothing about Postgres under the pipeline's reads.
 
 ## The sizing run the operator owes
 
-This is the one step nothing in the repo can do, because it needs the real server, real
-vendor data, a real panel run and the Anthropic spend that goes with it. Run it once, paste
-the table into this file under a dated heading, and only then move the limits.
+This is the one step nothing in the repo can do on its own, because it needs the real server,
+real vendor data, a real panel run and the Anthropic spend that goes with it. What *is* in the
+repo is everything around it: `scripts/deploy/sizing.sh` checks the stack can produce a
+measurement, starts and stops the sampler on the server, and brings the table back.
 
-1. On the server, check the stack is up and that a rebalance is due:
-   ```
-   ssh casaos.local
-   cd /mnt/data/AppData/agb-trader
-   ./agb-stack status
-   ./agb-stack exec -T db psql -U postgres -d agb -c "SELECT * FROM agb.job_state ORDER BY id DESC LIMIT 10"
-   ```
-2. From the workstation, start the sampler against the server and leave it running:
-   ```
-   ssh casaos.local 'python3 - --interval 5 --out /mnt/data/AppData/agb-trader/peaks.md' \
-       < src/agb/measure.py
-   ```
-3. Let the full rebalance run — the data pull, the feature build, the panel with its model
-   calls, the gate, the basket. The panel is the heaviest stage and the one worth not missing.
-4. Interrupt the sampler once the basket exists. Collect the table:
-   ```
-   scp casaos.local:/mnt/data/AppData/agb-trader/peaks.md .
-   ```
-5. For each service, set `mem_limit` in `compose.yaml` to the "limit it argues for" column,
+### When
+
+A rebalance is the measurement, so the run happens when the next one does rather than when it
+is convenient. `check` says when that is, from the same planner the scheduler uses:
+
+```
+make sizing CMD=check
+```
+
+It refuses the run early if it would measure the wrong thing: nothing deployed, the pipeline
+not running, no promoted model (the job fails before it proposes a basket), or no
+`panel_config` (the rebalance is stage-1 only and the panel, the heaviest stage, never runs).
+It also takes two readings through the server's own Docker, which is a different engine from
+the workstation's, so a format this cannot parse is found days before the run and not during
+it.
+
+Forcing a rebalance earlier is possible — insert the job as the scheduler would — but `(kind,
+period)` is unique, so it needs a period no rebalance has used, and that leaves a basket under
+a reference that means nothing and has to be voided. Waiting for the real one is cheaper.
+
+### The run
+
+```
+make sizing CMD=start     # before the rebalance becomes claimable
+make sizing CMD=watch     # as often as you like while it runs
+make sizing CMD=stop      # once the pipeline logs the proposed basket
+```
+
+`start` copies `src/agb/measure.py` to the server and runs it detached in its own session, so
+a dropped SSH connection does not take the measurement with it. The sampler rewrites its table
+after every reading, so `watch` shows the peaks as they stand, alongside the pipeline's last
+ten lines and any container that has exited 137 during the run — the one thing that invalidates
+the readings, and worth seeing while there is still time to re-measure with a shorter
+`--interval`.
+
+`docker stats --no-stream` itself takes a second or two per call on a Celeron, so the real
+cadence is a little longer than `AGB_SIZING_INTERVAL` asks for.
+
+`stop` sends one SIGTERM, which is how the sampler is asked to write its table and exit, and
+copies the table to `peaks.md` on the workstation.
+
+### Turning the table into limits
+
+1. For each service, set `mem_limit` in `compose.yaml` to the "limit it argues for" column,
    except where that is *above* what the box can afford — in which case the finding is that
    the box cannot afford that service as written, and it goes in an issue rather than into a
    limit that will be hit.
-6. Check the total: the sum of the limits of the services that run at once has to leave the
+2. Check the total: the sum of the limits of the services that run at once has to leave the
    household stack its share of 3.6 GB. The pipeline and the research profile never run on the
    server at the same time, and `migrate`, `cli`, `reconcile` and `certification-import` are
    one-shot.
-7. Deploy, run a second full rebalance under the new limits, and confirm it completes with no
-   container exiting 137. That second run is criterion (b); the first run alone is not.
+3. Paste the table into this file under a dated heading, so the limit above and the reading it
+   came from are read together.
+4. Deploy, and run a second full rebalance under the new limits with no container exiting 137.
+   That second run is criterion (b); the first run alone is not, and since a rebalance is
+   monthly, (b) lands a month after (a) unless a forced run is accepted.
 
 `tests/test_compose.py` enforces that every service still declares a limit, so a limit cannot
 be deleted in passing, only changed.
@@ -205,46 +234,49 @@ a health alert naming the counts and the first unsound hash, once, and the UI sh
 ### Verifying it on the server
 
 Because this is the one criterion with a deliberate-corruption test, it can be checked for real
-without a rebalance:
+without a rebalance — though not before one, since the store has bodies only after a panel run.
+`scripts/deploy/panel-check.sh` drives it:
 
-1. Pick a body the database cites — the store has bodies only after a panel run — and copy
-   it somewhere safe:
-   ```
-   cd /mnt/data/AppData/agb-trader
-   ./agb-stack exec -T db psql -U postgres -d agb -tAc \
-       "SELECT document_sha256 FROM agb.panel_filing LIMIT 1"
-   cp panel/<xx>/<sha>.zst ~/<sha>.zst.keep
-   ```
-2. Overwrite the body with something that is not its own content:
-   ```
-   printf 'not a zstd frame' > panel/<xx>/<sha>.zst
-   ```
-3. Either wait for 04:00, or insert tomorrow's job now, as the scheduler would, and let the
-   pipeline's next poll claim it:
-   ```
-   ./agb-stack exec -T db psql -U postgres -d agb -c \
-       "WITH j AS (INSERT INTO agb.job (kind, period, session_date, not_before, created_by)
-                   VALUES ('panel_audit', '2026-10-25', '2026-10-25', now(), 'scheduler')
-                   RETURNING id)
-        INSERT INTO agb.job_event (job_id, event, actor)
-        SELECT id, 'created', 'scheduler' FROM j"
-   ```
-   Pick a period no `panel_audit` job has yet: `(kind, period)` is unique, so re-running a
-   period inserts nothing rather than auditing twice.
-4. Read what it found, and expect the Telegram alert naming the counts and the first unsound
-   hash:
-   ```
-   ./agb-stack exec -T db psql -U postgres -d agb -c \
-       "SELECT period, bodies, checked, sound, missing, corrupt FROM agb.panel_audit
-        ORDER BY id DESC LIMIT 1"
-   ./agb-stack logs --tail 50 bot
-   ```
-5. Put the body back from the copy, and confirm the next audit's row is sound again:
-   ```
-   cp ~/<sha>.zst.keep panel/<xx>/<sha>.zst
-   ```
+```
+make panel-check CMD=check      # the store has cited bodies, and the sample will read the broken one
+make panel-check CMD=corrupt    # back one body up on the server, then overwrite it
+make panel-check CMD=run        # insert the audit job now and wait for what it finds
+make panel-check CMD=restore    # put the body back, byte for byte
+make panel-check CMD=status     # whether a body is broken, and the last three audits
+```
 
-With a sample of 200, a single corrupted body in a large store is found with probability
-200/bodies on any one night, so a store of a few thousand bodies surfaces it within days rather
-than on the first night. For a test that has to be deterministic, corrupt a body and run the
-job with a sample larger than the store.
+`corrupt` copies the body to `panel-check/<sha>.zst.keep` beside the store, checks the copy
+hashes the same as the original, records what it broke, and only then overwrites the body with
+bytes that are not a zstd frame. It refuses to break a second body while one is still broken,
+so there is exactly one thing to put back. `restore` copies it back and refuses to finish
+unless the restored file hashes to what the marker recorded, which is the difference between
+putting a body back and losing it. The store is the only copy of a panel body: the database
+holds hashes, not bytes.
+
+`run` inserts the `panel_audit` job as the scheduler would, for tomorrow's period by default,
+and waits up to five minutes for the pipeline to claim it, read the sample, and record the row.
+Then it prints the row and the bot's lines naming the store. It takes a period explicitly —
+`make panel-check CMD="run 2026-10-26"` — because `(kind, period)` is unique, so a period that
+already has an audit job inserts nothing instead of auditing twice.
+
+### Making the check certain
+
+With a sample of 200, a single corrupted body in a large store is read on any one night with
+probability 200/bodies, so the nightly job finds it within days rather than on the first night.
+That is the right behaviour for the nightly job and no use as a test.
+
+So the sample is settable on the deploy machine, with `AGB_PANEL_AUDIT_SAMPLE` in
+`env/pipeline.env`. `check` and `corrupt` read the store's size and the sample in force, and
+`corrupt` refuses to break anything when the sample does not cover the store, printing the two
+commands that fix it:
+
+```
+ssh casaos.local "echo AGB_PANEL_AUDIT_SAMPLE=<bodies> >> /mnt/data/AppData/agb-trader/env/pipeline.env"
+ssh casaos.local "/mnt/data/AppData/agb-trader/agb-stack up -d pipeline"
+```
+
+Put it back to 200 when the check is done: the nightly job has a two-hour grace period and
+shares one slow disk with the household stack, and a sample sized for a test is not sized for
+every night. The variable is deliberately absent from `env/pipeline.env.example`, since
+`deploy.sh` requires the server to set every name the example does and this one is a temporary
+override, not a setting the stack needs.
