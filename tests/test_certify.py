@@ -464,6 +464,16 @@ def test_a_manifest_whose_digest_was_edited_is_refused(db, certified, tmp_path):
 # The command line -----------------------------------------------------------------------------
 
 
+def test_an_import_with_no_database_says_where_the_import_runs(certified, monkeypatch):
+    """The research service sets no PG* variables and runs with `network_mode: none`, so an
+    unguarded connect fails on a local socket, complaining about a Unix account that does not
+    exist. The guard names the two commands that can do the write instead."""
+    for name in cli._DATABASE_ENV:
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(SystemExit, match="runs on the server as `./agb-stack import ranker"):
+        cli.main(["import", str(certified.directory)])
+
+
 def test_the_cli_certifies_and_imports(
     db, panel, research_lake, certified, tmp_path, monkeypatch, capsys
 ):

@@ -222,8 +222,17 @@ def _promote(args: argparse.Namespace) -> int:
         except registry.Refused as exc:
             # The refusal is recorded; leaving the block commits it.
             print(f"agb: refused: {exc}", file=sys.stderr)
+            # Which database was asked. A certification lives in the one it was imported
+            # into, so the same command run against another says the model is uncertified.
+            print(f"agb: asked {_where(conn)}", file=sys.stderr)
             return 1
     return 0
+
+
+def _where(conn: psycopg.Connection) -> str:
+    """The database the connection reached, as the refusals name it."""
+    info = conn.info
+    return f"database {info.dbname} on {info.host or 'a local socket'} as {info.user}"
 
 
 def _void(args: argparse.Namespace) -> int:
