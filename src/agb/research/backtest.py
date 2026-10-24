@@ -138,6 +138,15 @@ FROM sep s JOIN _backtest_window w ON s.ticker = w.ticker
 WHERE s.date BETWEEN w.since AND $until AND s.close > 0 AND s.closeadj > 0
 ORDER BY s.ticker, s.date
 """
+# The lake's own first months cannot be traded at all. The liquidity gate reads LIQUIDITY_BARS
+# bars of a name and the cost model reads the same window, so until the lake holds that many
+# sessions nothing is tradeable, the top of every ranking included. A model's score ranks every
+# row of the universe, where a feature such as momentum has no ranking until its trailing year
+# has landed, so those months reach the selection with a full ranking and no tradeable name in
+# it. `_SESSION` is the date the lake's LIQUIDITY_BARS'th session fell on.
+_SESSION = """
+SELECT date FROM (SELECT DISTINCT date FROM sep ORDER BY date) LIMIT 1 OFFSET $skip
+"""
 
 
 class BacktestError(Exception):
@@ -203,19 +212,30 @@ def run(
         partition_hash=panel.partition_hash,
         cost_model_version=panel.cost_model_version,
     ) as trial:
-        feed = _feed(runs, months, options, lake_dir=lake_dir, db=db, forced=forced)
-        if isinstance(scores, Mapping):
-            paths = _paths(feed, months, runs, options, forced)
-            trial.results = {"months": len(months), "paths": paths, "summary": _summary(paths)}
-        else:
-            ranked = runs[""]
-            outcome = simulate(feed, months, ranked, options, forced)
-            results = _report(outcome, feed, months, options, forced)
-            results["start_dates"] = [
-                _sensitivity(feed, months[i:], ranked, options, forced)
-                for i in _starts(months, options)
-            ]
-            trial.results = results
+        conn = db if db is not None else lake.connect(lake_dir)
+        try:
+            _require(conn)
+            months = _priced(conn, months)
+            feed = _feed(runs, months, options, conn, forced=forced)
+            if isinstance(scores, Mapping):
+                paths = _paths(feed, months, runs, options, forced)
+                trial.results = {
+                    "months": len(months),
+                    "paths": paths,
+                    "summary": _summary(paths),
+                }
+            else:
+                ranked = runs[""]
+                outcome = simulate(feed, months, ranked, options, forced)
+                results = _report(outcome, feed, months, options, forced)
+                results["start_dates"] = [
+                    _sensitivity(feed, months[i:], ranked, options, forced)
+                    for i in _starts(months, options)
+                ]
+                trial.results = results
+        finally:
+            if db is None:
+                conn.close()
         return Run(trial.trial_id, trial.results)
 
 
@@ -237,37 +257,66 @@ def replay(
     if not scores:
         raise BacktestError("no paths to run")
     runs = {str(label): rankings(panel.frame, options, series) for label, series in scores.items()}
-    feed = _feed(runs, months, options, lake_dir=lake_dir, db=db, forced=forced)
-    return _paths(feed, months, runs, options, forced)
+    conn = db if db is not None else lake.connect(lake_dir)
+    try:
+        _require(conn)
+        months = _priced(conn, months)
+        feed = _feed(runs, months, options, conn, forced=forced)
+        return _paths(feed, months, runs, options, forced)
+    finally:
+        if db is None:
+            conn.close()
 
 
 def _feed(
     runs: Mapping[str, Mapping[date, list[str]]],
     months: Sequence[Month],
     options: Options,
+    conn: duckdb.DuckDBPyConnection,
     *,
-    lake_dir: Path,
-    db: duckdb.DuckDBPyConnection | None,
     forced: Sequence[corporate.Event] = (),
 ) -> "Feed":
     """The bars of every name any ranking could trade, and of every name a recorded event
     names: a subject whose rank has gone and an acquirer that was never ranked both still have
     to be marked and traded."""
-    conn = db if db is not None else lake.connect(lake_dir)
-    try:
-        _require(conn)
-        depth = options.hold_through + options.size
-        names = {name for r in runs.values() for m in r.values() for name in m[:depth]}
-        named = {event.symbol for event in forced}
-        named |= {event.into_symbol for event in forced if event.into_symbol is not None}
-        wanted = _first_read(runs, months, names | named)
-        # An event falls where the filing puts it, which can be any month and need not be one
-        # the name is ranked in, so a name a recorded event names is read from the first.
-        wanted |= dict.fromkeys(named, months[0].snapshot_date)
-        return load(conn, wanted, months, benchmark=BENCHMARK)
-    finally:
-        if db is None:
-            conn.close()
+    depth = options.hold_through + options.size
+    traded = {month.as_of for month in months}
+    # A ranking of a month the backtest does not trade names nobody, so it feeds nobody.
+    names = {
+        name
+        for ranked in runs.values()
+        for as_of, month_names in ranked.items()
+        if as_of in traded
+        for name in month_names[:depth]
+    }
+    named = {event.symbol for event in forced}
+    named |= {event.into_symbol for event in forced if event.into_symbol is not None}
+    wanted = _first_read(runs, months, names | named)
+    # An event falls where the filing puts it, which can be any month and need not be one
+    # the name is ranked in, so a name a recorded event names is read from the first.
+    wanted |= dict.fromkeys(named, months[0].snapshot_date)
+    return load(conn, wanted, months, benchmark=BENCHMARK)
+
+
+def _priced(conn: duckdb.DuckDBPyConnection, months: Sequence[Month]) -> list[Month]:
+    """The months the lake can price, oldest first: the ones whose signal session has
+    LIQUIDITY_BARS of the lake's sessions at or before it.
+
+    A month the lake holds fewer sessions than that for has no tradeable name in it, because
+    no name can hold the bars the liquidity gate counts. Trading it would buy nothing and
+    still record a month of no return, so the backtest starts after it."""
+    row = conn.execute(_SESSION, {"skip": LIQUIDITY_BARS - 1}).fetchone()
+    if row is None:
+        raise BacktestError(
+            f"the lake holds fewer than the {LIQUIDITY_BARS} sessions a decision reads"
+        )
+    priced = [month for month in months if month.snapshot_date >= row[0]]
+    if not priced:
+        raise BacktestError(
+            f"the lake's {LIQUIDITY_BARS}th session is {row[0]}, which is after every month's "
+            "signal session, so no month of the panel can be traded"
+        )
+    return priced
 
 
 def _first_read(
