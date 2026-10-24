@@ -177,6 +177,22 @@ def test_fills_are_at_the_trade_sessions_close_and_charged_the_cost_model(
     )
 
 
+@pytest.mark.parametrize("close", [0.025, 0.1, 1.000001, 10.123456, 112.345678, 4820.5])
+def test_a_fill_one_tick_from_the_close_is_the_venues_spread(close):
+    """The fill guard tolerates one tick at every price, down to the split-adjusted closes of
+    the 1990s, and still catches two. One tick does not always measure as one tick in binary
+    floating point: `0.025 - 0.024999` comes out at 1.000000000001e-06, just over the
+    tolerance, where the same spread on a dollar-priced name comes out just under it, so a
+    comparison that does not round first refuses penny stocks and nothing else."""
+    tick = 10**-backtest.PRECISION
+    assert not backtest._off_close(close, close)
+    for price in (close - tick, close + tick):
+        assert not backtest._off_close(price, close), "one tick is the venue's spread"
+    for price in (close - 2 * tick, close + 2 * tick):
+        assert backtest._off_close(price, close), "two ticks is not a fill at the close"
+    assert backtest._off_close(close, None), "a session the name does not print is refused"
+
+
 def test_the_engines_account_reconciles_with_the_fills(reference):
     """The cash the fills add up to is what the engine's account holds, and the positions the
     strategy tracked are what the fills leave."""
