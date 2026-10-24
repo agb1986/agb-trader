@@ -17,6 +17,7 @@ text: what is wrong, then the facts behind it.
 
 import os
 import statistics
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -327,6 +328,39 @@ def month_of(at: datetime) -> str:
     return at.astimezone(NEW_YORK).strftime("%Y-%m")
 
 
+def worst_drawdown(months: Sequence[Month]) -> tuple[float, str | None]:
+    """The worst peak-to-trough fall the months contain, and the month it bottomed in, or
+    (0.0, None) when they never fell. The peak includes the current month, as the backtest's
+    does, so the alert and the UI read the same measurement the certified paths recorded."""
+    mark = peak = 1.0
+    worst, trough = 0.0, None
+    for month in months:
+        mark *= 1.0 + month.total_return
+        peak = max(peak, mark)
+        fall = mark / peak - 1.0
+        if fall < worst:
+            worst, trough = fall, month.period
+    return worst, trough
+
+
+def longest_losing_run(months: Sequence[Month]) -> tuple[int, str | None]:
+    """The longest run of consecutive losing months, and the month it ended in."""
+    run, longest, end = 0, 0, None
+    for month in months:
+        run = run + 1 if month.total_return < 0 else 0
+        if run > longest:
+            longest, end = run, month.period
+    return longest, end
+
+
+def scatter(months: Sequence[Month], expected: float) -> float | None:
+    """How far the months scatter around the month the backtest expected, or None under two
+    months, which is too few to measure a dispersion at all."""
+    if len(months) < 2:
+        return None
+    return statistics.stdev(month.total_return - expected for month in months)
+
+
 def drawdown(conn: psycopg.Connection) -> list[Finding]:
     """The account's worst peak-to-trough fall, against the fifth percentile of the certified
     paths' own worst falls. The peak includes the current month, as the backtest's does, so
@@ -334,14 +368,7 @@ def drawdown(conn: psycopg.Connection) -> list[Finding]:
     limits = thresholds(conn)
     if limits is None or limits.drawdown_q05 is None:
         return []
-    mark = peak = 1.0
-    worst, trough = 0.0, None
-    for month in equity_months(conn):
-        mark *= 1.0 + month.total_return
-        peak = max(peak, mark)
-        fall = mark / peak - 1.0
-        if fall < worst:
-            worst, trough = fall, month.period
+    worst, trough = worst_drawdown(equity_months(conn))
     if trough is None or worst >= limits.drawdown_q05:
         return []
     deepest = (
@@ -368,11 +395,7 @@ def losing_run(conn: psycopg.Connection) -> list[Finding]:
     limits = thresholds(conn)
     if limits is None or limits.losing_run_q95 is None:
         return []
-    run, longest, end = 0, 0, None
-    for month in equity_months(conn):
-        run = run + 1 if month.total_return < 0 else 0
-        if run > longest:
-            longest, end = run, month.period
+    longest, end = longest_losing_run(equity_months(conn))
     if end is None or longest <= limits.losing_run_q95:
         return []
     longest_certified = (
@@ -399,10 +422,8 @@ def tracking(conn: psycopg.Connection) -> list[Finding]:
     if limits is None or limits.tracking_q95 is None or limits.monthly_return is None:
         return []
     months = equity_months(conn)
-    if len(months) < 2:
-        return []
-    dispersion = statistics.stdev(m.total_return - limits.monthly_return for m in months)
-    if dispersion <= limits.tracking_q95:
+    dispersion = scatter(months, limits.monthly_return)
+    if dispersion is None or dispersion <= limits.tracking_q95:
         return []
     widest = (
         ""
