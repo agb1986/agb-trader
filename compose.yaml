@@ -319,7 +319,11 @@ services:
       - ${AGB_RESEARCH_DIR:-./research}:/research
     network_mode: none
     restart: "no"
-    mem_limit: 16g
+    # Certification is the heaviest thing this repository runs: fifteen score paths share one
+    # feed of every name any of them could trade, which is tens of millions of daily bars held
+    # as engine objects at once. Sixteen gigabytes killed it seventy minutes in. This is the
+    # workstation's own limit and is not what the server's sizing run measures.
+    mem_limit: 40g
 
 volumes:
   pgdata:
