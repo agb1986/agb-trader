@@ -26,8 +26,8 @@ export AGB_RESEARCH_USER := $(shell id -u):$(shell id -g)
 COMPOSE := docker compose --env-file $(ENV_DIR)/db.env
 
 .DEFAULT_GOAL := help
-.PHONY: help env up down status logs agb reconcile backfill lake sync-lake research deploy \
-	rollback test test-fast lint
+.PHONY: help env up down status logs agb reconcile backfill lake sync-lake research measure \
+	deploy rollback test test-fast lint
 
 help: ## List the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-9s %s\n", $$1, $$2}'
@@ -72,6 +72,9 @@ sync-lake: ## Pull the server's lake into $(LAKE_DIR), read-only against the ser
 research: sync-lake ## Sync the lake, then run a research command, e.g. make research CMD="cpcv"
 	@mkdir -p $(AGB_RESEARCH_DIR)
 	$(COMPOSE) --profile research run --build --rm research $(CMD)
+
+measure: ## Sample each container's memory until interrupted, e.g. make measure OUT=peaks.md
+	uv run python -m agb.measure $(if $(OUT),--out $(OUT),)
 
 deploy: ## Build this commit's image, ship it to the server and restart the stack there
 	scripts/deploy/deploy.sh

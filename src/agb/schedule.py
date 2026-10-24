@@ -25,6 +25,10 @@ The work:
 - **backup**, one per calendar day D, weekends and holidays included, period `YYYY-MM-DD`.
   Claimable from 03:00 New York time on D and expected done BACKUP_GRACE later. Planning
   starts from tomorrow, so the scheduler never writes a backup that is already late.
+- **panel_audit**, one per calendar day D, period `YYYY-MM-DD`. The pipeline reads a sample of
+  the panel store's bodies back and records what it found. Claimable from 04:00 New York time,
+  after the backup's window, and expected done PANEL_AUDIT_GRACE later. Planned from tomorrow
+  for the same reason as the backup.
 """
 
 from dataclasses import dataclass
@@ -40,6 +44,7 @@ PROPOSAL = "proposal"
 APPROVAL_REQUEST = "approval_request"
 SUBMISSION = "submission"
 BACKUP = "backup"
+PANEL_AUDIT = "panel_audit"
 
 # Orders go in during this window before the session's MOC cutoff. It is also when the
 # submission job becomes claimable, and how long execution's lease on it runs: the lease
@@ -52,6 +57,10 @@ APPROVAL_REQUEST_GRACE = timedelta(minutes=30)
 # Well clear of the evening pull, and outside the hour daylight saving skips or repeats.
 BACKUP_AT = time(3, 0)
 BACKUP_GRACE = timedelta(hours=2)
+# After the backup's window, so the two nightly jobs do not read the same disk at once; the
+# sample is sized against a measured run to finish well inside the grace (src/agb/panel_audit.py).
+PANEL_AUDIT_AT = time(4, 0)
+PANEL_AUDIT_GRACE = timedelta(hours=2)
 # Longer than the widest gap between two rebalances, so the next one is always written well
 # before the overdue view's horizon (40 days by default) runs out.
 LOOKAHEAD = timedelta(days=45)
@@ -144,6 +153,16 @@ def plan(calendar: NyseCalendar, today: date, *, approval_required: bool = True)
         planned.append(
             Planned(
                 BACKUP, period, day, start, (Expected(BACKUP, period, start + BACKUP_GRACE, True),)
+            )
+        )
+        audit_at = datetime.combine(day, PANEL_AUDIT_AT, NEW_YORK).astimezone(UTC)
+        planned.append(
+            Planned(
+                PANEL_AUDIT,
+                period,
+                day,
+                audit_at,
+                (Expected(PANEL_AUDIT, period, audit_at + PANEL_AUDIT_GRACE, True),),
             )
         )
         day += timedelta(days=1)

@@ -412,6 +412,7 @@ class Bot:
             *health.stale_heartbeats(conn, now, self.stale_after),
             *health.overdue(conn, now),
             *health.position_mismatch(conn),
+            *health.panel_bodies(conn),
         ]
 
     def performance(self, conn: psycopg.Connection) -> list[Finding]:
