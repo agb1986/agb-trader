@@ -219,6 +219,42 @@ def test_backups_are_planned_across_the_whole_window(cal):
     assert min(periods) == "2026-09-16"
 
 
+def test_a_panel_audit_every_night_after_the_backup(cal):
+    # The same four nights as the backups, so the two nightly jobs can be compared: the audit
+    # reads the panel store an hour after the backup has copied it.
+    audits = {
+        p.period: p
+        for p in schedule.plan(cal, date(2026, 10, 30))
+        if p.kind == schedule.PANEL_AUDIT and p.period <= "2026-11-03"
+    }
+    assert sorted(audits) == ["2026-10-31", "2026-11-01", "2026-11-02", "2026-11-03"]
+    assert audits["2026-10-31"].not_before == utc(2026, 10, 31, 8, 0)
+    assert audits["2026-11-02"].not_before == utc(2026, 11, 2, 9, 0)  # daylight saving ended
+    job = audits["2026-11-02"]
+    assert job.session_date == date(2026, 11, 2)
+    [expected] = job.expected
+    assert (expected.kind, expected.period) == (schedule.PANEL_AUDIT, "2026-11-02")
+    assert expected.due_at == utc(2026, 11, 2, 11, 0)
+    assert expected.by_job
+
+
+def test_the_panel_audit_starts_after_that_night_is_backed_up(cal):
+    planned = by_key(schedule.plan(cal, date(2026, 10, 30)))
+    for period in ("2026-10-31", "2026-11-02"):
+        backup = planned[(schedule.BACKUP, period)]
+        audit = planned[(schedule.PANEL_AUDIT, period)]
+        # An hour apart, so the audit never reads a store the backup is still copying.
+        assert audit.not_before - backup.not_before == timedelta(hours=1)
+
+
+def test_panel_audits_are_planned_across_the_whole_window(cal):
+    periods = {
+        p.period for p in schedule.plan(cal, date(2026, 9, 15)) if p.kind == schedule.PANEL_AUDIT
+    }
+    assert len(periods) == schedule.LOOKAHEAD.days
+    assert min(periods) == "2026-09-16"
+
+
 def test_only_the_scheduler_creates_jobs(db):
     for role in ("pipeline", "execution", "bot", "ui", "backup", "cli"):
         with pytest.raises(errors.InsufficientPrivilege):

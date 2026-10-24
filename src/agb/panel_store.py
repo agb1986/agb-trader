@@ -70,7 +70,10 @@ class PanelStore:
             compressed = self.path(digest).read_bytes()
         except FileNotFoundError:
             raise StoreError(f"no body {digest} in {self.root}") from None
-        data = zstandard.ZstdDecompressor().decompress(compressed)
+        try:
+            data = zstandard.ZstdDecompressor().decompress(compressed)
+        except zstandard.ZstdError as exc:
+            raise StoreError(f"body {digest} in {self.root} does not decompress: {exc}") from exc
         if sha256(data) != digest:
             raise StoreError(f"body {digest} in {self.root} does not match its hash")
         return data

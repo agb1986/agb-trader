@@ -64,6 +64,56 @@ def _status(args: argparse.Namespace) -> int:
     return 0
 
 
+# What each job kind actually takes, claim to completion. A reclaimed job is measured from
+# its last claim, because that is the attempt that finished. Jobs that failed or are still
+# running have no duration and are left out.
+_RUNTIMES = """
+    WITH span AS (
+        SELECT j.id,
+               j.kind,
+               max(e.at) FILTER (WHERE e.event IN ('claimed', 'reclaimed')) AS started,
+               max(e.at) FILTER (WHERE e.event = 'completed') AS finished
+        FROM agb.job j
+        JOIN agb.job_event e ON e.job_id = j.id
+        GROUP BY j.id, j.kind
+    )
+    SELECT kind,
+           count(*) AS runs,
+           min(finished - started) AS fastest,
+           percentile_disc(0.5) WITHIN GROUP (ORDER BY finished - started) AS median,
+           max(finished - started) AS slowest
+    FROM span
+    WHERE started IS NOT NULL AND finished IS NOT NULL AND finished >= started
+    GROUP BY kind
+    ORDER BY kind
+"""
+
+
+def format_runtimes(rows: Iterable[tuple[str, int, timedelta, timedelta, timedelta]]) -> str:
+    """One line per job kind, for setting poll intervals and lease durations from measurement."""
+    lines = [f"{'KIND':<16}  {'RUNS':>5}  {'FASTEST':>8}  {'MEDIAN':>8}  {'SLOWEST':>8}"]
+    counted = 0
+    for kind, runs, fastest, median, slowest in rows:
+        counted += 1
+        lines.append(
+            f"{kind:<16}  {runs:>5}  {format_age(fastest):>8}  "
+            f"{format_age(median):>8}  {format_age(slowest):>8}"
+        )
+    if not counted:
+        lines.append("no completed job has a claim and a completion to measure between")
+    return "\n".join(lines)
+
+
+def runtimes(conn: psycopg.Connection) -> str:
+    return format_runtimes(conn.execute(_RUNTIMES).fetchall())
+
+
+def _runtimes(args: argparse.Namespace) -> int:
+    with psycopg.connect(application_name="agb-cli") as conn:
+        print(runtimes(conn))
+    return 0
+
+
 _PANEL_CONFIGS = """
     SELECT id, created_at, shortlist_n, w, analyst_model, prosecutor_model, defender_model,
            judge_model, rubric_version, scrubber_version, actor
@@ -495,6 +545,12 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("status", help="each service's last heartbeat and its age").set_defaults(
         run=_status
     )
+    commands.add_parser(
+        "runtimes",
+        help="how long each job kind has taken, claim to completion",
+        description="Reads the measured durations out of the job event log, which is what "
+        "the poll intervals and lease durations in src/agb/schedule.py are set from.",
+    ).set_defaults(run=_runtimes)
     configs = commands.add_parser(
         "panel-config", help="the panel's immutable configurations"
     ).add_subparsers(dest="action", required=True)

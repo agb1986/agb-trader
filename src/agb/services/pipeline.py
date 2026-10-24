@@ -15,6 +15,11 @@
     paper mode it approves one that passes, and in live mode (or in paper mode set to ask)
     leaves it for the human. With no model promoted, or the promoted one voided or altered,
     the job fails and no basket is proposed.
+  * `panel_audit`: reads a sample of the panel store's bodies back through the store, which
+    checks each against the hash it is named by, and records what it found in
+    `agb.panel_audit` (agb.panel_audit). The pipeline runs it because it is the only service
+    that mounts the store. A missing or corrupt body is not this job's failure: the job
+    completes, having done its work, and the bot alerts on what the row says.
 
 Before taking a job it builds any rerun the operator asked for (`agb rerun`, agb.approval):
 a copy of the missed basket under its new reference, for the next session, gated like any
@@ -53,6 +58,7 @@ from agb import (
     lake,
     nyse,
     panel,
+    panel_audit,
     panel_store,
     registry,
     schedule,
@@ -113,10 +119,10 @@ def capital_from_env() -> Decimal:
 
 
 class Pipeline:
-    """One pipeline cycle, run by `serve`. The URL opener, the capital, the gate's limits and
-    the clock the gate reads are injectable for tests. A ranker given here is used instead of
-    the promoted model, for tests only; otherwise each rebalance loads the promoted model
-    from `models_dir`."""
+    """One pipeline cycle, run by `serve`. The URL opener, the capital, the panel audit's
+    sample size, the gate's limits and the clock the gate reads are injectable for tests. A
+    ranker given here is used instead of the promoted model, for tests only; otherwise each
+    rebalance loads the promoted model from `models_dir`."""
 
     def __init__(
         self,
@@ -131,6 +137,7 @@ class Pipeline:
         capital: Decimal = basket.DEFAULT_CAPITAL,
         lease: timedelta = LEASE,
         retry: timedelta = RETRY,
+        sample: int = panel_audit.SAMPLE,
         limits: gate.Limits = gate.LIMITS,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
@@ -144,6 +151,7 @@ class Pipeline:
         self.capital = capital
         self.lease = lease
         self.retry = retry
+        self.sample = sample
         self.limits = limits
         self.clock = clock
 
@@ -180,7 +188,7 @@ class Pipeline:
             self.rerun(conn, *row)
         claim = jobs.claim(
             conn,
-            [schedule.DATA_PULL, schedule.REBALANCE],
+            [schedule.DATA_PULL, schedule.REBALANCE, schedule.PANEL_AUDIT],
             PIPELINE,
             self.lease,
             reclaim_expired=True,
@@ -189,6 +197,8 @@ class Pipeline:
             return
         if claim.kind == schedule.REBALANCE:
             self.rebalance(conn, claim)
+        elif claim.kind == schedule.PANEL_AUDIT:
+            self.audit(conn, claim)
         else:
             self.pull(conn, claim)
 
@@ -300,6 +310,41 @@ class Pipeline:
             f"passed {len(verdict.checks)} pre-trade checks" if verdict.passed else "halted",
             verdict.state,
         )
+
+    def audit(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
+        """Check a sample of the panel store's bodies and record the result.
+
+        A body that is missing or no longer matches its hash is a finding, not a failure: the
+        row is written and the job completes, and the bot raises the alert from the row. The
+        job fails only when the check itself could not be run.
+        """
+        store = PanelStore(self.panel_dir)
+        try:
+            audit = panel_audit.check(conn, store, self.sample)
+            panel_audit.record(conn, claim.period, claim.job_id, audit, PIPELINE)
+        except (OSError, psycopg.Error) as exc:
+            jobs.fail(conn, claim, str(exc))
+            log.error("panel audit %s failed: %s", claim.period, exc)
+            return
+        jobs.complete(conn, claim)
+        if audit.unsound:
+            log.error(
+                "panel audit %s: %d of %d bodies read back are unsound "
+                "(%d missing, %d corrupt), first %s",
+                claim.period,
+                len(audit.unsound),
+                audit.checked,
+                len(audit.missing),
+                len(audit.corrupt),
+                audit.unsound[0],
+            )
+        else:
+            log.info(
+                "panel audit %s: %d of %d bodies read back sound",
+                claim.period,
+                audit.sound,
+                audit.bodies,
+            )
 
     def pull(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
         session = date.fromisoformat(claim.period)

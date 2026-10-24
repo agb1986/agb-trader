@@ -1,6 +1,7 @@
 """What is unhealthy, read from the database: stale heartbeats, overdue expected events, a
-rebalance that was never scheduled, open halts, and the broker disagreeing with the database.
-The bot turns these into alerts and the pre-flight.
+rebalance that was never scheduled, open halts, the broker disagreeing with the database, and
+a panel body the nightly integrity check could not read back. The bot turns these into alerts
+and the pre-flight.
 
 Then how the account is performing, which is a different question with the same answer:
 nothing. A drawdown deeper than the certified paths reached, a losing run longer than they
@@ -235,6 +236,36 @@ def position_mismatch(conn: psycopg.Connection) -> list[Finding]:
             f" from the previous snapshot plus fills; snapshot {snapshot_date}",
         )
         for snapshot_date, symbol, expected, observed in rows
+    ]
+
+
+def panel_bodies(conn: psycopg.Connection) -> list[Finding]:
+    """The newest panel-store integrity check, if it found a body it could not read back.
+
+    The check itself is the pipeline's nightly `panel_audit` job, which records what it found
+    whether or not anything was wrong (agb.panel_audit). One alert per night, keyed by the
+    period, so a disk losing bodies raises one alert a night rather than one per body, and the
+    facts name the first hash to go and look for.
+    """
+    row = conn.execute(
+        "SELECT period, bodies, checked, missing, corrupt FROM agb.panel_audit "
+        "ORDER BY period DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return []
+    period, bodies, checked, missing, corrupt = row
+    unsound = list(missing) + list(corrupt)
+    if not unsound:
+        return []
+    return [
+        Finding(
+            "panel_body_unsound",
+            "panel store",
+            period,
+            f"panel store: {len(missing)} missing, {len(corrupt)} corrupt of {checked} checked",
+            f"checked {checked} of {bodies} referenced bodies on {period}; "
+            f"first unsound {unsound[0]}",
+        )
     ]
 
 

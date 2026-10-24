@@ -26,7 +26,16 @@ make rollback   # restart the server's stack on the release before
 ```
 
 [docs/build/deploy.md](docs/build/deploy.md) covers the server's layout, the nightly backups,
-and restoring from one.
+and restoring from one. The server's memory is tight, so each service's limit comes from a
+measured run rather than a guess:
+
+```sh
+make measure            # sample each container's peak memory until interrupted
+make agb CMD=runtimes   # how long each job kind has actually taken
+```
+
+[docs/build/measured-limits.md](docs/build/measured-limits.md) is the procedure, the headroom
+rule between a peak and a limit, and the nightly panel-store hash check.
 
 ## Development
 
