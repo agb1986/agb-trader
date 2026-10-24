@@ -67,7 +67,7 @@ check() {
     [ "$configs" -gt 0 ] ||
         die "no panel_config, so the rebalance is stage-1 only and the panel is never measured"
     echo "panel configurations: $configs"
-    lake=$(query "SELECT max(session_date) FROM agb.lake_snapshot")
+    lake=$(query "SELECT max(snapshot_date) FROM agb.lake_snapshot")
     echo "lake has data through: ${lake:-nothing}"
 
     echo "the sampler reads this server's docker:"
