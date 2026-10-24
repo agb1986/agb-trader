@@ -42,6 +42,7 @@ and the blend are unbacktested by construction, and every output of this module 
 import json
 import re
 import shutil
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -126,7 +127,6 @@ def run(
     months = panel.months
     if not months:
         raise CertificationError("the panel has no months")
-    labels = [month.as_of.isoformat() for month in months]
     trading = backtest.Options(
         signal="score",
         size=options.size,
@@ -151,10 +151,14 @@ def run(
             panel, replace(trading, cost_multiple=2.0), series, lake_dir=lake_dir, db=db
         )
         paths = traded.results["paths"]
+        # The backtest leaves out the leading months the lake cannot price, so the window the
+        # gates judge is the one it traded rather than every month the model was fitted over.
+        # The trial's own window stays the panel's, which is what was fitted.
+        labels = [month["as_of"] for month in paths[0]["monthly"]]
         net = _matrix(paths, "net")
         gross = _matrix(paths, "gross")
         net_2x = _matrix(twice, "net")
-        others = candidates(ledger, panel, exclude={trial.trial_id, traded.trial_id})
+        others = candidates(ledger, panel, labels=labels, exclude={trial.trial_id, traded.trial_id})
         matrix = np.column_stack([net.mean(axis=0), *others.values()])
         declared = ledger.count()
         verdict = gates.evaluate(
@@ -167,7 +171,8 @@ def run(
             participation=[(p["participation_max"], p["participation_mean"]) for p in paths],
             thresholds=options.thresholds,
         )
-        # What would trade: the configuration refitted on every month the gates judged.
+        # What would trade: the configuration refitted on every month of the panel, the
+        # leading ones the backtest could not trade included, since they still carry a label.
         booster = train.fit(panel.select(months), config, trial=trial)
         trial.results = {
             **verdict,
@@ -202,13 +207,21 @@ def run(
 
 
 def candidates(
-    ledger: Ledger, panel: Panel, *, exclude: set[str] = frozenset()
+    ledger: Ledger,
+    panel: Panel,
+    *,
+    labels: Sequence[str],
+    exclude: set[str] = frozenset(),
 ) -> dict[str, np.ndarray]:
     """The monthly net return series of every earlier succeeded backtest over this panel's
     months, partition and cost-model version, keyed by trial id: the configurations the
     overfitting gate ranks this model against. A backtest over several paths contributes the
-    paths' mean month."""
-    months = panel.months
+    paths' mean month.
+
+    A backtest's recorded window is the panel it was handed, while `labels` is the shorter
+    window it could trade, so the series a candidate contributes is held to the traded length:
+    two runs whose months differ are not two readings of the same thing."""
+    start, end = panel.months[0].as_of, panel.months[-1].as_of
     found: dict[str, np.ndarray] = {}
     for row in ledger.rows():
         if (
@@ -217,8 +230,8 @@ def candidates(
             or row["trial_id"] in exclude
             or row["partition_hash"] != panel.partition_hash
             or row["cost_model_version"] != panel.cost_model_version
-            or row["train_start"] != months[0].as_of
-            or row["train_end"] != months[-1].as_of
+            or row["train_start"] != start
+            or row["train_end"] != end
             or not row["results"]
         ):
             continue
@@ -229,7 +242,7 @@ def candidates(
             series = np.array([month["net"] for month in results["monthly"]], dtype="float64")
         else:
             continue
-        if len(series) == len(months) and np.isfinite(series).all():
+        if len(series) == len(labels) and np.isfinite(series).all():
             found[row["trial_id"]] = series
     return found
 
