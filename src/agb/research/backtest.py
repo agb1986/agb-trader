@@ -109,12 +109,34 @@ CLOSE_HOUR_UTC = 21
 # sixty-one bars from the first rebalance on.
 HISTORY_DAYS = 120
 _NEEDED = ("ticker", "date", "open", "high", "low", "close", "closeadj", "volume")
+# Each name gets its own window rather than one window for all of them. A name first ranked in
+# 2015 is never looked at before 2015, and loading its 1998 bars costs a `Bar` object apiece to
+# no end: over a validation's fifteen paths most of the bars loaded were leading history for a
+# name that had not been ranked yet. `_LEAD` finds the date that still leaves a name
+# LIQUIDITY_BARS bars of history before the first session a decision can read it -- every bar
+# the liquidity gate counts and the cost model's window reads -- and `_BARS` loads from there.
+#
+# `_LEAD` keeps a bar on a stricter test than `_BARS` does. `_BARS` loads on `closeadj > 0`
+# and the frame then keeps the bars whose adjusted close came out above zero, which is
+# `closeadj` again by way of a division and a multiplication; an adjusted close above a
+# millionth survives that round trip. So a bar `_LEAD` counted is always a bar the loaded
+# frame keeps, and the history is never one bar short of the sixty-one the gate reads.
+_LEAD = """
+SELECT ticker, min(date) AS since
+FROM (
+    SELECT s.ticker, s.date,
+           row_number() OVER (PARTITION BY s.ticker ORDER BY s.date DESC) AS back
+    FROM sep s JOIN _backtest_first f ON s.ticker = f.ticker
+    WHERE s.date < f.first AND s.close > 0 AND s.closeadj > 1e-6
+)
+WHERE back <= $bars
+GROUP BY ticker
+"""
 _BARS = """
-SELECT ticker, date, open, high, low, close, closeadj, volume
-FROM sep
-WHERE ticker IN (SELECT ticker FROM _backtest_names)
-  AND date BETWEEN $since AND $until AND close > 0 AND closeadj > 0
-ORDER BY ticker, date
+SELECT s.ticker, s.date, s.open, s.high, s.low, s.close, s.closeadj, s.volume
+FROM sep s JOIN _backtest_window w ON s.ticker = w.ticker
+WHERE s.date BETWEEN w.since AND $until AND s.close > 0 AND s.closeadj > 0
+ORDER BY s.ticker, s.date
 """
 
 
@@ -236,12 +258,38 @@ def _feed(
         _require(conn)
         depth = options.hold_through + options.size
         names = {name for r in runs.values() for m in r.values() for name in m[:depth]}
-        names |= {event.symbol for event in forced}
-        names |= {event.into_symbol for event in forced if event.into_symbol is not None}
-        return load(conn, sorted(names), months, benchmark=BENCHMARK)
+        named = {event.symbol for event in forced}
+        named |= {event.into_symbol for event in forced if event.into_symbol is not None}
+        wanted = _first_read(runs, months, names | named)
+        # An event falls where the filing puts it, which can be any month and need not be one
+        # the name is ranked in, so a name a recorded event names is read from the first.
+        wanted |= dict.fromkeys(named, months[0].snapshot_date)
+        return load(conn, wanted, months, benchmark=BENCHMARK)
     finally:
         if db is None:
             conn.close()
+
+
+def _first_read(
+    runs: Mapping[str, Mapping[date, list[str]]],
+    months: Sequence[Month],
+    names: set[str],
+) -> dict[str, date]:
+    """The first signal session each fed name can be read on, which is the first month any
+    path's ranking holds it at all, or the first month of all for a name no path ranks.
+
+    The first month it is ranked in at all, not the first it is ranked near the top of:
+    `decide` reads a print and a bar count for every name in the whole month's ranking, and
+    calling a name untradeable there because its bars had not been loaded would change the
+    selection."""
+    signal = {month.as_of: month.snapshot_date for month in months}
+    first: dict[str, date] = {}
+    for as_of in sorted(signal):
+        for ranked in runs.values():
+            for name in ranked.get(as_of, ()):
+                if name in names:
+                    first.setdefault(name, signal[as_of])
+    return {name: first.get(name, months[0].snapshot_date) for name in sorted(names)}
 
 
 def _paths(
@@ -382,24 +430,50 @@ class Feed:
         return [_equity(ticker) for ticker in self.series]
 
 
+def _windows(conn: duckdb.DuckDBPyConnection, wanted: Mapping[str, date]) -> dict[str, date]:
+    """The first bar to load for each name in `wanted`: the one that leaves it LIQUIDITY_BARS
+    bars of history before the first session a decision can read it on, or its own first bar
+    where the lake holds fewer than that.
+
+    Those are every bar the liquidity gate counts and the cost model's window reads, so each
+    decision is the one the whole history would have given."""
+    conn.register(
+        "_backtest_first",
+        pd.DataFrame({"ticker": list(wanted), "first": list(wanted.values())}),
+    )
+    try:
+        lead = dict(conn.execute(_LEAD, {"bars": LIQUIDITY_BARS}).fetchall())
+    finally:
+        conn.unregister("_backtest_first")
+    return {name: lead.get(name, read) for name, read in wanted.items()}
+
+
 def load(
     conn: duckdb.DuckDBPyConnection,
-    tickers: list[str],
+    wanted: Mapping[str, date],
     months: Sequence[Month],
     benchmark: str | None = None,
 ) -> Feed:
-    """The feed for `tickers`, and the benchmark's series alongside it if the lake holds one:
-    a lake of equity prices need not carry an index fund, and the diagnostic that reads it
-    reports nothing rather than failing the run."""
-    since = months[0].snapshot_date - timedelta(days=HISTORY_DAYS)
+    """The feed for `wanted`, each name against the first signal session a decision can read
+    it on, and the benchmark's series alongside it if the lake holds one: a lake of equity
+    prices need not carry an index fund, and the diagnostic that reads it reports nothing
+    rather than failing the run."""
+    start = months[0].snapshot_date
     until = months[-1].exit
-    names = sorted({*tickers, *([benchmark] if benchmark else [])})
-    conn.register("_backtest_names", pd.DataFrame({"ticker": names}))
+    windows = _windows(conn, wanted)
+    # The benchmark is marked at the first entry and the last exit and never ranked, so one
+    # window serves it: the one every name used to share.
+    opening = start - timedelta(days=HISTORY_DAYS)
+    if benchmark:
+        windows[benchmark] = min(windows.get(benchmark, opening), opening)
+    conn.register(
+        "_backtest_window",
+        pd.DataFrame({"ticker": list(windows), "since": list(windows.values())}),
+    )
     try:
-        frame = conn.execute(_BARS, {"since": since, "until": until}).df()
+        frame = conn.execute(_BARS, {"until": until}).df()
     finally:
-        conn.unregister("_backtest_names")
-    frame["date"] = pd.to_datetime(frame["date"]).dt.date
+        conn.unregister("_backtest_window")
     factor = frame["closeadj"] / frame["close"]
     adjusted = pd.DataFrame(
         {
@@ -412,6 +486,8 @@ def load(
     frame["adjusted"] = adjusted["close"]
     frame = frame[frame["adjusted"] > 0]
     adjusted = adjusted.loc[frame.index]
+    stamps = pd.to_datetime(frame["date"]).to_numpy()
+    frame["date"] = pd.to_datetime(frame["date"]).dt.date
     series = {
         ticker: Series(
             dates=group["date"].tolist(),
@@ -423,19 +499,27 @@ def load(
         )
         for ticker, group in frame.groupby("ticker", sort=True)
     }
-    fed = frame[frame["ticker"].isin(tickers)]
-    if fed.empty:
+    codes, names = pd.factorize(frame["ticker"], sort=True)
+    fed = np.array([name in wanted for name in names], dtype="bool")[codes]
+    if not fed.any():
+        since = min(windows[name] for name in wanted)
         raise BacktestError(f"no bars for the ranked names between {since} and {until}")
-    streamed = fed[fed["date"] >= months[0].snapshot_date]
+    # The lead bars a name's own window added are history for the gates to count, not sessions
+    # to replay: streaming them would put the name's first bar before the first signal session
+    # and move the engine's own first session with it.
+    opens = np.array(
+        [np.datetime64(max(wanted.get(name, start), start)) for name in names],
+        dtype="datetime64[ns]",
+    )
+    streamed = frame[fed & (stamps >= opens[codes])]
     bars = [
         _bar(row.ticker, row.date, *adjusted.loc[row.Index], row.volume)
         for row in streamed.sort_values(["date", "ticker"]).itertuples()
     ]
-    held = set(tickers)
     return Feed(
-        {ticker: s for ticker, s in series.items() if ticker in held},
+        {ticker: s for ticker, s in series.items() if ticker in wanted},
         bars,
-        max(fed["date"]),
+        frame["date"][fed].max(),
         benchmark=series.get(benchmark) if benchmark else None,
     )
 
