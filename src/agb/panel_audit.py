@@ -24,6 +24,11 @@ from agb.panel_store import PanelStore, StoreError
 # the sample is sized to finish well inside the nightly job's grace period.
 SAMPLE = 200
 
+# The deploy machine may ask for a different sample without a release: a larger one for the
+# deliberate-corruption check, which has to be certain the corrupted body is read, or a
+# smaller one if the measured run time says the nightly job is cutting into its grace period.
+SAMPLE_ENV = "AGB_PANEL_AUDIT_SAMPLE"
+
 # Every hash the database refers to, each once. A body cited by several rows is one body here.
 _REFERENCED = """
     WITH referenced AS (

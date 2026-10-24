@@ -107,6 +107,20 @@ def record(
         return cur.rowcount
 
 
+def sample_from_env() -> int:
+    """How many panel bodies the nightly check reads back, from AGB_PANEL_AUDIT_SAMPLE."""
+    raw = os.environ.get(panel_audit.SAMPLE_ENV, "")
+    if not raw:
+        return panel_audit.SAMPLE
+    try:
+        sample = int(raw)
+    except ValueError:
+        raise SystemExit(f"{panel_audit.SAMPLE_ENV} is not a number: {raw!r}") from None
+    if sample < 1:
+        raise SystemExit(f"{panel_audit.SAMPLE_ENV} is not a number of bodies: {raw!r}")
+    return sample
+
+
 def capital_from_env() -> Decimal:
     """The capital a basket is sized against, in dollars, from AGB_CAPITAL_USD."""
     raw = os.environ.get(basket.CAPITAL_ENV, "")
@@ -163,6 +177,7 @@ class Pipeline:
             models_dir=Path(os.environ.get(registry.MODELS_ENV, registry.DEFAULT_MODELS_DIR)),
             panel_dir=Path(os.environ.get(panel_store.DIR_ENV, panel_store.DEFAULT_DIR)),
             capital=capital_from_env(),
+            sample=sample_from_env(),
         )
 
     def client(self) -> Sharadar:
