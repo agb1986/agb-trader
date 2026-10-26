@@ -616,6 +616,19 @@ def _day(stamp: int) -> date:
     return pd.Timestamp(stamp, unit="ns", tz="UTC").date()
 
 
+def _off_close(price: float, expected: float | None) -> bool:
+    """Whether a fill sits further from the session's close than the venue's one-tick spread.
+
+    The difference is rounded onto the tick grid before it is compared, because one tick is
+    not always one tick in binary floating point: 0.025 - 0.024999 measures as
+    1.000000000001e-06, which is greater than 1e-06, while the same spread on a dollar-priced
+    name measures just under it. Only prices as small as the split-adjusted closes of the
+    1990s reach that part of the grid, so the unrounded comparison refused penny stocks and
+    nothing else. A real two-tick gap is still off the close.
+    """
+    return expected is None or round(abs(price - expected), PRECISION) > 10**-PRECISION
+
+
 def _require(conn: duckdb.DuckDBPyConnection) -> None:
     columns = {row[0] for row in conn.execute("DESCRIBE sep").fetchall()}
     missing = sorted(set(_NEEDED) - columns)
@@ -897,7 +910,7 @@ class _Rebalancer(Strategy):
         qty, price = int(event.last_qty), float(event.last_px)
         fee = event.commission.as_double()
         expected = self.feed.close_at(ticker, day)
-        if expected is None or abs(price - expected) > 10**-PRECISION:
+        if _off_close(price, expected):
             raise BacktestError(f"{ticker} filled at {price} on {day}, whose close is {expected}")
         charged, take = self.book.charges[len(self.fills)][1:]
         if abs(charged - fee) > 0.005:
