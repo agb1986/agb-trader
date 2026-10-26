@@ -18,7 +18,8 @@ reachable only from the `core` Compose network, so it runs on the server as
 `./agb-stack import <model id>`, which is the same code: `agb import-certification` and this
 command both call `agb.research.artifact.import_artifact`. Running it here needs a reachable
 database and the `research` role's PG* environment, which the workstation has for its own
-database only."""
+database only. `make promote MODEL=<model id>` does the whole handoff from the workstation:
+it ships the artifact, runs that import on the server and promotes the model there."""
 
 import argparse
 import json
@@ -196,16 +197,35 @@ def _run(args):
     return walkforward.run(panel, config, options, ledger)
 
 
+# What libpq needs before a connection can go anywhere but a local socket. The research
+# service sets none of them, and its uid has no local account either, so an unguarded connect
+# fails as `local user with ID 1000 does not exist`, which describes a Unix account rather
+# than the real problem.
+_DATABASE_ENV = ("PGHOST", "PGHOSTADDR", "PGSERVICE", "PGDATABASE", "DATABASE_URL")
+
+
 def _import(directory: Path) -> None:
     import psycopg
 
     from agb.research import artifact
 
+    if not os.environ.keys() & set(_DATABASE_ENV):
+        sys.exit(
+            "import: no database is configured here, and the research service runs with"
+            " network_mode: none, so it can never reach one; the import runs on the server as"
+            f" `./agb-stack import {directory.name}`, or `make promote MODEL={directory.name}`"
+            " from the workstation, which ships the artifact and runs it there"
+        )
     try:
         with psycopg.connect() as conn:
             row_id = artifact.import_artifact(conn, directory)
     except artifact.CertificationError as error:
         sys.exit(f"import: {error}")
+    except psycopg.OperationalError as error:
+        sys.exit(
+            f"import: the database this profile is pointed at refused the connection: {error}"
+            f" The import runs on the server as `./agb-stack import {directory.name}`."
+        )
     print(f"model_certification {row_id}: {directory}")
 
 

@@ -444,6 +444,21 @@ def test_the_cli_role_cannot_record_a_certification(db, models, monkeypatch, cap
     assert rows(db, "SELECT id FROM agb.model_certification") == []
 
 
+def test_a_refusal_names_the_database_it_asked(db, models, monkeypatch, capsys):
+    """A certification lives in the database it was imported into, so the same promotion run
+    against another database refuses a model that is certified on the server. The second line
+    says which database answered, which is what tells those two refusals apart."""
+    env = db.pg_env("cli")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv(registry.MODELS_ENV, str(models))
+
+    assert cli.main(["promote", MODEL_ID, "--actor", "alice"]) == 1
+    err = capsys.readouterr().err.splitlines()
+    assert err[0] == f"agb: refused: no certification of model {MODEL_ID}"
+    assert err[1] == f"agb: asked database {env['PGDATABASE']} on {env['PGHOST']} as cli"
+
+
 def test_the_cli_promotes_voids_and_voids_the_stale(
     db, models, certification_id, monkeypatch, capsys
 ):
