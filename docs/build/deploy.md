@@ -243,12 +243,13 @@ pointed at the workstation's own database, where no certification was ever impor
    ./agb-stack agb promote <model id>
    ```
 
-`agb promote` refuses a model with no certification, one that failed its gates, a voided
-one, one certified under an earlier cost model, and one whose artifact is missing from
-`models/`, altered since certification, or ships a trial ledger whose row count is not the
-trial count the certification declared. It also refuses the model that is already live. Each
-refusal says why and is recorded in `agb.command`, as is each promotion, which also writes an
-`agb.promotion_event`. The next rebalance loads the new model and checks its artifact again.
+`agb promote` refuses a model with no certification, one that failed its gates (unless it is
+waived for paper, below), a voided one, one certified under an earlier cost model, and one
+whose artifact is missing from `models/`, altered since certification, or ships a trial ledger
+whose row count is not the trial count the certification declared. It also refuses the model
+that is already live. Each refusal says why and is recorded in `agb.command`, as is each
+promotion, which also writes an `agb.promotion_event`. The next rebalance loads the new model
+and checks its artifact again.
 
 To take a certification out of service for good:
 
@@ -263,6 +264,27 @@ too. Each voiding is an `agb.certification_event`. A certification made under a 
 running release does not know yet, by research code ahead of the deploy, is refused but not
 voided, so it can be promoted once that release is live; for the same reason a rollback voids
 nothing.
+
+### Promoting a failed certification to measure in paper
+
+The sizing run (`docs/build/measured-limits.md`) needs a real rebalance to measure, and a
+rebalance with nothing promoted fails before it proposes a basket. While no model has passed
+its gates, a paper-only measurement waiver promotes one that failed, for that purpose alone:
+
+```sh
+./agb-stack agb promote <model id> --waive-for-paper --reason "measuring the live limits"
+```
+
+The waiver is refused unless the trading mode is paper, without a reason, on a model that
+passed (it needs no waiver), and on a voided or stale certification. Everything else about a
+promotion still holds: the artifact is verified as it always is. It is recorded as an
+`agb.certification_event`, at most one per certification, naming the command that asked for
+it.
+
+A waived model trades in paper and nowhere else. `agb mode live` is refused while it is the
+live model, and says so; promoting a model that passed its gates, or voiding the waived
+certification, lifts that refusal. `/status` shows the model as live under a paper waiver, and
+each rebalance that ranks with it logs a warning naming the waiver.
 
 ## Restoring a backup
 

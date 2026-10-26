@@ -110,9 +110,10 @@ make sizing CMD=check
 ```
 
 It refuses the run early if it would measure the wrong thing: nothing deployed, the pipeline
-not running, no promoted model (the job fails before it proposes a basket), or no
-`panel_config` (the rebalance is stage-1 only and the panel, the heaviest stage, never runs).
-It also takes two readings through the server's own Docker, which is a different engine from
+not running, no promoted model (the job fails before it proposes a basket; while no model has
+passed its gates, promote one under the paper-only measurement waiver,
+`docs/build/deploy.md`), or no `panel_config` (the rebalance is stage-1 only and the panel, the
+heaviest stage, never runs). It also takes two readings through the server's own Docker, which is a different engine from
 the workstation's, so a format this cannot parse is found days before the run and not during
 it.
 

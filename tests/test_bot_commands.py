@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+import registry_fake
 from market_fake import PERIOD, TRADE
 from psycopg import errors
 from test_bot import CHAT, FakeTelegram, events
@@ -170,6 +171,23 @@ def test_each_command_answers_from_the_database_after_a_paper_rebalance(db, pape
 
     assert help_ == help_text()
     assert blocks(help_)[0] == "COMMANDS"
+
+
+def test_status_says_the_live_model_is_live_under_the_paper_waiver(db, paper):
+    """A model promoted under the paper-only measurement waiver reads as such in /status:
+    it failed its gates, so the operator is told a move to live is refused while it stands.
+    tests/test_registry.py covers the waiver itself and tests/test_ladder.py the refusal."""
+    registry_fake.waive(db)
+
+    [status] = ask(db, "/status")
+
+    assert_style(status)
+    assert re.fullmatch(
+        rf"  model {registry_fake.FAILED_ID} live under a paper waiver\n"
+        rf"    certification \d+, promoted {ET} by operator; it failed its gates,"
+        rf" waived {ET}, so a move to live is refused until another is promoted",
+        blocks(status)[4],
+    )
 
 
 def test_pnl_for_a_month_runs_from_the_last_reading_before_it(db, paper):

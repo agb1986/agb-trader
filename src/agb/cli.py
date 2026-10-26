@@ -215,10 +215,26 @@ def _import_certification(args: argparse.Namespace) -> int:
 def _promote(args: argparse.Namespace) -> int:
     from agb import registry
 
-    source = registry.Source(args.actor, "cli", f"agb promote {args.model_id}")
+    raw = f"agb promote {args.model_id}"
+    if args.waive_for_paper:
+        if not args.reason:
+            print(
+                "agb: --waive-for-paper needs --reason: the waiver promotes a model that"
+                " failed certification, and the reason is what the audit log keeps",
+                file=sys.stderr,
+            )
+            return 2
+        raw += f" --waive-for-paper --reason {shlex.quote(args.reason)}"
+    elif args.reason:
+        print("agb: --reason is for --waive-for-paper only", file=sys.stderr)
+        return 2
+    source = registry.Source(args.actor, "cli", raw)
+    waive = args.reason if args.waive_for_paper else None
     with psycopg.connect(application_name="agb-cli") as conn:
         try:
-            print(registry.promote(conn, args.model_id, source, _models_dir()))
+            print(
+                registry.promote(conn, args.model_id, source, _models_dir(), waive_for_paper=waive)
+            )
         except registry.Refused as exc:
             # The refusal is recorded; leaving the block commits it.
             print(f"agb: refused: {exc}", file=sys.stderr)
@@ -624,11 +640,21 @@ def main(argv: list[str] | None = None) -> int:
         help="make a certified model the one the pipeline ranks with",
         description="Refuses a model with no passing certification, a voided or stale one, and "
         "one whose artifact under AGB_MODELS_DIR is missing, altered or ships a trial count "
-        "other than the certification declared. Every refusal is recorded.",
+        "other than the certification declared. Every refusal is recorded. "
+        "--waive-for-paper --reason <why> promotes a model whose only problem is that it "
+        "failed its gates, in paper mode alone, so that the stack can be exercised while "
+        "nothing has passed; a move to live is then refused until a model that passed is "
+        "promoted.",
     )
     promote.add_argument(
         "model_id", help="the certified model, as `agb.model_certification` has it"
     )
+    promote.add_argument(
+        "--waive-for-paper",
+        action="store_true",
+        help="promote a model that failed its gates, in paper mode only; needs --reason",
+    )
+    promote.add_argument("--reason", help="why the waiver is being taken, for the audit log")
     promote.add_argument("--actor", **actor)
     promote.set_defaults(run=_promote)
     void = commands.add_parser(

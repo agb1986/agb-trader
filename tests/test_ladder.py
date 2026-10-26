@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+import registry_fake
 from market_fake import PERIOD
 from psycopg import errors
 from test_approval_loop import cli_main
@@ -479,6 +480,41 @@ def test_the_mode_goes_live_only_once_every_criterion_is_met(db, monkeypatch, ca
         " JOIN agb.command c ON c.id = e.command_id",
     ) == [("live", "ada", "moved from paper by ada", attestation, "mode")]
     assert cli_main(db, monkeypatch, capsys, "mode")[1].splitlines()[0] == "Trading live."
+
+
+@pytest.mark.parametrize("remedy", ["promoted", "voided"])
+def test_a_model_promoted_under_the_paper_waiver_holds_the_mode_in_paper(
+    db, monkeypatch, capsys, remedy
+):
+    """A waived model failed its gates, so it may only ever trade in paper: the move to live
+    is refused while it is the live model, whatever the paper record says. Promoting a model
+    that passed, or voiding the waived certification, lifts the refusal.
+    tests/test_registry.py covers the waiver itself."""
+    earned_live(db)
+    registry_fake.waive(db)
+
+    code, _, err = cli_main(db, monkeypatch, capsys, "mode", "live", "--attest", "sound")
+
+    assert (code, err) == (
+        1,
+        f"agb: refused: the live model {registry_fake.FAILED_ID} failed certification and is"
+        f" promoted under the paper-only measurement waiver ({registry_fake.WAIVER});"
+        f" promote a model that passed its gates, or `agb void {registry_fake.FAILED_ID}`,"
+        " before moving to live\n",
+    )
+    assert ladder.mode(db.connect("cli")) == "paper"
+    assert rows(db, "SELECT verb, outcome FROM agb.command WHERE verb = 'mode'") == [
+        ("mode", "refused")
+    ]
+
+    if remedy == "promoted":
+        registry_fake.promote(db)
+    else:
+        registry_fake.void(db, registry_fake.FAILED_ID)
+
+    code, out, _ = cli_main(db, monkeypatch, capsys, "mode", "live", "--attest", "sound")
+
+    assert (code, out) == (0, f"the mode is live, at L0: {ladder.MEANING['L0']}.\n")
 
 
 # -- tightening, by itself -----------------------------------------------------------------
