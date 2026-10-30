@@ -371,3 +371,44 @@ def test_a_waiver_without_a_reason_is_refused_before_anything_is_shipped(tmp_pat
     assert done.returncode == 1
     assert "a waiver needs a reason" in done.stderr
     assert done.stdout == "", "it refuses before it reaches the server"
+
+
+# ssh for sizing.sh: the `pgrep` call is run for real, through a shell that carries the pattern
+# in its own command line exactly as the remote one does, and every other remote command answers
+# nothing. The pattern matching that shell is the whole bug, so the stub has to be able to make it.
+FAKE_SSH_SIZING = """#!/usr/bin/env bash
+cmd=${!#}
+case $cmd in
+*pgrep*) exec bash -c "$cmd" ;;
+esac
+"""
+
+
+def test_sizing_does_not_mistake_its_own_pgrep_for_the_sampler(tmp_path):
+    """`pgrep -f <path>` matches the shell that was handed the pattern, so sizing.sh read every
+    server as already sampling: `start` refused to start a sampler that was never there, and
+    `stop` aimed a pkill at the shell doing the asking."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    ssh = bin_dir / "ssh"
+    ssh.write_text(FAKE_SSH_SIZING)
+    ssh.chmod(0o755)
+
+    done = subprocess.run(
+        [str(ROOT / "scripts/deploy/sizing.sh"), "watch"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "AGB_DEPLOY_HOST": "server.test",
+            "AGB_DEPLOY_DIR": "/deploy/agb-trader",
+        },
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert "the sampler is not running on server.test" in done.stderr
+    assert "sampling on server.test" not in done.stdout
