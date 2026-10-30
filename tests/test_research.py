@@ -14,7 +14,7 @@ import pytest
 from research_fake import END, PANEL_START, Market
 
 from agb import cost, features
-from agb.research import cpcv, labels, reproduce, scan, train, walkforward
+from agb.research import cpcv, labels, reproduce, scan, train, trials, walkforward
 from agb.research.panel import Month, Panel
 from agb.research.trials import Ledger, LedgerError, Trial
 
@@ -316,6 +316,60 @@ def test_every_trial_appends_and_the_digest_names_them_all(ledger):
     assert len({row["trial_id"] for row in ledger.rows()}) == 2
     assert ledger.digest() != first
     assert [row["status"] for row in ledger.rows()] == ["succeeded", "succeeded"]
+
+
+def test_the_declared_count_is_configurations_searched_not_rows(ledger):
+    """Eight rows, four configurations searched.
+
+    The scan, the backtest and the walkforward are three. The backtest that crashed, the rerun
+    of it and the reproduction of that are the same configuration however often it is run, and
+    the attempt that never produced a result is nothing to select on. The certification is the
+    fourth; the cross-validation and the backtest it ran inside itself are how it was evaluated,
+    not two more configurations tried.
+    """
+    with open_trial(ledger, kind="scan"):
+        pass
+    with pytest.raises(RuntimeError, match="boom"):
+        with open_trial(ledger, kind="backtest", features=("mom_6_1",)):
+            raise RuntimeError("boom")
+    for _ in range(2):
+        with open_trial(ledger, kind="backtest", features=("mom_6_1",)):
+            pass
+    with open_trial(ledger, kind="certification"):
+        with open_trial(ledger, kind="cpcv"):
+            pass
+        with open_trial(ledger, kind="backtest"):
+            pass
+    with open_trial(ledger, kind="walkforward"):
+        pass
+    assert ledger.count() == 8
+    assert ledger.declared() == 4
+    # What every certification up to lgbm-2026-10 declared, and what their manifests are still
+    # read under.
+    assert ledger.declared(rule="rows") == 8
+
+
+def test_a_run_killed_without_writing_its_end_does_not_swallow_the_trials_after_it(ledger):
+    """A row left `running` by a kill has no end, so nothing says when it stopped holding other
+    runs. The run asking the question is open until it finishes and counts what it nests; any
+    other open row closes at its own start, or one zombie would hide every trial since."""
+    with open_trial(ledger, kind="certification"):
+        [killed] = ledger.rows()
+    assert killed["status"] == "running" and killed["finished_at"] is None
+    with open_trial(ledger, kind="scan"):
+        pass
+    with open_trial(ledger, kind="walkforward"):
+        pass
+    rows = [killed, *ledger.rows()[1:]]
+    assert trials.declared(rows) == 2
+    assert trials.declared(rows, current=killed["trial_id"]) == 1
+
+
+def test_an_unknown_trial_count_rule_is_refused(ledger):
+    with open_trial(ledger, kind="scan"):
+        pass
+    with pytest.raises(LedgerError, match="unknown trial count rule 'guesses'"):
+        ledger.declared(rule="guesses")
 
 
 def test_nothing_trains_without_a_trial(research_panel):

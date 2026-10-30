@@ -118,7 +118,7 @@ Two machines hold state, so ownership is explicit.
 
 **The server owns the Parquet lake** and performs the only vendor pull, bind-mounted from `/mnt/data`. The workstation `rsync`s the lake down over the LAN before a research run, so the backtest reads exactly the bytes live reads. Independent pulls on both machines would diverge on a Sharadar restatement or a failed fetch with nothing comparing them, producing a backtest that cannot be reproduced against live behaviour: a correctness property, not a convenience.
 
-**The model travels back** as a versioned artifact directory (containing the hashed `trials.parquet` ledger) plus an immutable `model_certification` row. The live pipeline refuses to load a model that has no certified row, a voided one, or one whose declared trial count differs from the ledger. Promotion to live is `agb promote <model_id>` on the server. This is what makes the validation gates enforceable across the machine boundary rather than a discipline someone remembers to follow.
+**The model travels back** as a versioned artifact directory (containing the hashed `trials.parquet` ledger) plus an immutable `model_certification` row. The live pipeline refuses to load a model that has no certified row, a voided one, or one whose declared trial count differs from what the shipped ledger recounts to. Promotion to live is `agb promote <model_id>` on the server. This is what makes the validation gates enforceable across the machine boundary rather than a discipline someone remembers to follow.
 
 **The panel store** — prompt and response bodies and source filing texts — is content-addressed zstd on `/mnt/data`, referenced by sha256 from Postgres. Its backup follows whatever protects the lake, which is left to the build.
 

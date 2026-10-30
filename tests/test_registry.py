@@ -195,12 +195,20 @@ def rebalance(db, lake_dir: Path, models: Path, **kwargs) -> None:
     Pipeline(lake_dir, "", models_dir=models, **kwargs)(db.connect("pipeline"))
 
 
-def test_the_registry_reads_the_layout_the_research_profile_writes():
+def test_the_registry_reads_the_layout_the_research_profile_writes(models):
     assert (registry.MANIFEST, registry.MODEL, registry.LEDGER) == (
         artifact.MANIFEST,
         artifact.MODEL,
         trials.FILE,
     )
+    # The server recounts the artifact's trials itself, without importing the research
+    # profile, so its counter has to agree with the one that wrote the number.
+    ledger = models / MODEL_ID / trials.FILE
+    assert registry.RULES == trials.RULES
+    for rule in trials.RULES:
+        assert registry.declared_trials_of(ledger, rule) == Ledger(ledger).declared(rule=rule)
+    with pytest.raises(registry.RegistryError, match="unknown rule 'guesses'"):
+        registry.declared_trials_of(ledger, "guesses")
 
 
 # Promoting ------------------------------------------------------------------------------------
@@ -270,14 +278,16 @@ def _no_artifact(db, models):
 
 
 def _fewer_trials(db, models):
-    """The artifact's ledger with its last trial dropped: the count it ships no longer matches
-    the count the certification declared."""
+    """The artifact's ledger with its first trial dropped: a prior backtest, which is a
+    configuration the search counted, so the count the ledger ships no longer matches the count
+    the certification declared. The last row would be the backtest the certification nests,
+    which the count never charged for."""
     ledger = Ledger(models / MODEL_ID / trials.FILE)
     rows = ledger.rows()
-    pq.write_table(pa.Table.from_pylist(rows[:-1], schema=trials.SCHEMA), ledger.path)
+    pq.write_table(pa.Table.from_pylist(rows[1:], schema=trials.SCHEMA), ledger.path)
     return MODEL_ID, (
-        f"the artifact's ledger holds {len(rows) - 1} trials; the certification declared"
-        f" {len(rows)}"
+        f"the artifact's ledger holds {trials.declared(rows[1:])} trials counted as"
+        f" {trials.RULE}; the certification declared {trials.declared(rows)}"
     )
 
 

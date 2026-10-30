@@ -11,9 +11,34 @@ relative to the configurations that were tried against it: each earlier backtest
 same months, partition and cost-model version is a candidate, as its paths' mean monthly
 net return, and the run's own series is one more.
 
-The declared trial count is the ledger's row count, read after the nested trials have
-closed and never from anything the run itself says. The final model is fitted on the whole
-panel inside the certification's own trial, as one more refit of it, so it adds no row.
+The declared trial count that the deflated Sharpe ratio charges for is the number of
+distinct configurations the ledger says were searched, `trials.RULE`, read off the ledger
+after the nested trials have closed and never from anything the run itself says. It is not
+the ledger's row count, which is also recorded, as `ledger_rows`. Three things make a row
+that is not another configuration searched, and counting them charged the model for work
+nobody did: a certification writes three rows, its own and the cross-validation and backtest
+it nests, which is one configuration evaluated once; the same configuration rerun after a
+crash, or rechecked by `reproduce`, writes a row every time; and a configuration no attempt
+of which ever produced a result was never something a result could be selected from. So the
+count drops rows nested inside another run's interval, takes distinct configurations rather
+than rows, and requires at least one that succeeded. Screening scans over raw signals are
+counted, since they are searches whose outcome informed what was certified; the training
+window, the panel's partition digest and the cost-model version are part of a configuration's
+identity, so rebuilding the panel and trying the same model again is another try, not the
+same reading over again.
+
+The count is lower under this rule than under the row count, which lowers the bar the
+deflated Sharpe ratio has to clear, and that is a reason to distrust it rather than a
+benefit: it is right only to the extent that each row it drops really is one evaluation's
+mechanics rather than a search. What the number cannot cover at all, and no ledger rule
+could, is choices made without a run: which features exist, which were kept, the
+hyperparameters, how the panel and the cost model are built, and how many times any of that
+was adjusted after seeing a result. Those are decisions taken by judgement, they leave no
+row, and the deflated Sharpe ratio is not charged for them. A pre-registered budget for the
+runs a model is allowed, and `ledger_rows` next to the declared count in every manifest, are
+what keeps the number honest; the gate's arithmetic cannot. The final model is fitted on the
+whole panel inside the certification's own trial, as one more refit of it, so it adds no
+row.
 Whatever the gates decide, the run leaves an artifact directory,
 `<research dir>/certifications/<model id>/`, that is never overwritten:
 
@@ -21,8 +46,8 @@ Whatever the gates decide, the run leaves an artifact directory,
                      other file, and the sha256 over those digests
     model.txt        the LightGBM booster fitted on every panel month, which is what the
                      live pipeline ranks with once the certification is promoted
-    trials.parquet   the ledger as it stood at certification, so the declared count can be
-                     checked against it by anyone holding the artifact
+    trials.parquet   the ledger as it stood at certification, so the declared count and the
+                     rule it was counted under can be rechecked by anyone holding the artifact
     paths.json       each path's monthly net and gross returns at 1x cost and net at 2x
     report.md        the verdict in prose, stating what the gates certify
 
@@ -65,6 +90,7 @@ from agb.research.artifact import (
 )
 from agb.research.panel import Panel
 from agb.research.trials import FILE as LEDGER_FILE
+from agb.research.trials import RULE as TRIAL_RULE
 from agb.research.trials import Ledger, Run, code_version
 
 CERTIFIES = gates.CERTIFIES
@@ -160,7 +186,10 @@ def run(
         net_2x = _matrix(twice, "net")
         others = candidates(ledger, panel, labels=labels, exclude={trial.trial_id, traded.trial_id})
         matrix = np.column_stack([net.mean(axis=0), *others.values()])
-        declared = ledger.count()
+        # `current` is this run's own row, which is still `running`: it is open until the run
+        # ends, so what it nests is read as nested, and it counts itself.
+        declared = ledger.declared(current=trial.trial_id)
+        rows = ledger.count()
         verdict = gates.evaluate(
             net=net,
             gross=gross,
@@ -176,6 +205,8 @@ def run(
         booster = train.fit(panel.select(months), config, trial=trial)
         trial.results = {
             **verdict,
+            "declared_trials_rule": TRIAL_RULE,
+            "ledger_rows": rows,
             "model_id": options.model_id,
             "certified_capital": CAPITAL,
             "cpcv_trial_id": fitted.trial_id,
@@ -273,6 +304,8 @@ def _write(
         "train_start": months[0].as_of.isoformat(),
         "train_end": months[-1].as_of.isoformat(),
         "declared_trials": results["declared_trials"],
+        "declared_trials_rule": results["declared_trials_rule"],
+        "ledger_rows": results["ledger_rows"],
         "dsr": results["dsr"],
         "pbo": results["pbo"],
         "sharpe_net": results["sharpe_net"],
@@ -329,7 +362,8 @@ def report(manifest: dict[str, Any]) -> str:
         f"Trained on {len(manifest['features'])} features from {manifest['train_start']} to"
         f" {manifest['train_end']}, cost model {manifest['cost_model_version']}, certified"
         f" capital {manifest['certified_capital']:,.0f}, {manifest['declared_trials']} trials"
-        f" declared from the ledger shipped as {LEDGER_FILE}.",
+        f" declared from the {manifest['ledger_rows']} rows of the ledger shipped as"
+        f" {LEDGER_FILE}, counted as {manifest['declared_trials_rule']}.",
         "",
         "## Gates, on returns net of 1x modelled cost",
         "",

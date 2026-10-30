@@ -9,7 +9,9 @@ docs/architecture/01:
     deflated Sharpe        Bailey and López de Prado's DSR: the probability that the observed
                            Sharpe beats the best Sharpe that `trials` independent tries of
                            nothing would have produced, with the trial count taken from the
-                           ledger and never from the run. Fails below the threshold (~0.9).
+                           ledger and never from the run: the distinct configurations it says
+                           were searched, which `agb.research.certify` defines and counts.
+                           Fails below the threshold (~0.9).
     overfitting            the probability of backtest overfitting, by combinatorially
                            symmetric cross-validation over the candidate configurations the
                            ledger holds for this window: how often the configuration that

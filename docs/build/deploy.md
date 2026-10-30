@@ -233,7 +233,7 @@ at all. The steps by hand are:
    This runs on the server because the database is reachable only from the stack's own
    network, and in its own container because only the `research` role may insert into
    `agb.model_certification`. It verifies the artifact before it writes: a missing, altered
-   or unlisted file, a shipped ledger whose row count is not the trial count the
+   or unlisted file, a shipped ledger that does not recount to the trial count the
    certification declared, and a model that is already certified are each refused, and
    nothing is written. The row's `artifact_path` records where the model was certified, from
    the manifest, not the path the import read.
@@ -247,7 +247,9 @@ at all. The steps by hand are:
 `agb promote` refuses a model with no certification, one that failed its gates (unless it is
 waived for paper, below), a voided one, one certified under an earlier cost model, and one
 whose artifact is missing from `models/`, altered since certification, or ships a trial ledger
-whose row count is not the trial count the certification declared. It also refuses the model
+that does not recount to the trial count the certification declared. The recount uses the rule
+the manifest says the certification counted by, so a model certified before the rule changed is
+still checked against the number it declared. It also refuses the model
 that is already live. Each refusal says why and is recorded in `agb.command`, as is each
 promotion, which also writes an `agb.promotion_event`. The next rebalance loads the new model
 and checks its artifact again.

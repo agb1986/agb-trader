@@ -8,7 +8,15 @@ what was tried. `train.fit` refuses to train without an open trial to count its 
 A row holds what reproducing the run needs: the kind of run, its whole configuration and
 feature list as JSON, the training window, the lake partition digest the panel was built
 from, the cost-model version, and the code version. `digest` hashes the ledger, so a report
-can name exactly which trials it summarises."""
+can name exactly which trials it summarises.
+
+Rows are not trials, for the purpose a certification declares a trial count for. One
+certification writes three rows, its own and the cross-validation and backtest it nests, and
+the same configuration rerun after a crash or rechecked by `reproduce` writes another row
+every time; none of that is another configuration searched. `declared` therefore counts the
+distinct configurations the ledger holds, by the rule `RULE`, and `count` stays the row
+count. What each rule means, and what neither of them can see, is
+docs/architecture/01-data-broker-backtesting.md and `agb.research.certify`."""
 
 import hashlib
 import json
@@ -25,6 +33,22 @@ import pyarrow.parquet as pq
 
 FILE = "trials.parquet"
 STATUSES = ("running", "succeeded", "failed", "abandoned")
+# How a certification reads its declared trial count off the ledger. `rows` is every row,
+# which is what certifications up to lgbm-2026-10 declared; `configurations` is the distinct
+# configurations searched, which is what they declare now. Each certification's manifest
+# records the rule it used, so an artifact is checked against the rule it was certified
+# under rather than the one in force when it is read.
+RULES = ("rows", "configurations")
+RULE = "configurations"
+# The fields that say what a run tried. Two rows that agree on all of them are one
+# configuration evaluated twice, not two configurations: a rerun after a crash, a
+# reproduction, a certification attempt that fell over and was started again. The window,
+# the partition digest and the cost-model version are part of it, so the same model
+# configuration over a rebuilt panel is a configuration tried again, not the same reading.
+IDENTITY = (
+    "kind", "config", "features", "train_start", "train_end",
+    "partition_hash", "cost_model_version", "code_version",
+)  # fmt: skip
 SCHEMA = pa.schema([
     ("trial_id", pa.string()),
     ("kind", pa.string()),
@@ -86,6 +110,74 @@ def code_version() -> str:
     return os.environ.get("AGB_VERSION", "dev")
 
 
+def configuration(row: dict[str, object]) -> tuple[object, ...]:
+    """What the row tried, with when it was tried and how it went left out."""
+    return tuple(row[name] for name in IDENTITY)
+
+
+def _closes_at(row: dict[str, object], current: str | None) -> datetime:
+    """When the row stopped being a run that could hold other runs inside it.
+
+    A row still marked `running` is either the run asking the question, which is open until it
+    finishes, or a run that was killed and never wrote its end. The first is open to the end of
+    time; the second closes at its own start, because treating a zombie row as open would make
+    every trial since it look like one of its children.
+    """
+    finished = row["finished_at"]
+    if isinstance(finished, datetime):
+        return finished
+    if row["trial_id"] == current:
+        return datetime.max.replace(tzinfo=UTC)
+    started = row["started_at"]
+    assert isinstance(started, datetime)
+    return started
+
+
+def nested(rows: list[dict[str, object]], *, current: str | None = None) -> set[str]:
+    """The ids of the rows a run opened while another run was still open.
+
+    A certification runs a cross-validation and a backtest and each writes its own row, so its
+    interval contains theirs. That is one configuration being evaluated, not three, so the
+    inner rows are not configurations the search tried. Containment is read off the intervals
+    rather than a parent column, which keeps old rows readable; rows that start at the same
+    instant as another are siblings, not children, so a batch written in one go stays counted.
+    """
+    inside = set()
+    for row in rows:
+        start, end = row["started_at"], _closes_at(row, current)
+        for other in rows:
+            if other["trial_id"] == row["trial_id"]:
+                continue
+            if other["started_at"] < start and _closes_at(other, current) >= end:
+                inside.add(str(row["trial_id"]))
+                break
+    return inside
+
+
+def declared(rows: list[dict[str, object]], *, rule: str = RULE, current: str | None = None) -> int:
+    """How many trials a certification over `rows` declares, under `rule`.
+
+    `rows` counts every row, which is what certifications up to lgbm-2026-10 declared.
+    `configurations` counts the distinct configurations that were searched and came back with a
+    result: rows nested inside another run are the mechanics of one evaluation, repeats of a
+    configuration are one configuration, and a configuration no attempt of which ever succeeded
+    produced nothing to select on. The run asking counts itself, since by the time anything
+    verifies the number its own row has succeeded.
+    """
+    if rule == "rows":
+        return len(rows)
+    if rule != "configurations":
+        raise LedgerError(f"unknown trial count rule {rule!r}; expected one of {RULES}")
+    inside = nested(rows, current=current)
+    counted = {
+        configuration(row)
+        for row in rows
+        if row["trial_id"] not in inside
+        and (row["status"] == "succeeded" or row["trial_id"] == current)
+    }
+    return len(counted)
+
+
 class Ledger:
     """The ledger at `path`. A missing file is an empty ledger; the first trial creates it."""
 
@@ -101,7 +193,12 @@ class Ledger:
         return self.table().to_pylist()
 
     def count(self) -> int:
+        """Every row in the ledger, whatever it is. `declared` is what a certification says."""
         return self.table().num_rows
+
+    def declared(self, *, rule: str = RULE, current: str | None = None) -> int:
+        """The trial count a certification declares, by `rule`. See the module function."""
+        return declared(self.rows(), rule=rule, current=current)
 
     def get(self, trial_id: str) -> dict[str, object]:
         for row in self.rows():
