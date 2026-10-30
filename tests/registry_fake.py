@@ -5,7 +5,9 @@ loads and promotes a real certified artifact).
 `Momentum` ranks by momentum over a short window, which the fake market's growth rates order
 by name, and carries a certification id and an artifact digest as agb.registry's
 CertifiedRanker does. `promote` records a passing certification of it, as the research import
-does, and its promotion, as `agb promote` does, so the gate finds the basket's digest live."""
+does, and its promotion, as `agb promote` does, so the gate finds the basket's digest live.
+`waive` records a failed certification promoted under the paper-only measurement waiver, for
+the tests of what a waiver holds back."""
 
 from __future__ import annotations
 
@@ -24,7 +26,10 @@ if TYPE_CHECKING:
     from agb.universe import Universe
 
 MODEL_ID = "momentum-fake"
+# A stand-in whose certification failed its gates, for the paper-only measurement waiver.
+FAILED_ID = "momentum-fake-failed"
 ARTIFACT = "ab" * 32
+WAIVER = "measuring the live limits before any model has passed"
 
 _CERTIFY = """
     INSERT INTO agb.model_certification (
@@ -96,6 +101,30 @@ def promote(db, model_id: str = MODEL_ID) -> int:
                 " VALUES (%s, %s, 'operator')",
                 (certification_id, command_id),
             )
+    return certification_id
+
+
+def waive(db, model_id: str = FAILED_ID, reason: str = WAIVER) -> int:
+    """Make `model_id`'s failed certification the live model under the paper-only measurement
+    waiver, as `agb promote <model id> --waive-for-paper --reason <why>` does."""
+    certification_id = certify(db, model_id, passed=False)
+    conn = db.connect("cli")
+    with conn.transaction():
+        [(command_id,)] = conn.execute(
+            _COMMAND,
+            (f"agb promote {model_id} --waive-for-paper --reason {reason!r}", "promote"),
+        ).fetchall()
+        conn.execute(
+            "INSERT INTO agb.certification_event"
+            " (certification_id, event, reason, cost_model_version, command_id, actor)"
+            " VALUES (%s, 'waived', %s, %s, %s, 'operator')",
+            (certification_id, reason, cost.CURRENT.version, command_id),
+        )
+        conn.execute(
+            "INSERT INTO agb.promotion_event (certification_id, command_id, actor)"
+            " VALUES (%s, %s, 'operator')",
+            (certification_id, command_id),
+        )
     return certification_id
 
 

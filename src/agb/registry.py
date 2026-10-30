@@ -19,6 +19,16 @@ refusal as a refused command:
     from the certification's;
   * the model already live.
 
+A promotion can carry one waiver, and one only. `agb promote <model id> --waive-for-paper
+--reason <why>` promotes a certification whose single problem is that it failed its gates,
+so that the stack can be exercised end to end while nothing has passed: the sizing run
+(docs/build/measured-limits.md) needs a real rebalance to measure, and a rebalance with
+nothing promoted fails before it proposes a basket. The waiver is refused unless the trading
+mode is paper, refused for a voided or stale certification, and refused for a certification
+that passed, which needs no waiver; the artifact is verified as it always is. A `waived`
+certification_event records it, and `agb mode live` is refused while a waived model is live
+(agb.ladder), so a waiver can never carry into live trading.
+
 The latest promotion is the live model (`agb.promoted_model`). The pipeline loads it at each
 rebalance with `load_promoted`, which verifies the artifact again and refuses the same way:
 nothing promoted, voided, stale, altered. It never falls back to another model. Every basket
@@ -36,7 +46,7 @@ import hashlib
 import json
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -67,6 +77,9 @@ PROMOTE = "promote"
 VOID = "void"
 VOID_STALE = "void_stale"
 
+# The trading mode a measurement waiver is confined to, as agb.current_mode has it.
+PAPER = "paper"
+
 # Each categorical feature's fixed vocabulary. The research panel holds them as pandas
 # categoricals over the same vocabulary, and LightGBM trains on their codes.
 _VOCABULARIES = {"sector": features.SECTORS}
@@ -94,6 +107,9 @@ class Certification:
     voided_at: datetime | None
     voided_by: str | None
     voided_reason: str | None
+    waived_at: datetime | None
+    waived_by: str | None
+    waived_reason: str | None
 
     def problem(self, current: str) -> str | None:
         """Why this certification cannot be live whatever its artifact, or None."""
@@ -111,12 +127,27 @@ class Certification:
             )
         return None
 
+    def waiver(self, mode: str, current: str) -> str | None:
+        """The paper-only measurement waiver this certification runs under, or None. A
+        waiver covers a failed gate and nothing else: it is no waiver in live mode, none for
+        a voided or stale certification, and none for one that passed."""
+        if self.waived_at is None or mode != PAPER or self.passed:
+            return None
+        if self.voided_at is not None or self.cost_model_version != current:
+            return None
+        return (
+            f"model {self.model_id} failed certification and is live under the paper-only"
+            f" measurement waiver recorded on {self.waived_at:%Y-%m-%d} by {self.waived_by}:"
+            f" {self.waived_reason}"
+        )
+
 
 _CERTIFICATION = """
     SELECT c.id, c.model_id, c.passed, c.artifact_sha256, c.declared_trials,
-           c.cost_model_version, c.features, v.at, v.actor, v.reason
+           c.cost_model_version, c.features, v.at, v.actor, v.reason, w.at, w.actor, w.reason
     FROM agb.model_certification c
     LEFT JOIN agb.certification_event v ON v.certification_id = c.id AND v.event = 'voided'
+    LEFT JOIN agb.certification_event w ON w.certification_id = c.id AND w.event = 'waived'
 """
 _BY_MODEL = _CERTIFICATION + "WHERE c.model_id = %s"
 _LIVE = _CERTIFICATION + "WHERE c.id = (SELECT certification_id FROM agb.promoted_model)"
@@ -137,10 +168,17 @@ _VOID = """
     VALUES (%(id)s, 'voided', %(reason)s, %(current)s, %(command_id)s, %(actor)s)
     ON CONFLICT (certification_id) WHERE event = 'voided' DO NOTHING
 """
+_WAIVE = """
+    INSERT INTO agb.certification_event
+        (certification_id, event, reason, cost_model_version, command_id, actor)
+    VALUES (%(id)s, 'waived', %(reason)s, %(current)s, %(command_id)s, %(actor)s)
+    ON CONFLICT (certification_id) WHERE event = 'waived' DO NOTHING
+"""
 _PROMOTE = """
     INSERT INTO agb.promotion_event (certification_id, command_id, actor)
     VALUES (%s, %s, %s)
 """
+_MODE = "SELECT mode FROM agb.current_mode"
 
 
 def certification(conn: psycopg.Connection, model_id: str) -> Certification | None:
@@ -241,13 +279,16 @@ def matrix(ranked: pa.Table, names: Sequence[str]) -> np.ndarray:
 @dataclass(frozen=True)
 class CertifiedRanker:
     """The stage-1 ranker of one certified, verified artifact. Its name is the model id, which
-    the basket records as its ranker identity beside the certification and the digest."""
+    the basket records as its ranker identity beside the certification and the digest.
+    `waiver` is set when the model is live under a paper-only measurement waiver, so that a
+    run which ranks with an uncertified model says so."""
 
     certification_id: int
     name: str
     artifact_sha256: str
     features: tuple[str, ...]
     booster: Any
+    waiver: str | None = None
 
     def rank(self, universe: Universe, lake: duckdb.DuckDBPyConnection) -> list[Ranked]:
         ranked = features.compute(universe, db=lake).ranked
@@ -294,38 +335,82 @@ def load(models_dir: Path, certification: Certification) -> CertifiedRanker:
 def load_promoted(conn: psycopg.Connection, models_dir: Path) -> CertifiedRanker:
     """The live model, ready to rank, or RegistryError saying why there is none: nothing
     promoted, the promoted certification voided, failed or stale, or its artifact missing or
-    not the certified one."""
+    not the certified one. A model promoted under a paper-only measurement waiver loads in
+    paper mode, carrying the waiver; in live mode it is refused as the failed certification
+    it is."""
     promoted = live(conn)
     if promoted is None:
         raise RegistryError("no model is promoted; `agb promote <model id>` promotes one")
-    if (why := promoted.problem(cost.CURRENT.version)) is not None:
+    (mode,) = conn.execute(_MODE).fetchone()
+    waiver = promoted.waiver(mode, cost.CURRENT.version)
+    why = promoted.problem(cost.CURRENT.version)
+    if why is not None and waiver is None:
         raise RegistryError(f"the promoted {why}")
-    return load(models_dir, promoted)
+    ranker = load(models_dir, promoted)
+    return ranker if waiver is None else replace(ranker, waiver=waiver)
 
 
 # The CLI's commands.
 
 
-def promote(conn: psycopg.Connection, model_id: str, source: Source, models_dir: Path) -> str:
+def promote(
+    conn: psycopg.Connection,
+    model_id: str,
+    source: Source,
+    models_dir: Path,
+    *,
+    waive_for_paper: str | None = None,
+) -> str:
     """Make `model_id`'s certification the live model. The promotion is a `promote` command
     and a promotion_event naming it; a refusal is recorded too, and raised as Refused.
-    Stale certifications are voided first."""
+    Stale certifications are voided first. `waive_for_paper` is the operator's reason for a
+    paper-only measurement waiver: it is refused outside paper mode, and refused for any
+    certification whose problem is anything but the failed gate."""
     void_stale(conn, source)
     args: dict[str, Any] = {"model_id": model_id}
+    if waive_for_paper is not None:
+        args["waive_for_paper"] = waive_for_paper
     candidate = certification(conn, model_id)
     was = conn.execute(_PROMOTED).fetchone()
-    why = _refusal(model_id, candidate, was, models_dir, cost.CURRENT.version)
+    (mode,) = conn.execute(_MODE).fetchone()
+    why = _refusal(
+        model_id,
+        candidate,
+        was,
+        models_dir,
+        cost.CURRENT.version,
+        mode=mode,
+        waive_for_paper=waive_for_paper,
+    )
     if why is not None or candidate is None:
         approval.record(conn, source, PROMOTE, args, why)
         raise Refused(why)
     args |= {"certification_id": candidate.id, "artifact_sha256": candidate.artifact_sha256}
     with conn.transaction():
         command_id = approval.record(conn, source, PROMOTE, args)
+        if waive_for_paper is not None:
+            conn.execute(
+                _WAIVE,
+                {
+                    "id": candidate.id,
+                    "reason": waive_for_paper,
+                    "current": cost.CURRENT.version,
+                    "command_id": command_id,
+                    "actor": source.actor,
+                },
+            )
         conn.execute(_PROMOTE, (candidate.id, command_id, source.actor))
     replacing = f", replacing {was[1]}" if was is not None else ""
+    identity = f"certification {candidate.id}, artifact {candidate.artifact_sha256[:12]}"
+    if waive_for_paper is None:
+        return (
+            f"model {model_id} promoted{replacing}: {identity}. The next rebalance ranks with it."
+        )
     return (
-        f"model {model_id} promoted{replacing}: certification {candidate.id}, artifact"
-        f" {candidate.artifact_sha256[:12]}. The next rebalance ranks with it."
+        f"model {model_id} promoted{replacing} under a paper-only measurement waiver:"
+        f" {identity}. It failed certification, so the next rebalance ranks with an"
+        " uncertified model, and a move to live is refused until a model that passed is"
+        " promoted."
     )
 
 
@@ -335,10 +420,25 @@ def _refusal(
     was: tuple | None,
     models_dir: Path,
     current: str,
+    *,
+    mode: str = "live",
+    waive_for_paper: str | None = None,
 ) -> str | None:
     if candidate is None:
         return f"no certification of model {model_id}"
-    if (why := candidate.problem(current)) is not None:
+    if waive_for_paper is not None:
+        if mode != PAPER:
+            return (
+                f"a measurement waiver promotes a model that failed certification, so it is"
+                f" refused in {mode} mode; it is for paper only"
+            )
+        if not waive_for_paper.strip():
+            return "a measurement waiver needs a reason"
+        if candidate.passed:
+            return f"model {model_id} passed certification and needs no waiver"
+        if candidate.voided_at is not None or candidate.cost_model_version != current:
+            return candidate.problem(current)
+    elif (why := candidate.problem(current)) is not None:
         return why
     if was is not None and was[0] == candidate.id:
         return f"model {model_id} is already live, promoted {was[3]:%Y-%m-%d} by {was[2]}"

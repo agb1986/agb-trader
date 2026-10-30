@@ -82,6 +82,11 @@ _STATUS = "SELECT seq, name, measured, threshold, met FROM agb.ladder_status ORD
 _READY = "SELECT target, ready, coalesce(outstanding, '{}') FROM agb.ladder_ready"
 _LIVE_STATUS = "SELECT seq, name, measured, threshold, met FROM agb.live_status ORDER BY seq"
 _LIVE_READY = "SELECT ready, criteria_met, coalesce(outstanding, '{}') FROM agb.live_ready"
+# A live model promoted under the paper-only measurement waiver: it failed its gates, so the
+# mode it was promoted in is the only one it may trade in. Voiding it lifts the hold, as
+# promoting a model that passed does; a voided model cannot be loaded at all. The view is read
+# rather than agb.registry imported, which would pull LightGBM and the model loader in here.
+_WAIVED = "SELECT model_id, waived_reason FROM agb.promoted_model WHERE waived AND NOT voided"
 _RAISE = """
     INSERT INTO agb.ladder_event (level, actor, reason, attestation, command_id)
     VALUES (%(level)s, %(actor)s, %(reason)s, %(attestation)s, %(command_id)s)
@@ -247,6 +252,14 @@ def _mode_refusal(
         return (
             "live is not earned yet: "
             f"{', '.join(eligible.outstanding)} outstanding in the paper record"
+        )
+    waived = conn.execute(_WAIVED).fetchone()
+    if waived is not None:
+        model_id, reason = waived
+        return (
+            f"the live model {model_id} failed certification and is promoted under the"
+            f" paper-only measurement waiver ({reason}); promote a model that passed its"
+            f" gates, or `agb void {model_id}`, before moving to live"
         )
     return None
 

@@ -220,6 +220,8 @@ class Pipeline:
     def rebalance(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
         try:
             ranker = self.ranker or registry.load_promoted(conn, self.models_dir)
+            if isinstance(ranker, registry.CertifiedRanker) and ranker.waiver is not None:
+                log.warning("rebalance %s ranks under a waiver: %s", claim.period, ranker.waiver)
             proposal = basket.propose(
                 conn,
                 claim,

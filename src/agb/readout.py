@@ -88,7 +88,7 @@ _LATEST_BASKET = """
     LIMIT 1
 """
 _LIVE_MODEL = """
-    SELECT model_id, certification_id, promoted_by, promoted_at, voided_at
+    SELECT model_id, certification_id, promoted_by, promoted_at, voided_at, waived, waived_at
     FROM agb.promoted_model
 """
 _NEXT_SUBMISSION = """
@@ -145,9 +145,17 @@ def status(conn: psycopg.Connection, now: datetime) -> str:
     if model is None:
         items.append(Item("no model promoted", "rebalances fail until `agb promote` runs"))
     else:
-        model_id, certification_id, promoted_by, promoted_at, voided_at = model
+        model_id, certification_id, promoted_by, promoted_at, voided_at, waived, waived_at = model
         facts = f"certification {certification_id}, promoted {et(promoted_at)} by {promoted_by}"
-        if voided_at is None:
+        if voided_at is None and waived:
+            items.append(
+                Item(
+                    f"model {model_id} live under a paper waiver",
+                    f"{facts}; it failed its gates, waived {et(waived_at)}, so a move to"
+                    " live is refused until another is promoted",
+                )
+            )
+        elif voided_at is None:
             items.append(Item(f"model {model_id} live", facts))
         else:
             items.append(

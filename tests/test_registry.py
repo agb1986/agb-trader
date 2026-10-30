@@ -3,8 +3,9 @@ live and recording the promotion (acceptance criterion 1), every refusal recorde
 command (2), a cost-model bump voiding the certifications made under the old one (3), the
 pipeline refusing a model it cannot trust (4), the gate halting a basket ranked by anything but
 the promoted artifact (5), a paper rebalance end to end on the promoted booster (6) and the
-placeholder ranker gone (7). tests/test_gate.py holds the gate's model check to every case on
-a stand-in model.
+placeholder ranker gone (7). The paper-only measurement waiver is here too: a certification
+that genuinely failed its gates, promoted for a paper rebalance and refused everywhere else.
+tests/test_gate.py holds the gate's model check to every case on a stand-in model.
 
 The artifact is certified once for the module, as tests/test_certify.py certifies one: the
 session's fake research panel, cross-validated in six groups, with five plain-signal
@@ -14,6 +15,7 @@ runs on the research lake, whose last session is the signal session of September
 
 import importlib.util
 import json
+import logging
 import re
 import shutil
 from dataclasses import replace
@@ -29,7 +31,7 @@ import registry_fake
 from agb import cli, cost, gate, lake, registry, schedule, universe
 from agb.approval import Source
 from agb.rebalance import SIZE
-from agb.research import artifact, backtest, certify, cpcv, train, trials
+from agb.research import artifact, backtest, certify, cpcv, gates, train, trials
 from agb.research.trials import Ledger
 from agb.roles import RESEARCH
 from agb.schedule import Expected, Planned
@@ -51,6 +53,14 @@ CAPITAL = Decimal("100000")
 LIMITS = gate.Limits(universe_min=20)
 # A cost model other than the one in force, as after a release that changes it.
 NEXT = "next"
+# A second certification of the same model, judged where no model can reach: the DSR gate
+# fails below its threshold, and a DSR is never one. It fails its gates and nothing else,
+# which is the failure the paper-only measurement waiver covers.
+FAILED_ID = "ranker-2026.1-failed"
+FAILED = certify.Options(
+    model_id=FAILED_ID, size=6, hold_through=10, thresholds=gates.Thresholds(dsr=1.0)
+)
+WAIVER = "measuring the live limits, issue #45"
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "agb"
 
@@ -88,12 +98,64 @@ def certification_id(db, certified) -> int:
     return artifact.import_artifact(db.connect(RESEARCH), certified.directory)
 
 
+@pytest.fixture(scope="module")
+def failed(research_panel, research_lake, tmp_path_factory) -> certify.Certification:
+    """The same configuration certified against a DSR threshold no model can reach, so the
+    gates fail and the artifact is as real as the certified one's."""
+    research_dir = tmp_path_factory.mktemp("research-failed")
+    run = certify.run(
+        research_panel, MODEL, VALIDATION, FAILED, Ledger(research_dir / trials.FILE),
+        research_dir=research_dir, lake_dir=research_lake,
+    )  # fmt: skip
+    assert not run.passed
+    return run
+
+
+@pytest.fixture
+def waivable(failed, models) -> Path:
+    """A models directory holding the failed artifact beside the certified one."""
+    shutil.copytree(failed.directory, models / FAILED_ID)
+    return models
+
+
+@pytest.fixture
+def failed_id(db, failed) -> int:
+    """The failed certification's row, imported as the research profile imports it. A failed
+    certification is recorded like any other."""
+    return artifact.import_artifact(db.connect(RESEARCH), failed.directory)
+
+
 def source(verb: str, actor: str = "operator") -> Source:
     return Source(actor, "cli", f"agb {verb}")
 
 
 def promote(db, models: Path, model_id: str = MODEL_ID) -> str:
     return registry.promote(db.connect("cli"), model_id, source(f"promote {model_id}"), models)
+
+
+def waive(db, models: Path, model_id: str = FAILED_ID, reason: str = WAIVER) -> str:
+    return registry.promote(
+        db.connect("cli"),
+        model_id,
+        source(f"promote {model_id} --waive-for-paper --reason {reason!r}"),
+        models,
+        waive_for_paper=reason,
+    )
+
+
+def go_live(db) -> None:
+    """Move the mode to live as `agb mode live` records it, which the ladder allows only once
+    the paper record has earned it (tests/test_ladder.py)."""
+    conn = db.connect("agb_owner")
+    [(command_id,)] = conn.execute(
+        "INSERT INTO agb.command (actor, surface, raw_text, verb, outcome)"
+        " VALUES ('operator', 'cli', 'agb mode live', 'mode', 'accepted') RETURNING id"
+    ).fetchall()
+    conn.execute(
+        "INSERT INTO agb.mode_event (mode, actor, reason, attestation, command_id)"
+        " VALUES ('live', 'cli', 'earned', 'the paper record is sound', %s)",
+        (command_id,),
+    )
 
 
 def bump(monkeypatch) -> None:
@@ -284,6 +346,185 @@ def test_promote_refuses_and_records_the_refusal(db, models, certification_id, r
     )
     assert rows(db, "SELECT id FROM agb.promotion_event") == promotions
     assert rows(db, "SELECT certification_id FROM agb.promoted_model") == live
+
+
+# Waiving --------------------------------------------------------------------------------------
+
+
+def test_a_waiver_promotes_the_failed_certification_and_records_the_waiver(
+    db, waivable, failed_id, failed
+):
+    digest = failed.manifest["artifact_sha256"]
+
+    message = waive(db, waivable)
+
+    assert message == (
+        f"model {FAILED_ID} promoted under a paper-only measurement waiver: certification"
+        f" {failed_id}, artifact {digest[:12]}. It failed certification, so the next rebalance"
+        " ranks with an uncertified model, and a move to live is refused until a model that"
+        " passed is promoted."
+    )
+    [(command_id, verb, args, outcome)] = rows(
+        db, "SELECT id, verb, args, outcome FROM agb.command"
+    )
+    assert (verb, outcome) == ("promote", "accepted")
+    assert args == {
+        "model_id": FAILED_ID,
+        "waive_for_paper": WAIVER,
+        "certification_id": failed_id,
+        "artifact_sha256": digest,
+    }
+    assert rows(
+        db,
+        "SELECT certification_id, event, reason, cost_model_version, command_id, actor"
+        " FROM agb.certification_event",
+    ) == [(failed_id, "waived", WAIVER, cost.CURRENT.version, command_id, "operator")]
+    assert rows(
+        db,
+        "SELECT certification_id, model_id, passed, waived, waived_reason FROM agb.promoted_model",
+    ) == [(failed_id, FAILED_ID, False, True, WAIVER)]
+
+
+def test_a_certification_is_waived_once(db, waivable, failed_id):
+    waive(db, waivable)
+
+    with pytest.raises(registry.Refused, match=f"model {FAILED_ID} is already live"):
+        waive(db, waivable)
+
+    assert len(rows(db, "SELECT id FROM agb.certification_event WHERE event = 'waived'")) == 1
+
+
+def _passed_its_gates(db, models, monkeypatch):
+    return MODEL_ID, WAIVER, f"model {MODEL_ID} passed certification and needs no waiver"
+
+
+def _no_reason(db, models, monkeypatch):
+    return FAILED_ID, "   ", "a measurement waiver needs a reason"
+
+
+def _live_mode(db, models, monkeypatch):
+    go_live(db)
+    return (
+        FAILED_ID,
+        WAIVER,
+        (
+            "a measurement waiver promotes a model that failed certification, so it is refused in"
+            " live mode; it is for paper only"
+        ),
+    )
+
+
+def _waiving_the_voided(db, models, monkeypatch):
+    registry.void(db.connect("cli"), FAILED_ID, "fitted on the test months", source("void"))
+    return (
+        FAILED_ID,
+        WAIVER,
+        (rf"model {FAILED_ID} was voided on \S+ by operator: fitted on the test months"),
+    )
+
+
+def _waiving_the_stale(db, models, monkeypatch):
+    """A cost-model bump leaves the failed certification stale, and promotion voids the stale
+    before it reads the candidate, so the waiver meets the voiding its own promotion wrote."""
+    bump(monkeypatch)
+    return FAILED_ID, WAIVER, f"certified under cost model .*, superseded by {NEXT}"
+
+
+def _waiving_without_the_artifact(db, models, monkeypatch):
+    shutil.rmtree(models / FAILED_ID)
+    return FAILED_ID, WAIVER, f"model {FAILED_ID} has no artifact at {models / FAILED_ID}"
+
+
+@pytest.mark.parametrize(
+    "refuse",
+    [
+        pytest.param(_passed_its_gates, id="passed"),
+        pytest.param(_no_reason, id="no_reason"),
+        pytest.param(_live_mode, id="live_mode"),
+        pytest.param(_waiving_the_voided, id="voided"),
+        pytest.param(_waiving_the_stale, id="stale"),
+        pytest.param(_waiving_without_the_artifact, id="no_artifact"),
+    ],
+)
+def test_a_waiver_refuses_and_records_the_refusal(
+    db, waivable, certification_id, failed_id, monkeypatch, refuse
+):
+    model_id, reason, why = refuse(db, waivable, monkeypatch)
+
+    with pytest.raises(registry.Refused, match=why) as refused:
+        waive(db, waivable, model_id, reason)
+
+    *_, last = commands(db)
+    assert last == (
+        "promote",
+        {"model_id": model_id, "waive_for_paper": reason},
+        "refused",
+        str(refused.value),
+        "operator",
+        "cli",
+    )
+    assert rows(db, "SELECT id FROM agb.promotion_event") == []
+    assert rows(db, "SELECT id FROM agb.certification_event WHERE event = 'waived'") == []
+
+
+def test_the_waived_model_loads_in_paper_carrying_the_waiver_and_never_in_live(
+    db, waivable, failed_id, failed
+):
+    waive(db, waivable)
+
+    ranker = registry.load_promoted(db.connect("pipeline"), waivable)
+
+    assert (ranker.certification_id, ranker.name, ranker.artifact_sha256) == (
+        failed_id,
+        FAILED_ID,
+        failed.manifest["artifact_sha256"],
+    )
+    assert re.fullmatch(
+        rf"model {re.escape(FAILED_ID)} failed certification and is live under the paper-only"
+        rf" measurement waiver recorded on \d{{4}}-\d\d-\d\d by operator:"
+        rf" {re.escape(WAIVER)}",
+        ranker.waiver,
+    )
+
+    # The waiver is paper's alone: the same promotion in live mode is the failed certification
+    # it has always been. The ladder refuses the move while it is live; this is the floor under
+    # that refusal.
+    go_live(db)
+    with pytest.raises(
+        registry.RegistryError, match=f"the promoted model {FAILED_ID} failed certification"
+    ):
+        registry.load_promoted(db.connect("pipeline"), waivable)
+
+
+def test_a_paper_rebalance_on_the_waived_model_runs_and_says_it_ranked_under_the_waiver(
+    db, research_lake, waivable, failed_id, failed, caplog
+):
+    """What the waiver is for: a real rebalance to measure, with every run that ranks by an
+    uncertified model saying so in the log."""
+    plan_rebalance(db)
+    waive(db, waivable)
+
+    with caplog.at_level(logging.WARNING):
+        rebalance(db, research_lake, waivable)
+
+    assert rows(db, "SELECT state FROM agb.job_state WHERE kind = 'rebalance'") == [("completed",)]
+    [(ranker, certification, digest)] = rows(
+        db, "SELECT ranker, model_certification_id, model_sha256 FROM agb.basket"
+    )
+    assert (ranker, certification, digest) == (
+        FAILED_ID,
+        failed_id,
+        failed.manifest["artifact_sha256"],
+    )
+    assert rows(db, "SELECT name, measured, threshold FROM agb.gate_check WHERE NOT passed") == []
+    assert rows(db, "SELECT state, actor FROM agb.basket_state") == [("approved", "system")]
+    [under] = [
+        record.getMessage() for record in caplog.records if "ranks under a waiver" in record.message
+    ]
+    assert under.startswith(
+        f"rebalance {PERIOD} ranks under a waiver: model {FAILED_ID} failed certification"
+    )
+    assert under.endswith(WAIVER)
 
 
 # Voiding --------------------------------------------------------------------------------------
