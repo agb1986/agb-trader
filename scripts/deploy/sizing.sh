@@ -24,6 +24,13 @@ interval=${AGB_SIZING_INTERVAL:-5}
 # so the project is that directory's name, and the household stack's containers are not it.
 project=$(basename "$dir")
 remote_script="$dir/measure.py"
+# The pattern `pgrep` and `pkill` are given below travels to the server inside the command line
+# of the shell that runs them, and that shell is a process like any other, so a plain path
+# matches it: `pgrep` then always finds a sampler, `start` always refuses to start one, and
+# `pkill` aims at the shell doing the asking. Bracketing the first character separates the two.
+# As a regex it still matches the sampler's own path; as text in that shell's command line it
+# reads `[m]easure.py`, which the regex does not match.
+sampler_pattern="$dir/[m]easure.py"
 remote_table="$dir/peaks.md"
 remote_log="$dir/measure.log"
 
@@ -38,7 +45,7 @@ query() {
     remote "$(q "$dir/agb-stack") exec -T db psql -U postgres -d agb -tA -c $(q "$1")"
 }
 # The sampler's process on the server, if it is running.
-sampler() { remote "pgrep -f $(q "$remote_script") || true"; }
+sampler() { remote "pgrep -f $(q "$sampler_pattern") || true"; }
 
 cd "$(git rev-parse --show-toplevel)"
 
@@ -139,7 +146,7 @@ stop() {
     running=$(sampler)
     if [ -n "$running" ]; then
         # The sampler writes its table and exits on the first SIGTERM.
-        remote "pkill -TERM -f $(q "$remote_script")"
+        remote "pkill -TERM -f $(q "$sampler_pattern")"
         for _ in 1 2 3 4 5 6 7 8 9 10; do
             [ -n "$(sampler)" ] || break
             sleep 1
