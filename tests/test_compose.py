@@ -4,6 +4,7 @@ conventions every later ticket inherits."""
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 
@@ -288,3 +289,85 @@ def test_research_runs_only_on_the_workstation_with_a_read_only_lake(resolved):
     assert mounts["/lake"].get("read_only") is True, "the lake is never written by research"
     assert not mounts["/research"].get("read_only")
     assert all(volume["type"] == "bind" for volume in mounts.values())
+
+
+# The remote commands promote.sh issues, with ssh replaced by a stub that logs the command it
+# was given instead of connecting. `test -e` answers no, so the artifact is shipped, imported
+# and promoted in one run, and the tar receiver drains its stdin so the sender sees no SIGPIPE.
+FAKE_SSH = """#!/usr/bin/env bash
+cmd=${!#}
+case $cmd in
+*"test -e"*) echo "$cmd" >> "$AGB_SSH_LOG"; exit 1 ;;
+true|*"test -d"*|*"test -x"*) echo "$cmd" >> "$AGB_SSH_LOG"; exit 0 ;;
+*"tar -xzf -"*) cat > /dev/null ;;
+esac
+echo "$cmd" >> "$AGB_SSH_LOG"
+"""
+
+
+def promote(tmp_path, *args, reason: str = "") -> subprocess.CompletedProcess:
+    """promote.sh over a stub ssh and a stub artifact, with the remote commands it issued in
+    `stdout` one per line."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    ssh = bin_dir / "ssh"
+    ssh.write_text(FAKE_SSH)
+    ssh.chmod(0o755)
+    artifact = tmp_path / "certifications" / "ranker-2026.1"
+    artifact.mkdir(parents=True, exist_ok=True)
+    (artifact / "manifest.json").write_text("{}")
+    log = tmp_path / "ssh.log"
+    log.write_text("")
+    done = subprocess.run(
+        [str(ROOT / "scripts/deploy/promote.sh"), "ranker-2026.1", *args],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "AGB_SSH_LOG": str(log),
+            "AGB_RESEARCH_DIR": str(tmp_path),
+            "AGB_DEPLOY_HOST": "server.test",
+            "AGB_DEPLOY_DIR": "/deploy",
+            "REASON": reason,
+        },
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return subprocess.CompletedProcess(done.args, done.returncode, log.read_text(), done.stderr)
+
+
+def test_promote_carries_the_paper_waiver_to_the_server(tmp_path):
+    """The waiver is a flag on the server's `agb promote`, so the handoff has to pass it and the
+    reason through; `make promote MODEL=... CMD=waive REASON=...` is the whole measurement
+    handoff, not three steps by hand."""
+    done = promote(tmp_path, "waive", reason="measuring the live limits, issue #45")
+    assert done.returncode == 0, done.stderr
+    [promotion] = [line for line in done.stdout.splitlines() if " agb promote " in line]
+    # The reason is one word of prose, so the remote shell has to parse it back as one argument.
+    assert shlex.split(promotion) == [
+        "/deploy/agb-stack",
+        "agb",
+        "promote",
+        "ranker-2026.1",
+        "--waive-for-paper",
+        "--reason",
+        "measuring the live limits, issue #45",
+    ]
+    # The waiver changes the last step alone: the artifact ships and imports as any other.
+    assert [line for line in done.stdout.splitlines() if line.endswith(" import ranker-2026.1")]
+
+
+def test_promote_waives_nothing_unless_it_is_asked_to(tmp_path):
+    done = promote(tmp_path)
+    assert done.returncode == 0, done.stderr
+    [promotion] = [line for line in done.stdout.splitlines() if " agb promote " in line]
+    assert promotion == "/deploy/agb-stack agb promote ranker-2026.1"
+
+
+def test_a_waiver_without_a_reason_is_refused_before_anything_is_shipped(tmp_path):
+    done = promote(tmp_path, "waive")
+    assert done.returncode == 1
+    assert "a waiver needs a reason" in done.stderr
+    assert done.stdout == "", "it refuses before it reaches the server"

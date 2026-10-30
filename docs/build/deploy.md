@@ -213,9 +213,10 @@ A model is certified on the workstation by the research profile, which writes it
 directory under `research/certifications/<model id>/`. Getting it live takes three steps, which
 `make promote MODEL=<model id>` runs in order over SSH, skipping each one that is already done;
 `make promote MODEL=<model id> CMD=check` reports where a model stands without changing
-anything. Neither `make agb` nor `make research` can do these writes: the `cli` service is
-pointed at the workstation's own database, where no certification was ever imported, and the
-`research` service has no database at all. The steps by hand are:
+anything, including the waiver it is live under, if any. Neither `make agb` nor
+`make research` can do these writes: the `cli` service is pointed at the workstation's own
+database, where no certification was ever imported, and the `research` service has no database
+at all. The steps by hand are:
 
 1. Copy the artifact directory, unchanged, to `models/<model id>/` in the deploy directory:
 
@@ -270,6 +271,13 @@ nothing.
 The sizing run (`docs/build/measured-limits.md`) needs a real rebalance to measure, and a
 rebalance with nothing promoted fails before it proposes a basket. While no model has passed
 its gates, a paper-only measurement waiver promotes one that failed, for that purpose alone:
+
+```sh
+make promote MODEL=<model id> CMD=waive REASON="measuring the live limits"
+```
+
+That is the three steps above with the waiver carried through to the last one, so a failed
+certification is shipped and imported exactly as a passing one is. By hand, on the server:
 
 ```sh
 ./agb-stack agb promote <model id> --waive-for-paper --reason "measuring the live limits"

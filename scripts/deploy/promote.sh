@@ -4,6 +4,9 @@
 #
 #   make promote MODEL=lgbm-2026-10            ship, import and promote, skipping done steps
 #   make promote MODEL=lgbm-2026-10 CMD=check  what the artifact and the server hold; no writes
+#   make promote MODEL=lgbm-2026-10 CMD=waive REASON="why"
+#                                              the same, for a certification that failed its
+#                                              gates, under the paper-only measurement waiver
 #
 # AGB_DEPLOY_HOST (default casaos.local) and AGB_DEPLOY_DIR (default
 # /mnt/data/AppData/agb-trader) say where, as they do for deploy.sh. AGB_RESEARCH_DIR (default
@@ -23,6 +26,12 @@ set -euo pipefail
 host=${AGB_DEPLOY_HOST:-casaos.local}
 dir=${AGB_DEPLOY_DIR:-/mnt/data/AppData/agb-trader}
 research=${AGB_RESEARCH_DIR:-research}
+# Set by the `waive` command below, which promotes a certification that failed its gates under
+# the paper-only measurement waiver. The server's `agb promote` holds every rule about it: it
+# refuses the waiver outside paper mode, on a certification that passed, and on one that is
+# voided or stale, so this only carries the reason across.
+waive=
+reason=${REASON:-}
 # What compose.yaml mounts into the certification-import and cli services as /models.
 models="$dir/models"
 
@@ -43,6 +52,7 @@ usage: promote.sh <model id> [command]
 
   all    (default) ship the artifact, import its certification, promote the model
   check  what the artifact and the server already hold, without writing anything
+  waive  all, under the paper-only measurement waiver; needs REASON="why the waiver"
 EOF
     exit 2
 }
@@ -113,13 +123,16 @@ record() {
 }
 
 make_live() {
-    local was
+    local was promote
     was=$(live)
     if [ "$was" = "$model" ]; then
         echo "already live: $model"
         return
     fi
-    remote "$(q "$dir/agb-stack") agb promote $(q "$model")"
+    promote="$(q "$dir/agb-stack") agb promote $(q "$model")"
+    [ -z "$waive" ] ||
+        promote="$promote --waive-for-paper --reason $(q "$reason")"
+    remote "$promote"
 }
 
 check() {
@@ -147,7 +160,14 @@ check() {
         echo "not certified yet on $host"
     fi
     was=$(live)
-    echo "live model: ${was:-none}"
+    if [ -z "$was" ]; then
+        echo "live model: none"
+    else
+        # Empty unless the live model is promoted under a waiver, which holds back live mode.
+        local waived
+        waived=$(query "SELECT waived_reason FROM agb.promoted_model WHERE waived")
+        echo "live model: $was${waived:+, under a paper waiver: $waived}"
+    fi
 }
 
 all() {
@@ -162,5 +182,11 @@ all() {
 case ${2:-all} in
 all) all ;;
 check) check ;;
+waive)
+    [ -n "$reason" ] ||
+        die "a waiver needs a reason; rerun with REASON=\"measuring the live limits\""
+    waive=1
+    all
+    ;;
 *) usage ;;
 esac
