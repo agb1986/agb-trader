@@ -109,7 +109,13 @@ start() {
     # Nothing outside the standard library, so the server needs no project environment.
     remote "cat > $(q "$remote_script")" < src/agb/measure.py
     # Its own session, so the sampler outlives this SSH connection and the terminal that ran it.
-    remote "cd $(q "$dir") && setsid nohup python3 $(q "$remote_script") \
+    #
+    # The `exec` comes first because the redirections below are the sampler's, not the remote
+    # shell's. That shell stays alive after it backgrounds the sampler, still holding the two
+    # pipes ssh reads the command's output from, and ssh waits for them to close however long
+    # that takes: `start` left the sampler running and then hung for good. Pointing the shell's
+    # own output at /dev/null closes them, and ssh returns as soon as the command is launched.
+    remote "exec > /dev/null 2>&1; cd $(q "$dir") && setsid nohup python3 $(q "$remote_script") \
         --project $(q "$project") --interval $(q "$interval") --out $(q "$remote_table") \
         >> $(q "$remote_log") 2>&1 < /dev/null &" || die "could not start the sampler on $host"
     sleep 2

@@ -412,3 +412,58 @@ def test_sizing_does_not_mistake_its_own_pgrep_for_the_sampler(tmp_path):
     assert done.returncode == 0, done.stderr
     assert "the sampler is not running on server.test" in done.stderr
     assert "sampling on server.test" not in done.stdout
+
+
+# ssh for sizing.sh `start`: it records every remote command and answers `pgrep` the way the
+# server does, with nothing until the sampler has been launched and a pid after it.
+FAKE_SSH_START = """#!/usr/bin/env bash
+cmd=${!#}
+echo "$cmd" >> "$AGB_SSH_LOG"
+case $cmd in
+*pgrep*) grep -q setsid "$AGB_SSH_LOG" && echo 4019410 ;;
+*"cat > "*) cat > /dev/null ;;
+esac
+exit 0
+"""
+
+
+def test_sizing_start_closes_the_remote_shell_s_output(tmp_path):
+    """`ssh` returns when the remote command's output pipes close, not when the command exits,
+    and the shell that backgrounds the sampler goes on holding them: `start` launched the
+    sampler and then hung until it ended. Only the sampler's own output is redirected, so the
+    shell's has to be sent to /dev/null too.
+
+    The hang itself needs the server's bash to reproduce (5.1.4 holds the pipes; the
+    workstation's 5.3.9 does not), so what is checked here is the shape of the command.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    ssh = bin_dir / "ssh"
+    ssh.write_text(FAKE_SSH_START)
+    ssh.chmod(0o755)
+    log = tmp_path / "ssh.log"
+    log.write_text("")
+
+    done = subprocess.run(
+        [str(ROOT / "scripts/deploy/sizing.sh"), "start"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "AGB_SSH_LOG": str(log),
+            "AGB_DEPLOY_HOST": "server.test",
+            "AGB_DEPLOY_DIR": "/deploy/agb-trader",
+        },
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert "as pid 4019410" in done.stdout
+    launch = [line for line in log.read_text().splitlines() if "setsid" in line]
+    assert len(launch) == 1, log.read_text()
+    assert launch[0].startswith("exec > /dev/null 2>&1;")
+    # The sampler's own output still goes to the log it keeps on the server.
+    assert ">> /deploy/agb-trader/measure.log 2>&1 < /dev/null &" in launch[0]
