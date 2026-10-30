@@ -48,6 +48,11 @@ Docker and a system Python but no project environment and no checkout:
 ssh casaos.local 'python3 - --out peaks.md' < src/agb/measure.py
 ```
 
+That system Python is 3.9, where the rest of this project is 3.12, so `src/agb/measure.py` is
+held to 3.9: it postpones its annotations and uses nothing newer. `tests/test_measure.py` runs
+it under a 3.9 interpreter to keep that true, and skips if one is not installed, which
+`uv python install 3.9` fixes.
+
 It samples every 5 seconds by default, stops on the first `Ctrl-C` (or `SIGTERM`), and writes
 its table then. `--interval`, `--project` and `--samples` are there for a shorter leash.
 

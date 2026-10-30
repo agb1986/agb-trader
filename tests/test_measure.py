@@ -5,12 +5,18 @@ through one injected `run`, so the readings here are made up but their shape is 
 tab-separated lines, binary units, a `used / allowed` pair per container.
 """
 
+import os
+import subprocess
+
 import pytest
+from conftest import ROOT
 
 from agb import measure
 from agb.measure import MIB, MeasureError, Peaks, format_size, parse_size, suggested
 
 PROJECT = "agb-trader"
+# What `python3` is on casaos.local, which is not what it is on the workstation.
+SERVER_PYTHON = "3.9"
 
 
 class FakeDocker:
@@ -210,4 +216,58 @@ def test_docker_failing_part_way_keeps_the_readings_it_did_give(tmp_path, monkey
 
     assert measure.main(["--samples", "3", "--interval", "0", "--out", str(out)]) == 1
 
+    assert "| db | agb-trader-db-1 | 1 | 300m | 512m | 480m |" in out.read_text()
+
+
+# docker as the sampler asks for it: `ps` names one container and its compose service, `stats`
+# gives that container one reading. Enough to walk the whole module, not just import it.
+FAKE_DOCKER = """#!/bin/sh
+case "$1" in
+ps) printf 'agb-trader-db-1\\tdb\\n' ;;
+stats) printf 'agb-trader-db-1\\t300MiB / 512MiB\\n' ;;
+esac
+"""
+
+
+def server_python():
+    """The Python the sampler meets on the server, or None if it is not installed here."""
+    found = subprocess.run(
+        ["uv", "python", "find", SERVER_PYTHON],
+        capture_output=True,
+        text=True,
+    )
+    return found.stdout.strip() if found.returncode == 0 else None
+
+
+def test_the_sampler_runs_on_the_server_s_older_python(tmp_path):
+    """`sizing.sh` pipes this module into the server's system Python, which is 3.9 against the
+    workstation's 3.12, and nothing else in the suite would notice it reaching for newer syntax:
+    `list[str] | None` on a function signature parses everywhere and raises only when the
+    interpreter evaluates it, so the first sign of it is a sizing run dying on the server."""
+    python = server_python()
+    if python is None:
+        pytest.skip(f"Python {SERVER_PYTHON} is not installed; `uv python install {SERVER_PYTHON}`")
+    docker = tmp_path / "docker"
+    docker.write_text(FAKE_DOCKER)
+    docker.chmod(0o755)
+    out = tmp_path / "peaks.md"
+
+    done = subprocess.run(
+        [
+            python,
+            str(ROOT / "src/agb/measure.py"),
+            "--samples",
+            "1",
+            "--interval",
+            "0",
+            "--out",
+            str(out),
+        ],
+        env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert done.returncode == 0, done.stderr
     assert "| db | agb-trader-db-1 | 1 | 300m | 512m | 480m |" in out.read_text()
