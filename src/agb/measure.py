@@ -11,7 +11,10 @@ adds headroom on top of it (`HEADROOM`, with a floor of `FLOOR` and rounded up t
 rather than pretending the measurement is exact.
 
 It depends on nothing outside the standard library, so it also runs on the server, which has
-Docker and a system Python but no project environment:
+Docker and a system Python but no project environment. That Python is older than the
+workstation's (3.9 against 3.12), so this module alone is written to the older one: annotations
+are postponed by the `__future__` import below, which keeps `X | None` out of the interpreter's
+hands, and nothing here uses syntax or library calls newer than 3.9.
 
     ssh casaos.local 'python3 - --out peaks.md' < src/agb/measure.py
 
@@ -23,6 +26,8 @@ killed rather than interrupted.
 `scripts/deploy/sizing.sh` drives it against the server, and docs/build/measured-limits.md is
 the procedure it belongs to.
 """
+
+from __future__ import annotations
 
 import argparse
 import re
