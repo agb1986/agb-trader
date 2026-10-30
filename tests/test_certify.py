@@ -33,7 +33,8 @@ OPTIONS = certify.Options(model_id="ranker-2024.1", size=6, hold_through=10)
 PRIORS = ("mom_12_1", "mom_6_1", "rev_1m", "vol_12m", "log_mktcap")
 STAGE_1 = "stage 1 (classical ranker) only"
 # The ledger of a workstation that has tried many things: enough declared trials that no
-# thirty-month edge survives the deflated Sharpe.
+# thirty-month edge survives the deflated Sharpe. Each row is a different configuration, so
+# every one of them is a trial the count charges for.
 MANY = 500
 
 
@@ -86,7 +87,8 @@ def stuff(ledger: Ledger, panel: Panel, count: int) -> None:
     rows = [
         {
             "trial_id": f"{i:016x}", "kind": "scan", "status": "succeeded",
-            "started_at": now, "finished_at": now, "config": "{}", "features": "[]",
+            "started_at": now, "finished_at": now,
+            "config": trials.encode({"scan": i}), "features": "[]",
             "train_start": panel.months[0].as_of, "train_end": panel.months[-1].as_of,
             "partition_hash": panel.partition_hash,
             "cost_model_version": panel.cost_model_version, "code_version": "test",
@@ -117,6 +119,12 @@ class Artifact:
 
     def drop_last_trial(self) -> None:
         rows = self.ledger().rows()[:-1]
+        pq.write_table(pa.Table.from_pylist(rows, schema=trials.SCHEMA), self.ledger().path)
+
+    def drop_first_trial(self) -> None:
+        """Drop the first row, which is a prior backtest: a configuration the search counted,
+        unlike the rows a certification nests."""
+        rows = self.ledger().rows()[1:]
         pq.write_table(pa.Table.from_pylist(rows, schema=trials.SCHEMA), self.ledger().path)
 
     def rewrite(self, **changes) -> None:
@@ -193,15 +201,24 @@ def test_the_artifact_carries_every_field_the_row_needs(certified, panel):
 def test_the_ledger_shipped_in_the_artifact_declares_the_trial_count(certified, prior):
     ledger, prior_ids = prior
     shipped = Ledger(certified.directory / trials.FILE)
-    # The five prior backtests, the certification, its cross-validation and its backtest.
-    declared = len(PRIORS) + 3
-    assert shipped.count() == ledger.count() == certified.manifest["declared_trials"] == declared
+    # Eight rows: the five prior backtests, the certification, its cross-validation and its
+    # backtest. Six configurations: the cross-validation and the backtest ran inside the
+    # certification, so they are the mechanics of one evaluation rather than two more searched.
+    rows = len(PRIORS) + 3
+    declared = len(PRIORS) + 1
+    assert shipped.count() == ledger.count() == rows
+    assert shipped.declared() == ledger.declared() == declared
+    assert certified.manifest["declared_trials"] == declared
+    assert certified.manifest["ledger_rows"] == rows
+    assert certified.manifest["declared_trials_rule"] == trials.RULE
     assert {row["kind"] for row in shipped.rows()} == {"backtest", "cpcv", "certification"}
     assert shipped.digest() == ledger.digest()
     own = shipped.get(certified.trial_id)
     assert own["kind"] == "certification" and own["status"] == "succeeded"
     results = json.loads(own["results"])
     assert results["declared_trials"] == declared and results["passed"]
+    assert results["declared_trials_rule"] == trials.RULE
+    assert results["ledger_rows"] == rows
     assert results["certifies"] == STAGE_1
     assert results["candidate_trials"] == prior_ids
     assert results["cpcv_trial_id"] != results["backtest_trial_id"]
@@ -236,7 +253,8 @@ def test_the_report_says_what_the_gates_certify(certified):
     assert "net of 1x modelled cost" in report
     assert "- dsr: " in report and "- dsr_2x: " in report and "- pbo: " in report
     assert "break-even cost multiple" in report
-    assert "trials declared from the ledger" in report
+    assert f"{len(PRIORS) + 1} trials declared from the {len(PRIORS) + 3} rows of the" in report
+    assert f"counted as {trials.RULE}" in report
 
 
 def test_a_certification_is_never_overwritten(certified, prior, panel, research_lake):
@@ -344,15 +362,19 @@ def test_a_failing_run_is_recorded_not_discarded(failed, certified, db):
     assert not failed.passed
     manifest = failed.manifest
     assert not manifest["gates"]["dsr"]["passed"]
-    assert manifest["declared_trials"] == MANY + 3
+    # Every stuffed row is its own configuration, and the certification is one more; the two
+    # rows it nests are not.
+    assert manifest["declared_trials"] == MANY + 1
+    assert manifest["ledger_rows"] == MANY + 3
     ledger = Ledger(failed.directory / trials.FILE)
+    assert ledger.count() == MANY + 3
     own = ledger.get(failed.trial_id)
     assert own["status"] == "succeeded" and not json.loads(own["results"])["passed"]
     report = (failed.directory / certify.REPORT).read_text()
     assert report.startswith(f"# Certification of {OPTIONS.model_id}: FAILED")
     assert f"These gates certify {STAGE_1}." in report
     row = imported(db, failed.directory)
-    assert not row["passed"] and row["declared_trials"] == MANY + 3
+    assert not row["passed"] and row["declared_trials"] == MANY + 1
     assert row["dsr"] == manifest["dsr"]
 
 
@@ -395,12 +417,25 @@ def test_a_tampered_ledger_is_detected(db, certified, tmp_path):
         artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
 
-def test_a_ledger_that_disagrees_with_the_declared_count_is_refused(db, certified, tmp_path):
+def test_a_ledger_with_the_wrong_number_of_rows_is_refused(db, certified, tmp_path):
     copy = copied(certified, tmp_path)
     copy.drop_last_trial()
     copy.rewrite()
     with pytest.raises(
-        artifact.CertificationError, match="holds 7 trials; the certification declared 8"
+        artifact.CertificationError, match="holds 7 rows; the certification shipped 8"
+    ):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
+
+
+def test_a_ledger_that_disagrees_with_the_declared_count_is_refused(db, certified, tmp_path):
+    # A forger who drops a configuration that was searched and covers the row count over it.
+    # The recount under the manifest's own rule is what refuses the artifact.
+    copy = copied(certified, tmp_path)
+    copy.drop_first_trial()
+    copy.rewrite(ledger_rows=len(PRIORS) + 2)
+    with pytest.raises(
+        artifact.CertificationError,
+        match="holds 5 trials counted as configurations; the certification declared 6",
     ):
         artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
@@ -409,12 +444,16 @@ def test_a_declared_count_the_trial_row_disagrees_with_is_refused(db, certified,
     copy = copied(certified, tmp_path)
     copy.rewrite(declared_trials=7)
     with pytest.raises(
-        artifact.CertificationError, match="holds 8 trials; the certification declared 7"
+        artifact.CertificationError,
+        match="holds 6 trials counted as configurations; the certification declared 7",
     ):
         artifact.import_artifact(db.connect(RESEARCH), copy.directory)
+    # Dropping a configuration and lowering the declared count to match leaves the recount and
+    # the manifest agreeing. The count the run itself charged for, which is in its own trial
+    # row under the ledger's digest, is what refuses it.
     copy = copied(certified, tmp_path / "again")
-    copy.drop_last_trial()
-    copy.rewrite(declared_trials=7)
+    copy.drop_first_trial()
+    copy.rewrite(declared_trials=len(PRIORS), ledger_rows=len(PRIORS) + 2)
     with pytest.raises(
         artifact.CertificationError, match="disagrees with the certification's own trial row"
     ):

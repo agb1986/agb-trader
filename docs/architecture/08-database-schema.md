@@ -85,12 +85,12 @@ Rejected: mutable order status updated in place from the broker stream, which lo
 `model_certification` is an immutable row holding:
 
 - the artifact's sha256 and path, the feature list, and the training window;
-- the declared trial count;
+- the declared trial count, which is the distinct configurations its ledger says were searched, not that ledger's row count (see [01 — Data, broker and backtesting](01-data-broker-backtesting.md));
 - DSR, PBO and cost-inclusive Sharpe, DSR at 2× modelled cost, the break-even cost multiple, and max and mean participation;
 - the cost-model version and the certified capital;
 - the CPCV path-distribution quantiles from which the performance alerts take their thresholds: maximum drawdown, longest losing run, and tracking dispersion. Thresholds belong to the certification that produced them, so each new model brings its own.
 
-**The trial count is checked, not trusted.** The workstation's trial ledger ships inside the artifact as a hashed `trials.parquet`, and the live pipeline refuses a model whose declared trial count differs from the ledger's row count. The DSR gate then rests on a count of recorded trials rather than a number someone typed.
+**The trial count is checked, not trusted.** The workstation's trial ledger ships inside the artifact as a hashed `trials.parquet`, and the live pipeline recounts it, under the rule the manifest says the certification counted by, and refuses a model whose declared trial count differs from that recount. The DSR gate then rests on a count of recorded trials rather than a number someone typed. The row the count is held against keeps only the number; the rule it was counted under lives in the manifest, next to a count of the ledger's rows, and the ledger itself is pinned by the artifact digest the row holds.
 
 `certification_event` records voiding, for example when cost constants change, and live refuses a voided model. It also records a paper-only measurement waiver, at most one per certification: a model that failed its gates, promoted so the stack can be exercised end to end before any model has passed. A waived model trades in paper and nowhere else, and a move to live is refused while it is the live one (`docs/build/deploy.md`). `promotion_event` records which certification is live. **Promotion is a human act through the server-side CLI** (`agb promote <model_id>`), not Telegram or the UI. It happens roughly once a year at the annual refit and is the most consequential state change in the system, so it stays off the phone. `/status` shows which model is live.
 

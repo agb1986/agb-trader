@@ -36,8 +36,8 @@ names the certification and the artifact digest it was ranked with, and the gate
 whose digest is not the live certification's.
 
 This module never imports agb.research, which needs pandas; it reads the artifact's layout
-itself, and the tests hold the two to the same file names. LightGBM is imported when a model
-is loaded.
+itself, and the tests hold the two to the same file names and to the same trial count over the
+same ledger. LightGBM is imported when a model is loaded.
 """
 
 from __future__ import annotations
@@ -72,6 +72,16 @@ DEFAULT_MODELS_DIR = Path("/models")
 MANIFEST = "manifest.json"
 MODEL = "model.txt"
 LEDGER = "trials.parquet"
+# How the certification counted its declared trials, from agb.research.trials, reimplemented
+# here for the same reason as the file names above. A manifest that names no rule was written
+# before there was more than one and declared the ledger's row count. `_IDENTITY` is what makes
+# two rows the same configuration; a row inside another row's interval is that run's own
+# cross-validation or backtest rather than another configuration searched.
+RULES = ("rows", "configurations")
+_IDENTITY = (
+    "kind", "config", "features", "train_start", "train_end",
+    "partition_hash", "cost_model_version", "code_version",
+)  # fmt: skip
 
 PROMOTE = "promote"
 VOID = "void"
@@ -195,16 +205,48 @@ def live(conn: psycopg.Connection) -> Certification | None:
 # The artifact.
 
 
+def declared_trials_of(ledger: Path, rule: str) -> int:
+    """How many trials the ledger at `ledger` holds, under `rule`.
+
+    The same count `agb.research.trials.declared` computes, over the ledger shipped in the
+    artifact. `rows` is every row. `configurations` is the distinct configurations that came
+    back with a result: rows nested inside another run's interval are that one run's
+    cross-validation and backtest, repeats of a configuration are one configuration, and a
+    configuration that never succeeded produced nothing to select on.
+    """
+    table = pq.read_table(ledger)
+    if rule == "rows":
+        return table.num_rows
+    if rule != "configurations":
+        raise RegistryError(f"the certification counted its trials by an unknown rule {rule!r}")
+    rows = table.select(["trial_id", "status", "started_at", "finished_at", *_IDENTITY]).to_pylist()
+    ends = {row["trial_id"]: row["finished_at"] or row["started_at"] for row in rows}
+    counted = set()
+    for row in rows:
+        if row["status"] != "succeeded":
+            continue
+        inside = any(
+            other["started_at"] < row["started_at"]
+            and ends[other["trial_id"]] >= ends[row["trial_id"]]
+            for other in rows
+            if other["trial_id"] != row["trial_id"]
+        )
+        if not inside:
+            counted.add(tuple(row[name] for name in _IDENTITY))
+    return len(counted)
+
+
 def verify(directory: Path, artifact_sha256: str, declared_trials: int) -> None:
     """Check that `directory` holds the certified artifact: its shipped ledger holds exactly
-    the declared number of trials, it has a booster, every listed file is present with its
-    listed digest, nothing unlisted is there, and the digest over the digests is the
-    certification's."""
+    the declared number of trials, counted the way the manifest says they were counted, it has
+    a booster, every listed file is present with its listed digest, nothing unlisted is there,
+    and the digest over the digests is the certification's."""
     path = directory / MANIFEST
     if not path.is_file():
         raise RegistryError(f"{directory} holds no {MANIFEST}")
     try:
-        files = json.loads(path.read_text())["files"]
+        manifest = json.loads(path.read_text())
+        files = manifest["files"]
         if not isinstance(files, dict):
             raise TypeError("files is not a mapping")
     except (ValueError, KeyError, TypeError) as exc:
@@ -212,14 +254,18 @@ def verify(directory: Path, artifact_sha256: str, declared_trials: int) -> None:
     ledger = directory / LEDGER
     if LEDGER not in files or not ledger.is_file():
         raise RegistryError(f"{directory} holds no {LEDGER}")
+    # The rule is read from the manifest, not the database, which keeps the count alone; the
+    # ledger it is applied to is pinned by the digest the database holds, so the recount is of
+    # the file the certification shipped whatever the manifest says about how to count it.
+    rule = manifest.get("declared_trials_rule", "rows")
     try:
-        trials = pq.read_metadata(ledger).num_rows
-    except (OSError, pa.ArrowException) as exc:
+        trials = declared_trials_of(ledger, rule)
+    except (OSError, pa.ArrowException, KeyError) as exc:
         raise RegistryError(f"{ledger} is not a trial ledger: {exc}") from None
     if trials != declared_trials:
         raise RegistryError(
-            f"the artifact's ledger holds {trials} trials; the certification declared"
-            f" {declared_trials}"
+            f"the artifact's ledger holds {trials} trials counted as {rule}; the certification"
+            f" declared {declared_trials}"
         )
     if MODEL not in files:
         raise RegistryError(f"{directory} holds no {MODEL}")
