@@ -36,9 +36,11 @@ live basket does not trade, selected against the shadow's own previous book, wit
 targets and no orders. It is a record of the counterfactual, never a position, so it has no
 reference, nothing to type at it, and the `basket_event` trigger refuses to move it on.
 
-The book is what the last filled live basket holds. Until the execution ticket lands there is
-no filled basket, so the book is empty and the first proposal buys twenty names. Execution
-replaces `book` with the broker's positions; the rules that consume it do not change.
+The book is what the broker reported at its last position read, which is also the book
+`agb.position_mismatch` reconciles against. Until the first basket fills there is no snapshot
+and the book is empty, so the first proposal buys twenty names. It is deliberately not the
+targets of the last filled basket: a basket reaches `filled` when its session is over, so the
+targets of orders that expired unfilled would stand in the book as positions nobody holds.
 
 A forced corporate event the operator recorded against the period (agb.corporate) is folded
 into that book first, so the rebalance starts from the holdings the broker actually has, and

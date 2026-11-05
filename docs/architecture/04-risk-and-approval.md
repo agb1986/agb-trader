@@ -45,6 +45,7 @@ Checks span three levels, because a basket can be perfectly self-consistent and 
 - No duplicate symbols.
 - Projected cash non-negative.
 - Turnover below roughly 60% of the book. The 20-buy/30-hold rank buffer should produce far less, so 60% indicates something upstream moved that should not have.
+  - Exception, as built: where the model behind the book is not the model that ranked the basket, the check admits up to a full rotation and records the change that admitted it. The rank buffer only holds the overlap up within one ranking; across two it says nothing, so a changed model has a declared reason to turn the book over and a flat 60% would halt every month that promotes one. The model behind the book is the ranker and artifact digest of the last live basket whose orders actually filled, and the exemption needs that change on the record: an unknown model, or the same name with a digest missing, reads as unchanged. Turnover above 100% stays a breach under any model, because a plan cannot sell more than the book is worth.
 
 **Order level.**
 - Symbol present in the current universe snapshot.

@@ -146,3 +146,41 @@ or to leave it and skip again, is the call to make before 2026-11-30 23:00 UTC.
 - `agb.broker_state`, 2026-11-05 10:09:10Z.
 - `src/agb/gate.py:76` and `src/agb/gate.py:361-378`; `src/agb/basket.py:158-167` and
   `src/agb/basket.py:285-288`.
+
+## Decision
+
+Taken 2026-11-05: option (d), on top of (b), which landed separately as PR #118.
+
+The gate's turnover check now admits up to a full rotation where the model behind the book is not
+the model that ranked the basket, and records the change that admitted it. The reasoning is the
+one the module docstring already states: these limits are malfunction detectors, not risk
+management. The rank buffer holds the overlap up within one ranking; across two rankings it says
+nothing, so a basket ranked by a newly promoted model has a declared reason to turn the book over,
+and a flat 60% would halt every month that promotes one.
+
+How it is built:
+
+- The model behind the book is the ranker and artifact digest of the last live basket whose orders
+  actually filled (`gate._HELD`, joining `agb.broker_order` to `agb.fill`). Deliberately not the
+  last basket in `filled`: that state only says the session is over, and a basket whose every
+  order expired unfilled reaches it having bought nothing, so its ranker never touched the book.
+  `basket.book()` cannot supply this, because after (b) it reads the broker's position snapshot,
+  which carries no provenance.
+- The change test is fail closed (`gate._model_changed`). No basket has ever filled, the same
+  ranker with the same digest, or the same ranker with either digest missing: all read as
+  unchanged, and the flat 60% stands. A different ranker name, or the same name with two differing
+  digests on the record, is a change.
+- The exemption is bounded at 100%. A plan that claims to sell more than the book is worth is a
+  malfunction under any model, which is the case the check was written for.
+- The exemption text goes in the check's `threshold`, not its `measured`. `measured` stays a bare
+  percentage, because `approval._fraction` and `readout.turnover_text` parse it as one; putting
+  prose there would silence the separate 30% `UNUSUAL_TURNOVER` ask to the human on exactly the
+  months that rotate hardest. A test pins that the L1 ask survives the exemption.
+
+What this does not do: it does not un-halt the 2026-11 basket. The gate runs once per basket and
+`run()` returns the verdict it recorded, and `/resume` clears the `gate_breach` latch without
+resubmitting. The change takes effect at the 2026-12 rebalance.
+
+Rejected: exempting a basket whose targets are disjoint from the book. That reads the same as (d)
+in this instance but lets a churny model rotate the book fully every month, which is the thing the
+check exists to stop.
