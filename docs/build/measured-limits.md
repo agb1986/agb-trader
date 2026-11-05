@@ -2,7 +2,7 @@
 
 **Source:** [#45 Measured memory limits and panel-store integrity check](https://github.com/agb1986/agb-trader/issues/45)
 **Design:** [07 — Services and deployment](../architecture/07-services-deployment.md)
-**Date:** 2026-10-24
+**Date:** 2026-10-24, limits set from the server sizing run 2026-11-05
 
 Three of the numbers this stack runs on were left to the build because they cannot be
 reasoned out: how much memory each service really needs, how long each job really takes, and
@@ -20,14 +20,16 @@ file records both the measurement and the arithmetic between it and the limit.
 
 | Criterion                                          | State                                                                     |
 | -------------------------------------------------- | ------------------------------------------------------------------------- |
-| (a) Peak memory per service during a full rebalance | Tool built and tested; **the sizing run on the server is owed.**          |
-| (b) Every limit derived from its measurement        | Arithmetic fixed and tested; limits move when (a) lands.                  |
+| (a) Peak memory per service during a full rebalance | Done: 68455 readings on the server across the 2026-11 rebalance, below.    |
+| (b) Every limit derived from its measurement        | Limits set from (a); **the second rebalance under them is owed.**         |
 | (c) Poll intervals and leases from measured times   | `agb runtimes` built; current values below are the unmeasured defaults.   |
 | (d) Nightly hash check of a sample of panel bodies  | Done in code and tested; the corruption check on the server is scripted.  |
 
-Nothing below invents a number for (a) or (b). The table further down is a workstation
-baseline taken while two services were idle, which is useful only as a demonstration that the
-tool reads docker correctly; it is **not** the sizing run and no limit may be changed from it.
+Nothing below invents a number for (a) or (b). Two tables follow and only one of them is a
+measurement of this stack under load: the server sizing run of 2026-11-05, which is where every
+limit in `compose.yaml` now comes from. The other is a workstation baseline taken while two
+services were idle, kept because it is the demonstration that the tool reads docker correctly;
+it is **not** the sizing run and no limit may be changed from it.
 
 ## The sampler
 
@@ -95,8 +97,9 @@ serving the evidence views, and the workstation is not the server.
 | db | agb-trader-db-1 | 3 | 50m | 512m | 128m |
 | ui | agb-trader-ui-1 | 3 | 155m | 256m | 256m |
 
-`db`'s 512m stays until a rebalance has been measured against it: an idle Postgres with no
-lake query running says nothing about Postgres under the pipeline's reads.
+`db`'s 512m stood until a rebalance had been measured against it, because an idle Postgres with
+no lake query running says nothing about Postgres under the pipeline's reads. The sizing run
+below measured it and the limit moved.
 
 ## The sizing run the operator owes
 
@@ -162,6 +165,55 @@ copies the table to `peaks.md` on the workstation.
 4. Deploy, and run a second full rebalance under the new limits with no container exiting 137.
    That second run is criterion (b); the first run alone is not, and since a rebalance is
    monthly, (b) lands a month after (a) unless a forced run is accepted.
+
+### Server sizing run, 2026-11-05 — the reading the limits come from
+
+68455 readings on casaos.local, from 2026-10-30 to 2026-11-05 09:08 UTC, through the server's
+own Docker. The window covers the 2026-11 rebalance that became claimable at 2026-10-30 22:00
+UTC, including its stage-2 panel run: the EDGAR fetches and the model calls, which is the
+heaviest thing this stack does and the reason the run had to wait for a real rebalance. No
+container exited 137 during the window, and `pipeline` finished the panel with `RestartCount 0`
+and `OOMKilled false`, so the readings stand.
+
+| service | container | samples | peak | limit then | limit it argues for | limit now |
+| --- | --- | --: | --: | --: | --: | --: |
+| backup | agb-trader-backup-1 | 68455 | 81m | 256m | 160m | 160m |
+| bot | agb-trader-bot-1 | 68455 | 105m | 256m | 192m | 192m |
+| db | agb-trader-db-1 | 68455 | 95m | 512m | 160m | 160m |
+| execution | agb-trader-execution-1 | 68455 | 105m | 256m | 192m | 192m |
+| pipeline | agb-trader-pipeline-1 | 68455 | 1441m | 2g | 2176m | 2176m |
+| scheduler | agb-trader-scheduler-1 | 68455 | 104m | 256m | 192m | 192m |
+| ui | agb-trader-ui-1 | 68455 | 100m | 256m | 192m | 192m |
+| vpn | agb-trader-vpn-1 | 68455 | 243m | 256m | 384m | 384m |
+
+Every limit is the column it argues for, so step 1 above took no judgement. Three of them are
+worth reading twice:
+
+- **`vpn` was the one at risk.** 243m against a 256m limit, drifting up over the week
+  (222m, 223m, 243m) as gluetun's tunnel stayed open. It is the only service that was anywhere
+  near its limit, and the only one whose limit went up for safety rather than down for room.
+- **`pipeline` rose from 99m to 1441m during the 28-minute panel run** and stayed inside its 2g
+  with about 600m to spare — but 1441m argues for 2176m, which is *above* the old limit. The
+  limit went up: a peak this close to a cap on the heaviest stage is the case the headroom rule
+  exists for.
+- **`db` dropped from 512m to 160m.** 95m is Postgres under the gate's 200 checks and the panel
+  writes, not an idle Postgres, so the reading is a real one. It is still one rebalance, and
+  one whose execution filled only 3 of 20 orders, so a month with a full basket to reconcile is
+  the run that tests it.
+
+The one-shots (`migrate`, `cli`, `reconcile`, `certification-import`) are not in the table
+because they exit long before a sampling interval means anything for them. They stay at 256m.
+`research` stays at 40g: it runs on the workstation only, never on the server.
+
+The total, which is step 2: the eight long-running limits sum to **3648m**, down from 4096m.
+That is more than the box has, deliberately — `mem_limit` is a cap, not a reservation, and what
+the stack actually holds at once is the peak column, **2274m**, of which `pipeline`'s 1441m
+happens for under half an hour a month. The sum is the worst case the kernel would allow, not
+the working set, and it is now 448m lower than it was.
+
+Criterion (b) is the next rebalance under these limits with nothing exiting 137. The 2026-11
+rebalance is halted at the turnover check, so that is 2026-12 unless the halt is resolved and a
+run is forced.
 
 `tests/test_compose.py` enforces that every service still declares a limit, so a limit cannot
 be deleted in passing, only changed.

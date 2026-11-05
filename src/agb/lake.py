@@ -67,7 +67,7 @@ CHUNK = 1 << 20
 # up later as a corrupt archive.
 ZIP_MAGIC = b"PK\x03\x04"
 # DuckDB's memory while it splits a bulk export; it spills the rest to disk. The pipeline
-# container is limited to 2g.
+# container is limited to 2176m, measured (docs/build/measured-limits.md).
 BULK_MEMORY = "1GB"
 # A bulk export is written as one Parquet file per partition, and SEP's history from 1998 is
 # about 7,200 daily partitions. DuckDB buffers rows for every distinct partition value one COPY
