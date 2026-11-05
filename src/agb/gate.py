@@ -35,7 +35,8 @@ approval message becomes the notification `agb.approval.notify` raises.
 The gate itself is not part of the ladder: it runs, and halts what fails, at every level.
 
 Equity is the capital the basket was sized against until execution reads the broker's
-account, and the book is `basket.book`. Both change source later; the checks do not.
+account; that source changes later and the checks do not. The book is `basket.book`: the
+positions the broker reported at its last read, not what any basket was planned to hold.
 
 The gate is safe to redo. It runs once per basket, in one transaction with its verdict, and
 a rebalance job reclaimed after the gate ran reads the recorded verdict back.

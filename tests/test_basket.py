@@ -197,7 +197,7 @@ def test_the_basket_is_the_book_and_the_order_plan_moves_it(db, tmp_path):
     # Selling OLD turns over 8,000 of the book's 22,500, with HALT marked at its last close.
     [(turnover,)] = rows(db, "SELECT measured FROM agb.gate_check WHERE name = 'turnover'")
     assert turnover == "35.56%"
-    # The book is the last filled basket, so the proposal has not moved it yet.
+    # The book is the broker's latest snapshot, so the proposal has not moved it yet.
     assert basket.book(db.connect("pipeline")) == book
 
 
@@ -439,8 +439,11 @@ def move(db, basket_id, seq, from_state, to_state, role, surface=None):
     )
 
 
-def filled_basket(db, reference, positions):
-    """A basket that went all the way to filled, holding `positions` (symbol: shares)."""
+def filled_basket(db, reference, positions, read=True):
+    """A basket that went all the way to filled, holding `positions` (symbol: shares). The
+    broker's snapshot is written too, because the book the rebalance reads is the broker's
+    positions and not these targets: a basket can reach filled with orders that expired.
+    With `read` false the account is never read, and the targets stand alone."""
     basket_id = proposed_basket(db, reference)
     conn = db.connect("pipeline")
     for symbol, shares in positions.items():
@@ -453,7 +456,28 @@ def filled_basket(db, reference, positions):
     move(db, basket_id, 3, "pending", "approved", "bot", "telegram")
     move(db, basket_id, 4, "approved", "submitted", "execution")
     move(db, basket_id, 5, "submitted", "filled", "execution")
+    if read:
+        snapshot(db, positions)
     return basket_id
+
+
+def snapshot(db, positions, snapshot_date=None):
+    """The broker's position read, as execution writes it after a close."""
+    conn = db.connect("execution")
+    [(last,)] = rows(db, "SELECT max(snapshot_date) FROM agb.position_snapshot")
+    if snapshot_date is None:
+        snapshot_date = last + timedelta(days=1) if last else date(2026, 9, 30)
+    [(snapshot_id,)] = conn.execute(
+        "INSERT INTO agb.position_snapshot (snapshot_date, positions, actor)"
+        " VALUES (%s, %s, 'execution') RETURNING id",
+        (snapshot_date, len(positions)),
+    ).fetchall()
+    for symbol, shares in positions.items():
+        conn.execute(
+            "INSERT INTO agb.position (snapshot_id, symbol, qty) VALUES (%s, %s, %s)",
+            (snapshot_id, symbol, shares),
+        )
+    return snapshot_id
 
 
 def state(db, basket_id):
@@ -470,6 +494,33 @@ def test_a_basket_walks_from_proposed_to_filled_by_the_roles_allowed_each_step(d
         (4, "submitted", "execution", "execution"),
         (5, "filled", "execution", "execution"),
     ]
+
+
+def test_the_book_is_what_the_broker_holds_and_not_what_the_basket_declared(db):
+    """A basket reaches filled when the session is over, whatever its orders did. The orders
+    that expired leave their targets standing, so the targets of a filled basket are a plan
+    and not a holding. The rebalance starts from the broker's own read."""
+    filled_basket(db, "2026-09", {"AAA": 10, "BBB": 20})
+    # BBB's MOC order expired unfilled, so the next read of the account holds AAA alone.
+    snapshot(db, {"AAA": 10})
+
+    assert basket.book(db.connect("pipeline")) == {"AAA": Decimal(10)}
+
+
+def test_a_book_is_empty_until_the_broker_has_been_read(db):
+    """Targets on their own are not a book. Until execution has read the account there is
+    nothing to start a rebalance from, whatever a basket says it bought."""
+    filled_basket(db, "2026-09", {"AAA": 10}, read=False)
+
+    assert basket.book(db.connect("pipeline")) == {}
+
+
+def test_an_account_that_holds_nothing_reads_as_an_empty_book(db):
+    """The snapshot row says the read happened. No positions against it is an account holding
+    nothing, which is a book, not a missing one."""
+    snapshot(db, {})
+
+    assert basket.book(db.connect("pipeline")) == {}
 
 
 def test_two_transitions_from_the_same_state_let_exactly_one_through(db):
