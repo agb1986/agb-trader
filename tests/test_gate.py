@@ -71,6 +71,7 @@ class Case:
     book: dict[str, Decimal] = field(default_factory=dict)
     now: datetime = EVENING
     promoted: gate.Promoted | None = PROMOTED
+    held: gate.Held | None = None
 
 
 SOUND = Case()
@@ -84,6 +85,7 @@ def evaluate(case=SOUND):
         book=case.book,
         now=case.now,
         promoted=case.promoted,
+        held=case.held,
     )
 
 
@@ -97,6 +99,19 @@ TURNOVER = Case(
     marks=MARKS | {s: Decimal(20) for s in HELD},
     book={s: Decimal(300) for s in HELD},
 )
+
+# Selling all ten held positions, $60,000 of a $60,000 book: a full rotation, 100% turnover.
+ROTATION = Case(
+    replace(BASE, orders=tuple(sell(s) for s in HELD) + BASE.orders),
+    marks=MARKS | {s: Decimal(20) for s in HELD},
+    book={s: Decimal(300) for s in HELD},
+)
+# The model behind the book: the one that ranked the basket, then three that are not it, or
+# are not on the record as not being it.
+SAME_MODEL = gate.Held(MODEL, ARTIFACT)
+OTHER_RANKER = gate.Held("placeholder-momentum-252-21", ZERO_HASH)
+RETRAINED = gate.Held(MODEL, ZERO_HASH)
+UNRECORDED = gate.Held(MODEL, None)
 
 # Each fixture fails exactly the check it names, and nothing else.
 FAILURES = [
@@ -190,6 +205,70 @@ def test_the_failing_checks_say_what_they_measured():
     assert failed(Case(marks={})) == [(None, f"no mark for {', '.join(NAMES)}")]
     assert failed(Case(book={"N05": Decimal(100)})) == [("N05", "buy 240, holding 100")]
     assert failed(Case(now=LATE)) == [(s, "2026-10-01 15:45 ET") for s in NAMES]
+
+
+def test_a_changed_ranker_admits_a_full_rotation_and_the_check_records_what_admitted_it():
+    """The limit catches a broken pipeline, not a bad month. Two rankings share no rank buffer,
+    so a basket ranked by a model that did not buy the book has a declared reason to turn it
+    over, and the check says which change let it through."""
+    exempt = {c.name: c for c in evaluate(replace(ROTATION, held=OTHER_RANKER))}["turnover"]
+
+    assert exempt.measured == "100.00%"
+    assert exempt.threshold == (
+        f"< 60%, or <= 100% on a changed model (placeholder-momentum-252-21 -> {MODEL})"
+    )
+    assert exempt.passed
+    # The measured value stays a bare percentage, because approval.ask_reason parses it to
+    # decide whether to put unusual turnover to the human, and the exemption must not silence
+    # that on the months that rotate hardest.
+    assert approval.ask_reason([], exempt.measured) is not None
+
+
+def test_a_retrain_under_the_same_name_is_a_changed_model():
+    """The ranker name is not the model. Two digests on the record that differ are a different
+    artifact whatever it is called."""
+    exempt = {c.name: c for c in evaluate(replace(ROTATION, held=RETRAINED))}["turnover"]
+
+    assert exempt.threshold.endswith(f"({MODEL} {ZERO_HASH[:12]} -> {ARTIFACT[:12]})")
+    assert exempt.passed
+
+
+@pytest.mark.parametrize(
+    ("held", "id"),
+    [(None, "no model on the record"), (SAME_MODEL, "the same model"), (UNRECORDED, "no digest")],
+    ids=["unknown", "same_model", "unrecorded_digest"],
+)
+def test_a_full_rotation_breaches_unless_the_change_is_on_the_record(held, id):
+    """Fail closed: the exemption is positively evidenced or it does not apply. A book bought
+    by the same model, a book no filled basket accounts for, and a model whose digest is
+    missing all stay on the flat limit."""
+    rotation = {c.name: c for c in evaluate(replace(ROTATION, held=held))}["turnover"]
+
+    assert rotation.measured == "100.00%"
+    assert rotation.threshold == "< 60%", id
+    assert not rotation.passed, id
+
+
+def test_a_changed_model_does_not_admit_selling_more_than_the_book_is_worth():
+    """A plan cannot sell more than the book holds, so anything above a full rotation is
+    arithmetic that does not add up, which is exactly what the check is for."""
+    phantom = replace(ROTATION, held=OTHER_RANKER, book={"H01": Decimal(300)})
+
+    turnover = {c.name: c for c in evaluate(phantom)}["turnover"]
+
+    assert turnover.measured == "1000.00%"
+    assert not turnover.passed
+
+
+def test_a_changed_model_leaves_the_flat_limit_in_place_below_a_full_rotation():
+    """The 70% fixture passes on a changed model because a full rotation does, not because the
+    limit moved: the same basket under the same model still breaches."""
+    changed = {c.name: c for c in evaluate(replace(TURNOVER, held=OTHER_RANKER))}["turnover"]
+    unchanged = {c.name: c for c in evaluate(replace(TURNOVER, held=SAME_MODEL))}["turnover"]
+
+    assert changed.measured == unchanged.measured == "70.00%"
+    assert changed.passed
+    assert not unchanged.passed
 
 
 def test_a_held_name_that_left_the_universe_may_still_be_sold():
@@ -494,6 +573,108 @@ def test_the_gate_measures_against_the_broker_read_and_not_the_declared_targets(
     assert {s for n, s in failed if n == "side"} == set(HELD[3:])
     [(measured,)] = rows(db, "SELECT measured FROM agb.gate_check WHERE name = 'turnover'")
     assert measured == "700.00%"
+
+
+def fill(db, basket_id, symbol):
+    """One of that basket's orders, taken by the broker and executed. A fill is the only
+    evidence that the model which ranked the basket is in the book."""
+    conn = db.connect("execution")
+    [(basket_order_id, client_order_id, side, qty)] = conn.execute(
+        "SELECT id, client_order_id, side, qty FROM agb.basket_order"
+        " WHERE basket_id = %s AND symbol = %s",
+        (basket_id, symbol),
+    ).fetchall()
+    [(order_id,)] = conn.execute(
+        "INSERT INTO agb.broker_order (basket_id, basket_order_id, client_order_id, symbol,"
+        " side, qty, cost_model_version, modelled_cost_bps, nbbo_bid, nbbo_ask, nbbo_mid,"
+        " nbbo_at, actor) VALUES (%s, %s, %s, %s, %s, %s, '1', 0, 19.99, 20.01, 20, now(),"
+        " 'execution') RETURNING id",
+        (basket_id, basket_order_id, client_order_id, symbol, side, qty),
+    ).fetchall()
+    conn.execute(
+        "INSERT INTO agb.fill (order_id, execution_id, qty, price, filled_at,"
+        " fee_model_version, actor) VALUES (%s, %s, %s, 20, now(), '1', 'execution')",
+        (order_id, f"x{order_id}", qty),
+    )
+    return order_id
+
+
+def bought(db, positions, ranker, model_sha256=None, filled=True, period="2026-09"):
+    """A live basket that reached `filled`, holding `positions`, ranked by `ranker`. With
+    `filled` false its orders all expired unfilled, which is a state the basket reaches
+    anyway: the session being over is not the same as having bought anything."""
+    basket_id = insert(
+        db,
+        replace(
+            BASE,
+            period=period,
+            session_date=date(2026, 9, 1),
+            snapshot_date=date(2026, 8, 31),
+            ranker=ranker,
+            model_sha256=model_sha256,
+            targets=tuple(gate.Target(s, Decimal("0.05"), n) for s, n in positions.items()),
+            orders=tuple(buy(s, qty=n, notional=n * 20) for s, n in positions.items()),
+        ),
+    )
+    move(db, basket_id, 2, "proposed", "pending", "bot", "telegram")
+    move(db, basket_id, 3, "pending", "approved", "bot", "telegram")
+    move(db, basket_id, 4, "approved", "submitted", "execution")
+    move(db, basket_id, 5, "submitted", "filled", "execution")
+    if filled:
+        fill(db, basket_id, next(iter(positions)))
+    return basket_id
+
+
+def test_a_full_rotation_passes_the_gate_when_the_book_was_bought_by_another_model(db):
+    """The 2026-11 case: last month's book came from a ranker this month's basket does not
+    use, so there is no rank buffer between the two and the plan sells everything. The gate
+    reads the change off the record and records what admitted the rotation."""
+    bought(db, ROTATION.book, "placeholder-momentum-252-21")
+    snapshot(db, ROTATION.book)
+    basket_id = insert(db, ROTATION.target)
+
+    verdict = run(db, basket_id, ROTATION)
+
+    assert verdict.passed
+    assert verdict.state == "approved"
+    [(measured, threshold)] = rows(
+        db, "SELECT measured, threshold FROM agb.gate_check WHERE name = 'turnover'"
+    )
+    assert measured == "100.00%"
+    assert threshold == (
+        f"< 60%, or <= 100% on a changed model (placeholder-momentum-252-21 -> {MODEL})"
+    )
+
+
+def test_the_model_behind_the_book_is_the_last_basket_that_filled_not_the_last_one_closed(db):
+    """A basket reaches `filled` when its session is over, whether or not a single order
+    executed. The model behind the book is the one that actually bought it, so a basket whose
+    orders all expired unfilled is not the anchor even though it closed later."""
+    bought(db, ROTATION.book, "placeholder-momentum-252-21")
+    bought(db, ROTATION.book, MODEL, model_sha256=ARTIFACT, filled=False, period="2026-10")
+    snapshot(db, ROTATION.book)
+    basket_id = insert(db, ROTATION.target, reference="2026-11")
+
+    verdict = run(db, basket_id, ROTATION)
+
+    assert verdict.passed
+    [(threshold,)] = rows(db, "SELECT threshold FROM agb.gate_check WHERE name = 'turnover'")
+    assert "placeholder-momentum-252-21" in threshold
+
+
+def test_a_full_rotation_halts_the_month_when_the_same_model_bought_the_book(db):
+    """The check the limit was written for: nothing on the record explains selling the whole
+    book, so the month halts."""
+    bought(db, ROTATION.book, MODEL, model_sha256=ARTIFACT)
+    snapshot(db, ROTATION.book)
+    basket_id = insert(db, ROTATION.target)
+
+    verdict = run(db, basket_id, ROTATION)
+
+    assert verdict.state == "halted"
+    assert {c.name for c in verdict.failed} == {"turnover"}
+    [(threshold,)] = rows(db, "SELECT threshold FROM agb.gate_check WHERE name = 'turnover'")
+    assert threshold == "< 60%"
 
 
 def test_the_breach_stays_open_until_a_human_clears_it(db):

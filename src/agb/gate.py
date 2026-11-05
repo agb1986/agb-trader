@@ -12,7 +12,9 @@ The gate runs every check that does not need the broker, in three groups:
     scores every name alike is useless whatever each score is, because stage 2 ranks its
     output into percentiles and a flat distribution ranks to noise.
   * **The basket.** Twenty positions whose weights sum to one, no symbol twice, cash left
-    over after the targets are bought, and turnover below 60% of the book. Fewer than twenty
+    over after the targets are bought, and turnover below 60% of the book, or a full
+    rotation where the model behind the book is not the model that ranked the basket. Fewer
+    than twenty
     passes only where a recorded forced corporate event (agb.corporate) explains it, and a
     name the rebalance carried with no event on the record halts the month: a name that has
     quietly stopped printing looks exactly like a halted one, and the difference is a human's
@@ -143,6 +145,16 @@ class Promoted:
 
 
 @dataclass(frozen=True)
+class Held:
+    """The model behind the book: the ranker and artifact digest of the last live basket whose
+    orders actually filled. None when nothing has ever filled, so the book, if there is one,
+    has no model on the record."""
+
+    ranker: str
+    model_sha256: str | None
+
+
+@dataclass(frozen=True)
 class Check:
     level: str
     name: str
@@ -179,6 +191,7 @@ def evaluate(
     book: Mapping[str, Decimal],
     now: datetime,
     promoted: Promoted | None,
+    held: Held | None = None,
     limits: Limits = LIMITS,
     calendar: nyse.NyseCalendar | None = None,
 ) -> list[Check]:
@@ -187,6 +200,8 @@ def evaluate(
     `members` is the universe the basket was ranked from, `marks` each name's last as-traded
     close on or before the signal session, `book` the positions before the rebalance, `now`
     the moment the gate runs and `promoted` the live model, None if nothing is promoted.
+    `held` is the model the book was bought under, which the turnover check reads; None, the
+    default, measures turnover against the flat limit and exempts nothing.
 
     The book is read through the forced events on the record (agb.corporate), because that is
     the book the broker actually has: a position an acquisition terminated is gone, and the
@@ -199,7 +214,7 @@ def evaluate(
     calendar = calendar or nyse.NyseCalendar(first - timedelta(days=40), target.session_date)
     return [
         *_provenance(target, promoted, limits, calendar, first),
-        *_basket(target, marks, book, limits),
+        *_basket(target, marks, book, limits, held),
         *(
             check
             for order in target.orders
@@ -280,14 +295,18 @@ def _model(target: Basket, promoted: Promoted | None) -> Check:
 
 
 def _basket(
-    target: Basket, marks: Mapping[str, Decimal], book: Mapping[str, Decimal], limits: Limits
+    target: Basket,
+    marks: Mapping[str, Decimal],
+    book: Mapping[str, Decimal],
+    limits: Limits,
+    held: Held | None,
 ) -> list[Check]:
     return [
         _positions(target, limits),
         _weight_sum(target, limits),
         _duplicates(target),
         _cash(target, marks),
-        _turnover(target, marks, book, limits),
+        _turnover(target, marks, book, limits, held),
     ]
 
 
@@ -360,11 +379,27 @@ def _cash(target: Basket, marks: Mapping[str, Decimal]) -> Check:
 
 
 def _turnover(
-    target: Basket, marks: Mapping[str, Decimal], book: Mapping[str, Decimal], limits: Limits
+    target: Basket,
+    marks: Mapping[str, Decimal],
+    book: Mapping[str, Decimal],
+    limits: Limits,
+    held: Held | None = None,
 ) -> Check:
     """What the plan sells, as a share of the book's value at its marks. An empty book has
-    nothing to turn over."""
+    nothing to turn over.
+
+    The limit catches a broken pipeline, not a bad month, and a basket ranked by a different
+    model than the one that bought the book has a declared reason to turn it over: the two
+    rankings are not comparable, so there is no rank buffer between them to keep the overlap
+    high. Where the change is on the record the check admits up to a full rotation and records
+    what admitted it. Nothing above a full rotation is admitted under any model, because a
+    plan cannot sell more than the book is worth and anything above 100% is arithmetic that
+    does not add up. An unchanged model stays on the flat limit, which is the case the check
+    was written for."""
+    changed = _model_changed(target, held)
     threshold = f"< {limits.turnover:.0%}"
+    if changed is not None:
+        threshold = f"{threshold}, or <= 100% on a changed model ({changed})"
     if not book:
         return Check(BASKET, "turnover", None, "no book", threshold, True)
     unpriced = sorted(s for s in book if s not in marks)
@@ -376,7 +411,25 @@ def _turnover(
     if value <= 0:
         return Check(BASKET, "turnover", None, f"book worth {_dollars(value)}", threshold, False)
     ratio = sold / value
-    return Check(BASKET, "turnover", None, f"{ratio:.2%}", threshold, ratio < limits.turnover)
+    passed = ratio < limits.turnover or (changed is not None and ratio <= 1)
+    return Check(BASKET, "turnover", None, f"{ratio:.2%}", threshold, passed)
+
+
+def _model_changed(target: Basket, held: Held | None) -> str | None:
+    """How the model behind the book differs from the one that ranked the basket, or None.
+
+    Fail closed: the exemption has to be positively evidenced, so an unknown model behind the
+    book is not a changed one. Different ranker names are a change. The same name with two
+    digests on the record that differ is a retrain under that name, which is also a change.
+    The same name with either digest missing reads as unchanged, because nothing on the record
+    says otherwise."""
+    if held is None:
+        return None
+    if held.ranker != target.ranker:
+        return f"{held.ranker} -> {target.ranker}"
+    if held.model_sha256 and target.model_sha256 and held.model_sha256 != target.model_sha256:
+        return f"{target.ranker} {held.model_sha256[:12]} -> {target.model_sha256[:12]}"
+    return None
 
 
 def _order(
@@ -459,6 +512,20 @@ _PANEL = """
     GROUP BY b.panel_run_id, b.panel_w
 """
 _PROMOTED = "SELECT certification_id, model_id, artifact_sha256, voided FROM agb.promoted_model"
+# The model behind the book: the last live basket whose orders actually filled. Not the last
+# basket in `filled`, which only says its session is over: a basket every order of which
+# expired unfilled reaches that state having bought nothing, and its ranker never touched the
+# book. A fill is the only evidence that a model is in the holdings.
+_HELD = """
+    SELECT b.ranker, b.model_sha256
+    FROM agb.basket b
+    WHERE b.kind = 'live' AND b.id <> %s AND EXISTS (
+        SELECT 1 FROM agb.broker_order o JOIN agb.fill f ON f.order_id = o.id
+        WHERE o.basket_id = b.id
+    )
+    ORDER BY b.session_date DESC, b.id DESC
+    LIMIT 1
+"""
 _TARGETS = """
     SELECT symbol, weight, shares, carried FROM agb.basket_target
     WHERE basket_id = %s ORDER BY id
@@ -535,6 +602,7 @@ def run(
 
         target = load(conn, basket_id)
         live = conn.execute(_PROMOTED).fetchone()
+        anchor = conn.execute(_HELD, (basket_id,)).fetchone()
         checks = evaluate(
             target,
             members=members,
@@ -542,6 +610,7 @@ def run(
             book=basket.book(conn),
             now=now,
             promoted=Promoted(*live) if live is not None else None,
+            held=Held(*anchor) if anchor is not None else None,
             limits=limits,
             calendar=calendar,
         )
