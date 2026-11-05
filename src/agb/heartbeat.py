@@ -25,8 +25,20 @@ _UPSERT = """
 """
 
 
+_TOUCH = "UPDATE agb.heartbeat SET beat_at = now() WHERE service = current_user"
+
+
 def beat(conn: psycopg.Connection, started_at: datetime, version: str | None) -> None:
     conn.execute(_UPSERT, {"started_at": started_at, "version": version})
+
+
+def progress(conn: psycopg.Connection) -> None:
+    """A beat from inside a cycle, for work that runs longer than the staleness window. Only
+    `beat_at` moves: `started_at` and `version` are `serve`'s to set, and a cycle that has not
+    started cannot report progress. The service is still only as alive as the work it gets
+    through between beats, which is what the staleness check is there to see.
+    """
+    conn.execute(_TOUCH)
 
 
 def interval_from_env() -> float:

@@ -28,8 +28,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from typing import Any
@@ -46,6 +46,26 @@ ACTOR = "pipeline"
 ROLES = ("analyst", "prosecutor", "defender", "judge")
 # Names worked on at once. EDGAR's rate limit is enforced by the shared client whatever this is.
 WORKERS = 4
+
+
+def _nothing() -> None:
+    """The default beat: a run nobody is watching the liveness of."""
+
+
+def _gather[T, R](
+    pool: ThreadPoolExecutor, work: Callable[[T], R], items: Iterable[T], beat: Callable[[], None]
+) -> list[R]:
+    """Run `work` over `items` on `pool` and return the results in `items` order, beating as
+    each one lands. A stretch of model calls takes far longer than the heartbeat's staleness
+    window, and the service cannot beat from its own loop while it is inside this one."""
+    futures: dict[Future[R], int] = {}
+    for index, item in enumerate(items):
+        futures[pool.submit(work, item)] = index
+    results: list[R] = [None] * len(futures)  # type: ignore[list-item]
+    for future in as_completed(futures):
+        results[futures[future]] = future.result()
+        beat()
+    return results
 
 
 class PanelError(Exception):
@@ -164,6 +184,7 @@ class Runner:
     model: analyst.Model
     store: PanelStore
     workers: int = WORKERS
+    beat: Callable[[], None] = _nothing
 
     @property
     def config_id(self) -> int:
@@ -196,8 +217,9 @@ class Runner:
             self.store,
             job_id,
             self.workers,
+            self.beat,
         )
-        score(conn, run_id, sectors, self.model, self.store, self.workers)
+        score(conn, run_id, sectors, self.model, self.store, self.workers, self.beat)
         return run_id
 
 
@@ -225,8 +247,12 @@ def run(
     store: PanelStore,
     job_id: int | None = None,
     workers: int = WORKERS,
+    beat: Callable[[], None] = _nothing,
 ) -> int:
-    """Gather the evidence for each name on `shortlist` as of `as_of`; returns the run's id."""
+    """Gather the evidence for each name on `shortlist` as of `as_of`; returns the run's id.
+
+    `beat` is called as each retrieval and each model call lands, for a caller whose liveness
+    is watched while this runs."""
     config = load_config(conn, config_id)
     check(config)
     if len(shortlist) > config.shortlist_n:
@@ -243,14 +269,15 @@ def run(
     run_id = row[0]
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        names = [
-            Name(r)
-            for r in pool.map(lambda symbol: edgar.retrieve(client, symbol, as_of), shortlist)
-        ]
+        retrieve = _gather(
+            pool, lambda symbol: edgar.retrieve(client, symbol, as_of), shortlist, beat
+        )
+        names = [Name(r) for r in retrieve]
         for name in names:
             _prepare(conn, name, config.models["analyst"], store)
         missed = [n for n in names if n.request is not None and n.completion is None]
-        for name, outcome in zip(missed, pool.map(lambda n: _call(model, n), missed), strict=True):
+        answers = _gather(pool, lambda n: _call(model, n), missed, beat)
+        for name, outcome in zip(missed, answers, strict=True):
             name.completion, name.failure = outcome
 
     for name in names:
@@ -510,6 +537,7 @@ def score(
     model: analyst.Model,
     store: PanelStore,
     workers: int = WORKERS,
+    beat: Callable[[], None] = _nothing,
 ) -> int:
     """Debate and score each name `run_id` extracted and has not scored yet, telling the debate
     roles its sector from `sectors` (symbol to sector); returns how many names were debated.
@@ -563,7 +591,8 @@ def score(
                 d.calls.append(call)
             missed = [d for d in live if d.calls[-1].completion is None]
             asked += len(missed)
-            for d, outcome in zip(missed, pool.map(lambda d: _ask(model, d), missed), strict=True):
+            answers = _gather(pool, lambda d: _ask(model, d), missed, beat)
+            for d, outcome in zip(missed, answers, strict=True):
                 d.calls[-1].completion, d.failure = outcome
             for d in live:
                 if d.failure is None:

@@ -27,6 +27,37 @@ def test_beat_upserts_the_services_own_row(db):
     assert beat_at >= first_beat
 
 
+def test_progress_moves_the_beat_and_nothing_else(db):
+    scheduler = db.connect("scheduler")
+    started = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    heartbeat.beat(scheduler, started, "v1")
+    [(_, _, first_beat, _)] = rows(scheduler)
+
+    heartbeat.progress(scheduler)
+
+    [(service, started_at, beat_at, version)] = rows(scheduler)
+    assert (service, started_at, version) == ("scheduler", started, "v1")
+    assert beat_at >= first_beat
+
+
+def test_progress_before_the_first_beat_reports_nothing(db):
+    """`serve` beats before it runs a cycle, so there is always a row by the time work can
+    report progress. Without one there is nothing to move and no row to invent."""
+    moved = db.connect("scheduler").execute(heartbeat._TOUCH)
+
+    assert moved.rowcount == 0
+    assert rows(db.connect("cli")) == []
+
+
+def test_progress_cannot_move_another_services_beat(db):
+    heartbeat.beat(db.connect("scheduler"), datetime.now(UTC), "v1")
+    before = rows(db.connect("cli"))
+
+    heartbeat.progress(db.connect("pipeline"))
+
+    assert rows(db.connect("cli")) == before
+
+
 def test_service_cannot_report_for_another(db):
     with pytest.raises(errors.InsufficientPrivilege, match="row-level security"):
         db.connect("pipeline").execute(
