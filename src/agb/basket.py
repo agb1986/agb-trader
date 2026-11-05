@@ -155,15 +155,14 @@ _INSERT_EVENT = """
     INSERT INTO agb.basket_event (basket_id, seq, from_state, to_state, actor, surface)
     VALUES (%s, 1, NULL, 'proposed', %s, %s)
 """
+# The positions the broker reported at its last read. Not the targets of the last filled
+# basket: a basket reaches `filled` when its state machine says the session is over, and the
+# orders that expired unfilled leave their targets standing. The holdings are what the broker
+# says they are, which is also the book `agb.position_mismatch` reconciles against.
 _BOOK = """
-    SELECT t.symbol, t.shares
-    FROM agb.basket_target t
-    WHERE t.basket_id = (
-        SELECT id FROM agb.basket_state
-        WHERE kind = 'live' AND state = 'filled'
-        ORDER BY session_date DESC, id DESC
-        LIMIT 1
-    )
+    SELECT p.symbol, p.qty
+    FROM agb.position p
+    WHERE p.snapshot_id = (SELECT max(id) FROM agb.position_snapshot)
 """
 # The shadow's own book: what the last shadow basket holds. It is never filled, because it is
 # never traded, so what it was proposed to hold is what it holds.
@@ -283,9 +282,10 @@ class _Shadow:
 
 
 def book(conn: psycopg.Connection) -> dict[str, Decimal]:
-    """The positions the rebalance starts from: the targets of the last filled live basket,
-    in shares. Empty until a basket has filled."""
-    return {symbol: Decimal(shares) for symbol, shares in conn.execute(_BOOK).fetchall()}
+    """The positions the rebalance starts from: what the broker held at the latest position
+    snapshot, in shares. Empty until a snapshot has been read, and empty for an account that
+    holds nothing — the snapshot row exists to say the read happened."""
+    return {symbol: Decimal(qty) for symbol, qty in conn.execute(_BOOK).fetchall()}
 
 
 def shadow_book(conn: psycopg.Connection) -> dict[str, Decimal]:

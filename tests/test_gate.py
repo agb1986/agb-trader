@@ -384,7 +384,25 @@ def hold(db, positions):
     move(db, basket_id, 3, "pending", "approved", "bot", "telegram")
     move(db, basket_id, 4, "approved", "submitted", "execution")
     move(db, basket_id, 5, "submitted", "filled", "execution")
+    snapshot(db, positions)
     return basket_id
+
+
+def snapshot(db, positions, snapshot_date=date(2026, 8, 31)):
+    """The broker's position read after that basket's close, which is the book the gate
+    measures against: the targets above say what was planned, not what filled."""
+    conn = db.connect("execution")
+    [(snapshot_id,)] = conn.execute(
+        "INSERT INTO agb.position_snapshot (snapshot_date, positions, actor)"
+        " VALUES (%s, %s, 'execution') RETURNING id",
+        (snapshot_date, len(positions)),
+    ).fetchall()
+    for symbol, shares in positions.items():
+        conn.execute(
+            "INSERT INTO agb.position (snapshot_id, symbol, qty) VALUES (%s, %s, %s)",
+            (snapshot_id, symbol, shares),
+        )
+    return snapshot_id
 
 
 def run(db, basket_id, case=SOUND):
@@ -455,6 +473,27 @@ def test_any_single_failure_halts_the_basket_and_opens_the_latch(db, case, name)
     assert rows(
         db, "SELECT reason FROM agb.basket_event WHERE basket_id = %s AND seq = 2", basket_id
     ) == [(reason,)]
+
+
+def test_the_gate_measures_against_the_broker_read_and_not_the_declared_targets(db):
+    """The 2026-11 halt: last month's basket reached filled with most of its orders expired,
+    so its targets claim a book the account does not have. A sell of a name that was only ever
+    a target closes nothing, and the gate sees that because it reads the broker, not the plan.
+    """
+    hold(db, TURNOVER.book)
+    # The next read of the account: of the ten the basket declared, one order filled.
+    snapshot(db, {"H01": Decimal(300)}, date(2026, 9, 30))
+    basket_id = insert(db, TURNOVER.target)
+
+    verdict = run(db, basket_id, TURNOVER)
+
+    assert verdict.state == "halted"
+    failed = {(c.name, c.symbol) for c in verdict.failed}
+    # Every sell is of a name the account does not hold, and the turnover is measured against
+    # the one position it does.
+    assert {s for n, s in failed if n == "side"} == set(HELD[3:])
+    [(measured,)] = rows(db, "SELECT measured FROM agb.gate_check WHERE name = 'turnover'")
+    assert measured == "700.00%"
 
 
 def test_the_breach_stays_open_until_a_human_clears_it(db):
