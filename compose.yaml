@@ -45,7 +45,7 @@ services:
       retries: 12
       start_period: 10s
     restart: unless-stopped
-    mem_limit: 512m
+    mem_limit: 160m
 
   # One-shot: creates the roles and applies migrations, then exits. Every service waits for it.
   migrate:
@@ -89,7 +89,7 @@ services:
         condition: service_completed_successfully
     networks: [core]
     restart: unless-stopped
-    mem_limit: 256m
+    mem_limit: 192m
 
   # The local UI: server-rendered pages over the database, read-only. It publishes on the
   # loopback address alone, so nothing on the network reaches it; the operator views it through
@@ -115,7 +115,7 @@ services:
         condition: service_completed_successfully
     networks: [core]
     restart: unless-stopped
-    mem_limit: 256m
+    mem_limit: 192m
 
   # Takes the scheduler's nightly backup job and writes a dated pg_dump into the backup
   # directory. It runs as the host user that owns that directory, so the dumps belong to the
@@ -138,7 +138,7 @@ services:
         condition: service_completed_successfully
     networks: [core]
     restart: unless-stopped
-    mem_limit: 256m
+    mem_limit: 160m
 
   # agb-trader's own VPN tunnel: ProtonVPN over WireGuard, with no port forwarding. It exists
   # to give the bot an HTTP proxy on port 8888 whose traffic leaves only through the tunnel;
@@ -156,7 +156,7 @@ services:
     devices: ["/dev/net/tun:/dev/net/tun"]
     networks: [egress]
     restart: unless-stopped
-    mem_limit: 256m
+    mem_limit: 384m
 
   # The Telegram bot, the only service on both networks: it reads the database on core and
   # reaches Telegram through the vpn's proxy on egress. bot.env holds the Telegram token, and
@@ -178,7 +178,7 @@ services:
         condition: service_healthy
     networks: [core, egress]
     restart: unless-stopped
-    mem_limit: 256m
+    mem_limit: 192m
 
   # Takes the scheduler's data_pull job for each session and lands Sharadar's SEP, SF1 and
   # TICKERS in the Parquet lake. It is the only service that holds the Sharadar key, which
@@ -210,7 +210,7 @@ services:
         condition: service_completed_successfully
     networks: [core]
     restart: unless-stopped
-    mem_limit: 2g
+    mem_limit: 2176m
 
   # Execution: the only service with broker keys. It submits the approved basket's
   # market-on-close orders and reads the fills back. No lake, no proxy: it talks to the
@@ -229,7 +229,7 @@ services:
         condition: service_completed_successfully
     networks: [core]
     restart: unless-stopped
-    mem_limit: 256m
+    mem_limit: 192m
 
   # The operator CLI: `make status`, or `make agb CMD="..."`. `agb promote` verifies the
   # certified artifact under /models before it makes the model live.
