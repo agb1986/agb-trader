@@ -54,6 +54,7 @@ from agb import (
     basket,
     edgar,
     gate,
+    heartbeat,
     jobs,
     lake,
     nyse,
@@ -195,7 +196,11 @@ class Pipeline:
             return None
         panel.check(config)
         return panel.Runner(
-            config, edgar.Edgar.from_env(), analyst.AnthropicModel(), PanelStore(self.panel_dir)
+            config,
+            edgar.Edgar.from_env(),
+            analyst.AnthropicModel(),
+            PanelStore(self.panel_dir),
+            beat=lambda: heartbeat.progress(conn),
         )
 
     def __call__(self, conn: psycopg.Connection) -> None:

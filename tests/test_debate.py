@@ -137,6 +137,26 @@ def dimensions(db, symbol, run_id):
     )
 
 
+def test_the_debate_beats_as_each_answer_lands(db, config, store):
+    """Three rounds of calls for every name take far longer than the heartbeat's staleness
+    window, and the service cannot beat from its own loop while it is inside them. So the
+    debate reports every answer to whoever is watching its liveness."""
+    model = FakeDebate()
+    run_id = run(db, config, store, FakeAnalyst(), NAMES)
+    beats = []
+
+    panel.score(
+        db.connect("pipeline"),
+        run_id,
+        SECTORS,
+        model,
+        store,
+        beat=lambda: beats.append(len(beats)),
+    )
+
+    assert len(beats) == len(model.requests)
+
+
 def test_the_judge_scores_six_dimensions_and_code_sums_them(db, config, store):
     model = FakeDebate()
 

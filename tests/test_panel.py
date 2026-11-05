@@ -254,6 +254,27 @@ def extract(db, store, symbol, run_id=None):
     return outcome, detail, sha and json.loads(store.get(sha))
 
 
+def test_a_run_beats_as_each_retrieval_and_each_call_lands(db, config, store):
+    """A run of a real shortlist takes far longer than the heartbeat's staleness window, and
+    the service cannot beat from its own loop while it is inside one. So the run reports every
+    retrieval and every model call to whoever is watching its liveness."""
+    model = FakeAnalyst()
+    beats = []
+
+    panel.run(
+        db.connect("pipeline"),
+        config,
+        SHORTLIST,
+        AS_OF,
+        client(),
+        model,
+        store,
+        beat=lambda: beats.append(len(beats)),
+    )
+
+    assert len(beats) == len(SHORTLIST) + len(model.calls)
+
+
 def test_the_extract_holds_only_verified_quotes_and_never_the_name(db, config, store):
     run(db, config, store, FakeAnalyst())
 
