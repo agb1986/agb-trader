@@ -23,7 +23,7 @@ from test_execution import (
     broker,
 )
 from test_gate import BASE, insert, rows, run, state
-from test_health import distribution, dividend, promote
+from test_health import distribution, dividend, mode, promote
 
 from agb import execution, readout
 from agb.services.bot import MESSAGE_MAX, Bot, help_text, parse, split
@@ -236,6 +236,9 @@ def test_pnl_reads_the_month_against_the_backtest_with_paper_dividends_added_bac
             " VALUES (%s, 'ACTIVE', false, false, false, false, %s, 'execution')",
             (at, equity),
         )
+    # The add-back only applies to months the system was in paper, which it reads from the
+    # mode in force at each closing reading, so the paper event has to precede them.
+    mode(db, "paper")
     promote(db, distribution(monthly=0.01))
     dividend(db, "2026-10", "AAA", "400.00", "2026-10-20")
 
