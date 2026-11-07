@@ -93,6 +93,7 @@ from nautilus_trader.trading.strategy import Strategy
 
 from agb import corporate, cost, features, lake, rebalance
 from agb.research import scan, tax
+from agb.research.cache import Cache, Key, backtest_key, path_keys, standing
 from agb.research.panel import Month, Panel
 from agb.research.trials import Ledger, Run
 
@@ -186,21 +187,48 @@ def run(
     db: duckdb.DuckDBPyConnection | None = None,
     scores: pd.Series | Mapping[str, pd.Series] | None = None,
     forced: Sequence[corporate.Event] = (),
+    cache: Cache | None = None,
 ) -> Run:
     """Backtest `options.signal` over the panel. `scores`, aligned to the panel's rows, stands
     in for a signal that is not a feature; a mapping of them, one per combinatorial path, runs
     each path and reports them side by side. `forced` is the recorded corporate events the
-    months must account for, each applied at the rebalance its period names."""
+    months must account for, each applied at the rebalance its period names.
+
+    `cache`, when given, checkpoints a multi-path run twice over: the run as a whole, so a
+    repeat of it costs nothing at all, and each path as that path finishes, so a run
+    interrupted part way through resumes at the first path it has no report for. A run served
+    whole does no simulation, so it writes no ledger row and hands back the row the run it
+    reuses wrote; see `agb.research.cache`. The single-signal case is not cached: it is not
+    what a certification runs, and its start-date sensitivity runs are not paths.
+    """
     frame = panel.frame
     months = panel.months
     if not months:
         raise BacktestError("the panel has no months")
     if scores is None and options.signal not in features.FEATURES:
         raise BacktestError(f"{options.signal!r} is not a feature; pass scores for a model signal")
-    if isinstance(scores, Mapping):
-        if not scores:
-            raise BacktestError("no paths to run")
+    paths_of = isinstance(scores, Mapping)
+    if paths_of and not scores:
+        raise BacktestError("no paths to run")
+    # Checked before the lake is opened and before a ranking is built. A whole-run hit is the
+    # only hit that skips `_feed`, whose bar load is most of what a cached certification saves;
+    # a run that misses on one path still pays for the bars of every name any path ranks.
+    entry = (
+        backtest_key(
+            cache, panel, stage="run", options=asdict(options), scores=scores, forced=forced
+        )
+        if cache is not None and paths_of
+        else None
+    )
+    if entry is not None:
+        held = entry.read()
+        if held is not None and standing(ledger, held.get("trial_id")):
+            return Run(str(held["trial_id"]), held["results"])
+    keys = None
+    if paths_of:
         runs = {str(label): rankings(frame, options, series) for label, series in scores.items()}
+        if cache is not None:
+            keys = path_keys(cache, panel, options=asdict(options), scores=scores, forced=forced)
     else:
         runs = {"": rankings(frame, options, scores)}
     with ledger.trial(
@@ -217,8 +245,8 @@ def run(
             _require(conn)
             months = _priced(conn, months)
             feed = _feed(runs, months, options, conn, forced=forced)
-            if isinstance(scores, Mapping):
-                paths = _paths(feed, months, runs, options, forced)
+            if paths_of:
+                paths = _paths(feed, months, runs, options, forced, keys=keys)
                 trial.results = {
                     "months": len(months),
                     "paths": paths,
@@ -236,7 +264,12 @@ def run(
         finally:
             if db is None:
                 conn.close()
-        return Run(trial.trial_id, trial.results)
+        trial_id, results = trial.trial_id, trial.results
+    # Written after the trial's row says `succeeded`, so an entry never names a row that is
+    # still open or that failed.
+    if entry is not None:
+        entry.write({"trial_id": trial_id, "results": results})
+    return Run(trial_id, results)
 
 
 def replay(
@@ -247,25 +280,47 @@ def replay(
     lake_dir: Path = lake.DEFAULT_DIR,
     db: duckdb.DuckDBPyConnection | None = None,
     forced: Sequence[corporate.Event] = (),
+    cache: Cache | None = None,
 ) -> list[dict[str, Any]]:
     """Each path's report, as `run` gives them, without a trial: the certification's second
     pass at twice the modelled cost reruns the same paths with a different constant and, as
-    the specification says, adds no trial."""
+    the specification says, adds no trial.
+
+    `cache` checkpoints it as it does `run`, minus the ledger row there is none of."""
     months = panel.months
     if not months:
         raise BacktestError("the panel has no months")
     if not scores:
         raise BacktestError("no paths to run")
+    entry = (
+        None
+        if cache is None
+        else backtest_key(
+            cache, panel, stage="replay", options=asdict(options), scores=scores, forced=forced
+        )
+    )
+    if entry is not None:
+        held = entry.read()
+        if held is not None and isinstance(held.get("paths"), list):
+            return held["paths"]
     runs = {str(label): rankings(panel.frame, options, series) for label, series in scores.items()}
+    keys = (
+        None
+        if cache is None
+        else path_keys(cache, panel, options=asdict(options), scores=scores, forced=forced)
+    )
     conn = db if db is not None else lake.connect(lake_dir)
     try:
         _require(conn)
         months = _priced(conn, months)
         feed = _feed(runs, months, options, conn, forced=forced)
-        return _paths(feed, months, runs, options, forced)
+        paths = _paths(feed, months, runs, options, forced, keys=keys)
     finally:
         if db is None:
             conn.close()
+    if entry is not None:
+        entry.write({"paths": paths})
+    return paths
 
 
 def _feed(
@@ -347,16 +402,32 @@ def _paths(
     runs: Mapping[str, Mapping[date, list[str]]],
     options: Options,
     forced: Sequence[corporate.Event] = (),
+    *,
+    keys: Mapping[str, Key] | None = None,
 ) -> list[dict[str, Any]]:
-    return [
-        {
+    """Each path's report, in the order the rankings were built.
+
+    A path's entry is written as that path finishes rather than at the end of the run, which
+    is what lets an interrupted run resume: the next attempt reads the reports of the paths
+    that completed and simulates only the rest.
+    """
+    reports = []
+    for label, ranked in runs.items():
+        entry = None if keys is None else keys.get(label)
+        held = None if entry is None else entry.read()
+        if held is not None:
+            reports.append(held)
+            continue
+        report = {
             "path": label,
             **_report(
                 simulate(feed, months, ranked, options, forced), feed, months, options, forced
             ),
         }
-        for label, ranked in runs.items()
-    ]
+        if entry is not None:
+            entry.write(report)
+        reports.append(report)
+    return reports
 
 
 # Rankings and the start dates -----------------------------------------------------------------

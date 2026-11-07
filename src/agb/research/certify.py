@@ -88,6 +88,7 @@ from agb.research.artifact import (
     artifact_sha256,
     file_sha256,
 )
+from agb.research.cache import Cache
 from agb.research.panel import Panel
 from agb.research.trials import FILE as LEDGER_FILE
 from agb.research.trials import RULE as TRIAL_RULE
@@ -145,8 +146,18 @@ def run(
     research_dir: Path,
     lake_dir: Path = lake.DEFAULT_DIR,
     db: duckdb.DuckDBPyConnection | None = None,
+    checkpoint: bool = True,
 ) -> Certification:
-    """Fit, trade and gate `config` over the panel, and write the artifact."""
+    """Fit, trade and gate `config` over the panel, and write the artifact.
+
+    `checkpoint` keeps the cross-validation's scores and every path's backtest under the
+    research directory, so an attempt that fell over, or one rerun over the same panel and
+    configuration, reuses them rather than spending another day computing them again. The
+    cache is keyed by everything that determines what it holds, so a hit is the same work and
+    not merely a likely one, and a reused stage hands back the trial id of the run that filled
+    it rather than appending a row, which is what keeps the verdict identical; see
+    `agb.research.cache`. Turning it off makes the run recompute everything.
+    """
     directory = research_dir / DIRECTORY / options.model_id
     if directory.exists():
         raise CertificationError(f"{directory} exists; a certification is never overwritten")
@@ -160,6 +171,9 @@ def run(
         init_cash=CAPITAL,
         cost_multiple=1.0,
     )
+    # After the overwrite guard, so a refused certification writes nothing at all, and
+    # outside the trial, so the cache directory is not a side effect of an open row.
+    cache = Cache.under(research_dir) if checkpoint else None
     with ledger.trial(
         KIND,
         {KIND: _config(options), "model": config.to_dict(), "cpcv": asdict(validation)},
@@ -170,11 +184,18 @@ def run(
         cost_model_version=panel.cost_model_version,
     ) as trial:
         scores: dict[int, pd.Series] = {}
-        fitted = cpcv.run(panel, config, validation, ledger, scores_out=scores)
+        fitted = cpcv.run(panel, config, validation, ledger, scores_out=scores, cache=cache)
         series = {str(p): scores[p] for p in sorted(scores)}
-        traded = backtest.run(panel, trading, ledger, lake_dir=lake_dir, db=db, scores=series)
+        traded = backtest.run(
+            panel, trading, ledger, lake_dir=lake_dir, db=db, scores=series, cache=cache
+        )
         twice = backtest.replay(
-            panel, replace(trading, cost_multiple=2.0), series, lake_dir=lake_dir, db=db
+            panel,
+            replace(trading, cost_multiple=2.0),
+            series,
+            lake_dir=lake_dir,
+            db=db,
+            cache=cache,
         )
         paths = traded.results["paths"]
         # The backtest leaves out the leading months the lake cannot price, so the window the
@@ -295,7 +316,11 @@ def _write(
     directory.mkdir(parents=True)
     shutil.copyfile(ledger.path, directory / LEDGER_FILE)
     booster.save_model(str(directory / MODEL))
-    (directory / PATHS).write_text(json.dumps(results["paths"], indent=1) + "\n")
+    # Sorted, as the manifest is: a digest over this file should say what the paths are and
+    # not what order a dict happened to be built in, so that a run served from the
+    # certification cache -- whose payloads come back through canonical JSON -- writes the
+    # same bytes as the run that filled it.
+    (directory / PATHS).write_text(json.dumps(results["paths"], indent=1, sort_keys=True) + "\n")
     manifest = {
         "model_id": options.model_id,
         "certifies": CERTIFIES,
