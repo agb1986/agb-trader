@@ -81,6 +81,13 @@ AGREEMENT = 0.90
 # one whenever whole-share sizing leaves nothing to buy, which is the fractional-share friction
 # made visible; it is the same mechanism as a trim and must stay as rare.
 UNFILLED = 0.02
+# How many of the panel's months the engine may run fewer than the scan. The engine starts
+# after the early months the lake cannot price with the liquidity gate's bars, because no name
+# in them can hold the bars the gate counts; the scan applies no such rule and runs the whole
+# panel. Over the five-year window the lake holds years of history before the window opens, so
+# the two agree exactly; over the saved full-history panel the engine runs 342 months of 344.
+# Beyond a couple of quarters the two would no longer be describing the same window.
+WARMUP = 6
 
 
 @dataclass(frozen=True)
@@ -124,8 +131,8 @@ def both(real_panel, lake_dir, tmp_path_factory) -> Both:
     captured: list[backtest.Simulation] = []
     real = backtest.simulate
 
-    def spy(feed, months, rankings, options):
-        outcome = real(feed, months, rankings, options)
+    def spy(feed, months, rankings, options, forced=()):
+        outcome = real(feed, months, rankings, options, forced)
         captured.append(outcome)
         return outcome
 
@@ -161,8 +168,11 @@ def test_the_two_sides_ran_the_same_panel(both):
         f" {engine['trimmed']} trims, {engine['unfilled']} unfilled; vectorbt annual"
         f" {fast['annual_return']:+.4f} sharpe {fast['sharpe']:.3f} drawdown"
         f" {fast['max_drawdown']:+.4f}, {fast['orders']} orders"
+        f" over {fast['months']} months"
     )
-    assert engine["months"] == fast["months"] == len(both.panel.months)
+    assert fast["months"] == len(both.panel.months), "the scan runs the whole panel"
+    skipped = fast["months"] - engine["months"]
+    assert 0 <= skipped <= WARMUP, f"the engine skipped {skipped} months the scan ran"
 
 
 def test_the_engines_divergence_from_vectorbt_is_only_the_frictions_the_scan_omits(both):
