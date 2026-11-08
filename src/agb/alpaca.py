@@ -1,11 +1,16 @@
 """The broker: Alpaca's trading and market-data APIs, through the standard library.
 
 The execution service is the only process that holds the keys, and this is the only module
-that uses them. Every call is one HTTP request; every answer is turned into a plain value
-with the fields the service needs, and every failure is an `AlpacaError` that carries the
-HTTP status and Alpaca's own error code, so the service can tell a duplicate
-`client_order_id` (422, code 40010001) or an order it cannot find (404) from a broken
-network. No error message ever carries a key.
+that uses them. Every answer is turned into a plain value with the fields the service needs,
+and every failure is an `AlpacaError` that carries the HTTP status and Alpaca's own error
+code, so the service can tell a duplicate `client_order_id` (422, code 40010001) or an order
+it cannot find (404) from a broken network. No error message ever carries a key.
+
+A read that does not get an answer the broker stands by -- a timeout, a dropped connection,
+a 429 or a 5xx -- is attempted again, twice at most, with a doubling backoff and the
+broker's own `Retry-After` when it sends one. Nothing else is: a write that times out may
+have reached the broker, so it gets one attempt and the caller decides what to do with the
+silence.
 
 Alpaca sends numbers as strings, so quantities and prices are Decimals here. Fractional
 quantities reach the broker as written; Alpaca accepts them on day orders only, and refuses a
@@ -14,20 +19,37 @@ fractional market-on-close order, which the service records as a rejection.
 
 import http.client
 import json
+import logging
 import os
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Protocol
 
+log = logging.getLogger(__name__)
+
 TRADING_API = "https://paper-api.alpaca.markets"
 DATA_API = "https://data.alpaca.markets"
 TIMEOUT = 15.0
+# How many extra attempts a read gets when the broker does not answer or answers that it could
+# not serve the request. Reads only, so an attempt that may have reached the broker is never
+# repeated. Three attempts of TIMEOUT each is the worst case for one read, well inside the
+# five-minute staleness window the services are judged by.
+RETRIES = 2
+# The wait before the first retry, doubling for each one after it.
+BACKOFF = 0.5
+# A `Retry-After` longer than this is taken as the broker asking for more than a cycle's worth
+# of patience: the call gives up and the service tries again on its own schedule.
+RETRY_AFTER_CAP = 5.0
+# The statuses worth another attempt. 429 is Alpaca's rate limit; the rest are its own
+# failures, and none of them means the request was carried out.
+RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
 # Alpaca's error code for a client_order_id it has seen before.
 DUPLICATE_CLIENT_ORDER_ID = 40010001
 # The market-on-close time in force.
@@ -41,10 +63,25 @@ PAGE = 100
 class AlpacaError(Exception):
     """A call the broker refused or that never completed."""
 
-    def __init__(self, message: str, status: int | None = None, code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        code: int | None = None,
+        retry_after: float | None = None,
+    ):
         super().__init__(message)
         self.status = status
         self.code = code
+        # What the broker's `Retry-After` header asked for, in seconds, when it sent one.
+        self.retry_after = retry_after
+
+    @property
+    def transient(self) -> bool:
+        """The call did not get an answer the broker stands by, and repeating it reads the
+        same state rather than doing anything twice. A refusal is not transient: the broker
+        understood and said no, and asking again says no again."""
+        return self.status is None or self.status in RETRY_STATUS
 
     @property
     def duplicate(self) -> bool:
@@ -176,6 +213,19 @@ def _decimal(value: Any) -> Decimal | None:
     return Decimal(str(value))
 
 
+def _seconds(value: Any) -> float | None:
+    """A `Retry-After` header as seconds. The HTTP date form is not read: a broker that
+    answers with a date is asking for a wait measured in minutes, which is longer than one
+    call should hold a cycle open, and `None` leaves the plain backoff in charge."""
+    if value is None:
+        return None
+    try:
+        seconds = float(str(value).strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
 def _when(value: Any) -> datetime | None:
     """An RFC 3339 instant, which Alpaca writes with up to nine fractional digits."""
     if not value:
@@ -234,6 +284,9 @@ class Alpaca:
         data: str = DATA_API,
         timeout: float = TIMEOUT,
         opener: urllib.request.OpenerDirector | None = None,
+        retries: int = RETRIES,
+        backoff: float = BACKOFF,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not key or not secret:
             raise ValueError("ALPACA_API_KEY and ALPACA_SECRET_KEY are not set")
@@ -246,6 +299,9 @@ class Alpaca:
         self._trading = trading.rstrip("/")
         self._data = data.rstrip("/")
         self._timeout = timeout
+        self._retries = max(0, retries)
+        self._backoff = backoff
+        self._sleep = sleep
         # Execution reaches the broker directly, never through a proxy, whatever the
         # environment says.
         self._opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -277,6 +333,15 @@ class Alpaca:
         query: dict[str, str] | None = None,
         body: dict[str, Any] | None = None,
     ) -> Any:
+        """One request, and for a read one or two more when the first does not get an answer
+        the broker stands by.
+
+        Only `GET` is ever repeated. A `POST`, `PATCH` or `DELETE` that times out may have
+        reached the broker and done what it asked for, and a second attempt would do it
+        again, so those get exactly one attempt and the caller decides. For a read, the same
+        call reads the same state, so repeating it is free of consequence and is what carries
+        the service through a rate limit or a broker that answers 502 for a few seconds.
+        """
         url = base + path
         if query:
             url += "?" + urllib.parse.urlencode(query)
@@ -285,10 +350,45 @@ class Alpaca:
         if data is not None:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        raw = self._read(request, method, path)
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise AlpacaError(f"{method} {path}: the answer is not JSON") from None
+
+    def _read(self, request: urllib.request.Request, method: str, path: str) -> bytes:
+        """Attempt the request, and for a read attempt it again while it is worth it."""
+        retries = self._retries if method == "GET" else 0
+        wait = self._backoff
+        for attempt in range(retries + 1):
+            try:
+                return self._attempt(request, method, path)
+            except AlpacaError as exc:
+                after = self._wait_for(exc, wait)
+                if attempt == retries or not exc.transient or after is None:
+                    raise
+                log.warning("%s %s: %s; trying again in %.1fs", method, path, exc, after)
+                self._sleep(after)
+                wait *= 2
+        raise AssertionError("unreachable: the loop returns or raises")
+
+    @staticmethod
+    def _wait_for(exc: AlpacaError, backoff: float) -> float | None:
+        """How long to wait before trying again, or `None` to give up. The broker's own
+        `Retry-After` wins when it sent one, because it knows when its rate limit resets;
+        past `RETRY_AFTER_CAP` it is asking for longer than this call should hold a cycle
+        open."""
+        if exc.retry_after is None:
+            return backoff
+        return exc.retry_after if exc.retry_after <= RETRY_AFTER_CAP else None
+
+    def _attempt(self, request: urllib.request.Request, method: str, path: str) -> bytes:
         # Every error is re-raised `from None`, so no traceback carries the request.
         try:
             with self._opener.open(request, timeout=self._timeout) as response:
-                raw = response.read()
+                return response.read()
         except urllib.error.HTTPError as exc:
             try:
                 answer = json.loads(exc.read())
@@ -300,15 +400,10 @@ class Alpaca:
                 self._scrub(f"{method} {path}: HTTP {exc.code}: {message or 'no message'}"),
                 status=exc.code,
                 code=code if isinstance(code, int) else None,
+                retry_after=_seconds(exc.headers.get("Retry-After") if exc.headers else None),
             ) from None
         except (OSError, ValueError, http.client.HTTPException) as exc:
             raise AlpacaError(self._scrub(f"{method} {path}: {exc}")) from None
-        if not raw:
-            return None
-        try:
-            return json.loads(raw)
-        except ValueError:
-            raise AlpacaError(f"{method} {path}: the answer is not JSON") from None
 
     def account(self) -> Account:
         raw = self._call("GET", self._trading, "/v2/account")

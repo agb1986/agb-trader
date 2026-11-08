@@ -796,6 +796,189 @@ def test_the_account_is_observed_every_five_minutes(db):
     assert observations() == 3
 
 
+def test_a_failed_observation_backs_off_instead_of_retrying_every_cycle(db, caplog):
+    """A read of the account that fails waits the backoff, not a cycle: the five-minute
+    reading is already overdue, so without it every cycle would try again and the rest of the
+    cycle would never run."""
+    conn = db.connect("execution")
+    fake = broker()
+    clock = Clock(datetime(2026, 10, 1, 14, 0, tzinfo=UTC))
+    service = Execution(fake, clock=clock)
+
+    attempts = []
+    down = True
+
+    def account():
+        attempts.append(clock.now)
+        if down:
+            raise AlpacaError("GET /v2/account: HTTP 429: too many requests", status=429)
+        return FakeBroker.account(fake)
+
+    # The first cycle reads the account and snapshots the last session, so afterwards the
+    # observation is the only thing left that reads it.
+    service(conn)
+    fake.account = account
+
+    def observations():
+        [(n,)] = rows(db, "SELECT count(*) FROM agb.broker_state")
+        return n
+
+    with caplog.at_level(logging.WARNING):
+        clock.now += timedelta(minutes=5)
+        service(conn)
+    assert len(attempts) == 1
+    assert "the account could not be observed; trying again in 0:00:30" in caplog.text
+
+    # The cycles inside the backoff carry on without the reading.
+    clock.now += timedelta(seconds=29)
+    service(conn)
+    assert len(attempts) == 1
+    clock.now += timedelta(seconds=1)
+    service(conn)
+    assert len(attempts) == 2
+
+    # And the wait doubles with each failure.
+    clock.now += timedelta(seconds=59)
+    service(conn)
+    assert len(attempts) == 2
+    clock.now += timedelta(seconds=1)
+    service(conn)
+    assert len(attempts) == 3
+
+    # A reading that succeeds clears the backoff: the next one is five minutes later again.
+    down = False
+    before = observations()
+    clock.now += timedelta(minutes=2)
+    service(conn)
+    assert len(attempts) == 4
+    assert observations() == before + 1
+    clock.now += timedelta(minutes=4, seconds=59)
+    service(conn)
+    assert len(attempts) == 4
+    clock.now += timedelta(seconds=1)
+    service(conn)
+    assert len(attempts) == 5
+
+
+def test_the_observation_backoff_doubles_to_a_cap():
+    service = Execution(broker(), clock=Clock(NOW))
+    at = NOW
+    for seconds in (30, 60, 120, 240, 480, 600, 600):
+        service.observe_failed(at)
+        assert not service.observe_due(at + timedelta(seconds=seconds - 1))
+        assert service.observe_due(at + timedelta(seconds=seconds))
+        at += timedelta(seconds=seconds)
+
+
+def test_a_run_of_failed_cycles_raises_one_alert_and_one_recovery(db, caplog):
+    """One alert per run of failed cycles, not one per cycle: a broker that is down for an
+    hour is one thing that happened."""
+    conn = db.connect("execution")
+    fake = broker()
+    clock = Clock(datetime(2026, 10, 1, 14, 0, tzinfo=UTC))
+    # No backoff on the observation, so the account read is what ends every cycle.
+    service = Execution(fake, clock=clock, observe_backoff=timedelta(0), failures_before_alert=3)
+    down = True
+
+    def account():
+        if down:
+            raise AlpacaError("GET /v2/account: HTTP 500: internal server error", status=500)
+        return FakeBroker.account(fake)
+
+    fake.account = account
+
+    with caplog.at_level(logging.ERROR):
+        for _ in range(4):
+            service(conn)
+            clock.now += timedelta(seconds=30)
+
+    raised = [(kind, subject, period) for kind, subject, period, _ in alerts(db)]
+    assert raised == [("cycle_failing", "execution", "2026-10-01T14:00:00Z")]
+    [(body,)] = rows(db, "SELECT body FROM agb.alert WHERE kind = 'cycle_failing'")
+    assert "3 execution cycles in a row have ended on an error" in body
+    assert "HTTP 500: internal server error" in body
+
+    # The recovery is told on the same period, once.
+    down = False
+    service(conn)
+    service(conn)
+    kinds = [kind for kind, *_ in alerts(db)]
+    assert kinds == ["cycle_failing", "cycle_recovered"]
+    [(body,)] = rows(db, "SELECT body FROM agb.alert WHERE kind = 'cycle_recovered'")
+    assert "after 4 failed in a row from 2026-10-01T14:00:00Z" in body
+
+
+def test_a_later_outage_raises_its_own_alert(db):
+    conn = db.connect("execution")
+    fake = broker()
+    clock = Clock(datetime(2026, 10, 1, 14, 0, tzinfo=UTC))
+    service = Execution(fake, clock=clock, observe_backoff=timedelta(0), failures_before_alert=2)
+    down = True
+
+    def account():
+        if down:
+            raise AlpacaError("GET /v2/account: HTTP 502: bad gateway", status=502)
+        return FakeBroker.account(fake)
+
+    fake.account = account
+
+    for _ in range(2):
+        service(conn)
+        clock.now += timedelta(seconds=30)
+    down = False
+    service(conn)
+
+    clock.now += timedelta(hours=1)
+    down = True
+    for _ in range(2):
+        service(conn)
+        clock.now += timedelta(seconds=30)
+
+    assert [(kind, period) for kind, _, period, _ in alerts(db)] == [
+        ("cycle_failing", "2026-10-01T14:00:00Z"),
+        ("cycle_recovered", "2026-10-01T14:00:00Z"),
+        ("cycle_failing", "2026-10-01T15:01:00Z"),
+    ]
+
+
+def test_fewer_failed_cycles_than_the_threshold_tell_the_operator_nothing(db, caplog):
+    """A single failed cycle is an ordinary event: the next one carries on from what the
+    database says, and nothing is raised until the run is long enough to be blind."""
+    conn = db.connect("execution")
+    fake = broker()
+    clock = Clock(datetime(2026, 10, 1, 14, 0, tzinfo=UTC))
+    service = Execution(fake, clock=clock, observe_backoff=timedelta(0))
+    down = True
+
+    def account():
+        if down:
+            raise AlpacaError("GET /v2/account: timed out")
+        return FakeBroker.account(fake)
+
+    fake.account = account
+
+    with caplog.at_level(logging.ERROR):
+        for _ in range(9):
+            service(conn)
+            clock.now += timedelta(seconds=30)
+    assert alerts(db) == []
+
+    # The tenth is five minutes with no reading of the account, which is the staleness window.
+    service(conn)
+    assert [kind for kind, *_ in alerts(db)] == ["cycle_failing"]
+
+    # A run that never reached the threshold is not announced as recovered either.
+    down = False
+    service(conn)
+    service(conn)
+    down = True
+    clock.now += timedelta(hours=1)
+    service(conn)
+    down = False
+    service(conn)
+    assert [kind for kind, *_ in alerts(db)] == ["cycle_failing", "cycle_recovered"]
+
+
 # -- where the keys live -------------------------------------------------------------------
 
 

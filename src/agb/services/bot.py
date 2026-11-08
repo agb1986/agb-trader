@@ -26,6 +26,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from time import sleep as wait
 from typing import Any
 
 import psycopg
@@ -46,6 +47,13 @@ PREFLIGHT_AT = time(10, 0)
 # A failed delivery is retried after this, doubling with each failure up to the cap.
 RETRY_AFTER = timedelta(minutes=1)
 RETRY_CAP = timedelta(hours=1)
+# How many extra attempts the poll gets inside one cycle, and how long it waits between them.
+# The bot reaches Telegram only through the VPN's proxy, and the failure that dominates its log
+# is a handshake that never completes: a second attempt opens a new connection, which is
+# usually all it takes. One extra attempt only, because the rest of the cycle -- the alerts it
+# raises and the deliveries it owes -- waits behind this read.
+POLL_RETRIES = 1
+POLL_BACKOFF = 1.0
 
 ALERT_HEADER = "HEALTH ALERT — nothing has been done and nothing will be."
 # The performance readings get their own header and a footer, because the question they
@@ -241,6 +249,9 @@ class Bot:
         preflight_at: time = PREFLIGHT_AT,
         retry_after: timedelta = RETRY_AFTER,
         retry_cap: timedelta = RETRY_CAP,
+        poll_retries: int = POLL_RETRIES,
+        poll_backoff: float = POLL_BACKOFF,
+        sleep: Callable[[float], None] = wait,
         halts: Check = health.open_halt_causes,
         broker: Check = health.broker_mismatch,
     ) -> None:
@@ -251,6 +262,9 @@ class Bot:
         self.preflight_at = preflight_at
         self.retry_after = retry_after
         self.retry_cap = retry_cap
+        self.poll_retries = max(0, poll_retries)
+        self.poll_backoff = poll_backoff
+        self._sleep = sleep
         self.halts = halts
         self.broker = broker
         self._offset: int | None = None
@@ -274,10 +288,8 @@ class Bot:
         """Read new messages and record each as a command. Only the configured chat is ever
         answered."""
         now = now or self.clock()
-        try:
-            updates = self.telegram.get_updates(self._offset)
-        except TelegramError as exc:
-            log.warning("could not read messages: %s", exc)
+        updates = self._updates()
+        if updates is None:
             return
         for update in updates:
             self._offset = max(self._offset or 0, update["update_id"] + 1)
@@ -288,6 +300,25 @@ class Bot:
                 self.answer(conn, message, now)
             else:
                 self.refuse(conn, message)
+
+    def _updates(self) -> list[dict[str, Any]] | None:
+        """New messages, or `None` when Telegram could not be reached.
+
+        Asking is idempotent: the offset advances only on what comes back, so the same ask
+        either returns the same messages or returns nothing. That makes it safe to try again
+        inside the cycle instead of leaving the messages to the next one, which is worth doing
+        because a cycle that polls nothing answers nobody.
+        """
+        for attempt in range(self.poll_retries + 1):
+            try:
+                return self.telegram.get_updates(self._offset)
+            except TelegramError as exc:
+                if attempt == self.poll_retries:
+                    log.warning("could not read messages: %s", exc)
+                    return None
+                log.warning("could not read messages: %s; trying again", exc)
+                self._sleep(self.poll_backoff)
+        return None
 
     def answer(self, conn: psycopg.Connection, message: dict[str, Any], now: datetime) -> None:
         """Record the command, then answer it: the command's readout, or why it was refused

@@ -95,6 +95,10 @@ RESUME = "resume"
 # The halt cause an expired submission lease opens. Only a human clears it.
 LEASE_EXPIRED = "execution_lease_expired"
 LATCH_FAILED = "latch_failed"
+# A run of cycles that all ended on an error, and the run ending. One pair per run, not one
+# alert per failed cycle: a broker that is down for an hour is one thing that happened.
+CYCLE_FAILING = "cycle_failing"
+CYCLE_RECOVERED = "cycle_recovered"
 LIQUIDATION = "liquidation"
 LIQUIDATION_FAILED = "liquidation_failed"
 
