@@ -113,6 +113,15 @@ last read it (`agb.broker_state_now`), and defers the job when there is no readi
 enough to size against. `AGB_CAPITAL_USD` remains as an override for a run that has to be
 sized by hand.
 
+Where the 100000 came from: `env/pipeline.env.example` set `AGB_CAPITAL_USD=100000`, and the
+server's `env/pipeline.env` was filled in from it, so the override was set on every rebalance
+the pipeline has ever run. The example now carries the variable commented out, as the override
+it is. The code change alone does not reach the server: the line has to come out of
+`env/pipeline.env` on the deploy machine, or every basket is still sized on 100000.
+
+    ssh casaos.local "sed -i '/^AGB_CAPITAL_USD=/d' /mnt/data/AppData/agb-trader/env/pipeline.env"
+    ssh casaos.local "/mnt/data/AppData/agb-trader/agb-stack up -d pipeline"
+
 ## The options
 
 **(a) Raise the turnover limit above 1.00.** `gate.Limits.turnover` is a hard-coded dataclass
