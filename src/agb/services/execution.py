@@ -33,6 +33,25 @@ log = logging.getLogger(__name__)
 
 # How often the account's flags are observed when nothing else is happening.
 OBSERVE_EVERY = timedelta(minutes=5)
+# How long an observation waits after one that failed, doubling to the cap. Without this a
+# failed observation leaves the five-minute reading overdue, so the next cycle tries again a
+# cycle later and every cycle after that: a broker that refuses this one read turns the
+# five-minute observation into a thirty-second retry loop, and the rest of the cycle -- the
+# submits, the reconciles, the snapshot -- never runs, because the failure ends the cycle at
+# the same point every time.
+OBSERVE_BACKOFF = timedelta(seconds=30)
+OBSERVE_BACKOFF_CAP = timedelta(minutes=10)
+# How many cycles in a row must end on an error before the operator is told. At the default
+# thirty-second cycle, ten of them is five minutes with no reading of the account, which is
+# the staleness window the health checks use. Below that it is noise: a single failed cycle is
+# an ordinary event, and the next one carries on from what the database says.
+FAILURES_BEFORE_ALERT = 10
+
+
+def _stamp(at: datetime) -> str:
+    """An instant as the alert table's `period`: one alert per run of failures, keyed by when
+    the run began."""
+    return at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class Execution:
@@ -46,16 +65,31 @@ class Execution:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         settle: timedelta = execution.SETTLE,
         observe_every: timedelta = OBSERVE_EVERY,
+        observe_backoff: timedelta = OBSERVE_BACKOFF,
+        observe_backoff_cap: timedelta = OBSERVE_BACKOFF_CAP,
+        failures_before_alert: int = FAILURES_BEFORE_ALERT,
         lease: timedelta = execution.SUBMISSION_LEASE,
     ) -> None:
         self.broker = broker
         self.clock = clock
         self.settle = settle
         self.observe_every = observe_every
+        self.observe_backoff = observe_backoff
+        self.observe_backoff_cap = observe_backoff_cap
+        self.failures_before_alert = failures_before_alert
         self.lease = lease
         self._calendar: NyseCalendar | None = None
         self._observed_at: datetime | None = None
         self._warned = False
+        # The observation's backoff: how long the last failed one asks us to wait, and when
+        # it was tried. Both None whenever the last observation succeeded.
+        self._observe_waiting: timedelta | None = None
+        self._observe_tried_at: datetime | None = None
+        # The run of failed cycles: how many, when it started, and whether it has been
+        # alerted on. All reset by a cycle that finishes.
+        self._failures = 0
+        self._failing_since: datetime | None = None
+        self._alerted = False
 
     @classmethod
     def from_env(cls) -> "Execution":
@@ -77,18 +111,64 @@ class Execution:
             self.cycle(conn)
         except (AlpacaError, ExecutionError, OSError) as exc:
             log.error("cycle stopped: %s", exc)
+            self.failed(conn, exc)
+        else:
+            self.recovered(conn)
+
+    def failed(self, conn: psycopg.Connection, exc: Exception) -> None:
+        """Count this failed cycle, and alert once when the run of them crosses the
+        threshold. One alert per run: the run's own start is the alert's period, so the next
+        outage raises its own and this one is never raised twice."""
+        now = self.clock()
+        if self._failing_since is None:
+            self._failing_since = now
+        self._failures += 1
+        if self._alerted or self._failures < self.failures_before_alert:
+            return
+        execution.raise_alert(
+            conn,
+            execution.CYCLE_FAILING,
+            execution.ROLE,
+            _stamp(self._failing_since),
+            f"{self._failures} execution cycles in a row have ended on an error since "
+            f"{_stamp(self._failing_since)}. The account has not been read in that time, so "
+            f"no basket goes in and nothing is reconciled until it recovers.\n"
+            f"the last error: {exc}",
+        )
+        self._alerted = True
+        log.error("raised %s after %d failed cycles", execution.CYCLE_FAILING, self._failures)
+
+    def recovered(self, conn: psycopg.Connection) -> None:
+        """A cycle finished. Clear the run, and say so if the operator was told about it."""
+        if self._alerted and self._failing_since is not None:
+            execution.raise_alert(
+                conn,
+                execution.CYCLE_RECOVERED,
+                execution.ROLE,
+                _stamp(self._failing_since),
+                f"execution cycles are completing again after {self._failures} failed in a "
+                f"row from {_stamp(self._failing_since)}.",
+            )
+            log.info("cycles recovered after %d failures", self._failures)
+        self._failures = 0
+        self._failing_since = None
+        self._alerted = False
 
     def cycle(self, conn: psycopg.Connection) -> None:
         now = self.clock()
         calendar = self.calendar(now)
         if execution.apply_latch(conn, self.broker, calendar, now):
-            self._observed_at = now
+            self.observed(now)
         if execution.apply_liquidation(conn, self.broker, calendar, now):
             execution.record_state(conn, self.broker)
-            self._observed_at = now
-        if self._observed_at is None or now - self._observed_at >= self.observe_every:
-            execution.record_state(conn, self.broker)
-            self._observed_at = now
+            self.observed(now)
+        if self.observe_due(now):
+            try:
+                execution.record_state(conn, self.broker)
+            except (AlpacaError, OSError):
+                self.observe_failed(now)
+                raise
+            self.observed(now)
         recovery.halt_expired_submissions(conn)
         if execution.LEASE_EXPIRED in execution.open_halts(conn):
             # A submission died with orders possibly at the broker. Nothing goes in until the
@@ -107,6 +187,31 @@ class Execution:
         session = self.closed_session(calendar, now)
         if session is not None:
             execution.snapshot(conn, self.broker, session, calendar)
+
+    def observe_due(self, now: datetime) -> bool:
+        """Whether to read the account's flags this cycle.
+
+        After a failure the wait is the backoff, counted from the attempt that failed, rather
+        than the five minutes counted from the last reading: that reading is already overdue,
+        so without the backoff every cycle would try again.
+        """
+        if self._observe_waiting is not None and self._observe_tried_at is not None:
+            return now - self._observe_tried_at >= self._observe_waiting
+        return self._observed_at is None or now - self._observed_at >= self.observe_every
+
+    def observed(self, now: datetime) -> None:
+        """The account was read, however it was read. The backoff goes with it."""
+        self._observed_at = now
+        self._observe_waiting = None
+        self._observe_tried_at = None
+
+    def observe_failed(self, now: datetime) -> None:
+        waiting = self.observe_backoff
+        if self._observe_waiting is not None:
+            waiting = min(self.observe_backoff_cap, self._observe_waiting * 2)
+        self._observe_waiting = waiting
+        self._observe_tried_at = now
+        log.warning("the account could not be observed; trying again in %s", waiting)
 
     def submit_due(self, conn: psycopg.Connection, calendar: NyseCalendar, now: datetime) -> None:
         """Send the orders of every approved basket whose submission window is open.

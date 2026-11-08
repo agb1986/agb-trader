@@ -13,7 +13,7 @@ from agb.health import Finding
 from agb.nyse import NEW_YORK, NyseCalendar
 from agb.roles import OWNER
 from agb.services import bot as bot_service
-from agb.services.bot import Bot, help_text
+from agb.services.bot import POLL_BACKOFF, Bot, help_text
 from agb.telegram import TelegramError
 
 CHAT = "4242"
@@ -289,9 +289,56 @@ def test_telegram_unreachable_does_not_stop_the_cycle(db, telegram, rebalance_ah
     expect(db, "approval_request", "2026-10", NOW - timedelta(minutes=1))
     telegram.fail = "getUpdates: timed out"
     with caplog.at_level(logging.WARNING, logger="agb.services.bot"):
-        Bot(telegram, CHAT, lambda: NOW)(db.connect("bot"))
+        Bot(telegram, CHAT, lambda: NOW, sleep=lambda _: None)(db.connect("bot"))
     assert "could not read messages: getUpdates: timed out" in caplog.text
     assert [event for _, event, *_ in events(db)] == ["failed"]
+
+
+def test_a_poll_that_cannot_reach_telegram_is_tried_again_inside_the_cycle(db, telegram, caplog):
+    """Asking for messages is idempotent -- the offset advances only on what comes back -- so
+    one more attempt inside the cycle is safe, and a cycle that polls nothing answers nobody."""
+    waits: list[float] = []
+    telegram.fail = "getUpdates: TLSV1_ALERT_PROTOCOL_VERSION"
+    bot = Bot(telegram, CHAT, lambda: NOW, sleep=waits.append)
+
+    with caplog.at_level(logging.WARNING, logger="agb.services.bot"):
+        bot.poll(db.connect("bot"))
+
+    assert len(telegram.offsets) == 2
+    assert waits == [POLL_BACKOFF]
+    assert "TLSV1_ALERT_PROTOCOL_VERSION; trying again" in caplog.text
+
+
+def test_a_poll_that_fails_once_still_reads_the_messages(db, telegram):
+    telegram.updates = [
+        {"update_id": 11, "message": {"chat": {"id": int(CHAT)}, "from": {"id": 1}, "text": "hi"}}
+    ]
+    reached = telegram.get_updates
+
+    def flaky(offset):
+        if not telegram.offsets:
+            telegram.offsets.append(offset)
+            raise TelegramError("getUpdates: handshake failed")
+        return reached(offset)
+
+    telegram.get_updates = flaky
+    Bot(telegram, CHAT, lambda: NOW, sleep=lambda _: None).poll(db.connect("bot"))
+
+    assert telegram.offsets == [None, None]
+    assert telegram.sent == [(CHAT, help_text("not a command"))]
+
+
+def test_a_poll_tries_no_more_than_it_is_told_to(db, telegram, caplog):
+    waits: list[float] = []
+    telegram.fail = "getUpdates: timed out"
+    bot = Bot(telegram, CHAT, lambda: NOW, poll_retries=0, sleep=waits.append)
+
+    with caplog.at_level(logging.WARNING, logger="agb.services.bot"):
+        bot.poll(db.connect("bot"))
+
+    assert len(telegram.offsets) == 1
+    assert waits == []
+    assert "trying again" not in caplog.text
 
 
 # The pre-flight.
