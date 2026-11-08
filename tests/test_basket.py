@@ -47,9 +47,9 @@ def plan_rebalance(db, period=PERIOD, session_date=TRADE):
 
 def run(db, root, **kwargs):
     """One pipeline cycle, ranking with the promoted stand-in model (tests/registry_fake.py)."""
-    kwargs = {"limits": LIMITS, "clock": lambda: EVENING, **kwargs}
+    kwargs = {"limits": LIMITS, "clock": lambda: EVENING, "capital": CAPITAL, **kwargs}
     ranker = registry_fake.ranker(db)
-    Pipeline(root, "", ranker=ranker, capital=CAPITAL, **kwargs)(db.connect("pipeline"))
+    Pipeline(root, "", ranker=ranker, **kwargs)(db.connect("pipeline"))
 
 
 def rows(db, query, *params):
@@ -396,15 +396,73 @@ def test_the_signal_session_is_the_last_session_before_the_trade_session():
     assert basket.signal_session(date(2026, 1, 2)) == date(2025, 12, 31)
 
 
-def test_the_capital_comes_from_the_environment(monkeypatch):
+def test_the_environment_only_overrides_the_capital(monkeypatch):
     monkeypatch.delenv(basket.CAPITAL_ENV, raising=False)
-    assert capital_from_env() == Decimal("100000")
+    assert capital_from_env() is None
     monkeypatch.setenv(basket.CAPITAL_ENV, "250000.50")
     assert capital_from_env() == Decimal("250000.50")
     monkeypatch.setenv(basket.CAPITAL_ENV, "lots")
     with pytest.raises(SystemExit, match="not a number"):
         capital_from_env()
     assert os.environ[basket.CAPITAL_ENV] == "lots"
+
+
+# Sizing. With no AGB_CAPITAL_USD the basket is sized on the account's own equity, as execution
+# last read it, rather than on a figure carried in the code.
+
+_STATE = """
+    INSERT INTO agb.broker_state (observed_at, account_status, suspend_trade, no_shorting,
+        trading_blocked, account_blocked, equity_usd, actor)
+    VALUES (%s, 'ACTIVE', false, false, false, false, %s, 'execution')
+"""
+
+
+def observe(db, equity, observed_at=EVENING):
+    db.connect("execution").execute(_STATE, (observed_at, equity))
+
+
+def test_the_capital_is_the_accounts_equity_as_execution_last_read_it(db):
+    observe(db, Decimal("93837.20"), EVENING - timedelta(hours=1))
+    observe(db, Decimal("41234.56"))
+    assert basket.account_capital(db.connect("pipeline"), EVENING) == Decimal("41234.56")
+
+
+def test_an_account_never_read_defers_the_basket(db):
+    with pytest.raises(basket.NotReady, match="no account reading"):
+        basket.account_capital(db.connect("pipeline"), EVENING)
+
+
+def test_an_account_reading_too_old_to_size_against_defers_the_basket(db):
+    observe(db, Decimal("41234.56"), EVENING - basket.EQUITY_FRESH - MINUTE)
+    with pytest.raises(basket.NotReady, match="past the"):
+        basket.account_capital(db.connect("pipeline"), EVENING)
+    assert basket.account_capital(
+        db.connect("pipeline"), EVENING, fresh=basket.EQUITY_FRESH + timedelta(hours=1)
+    ) == Decimal("41234.56")
+
+
+def test_a_basket_is_sized_on_the_account_when_the_capital_is_not_given(db, tmp_path):
+    plan_rebalance(db)
+    observe(db, Decimal("41234.56"))
+
+    run(db, Market(tmp_path).names(25).land(), capital=None)
+
+    assert job_state(db) == "completed"
+    assert rows(db, "SELECT capital_usd FROM agb.basket") == [(Decimal("41234.56"),)]
+    [(notional,)] = rows(db, "SELECT sum(notional_usd) FROM agb.basket_order WHERE side = 'buy'")
+    assert notional < Decimal("41234.56")
+
+
+def test_a_rebalance_with_no_account_reading_keeps_the_job_and_tries_again(db, tmp_path):
+    due = plan_rebalance(db)
+
+    run(db, Market(tmp_path).names(25).land(), capital=None)
+
+    assert job_state(db) == "claimed"
+    [(left,)] = rows(db, "SELECT lease_until - now() FROM agb.job")
+    assert timedelta(0) < left <= RETRY
+    assert rows(db, "SELECT count(*) FROM agb.basket") == [(0,)]
+    assert late_proposals(db, due + MINUTE) == [(PERIOD,)]
 
 
 # The state machine. A basket is inserted directly, as the pipeline does, so these need no lake.

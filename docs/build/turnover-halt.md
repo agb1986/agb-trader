@@ -108,6 +108,11 @@ come to $93,798.01. Cash plus the $11,554.20 the real sells raise is about $96,9
 buys fit — but with roughly $3,200 of headroom, not the $6,200 the $100,000 figure implies.
 The `cash` gate check passed against the $100,000 assumption, not against real equity.
 
+Fixed, issue #125: the rebalance now sizes each basket on the account's equity as execution
+last read it (`agb.broker_state_now`), and defers the job when there is no reading fresh
+enough to size against. `AGB_CAPITAL_USD` remains as an override for a run that has to be
+sized by hand.
+
 ## The options
 
 **(a) Raise the turnover limit above 1.00.** `gate.Limits.turnover` is a hard-coded dataclass
