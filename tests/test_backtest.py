@@ -574,11 +574,8 @@ def test_explicit_start_dates_run_from_the_first_month_at_or_after_each(
 
 def test_the_report_carries_the_approximate_after_tax_view(reference):
     """The report states an approximate UK capital gains bill on the run's own disposals, with
-    the rate, the allowance and the simplifications it rests on beside the numbers.
-
-    The reference run's lake is a lake of equity prices with no index fund in it, which is the
-    real lake's shape too, so the buy-and-hold comparison reports nothing and names the ticker
-    it wanted rather than failing the run."""
+    the rate, the allowance and the simplifications it rests on beside the numbers, and the
+    buy-and-hold comparison of the benchmark the reference run's lake holds."""
     results = reference.run.results
     view = results["after_tax"]
 
@@ -587,7 +584,7 @@ def test_the_report_carries_the_approximate_after_tax_view(reference):
     assert (view["rate"], view["annual_exempt_amount"]) == (0.24, 3000.0)
     assert view["simplifications"] == list(tax.SIMPLIFICATIONS)
     assert view["benchmark"] == backtest.BENCHMARK == "SPY"
-    assert view["buy_and_hold"] is None, "the fake lake holds no index fund, as the real one may"
+    assert view["buy_and_hold"] is not None, "the research lake holds the benchmark"
 
     taxed = view["strategy"]
     # Everything bought is sold or deemed sold at the final close, so the gains net to exactly
@@ -612,6 +609,22 @@ def test_the_report_carries_the_approximate_after_tax_view(reference):
         [q for q in reference.simulation.positions.values() if q]
     )
     json.dumps(view)  # what the ledger holds
+
+
+def test_a_lake_without_the_benchmark_still_backtests(tmp_path, ledger):
+    """The real lake holds equity prices and no index fund. A plain backtest on such a lake
+    completes as before: the buy-and-hold comparison reports nothing and names the ticker it
+    wanted, and each month's benchmark return is missing rather than guessed, which is what
+    certification reads as an excess Sharpe it cannot measure (issue #167)."""
+    root = Market(tmp_path / "lake").names(12).land()
+    panel = panel_module.build(root, PANEL_START, FORCED_END)
+
+    run = backtest.run(panel, backtest.Options(**SMALL), ledger, lake_dir=root)
+
+    view = run.results["after_tax"]
+    assert view["benchmark"] == backtest.BENCHMARK and view["buy_and_hold"] is None
+    assert run.results["monthly"], "the run traded"
+    assert all(month["benchmark"] is None for month in run.results["monthly"])
 
 
 def benchmark_close(root, day: date) -> Decimal:
@@ -709,7 +722,17 @@ def test_each_combinatorial_path_is_reported_for_the_gates(research_panel, resea
         assert {"total_return", "gross_return", "sharpe", "max_drawdown", "turnover"} <= set(path)
         assert {"participation_max", "delisting_exits", "orders", "fees_paid"} <= set(path)
         assert len(path["monthly"]) == 6
-        assert all(set(month) == {"as_of", "net", "gross"} for month in path["monthly"])
+        assert all(
+            set(month) == {"as_of", "net", "gross", "benchmark"} for month in path["monthly"]
+        )
+    # Each month's benchmark return runs over the same two sessions as the book's, from that
+    # month's entry to the next one's and from the last entry to the final exit, so the gates
+    # can subtract the one from the other month by month (issue #167).
+    days = [month.entry for month in panel.months] + [panel.months[-1].exit]
+    closes = [float(benchmark_close(research_lake, day)) for day in days]
+    expected = [end / start - 1 for start, end in zip(closes[:-1], closes[1:], strict=True)]
+    for path in paths:
+        assert [month["benchmark"] for month in path["monthly"]] == pytest.approx(expected)
     assert paths[0]["total_return"] != paths[1]["total_return"], "the reversed score buys the tail"
     summary = results["summary"]
     assert summary["paths"] == 2

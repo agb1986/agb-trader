@@ -209,7 +209,7 @@ def blank_db(cluster: Cluster) -> Iterator[str]:
 def research_lake(tmp_path_factory) -> Path:
     from research_fake import Market
 
-    return Market(tmp_path_factory.mktemp("research-lake")).names().land()
+    return Market(tmp_path_factory.mktemp("research-lake")).names().benchmark().land()
 
 
 @pytest.fixture(scope="session")
