@@ -13,18 +13,23 @@ from datetime import UTC, date, datetime, timedelta
 import psycopg
 import pyarrow as pa
 import pytest
+import registry_fake
+from market_fake import Market
 from panel_fake import FakePanel
 from psycopg import errors
 from sharadar_fake import sample, sep_row
-from test_basket import job_state, plan_rebalance
+from test_approval_loop import NEXT_MORNING, cli_main
+from test_basket import CAPITAL, EVENING, LIMITS, job_state, plan_rebalance
 from test_basket import rows as cli_rows
 from test_basket import run as rebalance
 from test_blend import fake_panel, market
+from test_gate import LATE
 
-from agb import heartbeat, jobs, lake, schedule
+from agb import approval, heartbeat, jobs, lake, schedule
 from agb.panel_store import PanelStore
 from agb.schedule import Expected, Planned
-from agb.services.pipeline import JOB_FAILED, RETRY, Pipeline, record
+from agb.services.pipeline import JOB_FAILED, RERUN_FAILED, RETRY, Pipeline, record
+from agb.services.scheduler import Scheduler
 
 PERIOD = "2026-09-14"
 SESSION = date(2026, 9, 14)
@@ -434,3 +439,108 @@ def test_a_lost_lease_ends_the_job_without_failing_it(db, tmp_path, caplog):
     assert job_state(db) != "failed"
     assert cli_rows(db, "SELECT count(*) FROM agb.job_event WHERE event = 'failed'") == [(0,)]
     assert alerts(db) == []
+
+
+# The basket cutoff in the database (issue #155): a gate that would approve a basket at or
+# after its cutoff is refused with a CheckViolation, which the pipeline handles like any other
+# database error. The tests pin the database's clock through agb.test_clock.
+
+
+def run_at(db, root, at, **kwargs):
+    """One pipeline cycle, on a connection whose database clock reads `at`, with the vendor
+    faked for any pull it takes."""
+    conn = db.connect("pipeline")
+    conn.execute("SELECT set_config('agb.test_clock', %s, false)", (at.isoformat(),))
+    kwargs = {
+        "limits": LIMITS,
+        "clock": lambda: EVENING,
+        "capital": CAPITAL,
+        "opener": sample(),
+        **kwargs,
+    }
+    Pipeline(root, KEY, ranker=registry_fake.ranker(db), **kwargs)(conn)
+
+
+def test_a_rebalance_gated_past_its_cutoff_fails_once_with_an_alert(db, tmp_path):
+    plan_rebalance(db)
+    root = market(tmp_path).land()
+
+    run_at(db, root, LATE)
+
+    assert job_state(db) == "failed"
+    [(detail,)] = cli_rows(db, "SELECT detail FROM agb.job_event WHERE event = 'failed'")
+    assert detail.startswith("CheckViolation: basket_cutoff: pipeline may not approve basket")
+    [(kind, subject, period, body, _)] = alerts(db)
+    assert (kind, subject, period) == (JOB_FAILED, "rebalance", "2026-10")
+    assert detail in body
+    # The gate's whole run was rolled back with the approval it would have written.
+    [(basket_id, state)] = cli_rows(db, "SELECT id, state FROM agb.basket_state")
+    assert state == "proposed"
+    assert cli_rows(db, "SELECT count(*) FROM agb.gate_run") == [(0,)]
+
+    run_at(db, root, LATE)
+
+    assert job_state(db) == "failed"
+    assert len(alerts(db)) == 1
+
+
+def failed_reruns(db):
+    return cli_rows(
+        db,
+        "SELECT subject, period, body, raised_by FROM agb.alert WHERE kind = %s",
+        RERUN_FAILED,
+    )
+
+
+def test_a_rerun_gated_past_its_cutoff_alerts_once_and_the_cycle_carries_on(
+    db, tmp_path, monkeypatch, capsys, caplog
+):
+    plan_rebalance(db)
+    approval.set_paper_approval(db.connect("cli"), True, "operator", "rehearse the loop")
+    root = Market(tmp_path).names(25).land()
+    rebalance(db, root)
+    Scheduler(lambda: LATE)(db.connect("scheduler"))
+    code, _, _ = cli_main(db, monkeypatch, capsys, "rerun", "2026-10", "--actor", "alex")
+    assert code == 0
+    # Paper mode runs unattended again, so the gate would approve the rerun itself.
+    approval.set_paper_approval(db.connect("cli"), False, "operator", "done rehearsing")
+    claimed = "SELECT count(*) FROM agb.job_event WHERE event = 'claimed'"
+    [(before,)] = cli_rows(db, claimed)
+    rerun_cutoff = datetime(2026, 10, 2, 19, 45, tzinfo=UTC)
+
+    with caplog.at_level(logging.ERROR, logger="agb.services.pipeline"):
+        run_at(db, root, rerun_cutoff, clock=lambda: NEXT_MORNING)
+
+    [record] = [r for r in caplog.records if r.getMessage().startswith("rerun 2026-10r1")]
+    assert "CheckViolation: basket_cutoff: pipeline may not approve" in record.getMessage()
+    [(subject, period, body, raised_by)] = failed_reruns(db)
+    assert (subject, period, raised_by) == ("2026-10r1", "2026-10-02", "pipeline")
+    assert "asked for by alex" in body and "CheckViolation: basket_cutoff" in body
+    assert cli_rows(db, "SELECT reference FROM agb.rerun_pending") == [("2026-10r1",)]
+    [(rerun, state)] = cli_rows(
+        db,
+        "SELECT b.id, s.state FROM agb.basket b JOIN agb.basket_state s ON s.id = b.id"
+        " WHERE b.reference = '2026-10r1'",
+    )
+    assert state == "proposed"
+    # The cycle went on to take the next job (the scheduler planned the month's data pulls).
+    assert cli_rows(db, claimed) == [(before + 1,)]
+
+    # Tried again the next cycle, still refused, and the alert is not raised a second time.
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="agb.services.pipeline"):
+        run_at(db, root, rerun_cutoff, clock=lambda: NEXT_MORNING)
+    assert [r for r in caplog.records if r.getMessage().startswith("rerun 2026-10r1")]
+    assert len(failed_reruns(db)) == 1
+
+    # The sweep retires the ungated rerun at its cutoff, with its own alert, and the pipeline
+    # stops trying it: the gate would refuse a basket no longer proposed every cycle.
+    Scheduler(lambda: rerun_cutoff)(db.connect("scheduler"))
+    assert cli_rows(db, "SELECT state FROM agb.basket_state WHERE id = %s", rerun) == [("missed",)]
+    raised = len(alerts(db))
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="agb.services.pipeline"):
+        run_at(db, root, rerun_cutoff, clock=lambda: NEXT_MORNING)
+    assert caplog.records == []
+    assert len(alerts(db)) == raised
+    assert cli_rows(db, "SELECT count(*) FROM agb.gate_run WHERE basket_id = %s", rerun) == [(0,)]

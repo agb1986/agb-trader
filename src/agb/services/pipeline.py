@@ -42,7 +42,11 @@ Parquet file, or any of the errors each job names -- fails with the cause named 
 again, so the alert is raised once. Only a database connection that has gone away is left to
 stop the service, so it restarts with a new one. A job whose lease was lost -- it ran out and
 another worker reclaimed it -- is left to that worker: the cycle logs it and ends without
-failing the job.
+failing the job. A rerun that fails is logged and raises a `pipeline_rerun_failed` alert, once
+per rerun; it has no job to fail, so it is tried again each cycle. That includes a gate that
+refuses to approve a basket past its cutoff (the `transition_timely` trigger's
+`CheckViolation`). A rerun whose basket was built but never gated, and has since been retired
+as missed by the approval sweep, is skipped: the sweep has already alerted on it.
 
     python -m agb.services.pipeline             run the service
     python -m agb.services.pipeline backfill    land the vendor's history from 1998, then exit
@@ -100,6 +104,16 @@ _RERUNS = """
 
 # Raised when a job fails, once per job: a failed job is not taken again.
 JOB_FAILED = "pipeline_job_failed"
+# Raised when a rerun fails, once per rerun: a rerun has no job to fail, so it is tried again
+# each cycle, and the alert says so the first time.
+RERUN_FAILED = "pipeline_rerun_failed"
+
+# The state of the basket already built under a rerun's reference, if there is one.
+_RERUN_STATE = """
+    SELECT s.state
+    FROM agb.basket b JOIN agb.basket_state s ON s.id = b.id
+    WHERE b.reference = %s
+"""
 
 _RAISE = """
     INSERT INTO agb.alert (kind, subject, period, body, raised_by)
@@ -148,12 +162,19 @@ def fail(conn: psycopg.Connection, claim: jobs.Claim, what: str, exc: Exception)
     jobs.fail(conn, claim, detail)
     log.error("%s %s failed: %s", what, claim.period, detail)
     body = f"The {what} for {claim.period} failed and will not be tried again: {detail}"
+    alert(conn, JOB_FAILED, claim.kind, claim.period, body)
+
+
+def alert(conn: psycopg.Connection, kind: str, subject: str, period: str, body: str) -> None:
+    """Raise an alert, once: one already raised for the same kind, subject and period is kept.
+    An alert that cannot be written is logged, unless the connection has gone away, which is
+    re-raised so the service restarts."""
     try:
-        conn.execute(_RAISE, (JOB_FAILED, claim.kind, claim.period, body, PIPELINE))
-    except psycopg.Error as alert_exc:
+        conn.execute(_RAISE, (kind, subject, period, body, PIPELINE))
+    except psycopg.Error as exc:
         if conn.closed or conn.broken:
             raise
-        log.error("%s %s: could not raise its alert: %s", what, claim.period, alert_exc)
+        log.error("%s %s %s: could not raise its alert: %s", kind, subject, period, exc)
 
 
 def sample_from_env() -> int:
@@ -367,6 +388,12 @@ class Pipeline:
         reference: str,
         session_date: date,
     ) -> None:
+        state = conn.execute(_RERUN_STATE, (reference,)).fetchone()
+        if state is not None and state[0] != "proposed":
+            # Built, never gated, and retired since -- the approval sweep marks such a basket
+            # missed at its cutoff and alerts on it. The gate would refuse it every cycle.
+            log.debug("rerun %s is already %s; not gating it", reference, state[0])
+            return
         try:
             proposal = basket.rerun(
                 conn, original, reference, session_date, command_id, self.lake_dir
@@ -393,7 +420,13 @@ class Pipeline:
         ) as exc:
             if isinstance(exc, psycopg.Error) and (conn.closed or conn.broken):
                 raise
-            log.error("rerun %s, asked for by %s, failed: %s", reference, actor, cause(exc))
+            detail = cause(exc)
+            log.error("rerun %s, asked for by %s, failed: %s", reference, actor, detail)
+            body = (
+                f"The rerun {reference} of basket {original}, asked for by {actor} for"
+                f" {session_date}, failed and is tried again each cycle: {detail}"
+            )
+            alert(conn, RERUN_FAILED, reference, session_date.isoformat(), body)
             return
         log.info(
             "rerun %s of basket %d, asked for by %s, is basket %d for %s: %s, %s",
