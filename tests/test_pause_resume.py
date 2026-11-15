@@ -180,7 +180,7 @@ def test_pause_cancels_a_submitted_basket_before_the_deadline_and_halts_it(db, o
     [halted] = lines[3:]
     assert halted.startswith(f"basket {PERIOD} halted at 2026-")
     assert halted.endswith(f": {reason}")
-    assert "partial_rebalance" not in kinds(db)
+    assert "partial_rebalance_paused" not in kinds(db)
     # Cancelled before the rest of the account moves.
     assert fake.calls.index(("suspend", True)) > max(
         i for i, call in enumerate(fake.calls) if call[0] == "cancel"
@@ -201,7 +201,7 @@ def test_a_cancel_that_fails_fires_the_partial_rebalance_alert_naming_what_is_li
     assert fake.orders["ord-0001"].status == "accepted"
     assert state(db, target.id)[0] == "halted"
     [(subject, body)] = rows(
-        db, "SELECT subject, body FROM agb.alert WHERE kind = 'partial_rebalance'"
+        db, "SELECT subject, body FROM agb.alert WHERE kind = 'partial_rebalance_paused'"
     )
     assert subject == PERIOD
     assert body == (

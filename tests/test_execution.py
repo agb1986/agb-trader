@@ -317,7 +317,7 @@ def test_an_order_that_will_not_cancel_is_named_in_a_partial_rebalance_alert(db)
     assert fake.orders["ord-0002"].status == "accepted"
     assert alerts(db) == [
         (
-            "partial_rebalance",
+            "partial_rebalance_halted",
             PERIOD,
             PERIOD,
             f"basket {PERIOD} halted mid-submission; still live at the broker: buy 240 N02",
@@ -414,7 +414,7 @@ def test_a_refused_order_is_recorded_as_rejected_and_the_rest_go_in(db):
     assert len(fake.orders) == 19
     assert alerts(db) == [
         (
-            "partial_rebalance",
+            "partial_rebalance_refused",
             PERIOD,
             PERIOD,
             f"basket {PERIOD} submitted with 1 of 20 orders refused by the broker: buy 240 N03",
@@ -575,11 +575,41 @@ def test_an_order_filled_short_is_named_in_a_partial_rebalance_alert(db):
     ]
     assert alerts(db) == [
         (
-            "partial_rebalance",
+            "partial_rebalance_short_fill",
             PERIOD,
             PERIOD,
             f"basket {PERIOD} filled short on 1 of 20 orders: buy 240 N05 filled 200",
         )
+    ]
+
+
+def test_a_basket_that_alerted_at_submission_and_then_filled_short_raises_both_alerts(db):
+    """Each cause is its own alert kind, so the refusal raised at submission does not take
+    the key the short fill at the close is raised under."""
+    conn = db.connect("execution")
+    target = approved(db)
+    fake = broker()
+    fake.refuse.add("N03")
+    assert execution.submit(conn, fake, target, NOW).state == "submitted"
+
+    fake.close(CLOSE_AT, short={"N05": Decimal(200)})
+    outcome = execution.reconcile(conn, fake, target, AFTER)
+
+    assert outcome.state == "filled"
+    assert alerts(db) == [
+        (
+            "partial_rebalance_refused",
+            PERIOD,
+            PERIOD,
+            f"basket {PERIOD} submitted with 1 of 20 orders refused by the broker: buy 240 N03",
+        ),
+        (
+            "partial_rebalance_short_fill",
+            PERIOD,
+            PERIOD,
+            f"basket {PERIOD} filled short on 2 of 20 orders: buy 240 N03 filled 0, "
+            "buy 240 N05 filled 200",
+        ),
     ]
 
 

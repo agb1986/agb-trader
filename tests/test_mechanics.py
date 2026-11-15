@@ -20,6 +20,7 @@ from test_execution import (
     CLOSE_AT,
     MID,
     NOW,
+    PAUSE,
     SYMBOLS,
     WITH_A_SALE,
     approved,
@@ -68,6 +69,8 @@ def by_hand(db, basket_id, short=None):
     ).fetchall()
     for order_id, symbol, side, qty in orders:
         got = (short or {}).get(symbol, qty)
+        if got == 0:
+            continue
         fees = cost.fees(side, got * MID, got)
         conn.execute(
             _FILL,
@@ -256,9 +259,12 @@ def test_a_short_fill_that_alerted_passes(db):
 
     assert result.passed is True
     assert result.measured == "1 short fills in 1 rebalances, each alerted"
-    assert result.threshold == "every rebalance with a short fill raises partial_rebalance"
+    assert result.threshold == (
+        "every rebalance with a short fill raises partial_rebalance_short_fill, "
+        "or partial_rebalance_halted or partial_rebalance_paused if it was halted"
+    )
     assert result.detail == {"orders": 1, "rebalances": ["2026-10"], "unalerted": []}
-    assert alerts(db) == [("partial_rebalance", "2026-10")]
+    assert alerts(db) == [("partial_rebalance_short_fill", "2026-10")]
 
 
 def test_a_short_fill_that_passed_in_silence_fails(db):
@@ -284,6 +290,73 @@ def test_a_short_fill_that_passed_in_silence_fails(db):
     ]
     assert mechanics.detail_text(result) == ("  N05    2026-10  buy 200 of 240 filled, no alert")
     assert alerts(db) == []
+
+
+def test_a_short_fill_alerted_only_at_submission_fails(db):
+    """The submission's refusal alert is another cause's. A basket that raised it and then
+    filled short without saying so has not alerted the short fill, so the check fails."""
+    conn = db.connect("execution")
+    target = approved(db, SOUND)
+    fake = broker()
+    fake.refuse.add("N03")
+    assert execution.submit(conn, fake, target, NOW).state == "submitted"
+    by_hand(db, target.id, short={"N03": Decimal(0), "N05": Decimal(200)})
+
+    result = mechanics.partial_fills(conn)
+
+    assert alerts(db) == [("partial_rebalance_refused", "2026-10")]
+    assert result.passed is False
+    assert result.measured == "2 short fills in 1 rebalances, 1 of them raised no alert"
+    assert [row["symbol"] for row in result.detail["unalerted"]] == ["N03", "N05"]
+
+
+def _legacy(db, reference, period, body):
+    """An alert under the one kind every partial-rebalance cause shared before they were
+    split, as execution raised it then."""
+    db.connect("execution").execute(
+        "INSERT INTO agb.alert (kind, subject, period, body, raised_by)"
+        " VALUES ('partial_rebalance', %s, %s, %s, 'execution')",
+        (reference, period, f"basket {reference} {body}"),
+    )
+
+
+def test_a_short_fill_alerted_under_the_shared_kind_passes_and_a_refusal_under_it_does_not(db):
+    """Alerts raised before the causes were split all carry `partial_rebalance`. The one the
+    close raised still says the short fill was alerted; the submission's, which took the key
+    and hid the close's, does not."""
+    conn = db.connect("execution")
+    target = approved(db, SOUND)
+    assert execution.submit(conn, broker(), target, NOW).state == "submitted"
+    by_hand(db, target.id, short={"N05": Decimal(200)})
+
+    refused = "submitted with 1 of 20 orders refused by the broker: N03"
+    _legacy(db, target.reference, target.reference, refused)
+    assert mechanics.partial_fills(conn).passed is False
+
+    # A second period only so the row is not dropped on the key the first one holds.
+    _legacy(db, target.reference, "close", "filled short on 1 of 20 orders: N05")
+    assert mechanics.partial_fills(conn).passed is True
+
+
+def test_a_halted_basket_with_an_order_still_live_passes_on_its_halt_alert(db):
+    """A basket halted mid-submission is left short by the halt, not by the close, and the
+    halt's alert is what names what stayed live."""
+    conn = db.connect("execution")
+    target = approved(db, SOUND)
+
+    def pause_after_two(fake, client_order_id):
+        if len(fake.submits()) == 2:
+            db.connect("bot").execute(PAUSE)
+
+    fake = broker(on_submit=pause_after_two)
+    fake.cancel_fails.add("ord-0002")
+    assert execution.submit(conn, fake, target, NOW).state == "halted"
+
+    result = mechanics.partial_fills(conn)
+
+    assert alerts(db) == [("partial_rebalance_halted", "2026-10")]
+    assert result.passed is True
+    assert result.measured == "2 short fills in 1 rebalances, each alerted"
 
 
 def test_a_record_with_no_short_fill_refuses(db):
