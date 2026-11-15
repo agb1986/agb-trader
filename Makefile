@@ -8,6 +8,9 @@
 # model artifacts the pipeline may rank with, each copied from a certification's directory as
 # `<model id>/`; the pipeline and the CLI only read it. RESEARCH_DIR receives the research
 # profile's trial ledger and models, on the workstation.
+#
+# AGB_EXPECTED_SERVICES names the services `make status` fails without: every long-running
+# service, and the bot only when the telegram profile is enabled.
 ENV_DIR ?= env
 BACKUP_DIR ?= backups
 LAKE_DIR ?= lake
@@ -23,6 +26,7 @@ export AGB_MODELS_DIR := $(abspath $(MODELS_DIR))
 export AGB_PIPELINE_USER := $(shell id -u):$(shell id -g)
 export AGB_RESEARCH_DIR := $(abspath $(RESEARCH_DIR))
 export AGB_RESEARCH_USER := $(shell id -u):$(shell id -g)
+export AGB_EXPECTED_SERVICES ?= scheduler pipeline execution ui backup$(if $(findstring telegram,$(COMPOSE_PROFILES)), bot)
 COMPOSE := docker compose --env-file $(ENV_DIR)/db.env
 
 .DEFAULT_GOAL := help
@@ -46,7 +50,7 @@ up: ## Build the app image and bring up the stack
 down: ## Stop the stack; the database volume is kept
 	$(COMPOSE) down
 
-status: ## Show each service's last heartbeat
+status: ## Show each service's last heartbeat; fails if one is stale or missing
 	$(COMPOSE) run --rm cli status
 
 logs: ## Follow the service logs

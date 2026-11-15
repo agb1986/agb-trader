@@ -10,7 +10,7 @@ from pathlib import Path
 
 import psycopg
 
-from agb import panel
+from agb import heartbeat, panel
 from agb.nyse import NyseCalendar, trading_date
 from agb.roles import SERVICES
 
@@ -54,14 +54,44 @@ def status(conn: psycopg.Connection) -> str:
     return format_status(conn.execute(_HEARTBEATS).fetchall())
 
 
+def expected_services() -> tuple[str, ...]:
+    """The services `agb status` insists on: AGB_EXPECTED_SERVICES, separated by spaces or
+    commas, or every service when it is unset or empty. The workstation's `make status` leaves
+    the bot out unless the telegram profile runs there; the server expects all of them."""
+    names = os.environ.get("AGB_EXPECTED_SERVICES", "").replace(",", " ").split()
+    return tuple(names) or SERVICES
+
+
+def unhealthy(
+    rows: Iterable[tuple[str, datetime, timedelta, str | None]],
+    expected: Iterable[str],
+    stale_after: timedelta,
+) -> list[str]:
+    """One line for each expected service that has never beaten or whose last beat is older
+    than `stale_after`. A service nobody expects is listed by `format_status` and judged by
+    nothing."""
+    ages = {service: age for service, _, age, _ in rows}
+    found = []
+    for service in expected:
+        if service not in ages:
+            found.append(f"{service} has never beaten")
+        elif ages[service] > stale_after:
+            found.append(f"{service} is stale: last beat {format_age(ages[service])} ago")
+    return found
+
+
 def clock() -> datetime:
     return datetime.now(UTC)
 
 
 def _status(args: argparse.Namespace) -> int:
     with psycopg.connect(application_name="agb-cli") as conn:
-        print(status(conn))
-    return 0
+        rows = conn.execute(_HEARTBEATS).fetchall()
+    print(format_status(rows))
+    found = unhealthy(rows, expected_services(), heartbeat.stale_after_from_env())
+    for line in found:
+        print(f"agb: {line}", file=sys.stderr)
+    return 1 if found else 0
 
 
 # What each job kind actually takes, claim to completion. A reclaimed job is measured from
@@ -567,9 +597,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agb", description="agb-trader operator CLI")
     parser.add_argument("--version", action="version", version=os.environ.get("AGB_VERSION", "dev"))
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("status", help="each service's last heartbeat and its age").set_defaults(
-        run=_status
-    )
+    commands.add_parser(
+        "status",
+        help="each service's last heartbeat and its age",
+        description="Exits 1 when an expected service (AGB_EXPECTED_SERVICES, default every "
+        "service) has never beaten or last beat longer ago than AGB_STALE_AFTER_SECONDS "
+        "(default 300).",
+    ).set_defaults(run=_status)
     commands.add_parser(
         "runtimes",
         help="how long each job kind has taken, claim to completion",
