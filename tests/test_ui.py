@@ -892,7 +892,9 @@ def assert_protected(response):
     assert response.getheader("X-Frame-Options") == "DENY"
     assert "frame-ancestors 'none'" in response.getheader("Content-Security-Policy", "")
     assert response.getheader("X-Content-Type-Options") == "nosniff"
-    assert response.getheader("Referrer-Policy") == "no-referrer"
+    # Not `no-referrer`: under it a browser sends `Origin: null` on the page's own form posts,
+    # which the write check refuses, so the UI's forms would fail. Do not tighten it back.
+    assert response.getheader("Referrer-Policy") == "same-origin"
 
 
 def test_the_server_answers_the_tunnels_two_names_unless_configured_otherwise(monkeypatch):

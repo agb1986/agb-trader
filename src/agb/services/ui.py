@@ -59,6 +59,9 @@ BODY_MAX = 4096
 ALLOWED_HOSTS = ("127.0.0.1:8080", "localhost:8080")
 # Sent on every response, refusals and the stdlib's own errors included. The pages are inline
 # HTML and CSS posting forms to themselves, so the policy allows exactly that and nothing else.
+# The referrer policy is `same-origin`, not `no-referrer`: under `no-referrer` a browser sends
+# `Origin: null` on the page's own form posts, which the write check refuses, so every form here
+# would fail. `same-origin` still sends no `Referer` to any other site.
 SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": (
@@ -66,7 +69,7 @@ SECURITY_HEADERS = {
         "frame-ancestors 'none'"
     ),
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    "Referrer-Policy": "same-origin",
 }
 
 
