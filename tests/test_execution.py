@@ -46,6 +46,8 @@ NOW = datetime(2026, 10, 1, 19, 35, tzinfo=UTC)
 CLOSE_AT = datetime(2026, 10, 1, 20, 0, tzinfo=UTC)
 AFTER = datetime(2026, 10, 1, 20, 5, tzinfo=UTC)
 NEXT = date(2026, 10, 2)
+# The period's basket regenerated, as a second basket for the same session.
+SECOND = f"{PERIOD}r1"
 CALENDAR = NyseCalendar(date(2026, 9, 1), date(2026, 12, 31))
 MID = Decimal("20.00")
 PAUSE = "INSERT INTO agb.halt_event (cause, action, actor) VALUES ('pause', 'set', 'bot')"
@@ -103,6 +105,15 @@ def halts(db):
 
 def alerts(db):
     return rows(db, "SELECT kind, subject, period, body FROM agb.alert ORDER BY id")
+
+
+def submission_job(db, period=PERIOD):
+    return rows(
+        db,
+        "SELECT e.event, e.detail FROM agb.job_event e JOIN agb.job j ON j.id = e.job_id"
+        " WHERE j.kind = 'submission' AND j.period = %s ORDER BY e.id",
+        period,
+    )
 
 
 def expect_submission(db, period=PERIOD):
@@ -755,16 +766,41 @@ def test_a_basket_whose_window_has_closed_stays_approved_with_a_warning(db, capl
     conn = db.connect("execution")
     target = approved(db)
     fake = broker()
-    service = Execution(fake, clock=Clock(datetime(2026, 10, 1, 19, 46, tzinfo=UTC)))
+    clock = Clock(datetime(2026, 10, 1, 19, 46, tzinfo=UTC))
+    service = Execution(fake, clock=clock)
 
     with caplog.at_level(logging.WARNING):
-        service(conn)
+        for _ in range(5):
+            service(conn)
+            clock.now += timedelta(seconds=30)
 
     assert state(db, target.id)[0] == "approved"
     assert fake.submits() == []
-    assert (
+    warning = (
         f"basket {PERIOD}: its submission window closed at 2026-10-01 15:45 ET; leaving it approved"
-    ) in caplog.text
+    )
+    assert caplog.text.count(warning) == 1
+    assert alerts(db) == [
+        (
+            "submission_window_missed",
+            PERIOD,
+            PERIOD,
+            f"basket {PERIOD} was still approved when its submission window closed at "
+            f"2026-10-01 15:45 ET, so none of its orders went in for {TRADE}. It is left "
+            "approved and is not tried again.",
+        )
+    ]
+
+
+def test_a_restarted_service_does_not_raise_the_missed_window_twice(db):
+    conn = db.connect("execution")
+    approved(db)
+    clock = Clock(datetime(2026, 10, 1, 19, 46, tzinfo=UTC))
+
+    Execution(broker(), clock=clock)(conn)
+    Execution(broker(), clock=clock)(conn)
+
+    assert [kind for kind, *_ in alerts(db)] == ["submission_window_missed"]
 
 
 def test_an_error_at_the_broker_ends_the_cycle_and_the_next_one_carries_on(db, caplog):
@@ -780,14 +816,102 @@ def test_an_error_at_the_broker_ends_the_cycle_and_the_next_one_carries_on(db, c
 
     with caplog.at_level(logging.ERROR):
         service(conn)
-    assert f"cycle stopped: {PERIOD}-N10: POST /v2/orders: connection reset" in caplog.text
+    assert (
+        f"{PERIOD} submission_failed: ExecutionError: {PERIOD}-N10: POST /v2/orders: "
+        "connection reset"
+    ) in caplog.text
+    assert "cycle stopped" not in caplog.text
     assert state(db, target.id)[0] == "approved"
     assert len(fake.orders) == 9
+    [(kind, subject, period, body)] = alerts(db)
+    assert (kind, subject, period) == ("submission_failed", PERIOD, PERIOD)
+    assert body.endswith(
+        f"the error: ExecutionError: {PERIOD}-N10: POST /v2/orders: connection reset"
+    )
+    # Released, not ended: the job can be held again, and the release says why.
+    assert submission_job(db) == [
+        ("claimed", None),
+        ("released", f"ExecutionError: {PERIOD}-N10: POST /v2/orders: connection reset"),
+    ]
 
     fake.on_submit = None
     service(conn)
     assert state(db, target.id)[0] == "submitted"
     assert len(fake.orders) == 20
+    assert [event for event, _ in submission_job(db)] == [
+        "claimed",
+        "released",
+        "claimed",
+        "completed",
+    ]
+    assert len(alerts(db)) == 1
+
+
+def test_one_basket_that_fails_leaves_the_others_reconcile_and_the_snapshot_to_run(db, caplog):
+    conn = db.connect("execution")
+    first = approved(db)
+    # A second basket for the same session: the period's basket regenerated under its own
+    # reference, so its orders have their own client_order_ids.
+    second_id = insert(db, reference=SECOND)
+    run(db, second_id)
+    # Last session's basket, sent with nothing to trade: due to be reconciled this cycle.
+    earlier = replace(
+        BASE,
+        period="2026-08",
+        session_date=date(2026, 9, 30),
+        snapshot_date=date(2026, 9, 29),
+        orders=(),
+    )
+    earlier_id = insert(db, earlier)
+    move(db, earlier_id, 2, "proposed", "pending", "bot", "telegram")
+    move(db, earlier_id, 3, "pending", "approved", "bot", "telegram")
+    move(db, earlier_id, 4, "approved", "submitted", "execution")
+
+    def break_the_first(fake, client_order_id):
+        if client_order_id.rsplit("-", 1)[0] == PERIOD:
+            raise RuntimeError("the answer could not be read")
+
+    fake = broker(on_submit=break_the_first)
+    with caplog.at_level(logging.ERROR):
+        Execution(fake, clock=Clock(NOW))(conn)
+
+    assert state(db, first.id)[0] == "approved"
+    assert state(db, second_id)[0] == "submitted"
+    assert {o.client_order_id for o in fake.orders.values()} == {f"{SECOND}-{s}" for s in NAMES}
+    assert state(db, earlier_id)[0] == "filled"
+    assert rows(db, "SELECT snapshot_date FROM agb.position_snapshot") == [(date(2026, 9, 30),)]
+    [(kind, subject, period, body)] = alerts(db)
+    assert (kind, subject, period) == ("submission_failed", PERIOD, PERIOD)
+    assert "the error: RuntimeError: the answer could not be read" in body
+    assert f"{PERIOD} submission_failed: RuntimeError: the answer could not be read" in caplog.text
+    assert "cycle stopped" not in caplog.text
+
+
+def test_a_reconcile_or_snapshot_that_fails_is_alerted_on_and_the_cycle_finishes(db, caplog):
+    conn = db.connect("execution")
+    target = approved(db)
+    fake = broker()
+    clock = Clock(NOW)
+    service = Execution(fake, clock=clock)
+    service(conn)
+    assert state(db, target.id)[0] == "submitted"
+
+    def unreadable(*args):
+        raise AlpacaError("GET /v2/account/activities: the broker's answer is malformed")
+
+    fake.fills = unreadable
+    fake.close(CLOSE_AT)
+    clock.now = AFTER
+    with caplog.at_level(logging.ERROR):
+        service(conn)
+
+    assert state(db, target.id)[0] == "submitted"
+    assert [(kind, subject, period) for kind, subject, period, _ in alerts(db)] == [
+        ("reconcile_failed", PERIOD, PERIOD),
+        ("snapshot_failed", "execution", str(TRADE)),
+    ]
+    assert "cycle stopped" not in caplog.text
+    assert service._failures == 0
 
 
 def test_without_keys_the_service_beats_only(db, caplog):

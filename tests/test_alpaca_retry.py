@@ -154,3 +154,27 @@ def test_no_key_reaches_the_message_of_a_retried_failure():
         client(broker, clock).account()
     assert KEY not in str(caught.value)
     assert SECRET not in str(caught.value)
+
+
+def test_an_order_answer_without_an_id_is_a_broker_error_not_a_key_error():
+    broker = FakeBroker(b'{"symbol": "AAA", "side": "buy", "status": "new"}')
+    with pytest.raises(AlpacaError) as caught:
+        client(broker, Clock()).order("x")
+    assert caught.value.status is None
+    assert "order: the broker's answer is malformed" in str(caught.value)
+    assert "'id'" in str(caught.value)
+
+
+def test_a_submission_answered_without_an_id_is_not_sent_again():
+    broker = FakeBroker(b'{"symbol": "AAA", "side": "buy", "status": "new"}')
+    with pytest.raises(AlpacaError) as caught:
+        client(broker, Clock()).submit("AAA", 5, "buy", "2026-10-AAA")
+    assert caught.value.status is None
+    assert len(broker.requests) == 1
+
+
+def test_an_answer_of_the_wrong_shape_is_a_broker_error():
+    broker = FakeBroker(b'[{"symbol": "AAA"}]')
+    with pytest.raises(AlpacaError) as caught:
+        client(broker, Clock()).account()
+    assert "account: the broker's answer is malformed" in str(caught.value)
