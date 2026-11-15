@@ -127,6 +127,8 @@ Rejected: automatic roll-forward to the next session's MOC. The backtest assumes
 
 Mechanically: reminders at roughly 60 and 20 minutes before the cutoff. At the cutoff the scheduler marks the basket **missed**, not **failed**. It does not set the halt latch, because nothing is broken, and the next month proceeds normally. Afterwards the human may issue an explicit command to run the same basket at the next session's MOC. That is a new basket, `2026-10r1`, with `deviation_of` pointing at the original, which keeps its missed outcome; the deviation is visible later when live performance is reconciled against the backtest.
 
+As built, the database holds the cutoff too: a trigger on `basket_event` refuses a move to approved at or after 15:45 ET on the basket's session, whoever inserts it. It has no NYSE calendar, so on an early-close day the Python check, which reads the calendar, is the stricter of the two. The scheduler also retires two kinds of basket that can no longer trade: a proposed basket the gate never ran on, at its cutoff, and an approved basket with nothing at the broker by the session's close. Each is marked missed with one alert. Neither counts as a clean miss, so the month's submission stays overdue until the operator reruns it or lets it go.
+
 ## The autonomy ladder
 
 Three levels, with movement up by human act and movement down automatic.

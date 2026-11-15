@@ -7,17 +7,32 @@ import re
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
+import registry_fake
+from conftest import SUPERUSER
 from market_fake import PERIOD, Market
 from psycopg import errors
 from test_basket import plan_rebalance
 from test_basket import run as build
 from test_bot import CHAT, FakeTelegram, expect
 from test_bot_commands import ET, blocks, say
-from test_execution import CALENDAR, NOW, basket, broker, expect_submission, halts
-from test_gate import EVENING, LATE, insert, move, rows, run, state
+from test_execution import (
+    CALENDAR,
+    CLOSE_AT,
+    NOW,
+    Clock,
+    alerts,
+    approved,
+    basket,
+    broker,
+    expect_submission,
+    halts,
+)
+from test_gate import EVENING, LATE, SOUND, insert, move, rows, run, state
 
-from agb import approval, cli, execution
+from agb import approval, cli, execution, gate, jobs, migrate, schedule
+from agb.roles import OWNER
 from agb.services.bot import Bot
+from agb.services.execution import Execution
 from agb.services.scheduler import Scheduler
 
 MINUTE = timedelta(minutes=1)
@@ -429,6 +444,163 @@ def test_an_answer_after_the_cutoff_but_before_the_sweep_is_refused(db, asks):
     [reply] = chat.say("/approve 2026-10")
     assert reply == (f"rebalance 2026-10: the deadline, 2026-10-01 15:45 ET, has passed\n\n{FORM}")
     assert state(db, basket_id)[:2] == ("pending", 2)
+
+
+# The cutoff in the database (issue #155): whoever inserts the approval, it is refused at or
+# after the basket's cutoff. The tests pin the database's clock through agb.test_clock.
+
+
+def move_at(db, at, basket_id, seq, from_state, to_state, role, surface=None, actor=None):
+    """`move`, on a connection whose database clock reads `at`."""
+    conn = db.connect(role)
+    conn.execute("SELECT set_config('agb.test_clock', %s, false)", (at.isoformat(),))
+    conn.execute(
+        "INSERT INTO agb.basket_event (basket_id, seq, from_state, to_state, actor, surface)"
+        " VALUES (%s, %s, %s, %s, %s, %s)",
+        (basket_id, seq, from_state, to_state, actor or role, surface or role),
+    )
+
+
+@pytest.mark.parametrize("at", [LATE, LATE + MINUTE, LATE + timedelta(days=3)])
+def test_the_database_refuses_a_human_approval_at_or_after_the_cutoff(db, pending_basket, at):
+    with pytest.raises(errors.CheckViolation, match="basket_cutoff: bot may not approve"):
+        move_at(db, at, pending_basket, 3, "pending", "approved", "bot", "telegram")
+    assert state(db, pending_basket)[:2] == ("pending", 2)
+
+
+def test_the_database_refuses_the_systems_approval_after_the_cutoff_too(db):
+    # Paper runs unattended, so a gate passed late would approve the basket alone.
+    basket_id = insert(db)
+    registry_fake.promote(db)
+    conn = db.connect("pipeline")
+    conn.execute("SELECT set_config('agb.test_clock', %s, false)", (LATE.isoformat(),))
+    with pytest.raises(errors.CheckViolation, match="basket_cutoff: pipeline may not approve"):
+        gate.run(conn, basket_id, members=SOUND.members, marks=SOUND.marks, now=SOUND.now)
+    assert state(db, basket_id)[:2] == ("proposed", 1)
+
+
+def test_the_database_allows_an_approval_before_the_cutoff(db, pending_basket):
+    move_at(db, LATE - MINUTE, pending_basket, 3, "pending", "approved", "bot", "telegram")
+    assert state(db, pending_basket)[:2] == ("approved", 3)
+
+
+def test_the_database_allows_every_other_move_after_the_cutoff(db, pending_basket):
+    move_at(db, LATE, pending_basket, 3, "pending", "missed", "scheduler", actor="system")
+    assert state(db, pending_basket)[:2] == ("missed", 3)
+
+
+@pytest.mark.parametrize("session", [date(2026, 10, 1), date(2026, 12, 1)])
+def test_the_databases_cutoff_is_the_calendars_on_a_regular_day(db, session):
+    # October is on daylight time and December is not; both close at 16:00 New York.
+    assert rows(db, "SELECT agb.basket_cutoff(%s)", session) == [(CALENDAR.moc_cutoff(session),)]
+
+
+def test_a_deployed_database_judges_an_approval_by_its_own_clock(cluster, blank_db):
+    with cluster.connect(blank_db, SUPERUSER) as admin:
+        migrate.bootstrap(admin, cluster.passwords)
+    with cluster.connect(blank_db, OWNER) as owner:
+        migrate.apply(owner, migrate.migrations_dir())
+    with cluster.connect(blank_db, "bot") as conn:
+        # The tests' clock setting means nothing there.
+        conn.execute("SET agb.test_clock = '-infinity'")
+        [(drift,)] = conn.execute(
+            "SELECT abs(extract(epoch FROM agb.approval_clock() - clock_timestamp()))"
+        ).fetchall()
+    assert drift < 5
+
+
+# The baskets left behind by their session (issue #155): the sweep retires them, each with
+# one alert, and leaves the month's submission overdue.
+
+
+def test_an_approved_basket_never_submitted_is_retired_at_the_close_with_one_alert(db):
+    expect_submission(db)
+    target = approved(db)
+    clock = Clock(LATE + MINUTE)
+    # Execution sees the closed window first, and alerts on it once.
+    Execution(broker(), clock=clock)(db.connect("execution"))
+    assert [kind for kind, *_ in alerts(db)] == ["submission_window_missed"]
+
+    # Inside the quarter hour after the cutoff the basket is still execution's.
+    Scheduler(lambda: CLOSE_AT - MINUTE)(db.connect("scheduler"))
+    assert state(db, target.id) == ("approved", 2, "system", "pipeline")
+    Scheduler(lambda: CLOSE_AT)(db.connect("scheduler"))
+    Scheduler(lambda: CLOSE_AT + MINUTE)(db.connect("scheduler"))
+
+    assert state(db, target.id) == ("missed", 3, "system", "scheduler")
+    assert rows(
+        db, "SELECT reason FROM agb.basket_event WHERE basket_id = %s AND seq = 3", target.id
+    ) == [("approved but not submitted by the window's end, 2026-10-01 15:45 ET",)]
+    assert [kind for kind, *_ in alerts(db)] == ["submission_window_missed"]
+    assert halts(db) == []
+    assert completion(db, "submission") == []
+
+
+def test_the_sweep_alone_alerts_on_an_approved_basket_never_submitted(db):
+    target = approved(db)
+    Scheduler(lambda: CLOSE_AT)(db.connect("scheduler"))
+    assert state(db, target.id)[:2] == ("missed", 3)
+    assert alerts(db) == [
+        (
+            "submission_window_missed",
+            PERIOD,
+            PERIOD,
+            f"basket {PERIOD} was still approved when its submission window closed at "
+            "2026-10-01 15:45 ET, so none of its orders went in for 2026-10-01. Marked missed "
+            "by system; the month's submission stays overdue.\n\n"
+            f"To trade it at the next session's close instead: agb rerun {PERIOD}",
+        )
+    ]
+
+
+def test_an_approved_basket_with_an_order_at_the_broker_is_left_to_execution(db):
+    target = approved(db)
+    db.connect("execution").execute(
+        "INSERT INTO agb.broker_order (basket_id, basket_order_id, client_order_id, symbol,"
+        " side, qty, cost_model_version, modelled_cost_bps, nbbo_bid, nbbo_ask, nbbo_mid,"
+        " nbbo_at, actor)"
+        " SELECT basket_id, id, client_order_id, symbol, side, qty, cost_model_version,"
+        " modelled_cost_bps, 19.99, 20.01, 20.00, now(), 'execution'"
+        " FROM agb.basket_order WHERE basket_id = %s ORDER BY id LIMIT 1",
+        (target.id,),
+    )
+    Scheduler(lambda: CLOSE_AT + MINUTE)(db.connect("scheduler"))
+    assert state(db, target.id)[:2] == ("approved", 2)
+    assert alerts(db) == []
+
+
+def test_an_approved_basket_whose_submission_is_held_is_left_to_execution(db):
+    target = approved(db)
+    claim = jobs.hold(
+        db.connect("execution"), schedule.SUBMISSION, PERIOD, "execution", timedelta(hours=1)
+    )
+    assert claim is not None
+    Scheduler(lambda: CLOSE_AT + MINUTE)(db.connect("scheduler"))
+    assert state(db, target.id)[:2] == ("approved", 2)
+    assert alerts(db) == []
+
+
+def test_a_proposed_basket_never_gated_is_retired_at_the_cutoff_with_one_alert(db):
+    expect_submission(db)
+    basket_id = insert(db)
+    Scheduler(lambda: LATE - MINUTE)(db.connect("scheduler"))
+    assert state(db, basket_id)[:2] == ("proposed", 1)
+    Scheduler(lambda: LATE)(db.connect("scheduler"))
+    Scheduler(lambda: LATE + MINUTE)(db.connect("scheduler"))
+
+    assert state(db, basket_id) == ("missed", 2, "system", "scheduler")
+    assert alerts(db) == [
+        (
+            "basket_never_gated",
+            PERIOD,
+            PERIOD,
+            f"basket {PERIOD} was proposed but never gated by its cutoff, 2026-10-01 15:45 ET."
+            " Marked missed by system; the month's submission stays overdue.\n\n"
+            f"To trade it at the next session's close instead: agb rerun {PERIOD}",
+        )
+    ]
+    assert halts(db) == []
+    assert completion(db, "submission") == []
 
 
 # AC7: the operator reruns a missed basket at the next session's close.

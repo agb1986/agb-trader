@@ -1,7 +1,8 @@
 """The scheduler service. It owns the calendar: each cycle it beats its heartbeat, writes the
 jobs and expected events due from today's session through the lookahead, records any lease
-that has expired, and marks missed every rebalance still waiting for the human at its
-session's MOC cutoff.
+that has expired, and marks missed every rebalance left behind by its session: one still
+waiting for the human or never gated at its MOC cutoff, and one approved but never submitted
+by its close.
 
 It also moves the autonomy ladder down and lets a clean rebalance through: a rejection or a
 gate breach at L1 or L2 drops the system back to L0, and at L1 a clean basket the human has
@@ -65,8 +66,8 @@ class Scheduler:
             log.warning("recorded %d expired job leases", expired)
         for reference in approval.proceed_all(conn, now, self.calendar(now)):
             log.info("rebalance %s: no rejection in the opt-out window, proceeding", reference)
-        for reference in approval.sweep(conn, now, self.calendar(now)):
-            log.warning("rebalance %s: no answer by the cutoff, marked missed", reference)
+        for reference, why in approval.sweep(conn, now, self.calendar(now)):
+            log.warning("rebalance %s: %s", reference, why)
 
 
 def main() -> None:

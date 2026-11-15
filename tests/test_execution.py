@@ -828,7 +828,7 @@ def test_a_basket_whose_window_has_closed_stays_approved_with_a_warning(db, capl
     assert state(db, target.id)[0] == "approved"
     assert fake.submits() == []
     warning = (
-        f"basket {PERIOD}: its submission window closed at 2026-10-01 15:45 ET; leaving it approved"
+        f"basket {PERIOD}: its submission window closed at 2026-10-01 15:45 ET; not trying it again"
     )
     assert caplog.text.count(warning) == 1
     assert alerts(db) == [
@@ -837,8 +837,8 @@ def test_a_basket_whose_window_has_closed_stays_approved_with_a_warning(db, capl
             PERIOD,
             PERIOD,
             f"basket {PERIOD} was still approved when its submission window closed at "
-            f"2026-10-01 15:45 ET, so none of its orders went in for {TRADE}. It is left "
-            "approved and is not tried again.",
+            f"2026-10-01 15:45 ET, so none of its orders went in for {TRADE}. It is not "
+            "tried again, and the scheduler marks it missed at the close.",
         )
     ]
 

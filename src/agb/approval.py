@@ -13,10 +13,14 @@ it caused names it.
 
 If nothing has answered by the cutoff the scheduler marks the basket missed, as the system,
 and raises the expiry notice. A miss is not a failure: it fulfils the month's submission,
-opens no halt cause, and the next month proceeds as usual. The operator may then ask for
-the same basket at the next session's close with `agb rerun <reference>`: a new basket,
-`2026-10r1`, whose `deviation_of` names the missed one, which keeps its outcome. The CLI
-records the request and the pipeline builds and gates the basket.
+opens no halt cause, and the next month proceeds as usual. The database refuses an approval
+at or after the cutoff too (`transition_timely`), whoever inserts it. The scheduler also
+retires a basket that can no longer trade: one the gate never ran on, at its cutoff, and one
+approved but never submitted, at the session's close. Each is marked missed with one alert,
+and leaves the month's submission overdue, because neither is a clean miss. The operator
+may then ask for the same basket at the next session's close with `agb rerun <reference>`: a
+new basket, `2026-10r1`, whose `deviation_of` names the missed one, which keeps its outcome.
+The CLI records the request and the pipeline builds and gates the basket.
 
 Everything here reads its state from the database and holds none, so the UI can call the
 same functions later.
@@ -34,7 +38,7 @@ from psycopg.types.json import Jsonb
 
 from agb import blend, jobs, readout, schedule
 from agb.health import et
-from agb.nyse import NEW_YORK, NyseCalendar, trading_date
+from agb.nyse import MOC_SUBMISSION_LEAD, NEW_YORK, NyseCalendar, trading_date
 
 APPROVAL_REQUEST = schedule.APPROVAL_REQUEST
 APPROVAL_REMINDER = "approval_reminder"
@@ -582,50 +586,128 @@ def decide(
     )
 
 
-# The miss at the cutoff.
+# The miss at the cutoff, and the baskets left behind it.
+
+# An approved basket that never went in, and a proposed one the gate never ran on. The first
+# is left alone while anything may still be sending it: once a broker order is written, or
+# while the month's submission job is held, it is execution's to finish or to report.
+_UNSENT = """
+    SELECT s.id, s.reference, s.period, s.session_date, s.state, s.seq, s.since
+    FROM agb.basket_state s
+    WHERE s.kind = 'live' AND s.state = 'approved'
+      AND NOT EXISTS (SELECT 1 FROM agb.broker_order o WHERE o.basket_id = s.id)
+      AND NOT EXISTS (SELECT 1 FROM agb.job_state j
+                      WHERE j.kind = %s AND j.period = s.period
+                        AND j.state IN ('claimed', 'lease_expired'))
+    ORDER BY s.session_date, s.id
+"""
+_UNGATED = """
+    SELECT s.id, s.reference, s.period, s.session_date, s.state, s.seq, s.since
+    FROM agb.basket_state s
+    WHERE s.kind = 'live' AND s.state = 'proposed'
+      AND NOT EXISTS (SELECT 1 FROM agb.gate_run r WHERE r.basket_id = s.id)
+    ORDER BY s.session_date, s.id
+"""
+# The alert execution raises for an approved basket still unsent when its window closes. The
+# sweep raises the same one, so the operator hears of the basket once, from whichever of the
+# two sees it first.
+WINDOW_MISSED = "submission_window_missed"
+# The alert for a basket the gate never ran on.
+NEVER_GATED = "basket_never_gated"
 
 
-def sweep(conn: psycopg.Connection, now: datetime, calendar: NyseCalendar) -> list[str]:
-    """Mark missed, as the system, every basket still waiting for the human at its cutoff,
-    raise the expiry notice and fulfil the month's submission. No halt cause opens. Returns
-    the references it marked."""
-    missed = []
+def unsent_text(reference: str, session: date, cutoff: datetime) -> str:
+    return (
+        f"basket {reference} was still approved when its submission window closed at "
+        f"{et(cutoff)}, so none of its orders went in for {session}. Marked missed by "
+        "system; the month's submission stays overdue.\n\n"
+        f"To trade it at the next session's close instead: agb rerun {reference}"
+    )
+
+
+def never_gated_text(reference: str, cutoff: datetime) -> str:
+    return (
+        f"basket {reference} was proposed but never gated by its cutoff, {et(cutoff)}. Marked "
+        "missed by system; the month's submission stays overdue.\n\n"
+        f"To trade it at the next session's close instead: agb rerun {reference}"
+    )
+
+
+def _retire(
+    conn: psycopg.Connection,
+    basket: Waiting,
+    reason: str,
+    alert: tuple[str, str],
+    fulfil: bool,
+) -> bool:
+    """Mark a basket missed as the system and raise its alert, in one transaction. A basket
+    another writer moved first is left to it. Returns whether this marked it."""
+    kind, body = alert
+    try:
+        with conn.transaction():
+            (event_id,) = conn.execute(
+                _MOVE,
+                {
+                    "basket": basket.id,
+                    "seq": basket.seq + 1,
+                    "from": basket.state,
+                    "to": "missed",
+                    "actor": SYSTEM,
+                    "surface": SCHEDULER,
+                    "reason": reason,
+                    "command": None,
+                },
+            ).fetchone()
+            conn.execute(_RAISE, (kind, basket.reference, basket.period, body, SCHEDULER))
+            if fulfil:
+                jobs.fulfil(
+                    conn, schedule.SUBMISSION, basket.period, "basket_event", event_id, SCHEDULER
+                )
+    except (UniqueViolation, CheckViolation):
+        return False
+    return True
+
+
+def sweep(conn: psycopg.Connection, now: datetime, calendar: NyseCalendar) -> list[tuple[str, str]]:
+    """Mark missed, as the system, every live basket left behind by its session, and raise
+    one alert for each. No halt cause opens. Returns each reference it marked and why.
+
+    * One still waiting for the human at its cutoff: the expiry notice, and the month's
+      submission is fulfilled, because a miss is not a failure.
+    * One proposed that the gate never ran on, at its cutoff: it can no longer be approved.
+    * One approved that never went in, at the session's close: the submission window ended
+      at the cutoff, and the quarter hour after it lets a submission already under way
+      write its first order, which keeps the basket execution's.
+
+    The last two leave the month's submission unfulfilled, so the overdue view shows it."""
+    retired = []
     for basket in waiting(conn):
         cutoff = cutoff_of(calendar, basket.session_date)
         if now < cutoff:
             continue
-        try:
-            with conn.transaction():
-                (event_id,) = conn.execute(
-                    _MOVE,
-                    {
-                        "basket": basket.id,
-                        "seq": basket.seq + 1,
-                        "from": basket.state,
-                        "to": "missed",
-                        "actor": SYSTEM,
-                        "surface": SCHEDULER,
-                        "reason": f"no answer by the cutoff, {et(cutoff)}",
-                        "command": None,
-                    },
-                ).fetchone()
-                conn.execute(
-                    _RAISE,
-                    (
-                        APPROVAL_EXPIRED,
-                        basket.reference,
-                        basket.period,
-                        expiry_text(basket.reference, cutoff),
-                        SCHEDULER,
-                    ),
-                )
-                jobs.fulfil(
-                    conn, schedule.SUBMISSION, basket.period, "basket_event", event_id, SCHEDULER
-                )
-        except (UniqueViolation, CheckViolation):
+        expiry = (APPROVAL_EXPIRED, expiry_text(basket.reference, cutoff))
+        reason = f"no answer by the cutoff, {et(cutoff)}"
+        if _retire(conn, basket, reason, expiry, fulfil=True):
+            retired.append((basket.reference, "no answer by the cutoff, marked missed"))
+    for row in conn.execute(_UNGATED).fetchall():
+        basket = Waiting(*row)
+        cutoff = cutoff_of(calendar, basket.session_date)
+        if now < cutoff:
             continue
-        missed.append(basket.reference)
-    return missed
+        alert = (NEVER_GATED, never_gated_text(basket.reference, cutoff))
+        reason = f"never gated by the cutoff, {et(cutoff)}"
+        if _retire(conn, basket, reason, alert, fulfil=False):
+            retired.append((basket.reference, "never gated by the cutoff, marked missed"))
+    for row in conn.execute(_UNSENT, (schedule.SUBMISSION,)).fetchall():
+        basket = Waiting(*row)
+        cutoff = cutoff_of(calendar, basket.session_date)
+        if now < cutoff + MOC_SUBMISSION_LEAD:
+            continue
+        alert = (WINDOW_MISSED, unsent_text(basket.reference, basket.session_date, cutoff))
+        reason = f"approved but not submitted by the window's end, {et(cutoff)}"
+        if _retire(conn, basket, reason, alert, fulfil=False):
+            retired.append((basket.reference, "approved but never submitted, marked missed"))
+    return retired
 
 
 # The rerun.
