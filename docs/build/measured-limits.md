@@ -296,7 +296,7 @@ measurement no longer holds.
 
 The job **completes** even when it finds an unsound body: the finding is the store's, not the
 job's, and a failed job would be reclaimed and re-run to find the same thing again. What raises
-the alarm is `health.panel_bodies`, which reads the most recent row and returns a
+the alarm is `health.panel_bodies`, which reads the most recently recorded row and returns a
 `panel_body_unsound` finding when anything in it was missing or corrupt. The bot sends that as
 a health alert naming the counts and the first unsound hash, once, and the UI shows it.
 
@@ -322,11 +322,14 @@ unless the restored file hashes to what the marker recorded, which is the differ
 putting a body back and losing it. The store is the only copy of a panel body: the database
 holds hashes, not bytes.
 
-`run` inserts the `panel_audit` job as the scheduler would, for tomorrow's period by default,
-and waits up to five minutes for the pipeline to claim it, read the sample, and record the row.
-Then it prints the row and the bot's lines naming the store. It takes a period explicitly —
-`make panel-check CMD="run 2026-10-26"` — because `(kind, period)` is unique, so a period that
-already has an audit job inserts nothing instead of auditing twice.
+`run` inserts a `panel_audit` job now and waits up to five minutes for the pipeline to claim it,
+read the sample, and record the row. Then it prints the row and the bot's lines naming the
+store. The scheduler plans a `panel_audit` for every night 45 days ahead, so every bare date
+already has a job and `(kind, period)` is unique: the default period is therefore today's date
+plus a suffix, `YYYY-MM-DD-drill-HHMMSS`, which the scheduler never plans. `agb.panel_audit`
+admits that form, and `health.panel_bodies` reads the row recorded last rather than the
+highest period, so the drill's audit is the one it alerts on. `run` takes a period explicitly
+too, `make panel-check CMD="run 2026-11-15-again"`; a bare date will be refused as taken.
 
 ### Making the check certain
 
