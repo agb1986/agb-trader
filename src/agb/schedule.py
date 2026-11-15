@@ -25,7 +25,7 @@ The work:
 - **backup**, one per calendar day D, weekends and holidays included, period `YYYY-MM-DD`.
   Claimable from 03:00 New York time on D and expected done BACKUP_GRACE later. Planning
   starts from tomorrow, so the scheduler never writes a backup that is already late.
-- **panel_audit**, one per calendar day D, period `YYYY-MM-DD`. The pipeline reads a sample of
+- **panel_audit**, one per calendar day D, period `YYYY-MM-DD`. The pipeline reads up to a cap of
   the panel store's bodies back and records what it found. Claimable from 04:00 New York time,
   after the backup's window, and expected done PANEL_AUDIT_GRACE later. Planned from tomorrow
   for the same reason as the backup.
@@ -58,7 +58,8 @@ APPROVAL_REQUEST_GRACE = timedelta(minutes=30)
 BACKUP_AT = time(3, 0)
 BACKUP_GRACE = timedelta(hours=2)
 # After the backup's window, so the two nightly jobs do not read the same disk at once; the
-# sample is sized against a measured run to finish well inside the grace (src/agb/panel_audit.py).
+# cap on bodies read is sized against a measured run to finish well inside the grace
+# (src/agb/panel_audit.py).
 PANEL_AUDIT_AT = time(4, 0)
 PANEL_AUDIT_GRACE = timedelta(hours=2)
 # Longer than the widest gap between two rebalances, so the next one is always written well
