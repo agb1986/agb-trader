@@ -240,7 +240,11 @@ def position_mismatch(conn: psycopg.Connection) -> list[Finding]:
 
 
 def panel_bodies(conn: psycopg.Connection) -> list[Finding]:
-    """The newest panel-store integrity check, if it found a body it could not read back.
+    """The latest panel-store integrity check, if it found a body it could not read back.
+
+    Latest by when it was recorded, not by period: an audit the operator drives for the drill
+    has a suffixed period (2026-11-15-drill-143012) and must be the one read, and a period
+    dated ahead of today must not shadow a real finding.
 
     The check itself is the pipeline's nightly `panel_audit` job, which records what it found
     whether or not anything was wrong (agb.panel_audit). One alert per night, keyed by the
@@ -249,7 +253,7 @@ def panel_bodies(conn: psycopg.Connection) -> list[Finding]:
     """
     row = conn.execute(
         "SELECT period, bodies, checked, missing, corrupt FROM agb.panel_audit "
-        "ORDER BY period DESC LIMIT 1"
+        "ORDER BY at DESC, id DESC LIMIT 1"
     ).fetchone()
     if row is None:
         return []

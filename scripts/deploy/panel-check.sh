@@ -5,7 +5,7 @@
 #
 #   make panel-check CMD=check       the store has bodies and the sample will read the one broken
 #   make panel-check CMD=corrupt     back one body up, then overwrite it
-#   make panel-check CMD=run         insert tonight's audit job and wait for what it finds
+#   make panel-check CMD=run         insert a drill audit job and wait for what it finds
 #   make panel-check CMD=restore     put the body back from the backup
 #   make panel-check CMD=status      what is broken right now, and the last audits
 #
@@ -28,6 +28,8 @@ marker="$keep_dir/broken"
 # The pipeline polls every AGB_HEARTBEAT_SECONDS, 30 by default, so a job inserted now is
 # claimed within a minute. Five minutes is room for the claim, the read and the record.
 wait_seconds=300
+# The default period of `run`: the day, then the time, so each drill is its own period.
+drill_format=%Y-%m-%d-drill-%H%M%S
 # The nightly cap on bodies read (panel_audit.SAMPLE), when the server does not ask for another.
 default_sample=100000
 
@@ -164,10 +166,17 @@ run() {
     deployed
     local period=${1:-}
     if [ -z "$period" ]; then
-        # Tomorrow, which is the night the scheduler would plan next and so a period free of a
-        # job of its own. (kind, period) is unique, so a used period would insert nothing.
-        period=$(remote "date -u -d tomorrow +%F")
+        # A date plus a suffix, which the scheduler never plans. It plans a panel_audit for
+        # every night 45 days ahead, so every bare date is taken ((kind, period) is unique),
+        # tomorrow's included. The audit's own check admits the suffix.
+        period=$(remote "date -u +$drill_format")
     fi
+    case $period in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[a-z0-9]*) ;;
+    *) echo "panel-check: $period is a bare date, which the scheduler has probably planned" >&2 ;;
+    esac
+    # The job's session date is the day the period starts with.
+    local day=${period:0:10}
     local taken
     taken=$(query "SELECT state FROM agb.job_state
                    WHERE kind = 'panel_audit' AND period = '$period'")
@@ -179,7 +188,7 @@ run() {
 
     query "WITH j AS (
                INSERT INTO agb.job (kind, period, session_date, not_before, created_by)
-               VALUES ('panel_audit', '$period', '$period', now(), 'operator')
+               VALUES ('panel_audit', '$period', '$day', now(), 'operator')
                RETURNING id)
            INSERT INTO agb.job_event (job_id, event, actor)
            SELECT id, 'created', 'operator' FROM j" > /dev/null
@@ -258,7 +267,7 @@ usage: panel-check.sh <command>
 
   check             the store has cited bodies and the sample will read the one broken
   corrupt           back one cited body up on the server, then overwrite it
-  run [<period>]    insert the audit job now (default tomorrow) and wait for what it finds
+  run [<period>]    insert the audit job now (default <today>-drill-<time>) and wait for what it finds
   restore           put the body back from the backup and verify it byte for byte
   status            whether a body is broken, and the last three audits
 EOF
