@@ -59,6 +59,49 @@ def test_every_service_has_a_memory_limit(resolved):
         assert service.get("mem_limit"), name
 
 
+def test_every_service_has_a_healthcheck(resolved):
+    """`up --wait` passes only once each long-running service reports healthy, so each of them
+    must check something; the one-shots disable it, because their exit status is the answer."""
+    app_image = resolved["services"]["scheduler"]["image"]
+    for name, service in resolved["services"].items():
+        check = service.get("healthcheck")
+        assert check, f"{name} declares no healthcheck"
+        if name in ONE_SHOT:
+            assert check == {"disable": True}, name
+            continue
+        assert not check.get("disable"), name
+        assert check.get("test"), name
+        assert {"interval", "timeout", "retries"} <= set(check), name
+        # Docker Engine 20.10 on the server predates start_interval.
+        assert "start_interval" not in check, name
+        if service.get("image") == app_image:
+            assert check["test"][:4] == ["CMD", "python", "-m", "agb.heartbeat"], name
+
+
+def test_the_ui_check_asks_its_server_at_the_operator_s_address(resolved):
+    """Its server runs in a thread beside the heartbeat loop, and it answers only the Host the
+    operator's browser sends. The check runs in the container's environment, so it sees the
+    same AGB_UI_ALLOWED_HOSTS the server does and addresses its request to one of those."""
+    check = resolved["services"]["ui"]["healthcheck"]
+    assert check["test"] == ["CMD", "python", "-m", "agb.heartbeat", "http://127.0.0.1:8080/"]
+    assert "AGB_UI_ALLOWED_HOSTS" in resolved["services"]["ui"]["environment"]
+    others = {
+        name: s["healthcheck"]["test"]
+        for name, s in resolved["services"].items()
+        if name not in ONE_SHOT | {"ui"} and s.get("image") == resolved["services"]["ui"]["image"]
+    }
+    assert all(test == ["CMD", "python", "-m", "agb.heartbeat"] for test in others.values())
+
+
+def test_the_heartbeat_check_judges_the_service_s_own_role(resolved):
+    """The check reads the row of the role it connects as, so each app service must connect as
+    its own role."""
+    app_image = resolved["services"]["scheduler"]["image"]
+    for name, service in resolved["services"].items():
+        if name not in ONE_SHOT and service.get("image") == app_image:
+            assert service["environment"]["PGUSER"] == name
+
+
 def test_the_database_is_not_published(resolved):
     assert not resolved["services"]["db"].get("ports")
 

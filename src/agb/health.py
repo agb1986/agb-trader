@@ -16,7 +16,6 @@ Each finding carries the dedupe key of the alert it raises, and two short lines 
 text: what is wrong, then the facts behind it.
 """
 
-import os
 import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -25,12 +24,14 @@ from decimal import Decimal
 
 import psycopg
 
+from agb import heartbeat
 from agb.cli import format_age
 from agb.nyse import NEW_YORK
 
-# A service whose heartbeat is older than this is stale: ten missed beats at the default
-# 30-second interval.
-STALE_AFTER = timedelta(minutes=5)
+# A service whose heartbeat is older than this is stale. The window is the heartbeat module's,
+# so the bot, the UI, `agb status` and each container's healthcheck all apply the same one.
+STALE_AFTER = heartbeat.STALE_AFTER
+stale_after_from_env = heartbeat.stale_after_from_env
 
 # The live cost reading is not worth a word before this many fills, and not worth one until
 # the excess over the modelled cost is larger than this many standard errors of itself.
@@ -57,11 +58,6 @@ class Finding:
 
     def lines(self) -> str:
         return f"  {self.what}\n    {self.facts}"
-
-
-def stale_after_from_env() -> timedelta:
-    seconds = os.environ.get("AGB_STALE_AFTER_SECONDS")
-    return timedelta(seconds=float(seconds)) if seconds else STALE_AFTER
 
 
 def et(at: datetime) -> str:

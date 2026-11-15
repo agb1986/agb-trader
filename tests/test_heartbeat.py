@@ -1,5 +1,8 @@
+import os
+import subprocess
+import sys
 import threading
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from psycopg import errors
@@ -128,3 +131,159 @@ def test_interval_comes_from_the_environment(monkeypatch):
     assert heartbeat.interval_from_env() == heartbeat.DEFAULT_INTERVAL_SECONDS
     monkeypatch.setenv("AGB_HEARTBEAT_SECONDS", "1.5")
     assert heartbeat.interval_from_env() == 1.5
+
+
+def set_age(conn, age: str) -> None:
+    """Push the connecting service's own beat back by `age`, as a service that stopped beating
+    that long ago would have left it."""
+    conn.execute(
+        "UPDATE agb.heartbeat SET beat_at = now() - %s::interval WHERE service = current_user",
+        [age],
+    )
+
+
+def test_healthcheck_passes_on_a_fresh_beat(db, monkeypatch, capsys):
+    for key, value in db.pg_env("scheduler").items():
+        monkeypatch.setenv(key, value)
+    heartbeat.beat(db.connect("scheduler"), datetime.now(UTC), "v1")
+
+    assert heartbeat.healthcheck(heartbeat.STALE_AFTER) == 0
+    assert "last beat" in capsys.readouterr().out
+
+
+def test_healthcheck_fails_on_a_stale_beat(db, monkeypatch, capsys):
+    for key, value in db.pg_env("scheduler").items():
+        monkeypatch.setenv(key, value)
+    scheduler = db.connect("scheduler")
+    heartbeat.beat(scheduler, datetime.now(UTC), "v1")
+    set_age(scheduler, "6 minutes")
+
+    assert heartbeat.healthcheck(heartbeat.STALE_AFTER) == 1
+    assert "stale" in capsys.readouterr().err
+
+
+def test_healthcheck_judges_only_its_own_service(db, monkeypatch, capsys):
+    """A fresh beat from another service does not make a silent one healthy."""
+    for key, value in db.pg_env("pipeline").items():
+        monkeypatch.setenv(key, value)
+    heartbeat.beat(db.connect("scheduler"), datetime.now(UTC), "v1")
+
+    assert heartbeat.healthcheck(heartbeat.STALE_AFTER) == 1
+    assert "no heartbeat yet" in capsys.readouterr().err
+
+
+def test_healthcheck_fails_when_the_database_is_unreachable(db, monkeypatch, capsys):
+    for key, value in db.pg_env("scheduler").items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("PGPASSWORD", "wrong")
+
+    assert heartbeat.healthcheck(heartbeat.STALE_AFTER) == 1
+    assert "password authentication failed" in capsys.readouterr().err
+
+
+def test_stale_after_comes_from_the_environment(monkeypatch):
+    monkeypatch.delenv("AGB_STALE_AFTER_SECONDS", raising=False)
+    assert heartbeat.stale_after_from_env() == heartbeat.STALE_AFTER
+    monkeypatch.setenv("AGB_STALE_AFTER_SECONDS", "90")
+    assert heartbeat.stale_after_from_env() == timedelta(seconds=90)
+
+
+@pytest.fixture
+def serve_ui(db, monkeypatch):
+    """Start the UI's real handler on a free loopback port, as tests/test_ui.py serves it, with
+    the names AGB_UI_ALLOWED_HOSTS gives when it starts, and return its base URL. The port is
+    not 8080, so a request must say which name it is addressed to."""
+    from agb.services import ui as service
+
+    monkeypatch.delenv("AGB_UI_HOST", raising=False)
+    monkeypatch.delenv("AGB_UI_ALLOWED_HOSTS", raising=False)
+    monkeypatch.setattr(service, "PORT", 0)
+    servers = []
+
+    def start(*, own_name: bool = False) -> str:
+        """`own_name` makes the server answer `127.0.0.1:<its port>` alone, the URL's own name,
+        as tests/test_ui.py's server does."""
+        httpd = service.server()
+        if own_name:
+            httpd.allowed_hosts = frozenset({f"127.0.0.1:{httpd.server_address[1]}"})
+        servers.append(httpd)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        return f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    yield start
+    for httpd in servers:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.fixture
+def ui_beating(db, monkeypatch):
+    for key, value in db.pg_env("ui").items():
+        monkeypatch.setenv(key, value)
+    heartbeat.beat(db.connect("ui"), datetime.now(UTC), "v1")
+
+
+def test_the_ui_check_asks_the_server_as_well_as_the_heartbeat(ui_beating, capsys, serve_ui):
+    url = serve_ui()
+
+    assert heartbeat.healthcheck(heartbeat.STALE_AFTER, f"{url}/", "127.0.0.1:8080") == 0
+    assert heartbeat.healthcheck(heartbeat.STALE_AFTER, f"{url}/nowhere", "127.0.0.1:8080") == 1
+    assert "answered 404" in capsys.readouterr().err
+
+
+def test_the_ui_check_fails_on_a_name_the_ui_refuses(ui_beating, capsys, serve_ui):
+    """The URL's own name, `127.0.0.1:<port>`, is not one the UI answers."""
+    url = serve_ui()
+
+    assert heartbeat.healthcheck(heartbeat.STALE_AFTER, f"{url}/") == 1
+    assert "answered 421" in capsys.readouterr().err
+
+
+def test_the_ui_check_follows_a_replaced_list_of_names(ui_beating, monkeypatch, serve_ui):
+    """AGB_UI_ALLOWED_HOSTS replaces the UI's default names, and the check sends one of them."""
+    monkeypatch.setenv("AGB_UI_ALLOWED_HOSTS", " , LocalHost:9090,127.0.0.1:9090")
+    url = serve_ui()
+
+    assert heartbeat.probe_host_from_env() == "localhost:9090"
+    assert heartbeat.healthcheck(heartbeat.STALE_AFTER, f"{url}/", "127.0.0.1:8080") == 1
+    assert (
+        heartbeat.healthcheck(heartbeat.STALE_AFTER, f"{url}/", heartbeat.probe_host_from_env())
+        == 0
+    )
+
+
+def test_without_a_list_the_ui_check_passes_on_the_url_s_own_name(ui_beating, serve_ui):
+    url = serve_ui(own_name=True)
+
+    assert heartbeat.probe_host_from_env() is None
+    assert heartbeat.healthcheck(heartbeat.STALE_AFTER, f"{url}/", None) == 0
+
+
+@pytest.mark.parametrize("configured", [None, "", " , "])
+def test_without_a_list_the_check_sends_the_url_s_own_name(monkeypatch, configured):
+    if configured is None:
+        monkeypatch.delenv("AGB_UI_ALLOWED_HOSTS", raising=False)
+    else:
+        monkeypatch.setenv("AGB_UI_ALLOWED_HOSTS", configured)
+    assert heartbeat.probe_host_from_env() is None
+
+
+def test_the_ui_check_fails_when_nothing_answers(ui_beating, capsys):
+    assert heartbeat.healthcheck(heartbeat.STALE_AFTER, "http://127.0.0.1:1/") == 1
+    assert "http://127.0.0.1:1/" in capsys.readouterr().err
+
+
+def test_the_check_runs_as_a_module_with_the_ui_s_url(db, serve_ui):
+    """The command line compose.yaml gives the UI, run the way Docker runs it. The test server
+    is not on 8080, so the list stands in for the container's, where the URL's own name works."""
+    url = serve_ui()
+    env = {**os.environ, **db.pg_env("ui"), "AGB_UI_ALLOWED_HOSTS": "127.0.0.1:8080"}
+    heartbeat.beat(db.connect("ui"), datetime.now(UTC), "v1")
+
+    checked = subprocess.run(
+        [sys.executable, "-m", "agb.heartbeat", f"{url}/"],
+        env=env, capture_output=True, text=True, timeout=30,
+    )  # fmt: skip
+
+    assert checked.returncode == 0, checked.stderr
+    assert checked.stdout.startswith("last beat")
