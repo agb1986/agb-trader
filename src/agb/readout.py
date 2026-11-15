@@ -100,12 +100,19 @@ _NEXT_SUBMISSION = """
 
 
 def status(conn: psycopg.Connection, now: datetime) -> str:
-    mode, _, _ = conn.execute(_MODE).fetchone()
+    # No mode row means the mode was never set, which the badge says rather than guessing.
+    row = conn.execute(_MODE).fetchone()
+    mode = row[0] if row is not None else None
     halts = health.open_halt_causes(conn)
     # The autonomy level stands beside the mode in live, where it decides what a rebalance
     # asks of the human. In paper it decides nothing, so it is not shown.
     level = conn.execute(_LEVEL).fetchone()
-    badge = mode.upper() if mode != "live" or level is None else f"{mode.upper()} · {level[0]}"
+    if mode is None:
+        badge = "MODE NOT SET"
+    elif mode != "live" or level is None:
+        badge = mode.upper()
+    else:
+        badge = f"{mode.upper()} · {level[0]}"
     header = f"agb-trader — {badge} · {'HALTED' if halts else 'ACTIVE'}"
     # A gate breach carries every failed check in its reason; /gate lists them in full.
     items = [Item(h.what, _cut(h.facts, HALT_MAX)) for h in halts]
@@ -724,13 +731,21 @@ def filled_text(conn: psycopg.Connection, basket_id: int, reference: str) -> str
     full = [o for o in orders if o[3] >= o[2]]
     notional = sum((o[3] * o[4] for o in orders if o[4] is not None), Decimal(0))
     fees = sum((o[7] for o in orders), Decimal(0))
-    if notional:
-        shortfall = sum((o[5] * o[3] * o[4] for o in orders if o[4] is not None), Decimal(0))
-        modelled = sum((o[6] * o[3] * o[4] for o in orders if o[4] is not None), Decimal(0))
+    # The cost figures weigh only the orders that carry both a shortfall and a modelled cost;
+    # an order missing either is traded but not measured, and the message says so.
+    measured = [o for o in orders if o[4] is not None and o[5] is not None and o[6] is not None]
+    weight = sum((o[3] * o[4] for o in measured), Decimal(0))
+    if notional and weight:
+        shortfall = sum((o[5] * o[3] * o[4] for o in measured), Decimal(0))
+        modelled = sum((o[6] * o[3] * o[4] for o in measured), Decimal(0))
+        unmeasured = len([o for o in orders if o[4] is not None]) - len(measured)
+        note = f" ({unmeasured} not measured)" if unmeasured else ""
         facts = (
-            f"shortfall {shortfall / notional:+.1f} bp vs mid, modelled "
-            f"{modelled / notional:.1f} bp; {dollars(notional)} traded, fees {dollars(fees)}"
+            f"shortfall {shortfall / weight:+.1f} bp vs mid, modelled "
+            f"{modelled / weight:.1f} bp{note}; {dollars(notional)} traded, fees {dollars(fees)}"
         )
+    elif notional:
+        facts = f"shortfall not measured; {dollars(notional)} traded, fees {dollars(fees)}"
     else:
         facts = "nothing traded"
     items.append(Item(f"{len(full)} of {len(orders)} orders filled in full", facts))
