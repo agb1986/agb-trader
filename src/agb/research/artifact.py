@@ -11,10 +11,11 @@ anything outside the standard library, `psycopg` and `agb.research.trials`, all 
 image installs. tests/test_artifact.py holds that line.
 
 An artifact is append-only: `load` refuses one whose files have changed since certification, one
-holding a file the manifest does not list, and one whose shipped ledger disagrees with the trial
-count the certification declared. The declared count is recounted off the shipped ledger under
-the rule the manifest says the certification counted by, not under the rule in force now, so an
-artifact certified before the rule changed still verifies against the number it declared.
+holding a file the manifest does not list, one whose shipped ledger's rows no longer chain, and
+one whose shipped ledger disagrees with the trial count the certification declared. The declared
+count is recounted off the shipped ledger under the rule the manifest says the certification
+counted by, not under the rule in force now, so an artifact certified before the rule changed
+still verifies against the number it declared.
 `import_artifact` refuses a model that is already certified. A
 failed certification imports exactly like a passing one, with `passed` false, because a failed
 certification is a fact about the model rather than something that never happened."""
@@ -73,9 +74,9 @@ def artifact_sha256(files: dict[str, str]) -> str:
 def load(directory: Path) -> dict[str, Any]:
     """The manifest of the artifact at `directory`, after every check: each listed file is
     present and unaltered, nothing unlisted is there, the digest over the digests matches,
-    the booster is among the files, and recounting the shipped ledger under the manifest's own
-    counting rule gives exactly the declared number of trials, among them this certification's
-    own row saying the same."""
+    the booster is among the files, the shipped ledger's rows chain, and recounting it under the
+    manifest's own counting rule gives exactly the declared number of trials, among them this
+    certification's own row saying the same."""
     path = directory / MANIFEST
     if not path.is_file():
         raise CertificationError(f"{directory} holds no {MANIFEST}")
@@ -104,6 +105,10 @@ def load(directory: Path) -> dict[str, Any]:
     if artifact_sha256(files) != manifest["artifact_sha256"]:
         raise CertificationError("the artifact digest does not match its files")
     ledger = Ledger(directory / LEDGER_FILE)
+    try:
+        ledger.verify()
+    except LedgerError as error:
+        raise CertificationError(f"{LEDGER_FILE} cannot be trusted: {error}") from None
     # Certifications up to lgbm-2026-10 declared the ledger's row count and said no rule, so a
     # manifest without one is read as having counted that way and still verifies.
     rule = manifest.get("declared_trials_rule", "rows")
