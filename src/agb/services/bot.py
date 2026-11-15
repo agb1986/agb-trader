@@ -4,11 +4,13 @@ performance reading past the certified range, a fill
 confirmation for each rebalance that filled and a gate-halt alert for each one the checks
 halted, puts each gated rebalance to the human and reminds them before its cutoff, raises the
 pre-flight on the session before a rebalance, and delivers every undelivered alert to the
-configured chat.
+configured chat. Each of those duties runs under its own handler: one that raises is logged,
+raises one alert for its run of failures, and leaves the rest to run, so delivery is always
+attempted.
 
-It holds no state beyond the Telegram update offset. Every message it sends is computed from
-the database, every message it receives is a `command` row whatever became of it, and every
-delivery attempt is an `alert_event`. Alerts notify and never act.
+It holds no state beyond the Telegram update offset and which duties are failing. Every
+message it sends is computed from the database, every message it receives is a `command` row
+whatever became of it, and every delivery attempt is an `alert_event`. Alerts notify and never act.
 
 `/pause`, `/resume` and `/liquidate` are the kill switch, and `/approve` and `/reject`
 answer the approval request. Neither is written here: the kill switch lives in
@@ -64,6 +66,11 @@ PERFORMANCE_FOOTER = (
     "Both are yours to choose; nothing in this message chooses for you, "
     "and no part of the system will act on it."
 )
+# A duty of the cycle that raised. One alert per run of failures: the cycle the run began in
+# identifies it, so a duty that recovers and fails again raises a new one.
+CYCLE_FAILURE = "cycle_failure"
+# How much of a failure's message the alert carries.
+FAILURE_MAX = 200
 FILL_CONFIRMATION = "fill_confirmation"
 GATE_HALT = "gate_halt"
 # The unprompted rebalance messages look back over this many of the latest live baskets.
@@ -179,6 +186,11 @@ def alert_text(finding: Finding) -> str:
     return f"{ALERT_HEADER}\n\n{finding.lines()}"
 
 
+def _cut(text: str, limit: int = FAILURE_MAX) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def preflight_text(period: str, findings: list[Finding]) -> str:
     if not findings:
         return f"PRE-FLIGHT {period}\nrebalance tomorrow, all services healthy"
@@ -269,18 +281,59 @@ class Bot:
         self.broker = broker
         self._offset: int | None = None
         self._calendar: NyseCalendar | None = None
+        # Each duty that is failing, with the cycle its run of failures began in.
+        self._failing: dict[str, datetime] = {}
 
     def __call__(self, conn: psycopg.Connection) -> None:
         now = self.clock()
-        self.poll(conn, now)
-        for finding in [*self.findings(conn, now), *self.broker(conn), *self.performance(conn)]:
+        self._step(conn, "poll", now, lambda: self.poll(conn, now))
+        self._step(conn, "findings", now, lambda: self.alerts(conn, now))
+        self._step(conn, "rebalances", now, lambda: self.rebalances(conn))
+        self._step(conn, "approvals", now, lambda: self.approvals(conn, now))
+        self._step(conn, "preflight", now, lambda: self.preflight(conn, now))
+        self._step(conn, "deliver", now, lambda: self.deliver(conn))
+
+    def _step(
+        self, conn: psycopg.Connection, step: str, now: datetime, duty: Callable[[], None]
+    ) -> None:
+        """Run one duty of the cycle under its own handler, so a duty that raises stops only
+        itself: the failure is logged, the first failure of a run raises one alert, and the
+        cycle goes on to the next duty, delivery included. A duty that succeeds ends its run.
+
+        A connection that is gone is the exception, because no later duty could reach the
+        database either: that error propagates, as it always has, and Compose restarts the
+        service.
+        """
+        try:
+            duty()
+        except Exception as exc:
+            if conn.closed or conn.broken:
+                raise
+            log.exception("the %s duty failed", step)
+            if step not in self._failing:
+                self._failing[step] = now
+                self._raise_failure(conn, step, now, exc)
+            return
+        if self._failing.pop(step, None) is not None:
+            log.info("the %s duty ran again", step)
+
+    def _raise_failure(
+        self, conn: psycopg.Connection, step: str, since: datetime, exc: Exception
+    ) -> None:
+        finding = Finding(
+            CYCLE_FAILURE,
+            step,
+            since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            f"bot duty failed: {step}",
+            f"{type(exc).__name__}: {_cut(str(exc))}; failing since {health.et(since)}, "
+            "the rest of the cycle still runs",
+        )
+        try:
             self.raise_alert(
                 conn, finding.kind, finding.subject, finding.period, alert_text(finding)
             )
-        self.rebalances(conn)
-        self.approvals(conn, now)
-        self.preflight(conn, now)
-        self.deliver(conn)
+        except Exception:
+            log.exception("could not raise the alert for the failed %s duty", step)
 
     # Messages in.
 
@@ -437,6 +490,13 @@ class Bot:
         return command_id
 
     # Alerts.
+
+    def alerts(self, conn: psycopg.Connection, now: datetime) -> None:
+        """An alert for each unhealthy finding, broker mismatch and performance reading."""
+        for finding in [*self.findings(conn, now), *self.broker(conn), *self.performance(conn)]:
+            self.raise_alert(
+                conn, finding.kind, finding.subject, finding.period, alert_text(finding)
+            )
 
     def findings(self, conn: psycopg.Connection, now: datetime) -> list[Finding]:
         return [
