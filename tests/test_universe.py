@@ -2,7 +2,7 @@
 of an earlier universe, delisted names in the universes before they went, and the snapshot date
 and partition digest each universe is built from."""
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pyarrow as pa
 import pytest
@@ -230,6 +230,91 @@ def test_market_cap_and_price_use_the_close_as_traded(tmp_path):
     assert result.members[0].dollar_volume == pytest.approx(2_000_000.0)
 
 
+def test_a_split_between_filings_leaves_the_market_cap_unchanged(tmp_path):
+    # SPLT filed 30M shares when it traded at $40 (market cap $1.2B), then split ten for one. Its
+    # close as traded is $4 after the split and the adjusted close $4 throughout, so the filed
+    # share count is a tenth of today's. The unadjusted cap would be $120M, under the $300M
+    # floor. The price is above $5 here only so the cap, not the price screen, is what is tested.
+    filed, split_on = date(2026, 6, 1), date(2026, 8, 3)
+    market = Market(tmp_path)
+    for day in weekdays(SESSION, 90):
+        after = day >= split_on
+        market.trades("SPLT", [day], price=60.0 if after else 600.0, close=60.0)
+    market.files("SPLT", datekey=filed, shares=3_000_000.0).listed("SPLT")
+
+    result = universe.snapshot(MONTH_END, market.land())
+
+    assert result.tickers == ("SPLT",)
+    # 3M shares at $600 before the split is $1.8B; ten for one makes it 30M shares at $60.
+    assert result.members[0].price == pytest.approx(60.0)
+    assert result.members[0].market_cap == pytest.approx(1_800_000_000.0)
+
+
+def test_a_split_after_the_snapshot_does_not_change_its_market_cap(tmp_path):
+    # SPLT split ten for one after the snapshot session; the lake's adjusted close then differs
+    # from the unadjusted one on the snapshot date by the same factor as on the filing date, so
+    # the cap on the snapshot is the filed shares at the traded price.
+    market = Market(tmp_path)
+    for day in weekdays(SESSION, 90):
+        market.trades("SPLT", [day], price=50.0, close=5.0)
+    market.files("SPLT", datekey=date(2026, 6, 1), shares=10_000_000.0).listed("SPLT")
+
+    result = universe.snapshot(MONTH_END, market.land())
+
+    assert result.members[0].market_cap == pytest.approx(500_000_000.0)
+
+
+def test_a_reverse_split_between_filings_leaves_the_market_cap_unchanged(tmp_path):
+    # One for ten: 600M filed shares at $2 (cap $1.2B) become 60M shares at $20.
+    market = Market(tmp_path)
+    for day in weekdays(SESSION, 90):
+        market.trades("REV", [day], price=20.0 if day >= date(2026, 8, 3) else 2.0, close=20.0)
+    market.files("REV", datekey=date(2026, 6, 1), shares=600_000_000.0).listed("REV")
+
+    result = universe.snapshot(MONTH_END, market.land())
+
+    assert result.members[0].market_cap == pytest.approx(1_200_000_000.0)
+
+
+def test_a_filing_on_a_weekend_is_priced_at_the_session_before_it(tmp_path):
+    # Saturday 2026-08-01: the last session before it is Friday 31 July, before the split.
+    market = Market(tmp_path)
+    for day in weekdays(SESSION, 90):
+        market.trades("SPLT", [day], price=60.0 if day >= date(2026, 8, 3) else 600.0, close=60.0)
+    market.files("SPLT", datekey=date(2026, 8, 1), shares=3_000_000.0).listed("SPLT")
+
+    result = universe.snapshot(MONTH_END, market.land())
+
+    assert result.members[0].market_cap == pytest.approx(1_800_000_000.0)
+
+
+def test_a_filing_with_no_session_before_it_is_taken_as_unsplit(tmp_path):
+    root = Market(tmp_path).name("OLD", datekey=date(1997, 11, 14), shares=60_000_000.0).land()
+
+    assert universe.snapshot(MONTH_END, root).members[0].market_cap == pytest.approx(1.2e9)
+
+
+def test_a_name_with_too_few_sessions_is_left_out_with_a_reason(tmp_path):
+    market = Market(tmp_path).name("GOOD")
+    market.name("THIN", weekdays(SESSION, 3), datekey=date(2026, 8, 28))
+    market.name("EDGE", weekdays(SESSION, universe.MIN_LIQUIDITY_SESSIONS))
+
+    result = universe.snapshot(MONTH_END, market.land())
+
+    assert result.tickers == ("EDGE", "GOOD")
+    assert result.excluded == (universe.Exclusion("THIN", universe.THIN_HISTORY),)
+    assert "sessions" in universe.THIN_HISTORY
+
+
+def test_a_name_with_few_sessions_that_fails_another_screen_is_not_reported(tmp_path):
+    market = Market(tmp_path).name("TINY", weekdays(SESSION, 3), price=1.0)
+
+    result = universe.snapshot(MONTH_END, market.land())
+
+    assert result.tickers == ()
+    assert result.excluded == ()
+
+
 def test_a_share_factor_scales_the_market_cap(tmp_path):
     root = Market(tmp_path).name("HALF", shares=100_000_000.0, sharefactor=0.1).land()
 
@@ -300,7 +385,7 @@ def test_a_digest_cache_gives_the_same_answer(tmp_path):
 
 
 def test_an_open_connection_is_reused_rather_than_rebuilt(tmp_path):
-    root = market(tmp_path)
+    root = market(tmp_path, sessions=weekdays(SESSION, 90))
 
     with lake.connect(root) as db:
         first = universe.snapshot(date(2026, 7, 31), root, db=db)
@@ -335,10 +420,31 @@ def test_month_ends_run_from_1998_and_are_sessions():
     assert universe.month_ends(date(2026, 8, 1), date(2026, 7, 1)) == []
 
 
+def test_an_unfinished_session_is_not_a_month_end():
+    # Monday 2026-08-31 is the last session of August. At 14:00 New York (18:00 UTC) it is still
+    # trading, so the month is not yet a month-end; after the 16:00 close it is.
+    during = datetime(2026, 8, 31, 18, 0, tzinfo=UTC)
+    after = datetime(2026, 8, 31, 21, 0, tzinfo=UTC)
+    assert universe._last_finished_session(during) == date(2026, 8, 30)
+    assert universe._last_finished_session(after) == date(2026, 8, 31)
+    assert date(2026, 8, 31) not in universe.month_ends(
+        date(2026, 7, 1), universe._last_finished_session(during)
+    )
+    assert universe.month_ends(date(2026, 7, 1), universe._last_finished_session(after))[-1] == (
+        date(2026, 8, 31)
+    )
+
+
+def test_a_weekend_is_not_an_unfinished_session():
+    saturday = datetime(2026, 8, 29, 18, 0, tzinfo=UTC)
+    assert universe._last_finished_session(saturday) == date(2026, 8, 29)
+
+
 def test_a_universe_builds_for_a_month_end_anywhere_in_the_history(tmp_path):
     ends = [date(1998, 1, 30), date(2008, 8, 29), date(2020, 5, 29), date(2026, 8, 31)]
     assert set(ends) <= set(universe.month_ends(date(1998, 1, 1), date(2026, 8, 31)))
-    root = Market(tmp_path).name("GOOD", ends, datekey=date(1997, 11, 14)).land()
+    sessions = sorted({day for end in ends for day in weekdays(end, 60)})
+    root = Market(tmp_path).name("GOOD", sessions, datekey=date(1997, 11, 14)).land()
 
     with lake.connect(root) as db:
         built = [universe.snapshot(end, root, db=db) for end in ends]
