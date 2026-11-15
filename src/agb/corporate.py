@@ -203,6 +203,15 @@ _EXISTS = """
     SELECT actor, at FROM agb.forced_event
     WHERE period = %s AND symbol = %s AND kind = %s
 """
+# A transaction-scoped advisory lock on one event's (period, symbol, kind). The first key
+# names the lock's purpose, so it shares no lock with another use of advisory locks; the
+# second is the event's own. Two different events that hash alike only wait for each other.
+_LOCK = "SELECT pg_advisory_xact_lock(%s, hashtext(%s))"
+_LOCK_CLASS = 0x46455654  # "FEVT", forced event
+
+
+def _lock_key(event: Event) -> tuple[int, str]:
+    return _LOCK_CLASS, f"{event.period}/{event.symbol}/{event.kind}"
 
 
 def record(conn: psycopg.Connection, event: Event, source: approval.Source) -> int:
@@ -221,7 +230,32 @@ def record(conn: psycopg.Connection, event: Event, source: approval.Source) -> i
         "into_shares": None if event.into_shares is None else str(event.into_shares),
         "detail": event.detail,
     }
-    seen = conn.execute(_EXISTS, (event.period, event.symbol, str(event.kind))).fetchone()
+    with conn.transaction():
+        # Two filings of the same event at once would both find nothing at READ COMMITTED and
+        # both insert, so the check and the insert are serialised on a lock of this one
+        # event's key, held until the transaction ends.
+        conn.execute(_LOCK, _lock_key(event))
+        seen = conn.execute(_EXISTS, (event.period, event.symbol, str(event.kind))).fetchone()
+        if seen is None:
+            command_id = approval.record(conn, source, VERB, args)
+            row = conn.execute(
+                _INSERT,
+                {
+                    "period": event.period,
+                    "symbol": event.symbol,
+                    "kind": str(event.kind),
+                    "effective_date": event.effective_date,
+                    "shares_before": event.shares,
+                    "shares_after": event.shares_after,
+                    "price_usd": event.price_usd,
+                    "into_symbol": event.into_symbol,
+                    "into_shares": event.into_shares,
+                    "detail": event.detail,
+                    "actor": source.actor,
+                    "surface": source.surface,
+                    "command_id": command_id,
+                },
+            ).fetchone()
     if seen is not None:
         why = (
             f"{event.symbol} already has a {event.kind} recorded for {event.period}, "
@@ -229,26 +263,6 @@ def record(conn: psycopg.Connection, event: Event, source: approval.Source) -> i
         )
         approval.record(conn, source, VERB, args, why)
         raise CorporateError(why)
-    with conn.transaction():
-        command_id = approval.record(conn, source, VERB, args)
-        row = conn.execute(
-            _INSERT,
-            {
-                "period": event.period,
-                "symbol": event.symbol,
-                "kind": str(event.kind),
-                "effective_date": event.effective_date,
-                "shares_before": event.shares,
-                "shares_after": event.shares_after,
-                "price_usd": event.price_usd,
-                "into_symbol": event.into_symbol,
-                "into_shares": event.into_shares,
-                "detail": event.detail,
-                "actor": source.actor,
-                "surface": source.surface,
-                "command_id": command_id,
-            },
-        ).fetchone()
     assert row is not None, "the insert returns the id it wrote"
     return row[0]
 

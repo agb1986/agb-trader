@@ -109,6 +109,15 @@ Needed for T09 (paper market-on-close orders).
 
 All three go in `env/execution.env`. This traffic never goes through the VPN; submitting orders from a foreign VPN exit invites account flags.
 
+`ALPACA_BASE_URL` must be the trading endpoint for the mode in force (`agb.current_mode`), with or without a trailing slash:
+
+| Mode | `ALPACA_BASE_URL` |
+| --- | --- |
+| paper | `https://paper-api.alpaca.markets` (also the default when the variable is unset) |
+| live | `https://api.alpaca.markets` |
+
+The execution service refuses to start with any other value, and stops if the mode changes under it, naming the URL it saw and the mode it checked. Change the URL in `env/execution.env` in the same step as switching the mode.
+
 The T09 live check needs a trading day. The market-on-close order has to be submitted before 15:45 ET, which is 20:45 in the UK for most of the year and 19:45 during the few weeks when US and UK daylight saving are out of step.
 
 ### 8. Database passwords

@@ -15,9 +15,11 @@ broker's own `Retry-After` when it sends one. Nothing else is: a write that time
 have reached the broker, so it gets one attempt and the caller decides what to do with the
 silence.
 
-Alpaca sends numbers as strings, so quantities and prices are Decimals here. Fractional
-quantities reach the broker as written; Alpaca accepts them on day orders only, and refuses a
-fractional market-on-close order, which the service records as a rejection.
+Alpaca sends numbers as strings, so quantities and prices are Decimals here, and every instant
+it sends must carry its offset: one without is a malformed answer, not a guess at a time zone.
+Fractional quantities reach the broker in fixed-point notation, never as an exponent; Alpaca
+accepts them on day orders only, and refuses a fractional market-on-close order, which the
+service records as a rejection.
 """
 
 import functools
@@ -39,6 +41,12 @@ from typing import Any, Protocol
 log = logging.getLogger(__name__)
 
 TRADING_API = "https://paper-api.alpaca.markets"
+LIVE_TRADING_API = "https://api.alpaca.markets"
+# The one trading endpoint each trading mode may reach, as agb.current_mode names the mode.
+# ALPACA_BASE_URL must be the one for the mode in force, give or take a trailing slash: paper
+# keys sent to the live host fail, but live keys sent while the mode says paper would trade
+# real money on a book the system believes is simulated.
+TRADING_APIS = {"paper": TRADING_API, "live": LIVE_TRADING_API}
 DATA_API = "https://data.alpaca.markets"
 # The market data feed every quote request names. IEX is the one a free data plan serves in
 # real time; it is the IEX exchange's own book rather than the consolidated NBBO, which is the
@@ -66,6 +74,37 @@ MOC = "cls"
 TERMINAL = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
 # Activities come in pages of at most this many.
 PAGE = 100
+# The most pages one `fills` call reads: ten thousand executions, far more than any window a
+# caller asks about. A broker that keeps answering full pages, or hands back the same page
+# token, ends the call with an error instead of holding the cycle open for ever.
+FILL_PAGES = 100
+
+
+class BaseUrlError(ValueError):
+    """An ALPACA_BASE_URL the execution service will not start with."""
+
+
+def trading_url(url: str) -> str:
+    """`url` as a trading base URL, without a trailing slash, if it is one of Alpaca's trading
+    endpoints over https; otherwise a `BaseUrlError` naming it."""
+    base = url.rstrip("/")
+    if base not in TRADING_APIS.values():
+        accepted = ", ".join(f"{u} ({m})" for m, u in TRADING_APIS.items())
+        raise BaseUrlError(f"ALPACA_BASE_URL {url!r} is not an Alpaca trading endpoint: {accepted}")
+    return base
+
+
+def check_mode(url: str, mode: str | None) -> None:
+    """Refuse a trading base URL that is not the endpoint for `mode`, the trading mode in
+    force: the paper host in paper mode and the live host in live mode."""
+    base = trading_url(url)
+    if mode not in TRADING_APIS:
+        raise BaseUrlError(f"ALPACA_BASE_URL is {url!r} but the trading mode is {mode!r}")
+    if base != TRADING_APIS[mode]:
+        raise BaseUrlError(
+            f"ALPACA_BASE_URL is {url!r} but agb.current_mode is {mode!r}, whose endpoint is "
+            f"{TRADING_APIS[mode]}"
+        )
 
 
 class AlpacaError(Exception):
@@ -235,11 +274,15 @@ def _seconds(value: Any) -> float | None:
 
 
 def _when(value: Any) -> datetime | None:
-    """An RFC 3339 instant, which Alpaca writes with up to nine fractional digits."""
+    """An RFC 3339 instant, which Alpaca writes with up to nine fractional digits. One with no
+    offset is refused rather than read in this machine's time zone."""
     if not value:
         return None
     text = _FRACTION.sub(r"\1", str(value)).replace("Z", "+00:00")
-    return datetime.fromisoformat(text).astimezone(UTC)
+    when = datetime.fromisoformat(text)
+    if when.tzinfo is None:
+        raise ValueError(f"{value!r} has no UTC offset")
+    return when.astimezone(UTC)
 
 
 def _closed(raw: Any) -> list[Closed]:
@@ -343,9 +386,14 @@ class Alpaca:
         return cls(
             os.environ.get("ALPACA_API_KEY", ""),
             os.environ.get("ALPACA_SECRET_KEY", ""),
-            trading=os.environ.get("ALPACA_BASE_URL") or TRADING_API,
+            trading=trading_url(os.environ.get("ALPACA_BASE_URL") or TRADING_API),
             data=os.environ.get("ALPACA_DATA_URL") or DATA_API,
         )
+
+    @property
+    def trading(self) -> str:
+        """The trading base URL this client reaches."""
+        return self._trading
 
     @staticmethod
     def configured() -> bool:
@@ -505,7 +553,7 @@ class Alpaca:
         `AlpacaError` whose `duplicate` is true; the caller looks the order up instead."""
         body = {
             "symbol": symbol,
-            "qty": str(qty),
+            "qty": format(qty, "f"),
             "side": side,
             "type": "market",
             "time_in_force": MOC,
@@ -556,14 +604,15 @@ class Alpaca:
 
     @_parsed
     def fills(self, after: datetime) -> list[Fill]:
-        """Every execution after `after`, oldest first, across as many pages as it takes."""
+        """Every execution after `after`, oldest first, across as many pages as it takes up to
+        `FILL_PAGES`; more than that is an `AlpacaError`, not a partial answer."""
         fills: list[Fill] = []
         query = {
             "after": after.astimezone(UTC).isoformat().replace("+00:00", "Z"),
             "direction": "asc",
             "page_size": str(PAGE),
         }
-        while True:
+        for _ in range(FILL_PAGES):
             page = self._call("GET", self._trading, "/v2/account/activities/FILL", query=query)
             page = page or []
             for f in page:
@@ -589,3 +638,4 @@ class Alpaca:
             if len(page) < PAGE:
                 return fills
             query["page_token"] = str(page[-1]["id"])
+        raise AlpacaError(f"fills: more than {FILL_PAGES} pages of {PAGE} after {query['after']}")
