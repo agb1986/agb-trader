@@ -12,6 +12,13 @@ the job's period, so October 2026's basket is `2026-10`. The proposal also carri
 universe and each name's mark, which the pre-trade gate (agb.gate) checks the basket against
 before it can move on.
 
+The basket is sized on the capital the caller states, which the pipeline takes from the
+account's own equity (`account_capital`, over `agb.broker_state_now`) rather than from a
+figure carried in the code. Equity, not cash: the weights describe the whole portfolio, the
+order plan trades only the difference from what is held, and the gate derives cash from
+capital less the book's value. Every basket row records the `capital_usd` it was sized on, so
+the audit trail says what each month assumed.
+
 Proposing is safe to redo. A job whose lease expired mid-proposal is reclaimed and proposed
 again; the second attempt finds the reference taken, writes nothing and completes the job with
 the first basket. A lake that does not yet hold the signal session is not a failure: `NotReady`
@@ -52,7 +59,7 @@ the backtest and the live path identical through a merger or a halt.
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Protocol
@@ -66,11 +73,17 @@ from agb.ranker import Ranked, Ranker
 from agb.roles import PIPELINE
 
 CAPITAL_ENV = "AGB_CAPITAL_USD"
-DEFAULT_CAPITAL = Decimal("100000")
+# How old the account reading a basket may be sized against. Execution writes the account state
+# every cycle, so a reading older than this means execution was not running, and the equity it
+# last wrote is not what the account holds now. A basket sized on a stale number asks for capital
+# the account may not have, so the rebalance waits for a fresh reading rather than guessing.
+EQUITY_FRESH = timedelta(hours=24)
 SURFACE = "pipeline"
 # The weight the shadow basket is blended at when the live basket trades the pure stage-1
 # ranking. When the live basket trades a blend, the shadow is the stage-1 ranking instead.
 SHADOW_W = 0.2
+
+_EQUITY = "SELECT equity_usd, observed_at FROM agb.broker_state_now"
 
 _PERIOD = re.compile(r"^\d{4}-\d{2}$")
 # The daily bars the cost model reads, plus the one day the two-day spread needs.
@@ -230,6 +243,31 @@ class NotReady(BasketError):
     """The lake does not yet hold the signal session; try again later."""
 
 
+def account_capital(
+    conn: psycopg.Connection, now: datetime, *, fresh: timedelta = EQUITY_FRESH
+) -> Decimal:
+    """The capital a basket is sized against: the account's equity, as execution last read it.
+    Equity rather than cash, because the basket's weights describe the whole portfolio and the
+    plan only trades the difference from what is held. Raises `NotReady` when no reading exists
+    or the newest one is older than `fresh`, so the rebalance retries instead of sizing on a
+    number that is not the account's."""
+    row = conn.execute(_EQUITY).fetchone()
+    if row is None:
+        raise NotReady("no account reading to size the basket against")
+    equity, observed_at = row
+    if equity is None:
+        raise NotReady(
+            f"the account reading of {observed_at:%Y-%m-%d %H:%M:%S%z} carries no equity"
+        )
+    age = now - observed_at
+    if age > fresh:
+        raise NotReady(
+            f"the newest account reading is {observed_at:%Y-%m-%d %H:%M:%S%z}, {age} old,"
+            f" past the {fresh} a basket may be sized against"
+        )
+    return Decimal(equity)
+
+
 @dataclass(frozen=True)
 class Proposal:
     """What `propose` wrote, for the log, and what the gate reads beside the basket: the
@@ -312,16 +350,18 @@ def propose(
     lake_dir: Path,
     ranker: Ranker,
     *,
-    capital: Decimal = DEFAULT_CAPITAL,
+    capital: Decimal,
     panel: Stage2 | None = None,
     calendar: nyse.NyseCalendar | None = None,
 ) -> Proposal:
     """Propose the basket for a claimed rebalance job, and return what was written. With a
-    panel the shortlist is scored and the basket is blended; with none it is stage-1 only."""
+    panel the shortlist is scored and the basket is blended; with none it is stage-1 only.
+    `capital` has no default: a basket sized on a number that is not the account's is worse
+    than no basket, so the caller states it. `account_capital` reads the account's."""
     if not _PERIOD.match(claim.period):
         raise BasketError(f"rebalance period {claim.period!r} is not a month")
     if capital <= 0:
-        raise BasketError(f"{CAPITAL_ENV} must be positive, not {capital}")
+        raise BasketError(f"capital must be positive, not {capital}")
     row = conn.execute("SELECT session_date FROM agb.job WHERE id = %s", (claim.job_id,)).fetchone()
     if row is None:
         raise BasketError(f"job {claim.job_id} does not exist")

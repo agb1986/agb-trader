@@ -11,10 +11,13 @@
     the newest `panel_config`, the EDGAR client from EDGAR_USER_AGENT, the Anthropic model
     from ANTHROPIC_API_KEY and the store under AGB_PANEL_DIR), runs the
     pre-trade gate on it (agb.gate), and completes the job, which fulfils the proposal's
-    expected event. The gate halts a basket that fails any check and opens the halt latch; in
-    paper mode it approves one that passes, and in live mode (or in paper mode set to ask)
-    leaves it for the human. With no model promoted, or the promoted one voided or altered,
-    the job fails and no basket is proposed.
+    expected event. The basket is sized on the account's equity as execution last read it
+    (`agb.broker_state_now`); with no reading fresh enough the job is kept and tried again,
+    and AGB_CAPITAL_USD overrides the account for a run that must be sized by hand. The gate
+    halts a basket that fails any check and opens the halt latch; in paper mode it approves one
+    that passes, and in live mode (or in paper mode set to ask) leaves it for the human. With
+    no model promoted, or the promoted one voided or altered, the job fails and no basket is
+    proposed.
   * `panel_audit`: reads a sample of the panel store's bodies back through the store, which
     checks each against the hash it is named by, and records what it found in
     `agb.panel_audit` (agb.panel_audit). The pipeline runs it because it is the only service
@@ -122,11 +125,13 @@ def sample_from_env() -> int:
     return sample
 
 
-def capital_from_env() -> Decimal:
-    """The capital a basket is sized against, in dollars, from AGB_CAPITAL_USD."""
+def capital_from_env() -> Decimal | None:
+    """The capital a basket is sized against, in dollars, from AGB_CAPITAL_USD. None when the
+    variable is unset, which is the normal case: the rebalance then sizes on the account's own
+    equity, and the variable is only an override for a run that must be sized by hand."""
     raw = os.environ.get(basket.CAPITAL_ENV, "")
     if not raw:
-        return basket.DEFAULT_CAPITAL
+        return None
     try:
         return Decimal(raw)
     except InvalidOperation:
@@ -137,7 +142,9 @@ class Pipeline:
     """One pipeline cycle, run by `serve`. The URL opener, the capital, the panel audit's
     sample size, the gate's limits and the clock the gate reads are injectable for tests. A
     ranker given here is used instead of the promoted model, for tests only; otherwise each
-    rebalance loads the promoted model from `models_dir`."""
+    rebalance loads the promoted model from `models_dir`. Capital left as None, which is how
+    `from_env` leaves it unless AGB_CAPITAL_USD is set, sizes each basket on the account's
+    equity as execution last read it."""
 
     def __init__(
         self,
@@ -149,7 +156,7 @@ class Pipeline:
         models_dir: Path = registry.DEFAULT_MODELS_DIR,
         panel_dir: Path = panel_store.DEFAULT_DIR,
         runner: basket.Stage2 | None = None,
-        capital: Decimal = basket.DEFAULT_CAPITAL,
+        capital: Decimal | None = None,
         lease: timedelta = LEASE,
         retry: timedelta = RETRY,
         sample: int = panel_audit.SAMPLE,
@@ -232,7 +239,11 @@ class Pipeline:
                 claim,
                 self.lake_dir,
                 ranker,
-                capital=self.capital,
+                capital=(
+                    self.capital
+                    if self.capital is not None
+                    else basket.account_capital(conn, self.clock())
+                ),
                 panel=self.stage2(conn),
             )
             verdict = gate.run(
