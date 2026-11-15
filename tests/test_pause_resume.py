@@ -6,6 +6,7 @@ execution tests.
 """
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from alpaca_fake import FakeBroker
@@ -205,10 +206,58 @@ def test_a_cancel_that_fails_fires_the_partial_rebalance_alert_naming_what_is_li
     )
     assert subject == PERIOD
     assert body == (
-        f"basket {PERIOD} halted by a pause mid-submission; still live at the broker: {live}"
+        f"basket {PERIOD} halted by a pause mid-submission; still live or filled at the broker: "
+        f"{live}"
     )
-    assert confirmation(db, "pause").endswith(f"; still live at the broker: {live}")
-    assert f"still live at the broker: {live}" in "\n".join(operator.cycle())
+    assert confirmation(db, "pause").endswith(f"; still live or filled at the broker: {live}")
+    assert f"still live or filled at the broker: {live}" in "\n".join(operator.cycle())
+
+
+def test_a_pause_names_an_order_still_being_cancelled_and_one_that_filled_first(db, operator):
+    """Issue #149: an order the broker is still cancelling may fill yet, and one cancelled after
+    a partial fill has moved the book. Neither is reported as cancelled with the book unmoved:
+    both are named, with the broker's status and fill, in the reason and the alert."""
+    conn = db.connect("execution")
+    fake = broker(("H01", *NAMES))
+    target = submitted(db, conn, fake)
+    sent = len(fake.orders)
+    fake.cancel_pending.add("ord-0001")
+    fake._set("ord-0002", status="partially_filled", filled_qty=Decimal(50))
+    first, second = fake.orders["ord-0001"], fake.orders["ord-0002"]
+    named = (
+        f"{first.side} {first.qty} {first.symbol} (pending_cancel, 0 filled), "
+        f"{second.side} {second.qty} {second.symbol} (canceled, 50 filled)"
+    )
+
+    operator.says("/pause")
+    Execution(fake, clock=Clock(BEFORE_DEADLINE))(conn)
+
+    assert fake.orders["ord-0001"].status == "pending_cancel"
+    assert fake.orders["ord-0002"].status == "canceled"
+    assert state(db, target.id)[0] == "halted"
+    reason = (
+        f"paused mid-submission: {sent - 1} of {sent} orders cancelled; "
+        f"still live or filled at the broker: {named}"
+    )
+    assert rows(
+        db, "SELECT reason FROM agb.basket_event WHERE basket_id = %s AND seq = 4", target.id
+    ) == [(reason,)]
+    assert rows(
+        db,
+        "SELECT o.client_order_id, s.kind, s.status, s.filled_qty FROM agb.order_state s"
+        " JOIN agb.broker_order o ON o.id = s.order_id"
+        " WHERE o.client_order_id IN (%s, %s) ORDER BY o.id",
+        first.client_order_id,
+        second.client_order_id,
+    ) == [
+        (first.client_order_id, "status", "pending_cancel", 0),
+        (second.client_order_id, "cancelled", "canceled", 50),
+    ]
+    [(body,)] = rows(db, "SELECT body FROM agb.alert WHERE kind = 'partial_rebalance_paused'")
+    assert body == (
+        f"basket {PERIOD} halted by a pause mid-submission; still live or filled at the broker: "
+        f"{named}"
+    )
 
 
 def test_after_the_cancel_deadline_a_pause_leaves_the_orders_to_the_close(db, operator):
@@ -257,7 +306,7 @@ def test_a_pause_during_the_submission_is_reported_with_what_it_cancelled(db, op
     assert fake.suspend_trade is True
     [halted] = confirmation(db, "pause").splitlines()[3:]
     assert halted.endswith(
-        ": halt open mid-submission (pause): 5 of 20 orders sent, 0 not cancelled"
+        ": halt open mid-submission (pause): 5 of 20 orders sent, 0 still live or filled"
     )
     assert {o.status for o in fake.orders.values()} == {"canceled"}
 

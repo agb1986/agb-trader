@@ -50,7 +50,7 @@ recorded as not carried out.
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -90,8 +90,10 @@ ORDER = "order"
 # that it has never seen it. Neither is a trading decision; both are only what was found.
 RECONCILED = "reconciled"
 UNSENT = "unsent"
-# Broker order states from which nothing more will come.
+# Broker order states from which nothing more will come. `pending_cancel` is not one: the
+# broker has the cancel but may still fill the order before it lands.
 DONE = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
+PENDING_CANCEL = "pending_cancel"
 # A basket left short raises one alert per cause, each its own kind: an alert is keyed on
 # (kind, subject, period), so causes sharing a kind would let the first one raised hide the
 # rest. Refused at submission, halted mid-submission with orders still live, halted by a
@@ -176,7 +178,7 @@ class Sent:
 
     @property
     def done(self) -> bool:
-        return self.kind == "rejected" or self.kind == "cancelled" or self.status in DONE
+        return self.kind == "rejected" or self.status in DONE
 
 
 @dataclass(frozen=True)
@@ -520,12 +522,14 @@ def _quotes(broker: Broker, symbols: Sequence[str]) -> dict[str, Quote]:
 
 
 def _cancel_sent(conn: psycopg.Connection, broker: Broker, orders: Sequence[Sent]) -> list[Sent]:
-    """Cancel every order the broker holds that is not done. Returns those that stayed live."""
+    """Cancel every order the broker holds that is not done. Returns those that moved the
+    book or may still move it, each with the broker's latest word on it: an order still live,
+    one the broker is still cancelling, and one that filled in part or in full first."""
     remaining = []
     for order in orders:
         if not order.live or order.done:
             continue
-        _event(conn, order.id, "cancel_requested", None, status="pending_cancel")
+        _event(conn, order.id, "cancel_requested", None, status=PENDING_CANCEL)
         try:
             broker.cancel(order.broker_order_id)
             latest = broker.order(order.broker_order_id)
@@ -533,43 +537,60 @@ def _cancel_sent(conn: psycopg.Connection, broker: Broker, orders: Sequence[Sent
             _event(conn, order.id, "cancel_failed", None, status="unknown", detail=str(exc))
             remaining.append(order)
             continue
-        if latest.status in ("canceled", "pending_cancel"):
+        answered = replace(order, status=latest.status, filled_qty=latest.filled_qty)
+        if latest.status == "canceled":
             _event(conn, order.id, "cancelled", latest)
+            if latest.filled_qty > 0:
+                remaining.append(answered)
         elif latest.status in DONE:
             # Done before the cancel landed: nothing left to cancel, and if it filled the
             # book has moved.
             _event(conn, order.id, "status", latest)
             if latest.filled_qty > 0:
-                remaining.append(order)
+                remaining.append(answered)
+        elif latest.status == PENDING_CANCEL:
+            # The broker has the cancel but not yet a final word, and may fill the order
+            # first. It stays open until a later read-back sees how it ended.
+            _event(conn, order.id, "status", latest)
+            remaining.append(answered)
         else:
             _event(conn, order.id, "cancel_failed", latest, detail=f"still {latest.status}")
-            remaining.append(order)
+            remaining.append(answered)
     return remaining
+
+
+def _named(order: Sent) -> str:
+    """An order `_cancel_sent` left behind, as a halt's reason and alert name it."""
+    name = f"{order.side} {order.qty} {order.symbol}"
+    if order.status in DONE or order.status == PENDING_CANCEL:
+        return f"{name} ({order.status}, {order.filled_qty} filled)"
+    return name
 
 
 def _stop(
     conn: psycopg.Connection, broker: Broker, basket: Basket, causes: Sequence[str]
 ) -> Outcome:
     """A halt cause open at or during submission: cancel what was sent, halt the basket, and
-    alert on anything that stayed live."""
+    alert on anything that stayed live or filled before the cancel landed."""
     already = sent(conn, basket.id)
     remaining = _cancel_sent(conn, broker, already)
     live = [o for o in already if o.live]
     when = "mid-submission" if live else "before submission"
     reason = (
         f"halt open {when} ({', '.join(causes)}): {len(live)} of "
-        f"{len(planned(conn, basket.id))} orders sent, {len(remaining)} not cancelled"
+        f"{len(planned(conn, basket.id))} orders sent, {len(remaining)} still live or filled"
     )
     with conn.transaction():
         _halt(conn, basket, reason, breach=False)
     if remaining:
-        names = ", ".join(f"{o.side} {o.qty} {o.symbol}" for o in remaining)
+        names = ", ".join(_named(o) for o in remaining)
         raise_alert(
             conn,
             PARTIAL_HALTED,
             basket.reference,
             basket.period,
-            f"basket {basket.reference} halted mid-submission; still live at the broker: {names}",
+            f"basket {basket.reference} halted mid-submission; still live or filled at the "
+            f"broker: {names}",
         )
     log.warning("basket %s: %s", basket.reference, reason)
     return Outcome(basket.id, "halted", len(live), reason)
@@ -818,7 +839,8 @@ def cancel_in_flight(
 ) -> list[str]:
     """A pause's cancel: every submitted basket whose session has not closed. Before the
     cancel deadline its sent orders are cancelled and it is halted, with a partial-rebalance
-    alert naming any order that stayed live; after it, the orders are left to the close.
+    alert naming any order that stayed live, is still being cancelled, or filled in part or in
+    full before the cancel landed; after it, the orders are left to the close.
     Returns a line for each basket left to the close."""
     left = []
     for basket in waiting(conn, "submitted"):
@@ -836,12 +858,12 @@ def cancel_in_flight(
             )
             continue
         remaining = _cancel_sent(conn, broker, orders)
-        reason = (
-            f"paused mid-submission: {len(live) - len(remaining)} of {len(live)} orders cancelled"
-        )
+        # A cancelled order that filled in part was cancelled, and is still named below.
+        cancelled = len(live) - sum(1 for o in remaining if o.status != "canceled")
+        reason = f"paused mid-submission: {cancelled} of {len(live)} orders cancelled"
         if remaining:
-            names = ", ".join(f"{o.side} {o.qty} {o.symbol}" for o in remaining)
-            reason += f"; still live at the broker: {names}"
+            names = ", ".join(_named(o) for o in remaining)
+            reason += f"; still live or filled at the broker: {names}"
         with conn.transaction():
             current = conn.execute(_STATE, (basket.id,)).fetchone()
             if current is None or current[0] != "submitted":
@@ -855,8 +877,8 @@ def cancel_in_flight(
                 PARTIAL_PAUSED,
                 basket.reference,
                 basket.period,
-                f"basket {basket.reference} halted by a pause mid-submission; still live at "
-                f"the broker: {names}",
+                f"basket {basket.reference} halted by a pause mid-submission; still live or "
+                f"filled at the broker: {names}",
             )
         log.warning("basket %s: %s", basket.reference, reason)
     return left
