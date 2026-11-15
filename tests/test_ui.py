@@ -879,6 +879,33 @@ def test_the_server_binds_the_loopback_address_unless_a_container_says_otherwise
     assert service.host_from_env() == "0.0.0.0"
 
 
+def allow_own_address(httpd):
+    """The address a test server bound, which is a random port, made the one name it answers:
+    the default list names port 8080, which the operator's own UI may hold on this machine."""
+    host, port = httpd.server_address[:2]
+    httpd.allowed_hosts = frozenset({f"{host}:{port}"})
+    return host, port
+
+
+def assert_protected(response):
+    """The four headers every response carries, whatever its status."""
+    assert response.getheader("X-Frame-Options") == "DENY"
+    assert "frame-ancestors 'none'" in response.getheader("Content-Security-Policy", "")
+    assert response.getheader("X-Content-Type-Options") == "nosniff"
+    assert response.getheader("Referrer-Policy") == "no-referrer"
+
+
+def test_the_server_answers_the_tunnels_two_names_unless_configured_otherwise(monkeypatch):
+    """The names a request may be addressed to: the two the operator's tunnel opens the UI as,
+    or the comma-separated list AGB_UI_ALLOWED_HOSTS names instead, compared without case."""
+    monkeypatch.delenv("AGB_UI_ALLOWED_HOSTS", raising=False)
+    assert service.allowed_hosts_from_env() == {"127.0.0.1:8080", "localhost:8080"}
+    monkeypatch.setenv("AGB_UI_ALLOWED_HOSTS", " 127.0.0.1:9090, LocalHost:9090 ,")
+    assert service.allowed_hosts_from_env() == {"127.0.0.1:9090", "localhost:9090"}
+    monkeypatch.setenv("AGB_UI_ALLOWED_HOSTS", " , ")
+    assert service.allowed_hosts_from_env() == {"127.0.0.1:8080", "localhost:8080"}
+
+
 def test_the_server_answers_on_the_loopback_address_alone(db, monkeypatch, traded):
     """Acceptance criterion (a): the socket binds 127.0.0.1, every view answers a GET over it,
     an unknown path is a 404 and nothing but GET and HEAD is answered at all. The port is
@@ -889,7 +916,7 @@ def test_the_server_answers_on_the_loopback_address_alone(db, monkeypatch, trade
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(service, "PORT", 0)
     httpd = service.server()
-    host, port = httpd.server_address[:2]
+    host, port = allow_own_address(httpd)
     assert host == "127.0.0.1"
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
@@ -901,6 +928,7 @@ def test_the_server_answers_on_the_loopback_address_alone(db, monkeypatch, trade
             assert response.status == 200, path
             assert response.getheader("Content-Type") == "text/html; charset=utf-8"
             assert response.getheader("Cache-Control") == "no-store"
+            assert_protected(response)
             assert f">{label}</a>" in body
             client.close()
         client = HTTPConnection(host, port)
@@ -1145,7 +1173,7 @@ def test_the_server_posts_a_form_to_a_write_route_and_refuses_everything_else(db
     monkeypatch.delenv("AGB_UI_HOST", raising=False)
     monkeypatch.setattr(service, "PORT", 0)
     httpd = service.server()
-    host, port = httpd.server_address[:2]
+    host, port = allow_own_address(httpd)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
         client = HTTPConnection(host, port)
@@ -1187,3 +1215,63 @@ def test_the_server_posts_a_form_to_a_write_route_and_refuses_everything_else(db
         httpd.server_close()
 
     assert commands(db) == [("pause", "accepted", None, "ui:operator", "ui")]
+
+
+def test_a_request_addressed_to_another_name_or_a_write_with_no_origin_is_refused(
+    db, monkeypatch, waiting
+):
+    """Issue #171. A page that rebinds its own name to the loopback address arrives carrying that
+    name as `Host` and a matching `Origin`, so the name is checked against the allowed list and
+    anything else is a 421, a read as much as a write: the pages carry the basket reference. A
+    write must also declare an `Origin` from the same list. None of it is recorded, and every
+    response, refusals and the stdlib's own errors included, forbids framing and sniffing."""
+    for key, value in db.pg_env("ui").items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("AGB_UI_HOST", raising=False)
+    monkeypatch.setattr(service, "PORT", 0)
+    httpd = service.server()
+    host, port = allow_own_address(httpd)
+    here = f"http://{host}:{port}"
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    def send(method, path, headers):
+        client = HTTPConnection(host, port)
+        client.request(method, path, body="" if method == "POST" else None, headers=headers)
+        response = client.getresponse()
+        body = response.read().decode()
+        client.close()
+        assert_protected(response)
+        return response.status, body
+
+    try:
+        rebound = {"Host": "evil.example", "Origin": "http://evil.example"}
+        for path in ui.WRITES:
+            status, body = send("POST", path, FORM | rebound)
+            assert status == 421, path
+            assert "That request was not addressed to this server." in body
+            status, _ = send("POST", path, FORM | rebound | {"Origin": here})
+            assert status == 421, f"{path}: an allowed origin does not excuse the host"
+        for path in ui.ROUTES:
+            assert send("GET", path, {"Host": "evil.example"})[0] == 421, path
+        assert send("HEAD", "/", {"Host": "evil.example"})[0] == 421
+        assert send("GET", "/", {"Host": f"evil.example:{port}"})[0] == 421
+        assert send("GET", "/", {"Host": ""})[0] == 421, "a request that names no host"
+
+        for path in ui.WRITES:
+            status, body = send("POST", path, FORM)
+            assert status == 403, f"{path}: a write that declares no origin"
+            assert "That request did not come from here." in body
+            for origin in ("null", "http://evil.example", f"https://{host}:{port}"):
+                status, _ = send("POST", path, FORM | {"Origin": origin})
+                assert status == 403, f"{path} from {origin}"
+
+        assert send("GET", "/", {"Host": f"{host}:{port}".upper()})[0] == 200
+        assert send("HEAD", "/", {})[0] == 200
+        assert send("GET", "/nowhere", {})[0] == 404
+        assert send("PUT", "/", {})[0] == 501, "the stdlib's own error carries the headers too"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    assert commands(db) == []
+    assert state(db, waiting)[0] == "pending", "nothing answered the rebalance"

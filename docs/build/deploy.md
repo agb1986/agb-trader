@@ -139,6 +139,14 @@ kill switch stay in Telegram until the write path lands.
 Set `AGB_UI_PORT` in the deploy directory's `.env` if 8080 is taken on the server; the container
 still listens on 8080, so the tunnel's right-hand side does not change.
 
+Open the UI as `http://127.0.0.1:8080` or `http://localhost:8080`, so keep the tunnel's left-hand
+side on local port 8080. The UI answers only requests addressed to those two names and refuses
+any other `Host` with a 421. This is what stops a page on another site that rebinds its own name
+to the loopback address. A write must also send an `Origin` naming one of them, so a POST from
+curl needs `-H 'Origin: http://127.0.0.1:8080'`. The `AGB_UI_ALLOWED_HOSTS` variable
+(comma-separated `host:port`) replaces the list, but `compose.yaml` does not pass it to the `ui`
+service yet.
+
 ## Backups
 
 The scheduler plans a backup job for every calendar day. The job becomes claimable at 03:00
