@@ -10,6 +10,7 @@ import re
 import pytest
 import yaml
 from conftest import ROOT
+from test_measure import SERVER_PYTHON
 
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 DEPENDABOT = ROOT / ".github" / "dependabot.yml"
@@ -66,7 +67,13 @@ def test_lint_runs_what_make_lint_runs(workflow):
 
 
 def test_the_fast_tests_run_what_make_test_fast_runs(workflow):
-    assert commands(workflow["jobs"]["fast-tests"]) == ["uv sync --frozen", *recipe("test-fast")]
+    # The server's Python as well, so the sampler test runs rather than skips and CI passes as
+    # many tests as a local run.
+    assert commands(workflow["jobs"]["fast-tests"]) == [
+        "uv sync --frozen",
+        f"uv python install {SERVER_PYTHON}",
+        *recipe("test-fast"),
+    ]
     assert recipe("test-fast") == ['uv run pytest -m "not stack and not live"']
 
 

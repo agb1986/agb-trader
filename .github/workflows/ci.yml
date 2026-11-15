@@ -46,6 +46,9 @@ jobs:
         with:
           version: "0.10.10"
       - run: uv sync --frozen
+      # The server's system Python, which tests/test_measure.py runs the sizing sampler on;
+      # without it that test skips and CI reports fewer passes than a local run.
+      - run: uv python install 3.9
       # The tests start their own throwaway Postgres container, and the Compose checks run
       # `docker compose config`; the hosted runner provides both.
       - run: uv run pytest -m "not stack and not live"
