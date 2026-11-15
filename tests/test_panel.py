@@ -378,6 +378,25 @@ def test_a_missing_body_is_not_a_cache_hit(db, config, store):
     assert model.calls == ["ACME", "ACME"]
 
 
+def test_a_corrupt_body_is_not_a_cache_hit_and_the_answer_repairs_it(db, config, store):
+    model = FakeAnalyst()
+    run(db, config, store, model, ["ACME"])
+    [(response_sha256,)] = rows(db, "SELECT response_sha256 FROM agb.panel_model_call")
+    path = store.path(response_sha256)
+    path.write_bytes(path.read_bytes()[:20])
+
+    run_id = run(db, config, store, model, ["ACME"])
+
+    # The pass did not die on the bad body: it asked again, the same answer came back, and
+    # storing it rewrote the body under its hash.
+    assert model.calls == ["ACME", "ACME"]
+    assert extract(db, store, "ACME", run_id)[0] == "extracted"
+    assert json.loads(store.get(response_sha256))
+    assert rows(db, "SELECT DISTINCT response_sha256 FROM agb.panel_model_call") == [
+        (response_sha256,)
+    ]
+
+
 def test_edgar_is_asked_with_the_user_agent_and_nothing_after_the_as_of_date(db, config, store):
     fake = FakeEdgar()
     panel.run(db.connect("pipeline"), config, ["ACME"], AS_OF, client(fake), FakeAnalyst(), store)

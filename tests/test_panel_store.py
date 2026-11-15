@@ -1,6 +1,8 @@
 import hashlib
+import os
 
 import pytest
+import zstandard
 
 from agb.panel_store import PanelStore, StoreError
 
@@ -50,3 +52,46 @@ def test_a_missing_or_corrupt_body_is_an_error(tmp_path):
     )
     with pytest.raises(StoreError):
         store.get(digest)
+
+
+def corrupt(store, digest, damage):
+    path = store.path(digest)
+    path.write_bytes(damage(path.read_bytes()))
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        pytest.param(lambda data: data[: len(data) // 2], id="truncated"),
+        pytest.param(lambda data: b"\0" * len(data), id="zeroed"),
+        pytest.param(lambda data: zstandard.compress(b"some other body"), id="overwritten"),
+    ],
+)
+def test_storing_a_body_again_repairs_one_that_has_gone_bad(tmp_path, damage):
+    store = PanelStore(tmp_path)
+    digest = store.put(b"the original body")
+    corrupt(store, digest, damage)
+    with pytest.raises(StoreError):
+        store.get(digest)
+
+    assert store.put(b"the original body") == digest
+
+    assert store.get(digest) == b"the original body"
+    assert files(tmp_path) == [store.path(digest)]
+
+
+def test_a_new_body_is_synced_with_its_directory(tmp_path, monkeypatch):
+    store = PanelStore(tmp_path)
+    synced = []
+    fsync = os.fsync
+
+    def recording(fd):
+        synced.append(os.fstat(fd).st_ino)
+        fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", recording)
+
+    digest = store.put(b"a body the database will name")
+
+    path = store.path(digest)
+    assert synced == [path.stat().st_ino, path.parent.stat().st_ino]

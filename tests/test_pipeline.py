@@ -1,18 +1,30 @@
 """The pipeline service's data pull: a landed session completes its job and records its
-snapshot, a failed or missed pull is overdue, a re-run changes nothing, and the backfill."""
+snapshot, a failed or missed pull is overdue, a re-run changes nothing, and the backfill. Then
+what any job does when it breaks: it fails once, naming its cause, with an alert, and the
+service carries on; a job whose lease was lost is left alone."""
 
+import logging
+import re
 import threading
 import time
 import urllib.error
 from datetime import UTC, date, datetime, timedelta
 
+import psycopg
+import pyarrow as pa
 import pytest
+from panel_fake import FakePanel
 from psycopg import errors
 from sharadar_fake import sample, sep_row
+from test_basket import job_state, plan_rebalance
+from test_basket import rows as cli_rows
+from test_basket import run as rebalance
+from test_blend import fake_panel, market
 
 from agb import heartbeat, jobs, lake, schedule
+from agb.panel_store import PanelStore
 from agb.schedule import Expected, Planned
-from agb.services.pipeline import RETRY, Pipeline, record
+from agb.services.pipeline import JOB_FAILED, RETRY, Pipeline, record
 
 PERIOD = "2026-09-14"
 SESSION = date(2026, 9, 14)
@@ -313,3 +325,112 @@ def test_snapshots_are_append_only(db, tmp_path):
             " actor) VALUES (current_date, 'sep', 'sep/date=2026-09-14', repeat('0', 64), 0,"
             " 'scheduler')"
         )
+
+
+class Breaks(FakePanel):
+    """A panel that breaks partway through its pass the way `breaking` does, after writing its
+    run and its first names as the real one does."""
+
+    def __init__(self, config, breaking, **kwargs):
+        super().__init__(config, **kwargs)
+        self.breaking = breaking
+
+    def __call__(self, conn, shortlist, sectors, as_of, job_id=None):
+        super().__call__(conn, shortlist[:3], sectors, as_of, job_id)
+        self.breaking(conn)
+
+
+def corrupt_body(tmp_path):
+    """Reading back a body the store holds that has gone bad on disk."""
+    store = PanelStore(tmp_path / "panel")
+    digest = store.put(b'{"text": "the Analyst\'s extract"}')
+    store.path(digest).write_bytes(b"not zstd")
+    return lambda conn: store.get(digest)
+
+
+def database_error(tmp_path):
+    return lambda conn: conn.execute("SELECT 1 / 0")
+
+
+def unreadable_parquet(tmp_path):
+    return lambda conn: pa.array(["N01"]).cast(pa.int64())
+
+
+def alerts(db):
+    return cli_rows(db, "SELECT kind, subject, period, body, raised_by FROM agb.alert")
+
+
+@pytest.mark.parametrize(
+    ("breaking", "cause"),
+    [
+        (corrupt_body, "StoreError: body .* does not decompress"),
+        (database_error, "DivisionByZero: division by zero"),
+        (unreadable_parquet, "ArrowInvalid: "),
+    ],
+    ids=["corrupt-body", "database", "arrow"],
+)
+def test_a_job_that_breaks_fails_once_with_an_alert_and_the_service_carries_on(
+    db, tmp_path, breaking, cause
+):
+    plan_rebalance(db)
+    root = market(tmp_path).land()
+    panel = Breaks(fake_panel(db, 0.2).config_id, breaking(tmp_path), shortlist_n=25)
+
+    rebalance(db, root, runner=panel)
+
+    assert job_state(db) == "failed"
+    [(detail,)] = cli_rows(db, "SELECT detail FROM agb.job_event WHERE event = 'failed'")
+    assert re.match(cause, detail)
+    [(kind, subject, period, body, raised_by)] = alerts(db)
+    assert (kind, subject, period, raised_by) == (JOB_FAILED, "rebalance", "2026-10", "pipeline")
+    assert "will not be tried again" in body and detail in body
+    assert cli_rows(db, "SELECT count(*) FROM agb.basket") == [(0,)]
+
+    # The next cycle runs: the failed job is not taken again, so nothing is asked of the
+    # panel and the alert is not raised a second time.
+    rebalance(db, root, runner=panel)
+
+    assert len(panel.calls) == 1
+    assert job_state(db) == "failed"
+    assert len(alerts(db)) == 1
+
+
+def test_a_dropped_database_connection_still_stops_the_service(db, tmp_path):
+    plan_rebalance(db)
+    root = market(tmp_path).land()
+
+    def drop(conn):
+        # The connection goes away under the pass, as it does when Postgres restarts.
+        conn.close()
+        conn.execute("SELECT 1")
+
+    panel = Breaks(fake_panel(db, 0.2).config_id, drop, shortlist_n=25)
+
+    with pytest.raises(psycopg.OperationalError):
+        rebalance(db, root, runner=panel)
+
+    assert alerts(db) == []
+
+
+def test_a_lost_lease_ends_the_job_without_failing_it(db, tmp_path, caplog):
+    plan_rebalance(db)
+    root = market(tmp_path).land()
+
+    def lose_lease(conn):
+        # The lease runs out mid-pass and is given up, as recovery does for a stuck job, so
+        # the job is no longer this worker's to complete.
+        time.sleep(0.05)
+        [(job_id,)] = cli_rows(db, "SELECT id FROM agb.job WHERE kind = 'rebalance'")
+        assert jobs.release_expired(conn, job_id, "pipeline", "lease ran out")
+
+    panel = Breaks(fake_panel(db, 0.2).config_id, lose_lease, shortlist_n=25)
+
+    with caplog.at_level(logging.ERROR, logger="agb.services.pipeline"):
+        rebalance(db, root, runner=panel, lease=timedelta(0))
+
+    [record] = [r for r in caplog.records if "lease lost" in r.getMessage()]
+    assert record.exc_info is None
+    assert "rebalance 2026-10" in record.getMessage()
+    assert job_state(db) != "failed"
+    assert cli_rows(db, "SELECT count(*) FROM agb.job_event WHERE event = 'failed'") == [(0,)]
+    assert alerts(db) == []
