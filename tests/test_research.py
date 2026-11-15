@@ -439,6 +439,37 @@ def test_a_run_that_overlaps_another_without_being_its_child_still_counts(ledger
     assert trials.declared(rows) == 2
 
 
+def test_a_row_is_rooted_at_the_run_it_names_as_its_parent_not_the_run_around_it(ledger):
+    """A certification started from another terminal while one is open runs its backtest inside
+    the first one's interval, and its root is still the certification that opened it. Rows from
+    before the chain are rooted by their interval."""
+    legacy = [{**row, "parent": None, "previous": None} for row in _legacy_rows(ledger)]
+
+    def other_terminal(opened):
+        with open_trial(ledger, kind="certification", features=("mom_6_1",)) as theirs:
+            with open_trial(ledger, kind="backtest") as backtest:
+                opened.extend([theirs.trial_id, backtest.trial_id])
+
+    opened: list[str] = []
+    with open_trial(ledger, kind="certification") as outer:
+        with open_trial(ledger, kind="backtest") as mine:
+            pass
+        thread = threading.Thread(target=other_terminal, args=(opened,))
+        thread.start()
+        thread.join()
+    theirs, their_backtest = opened
+    rows = ledger.rows()
+    assert their_backtest in trials.nested(rows, current=None)
+    roots = trials.roots(rows)
+    assert roots[mine.trial_id]["trial_id"] == outer.trial_id
+    assert roots[their_backtest]["trial_id"] == theirs
+    assert roots[theirs]["trial_id"] == theirs
+    by_kind = {row["kind"]: row for row in legacy}
+    old = trials.roots(legacy)
+    assert old[by_kind["cpcv"]["trial_id"]] == by_kind["certification"]
+    assert all(old[r["trial_id"]] is r for r in legacy if r["kind"] != "cpcv")
+
+
 def test_the_started_count_never_falls_below_the_configuration_count(ledger):
     """Over a ledger holding every kind of row the change could affect, the new rule counts at
     least as many trials as the rule it replaces: rows from before the chain, a run killed before

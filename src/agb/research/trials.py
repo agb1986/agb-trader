@@ -223,6 +223,35 @@ def nested(rows: list[dict[str, object]], *, current: str | None = None) -> set[
     return inside
 
 
+def roots(rows: list[dict[str, object]], *, current: str | None = None) -> dict[str, dict]:
+    """Each row's id, mapped to the run at its root: the run it was the mechanics of.
+
+    A chained row follows the `parent` links up to a row that names none, so a run that merely
+    overlapped another, from a second terminal, is its own root. A row from before the chain is
+    read by its interval, as `nested` reads it: the first run around it that is inside none.
+    """
+    by_id = {row["trial_id"]: row for row in rows}
+    inside = nested(rows, current=current)
+    outer = [row for row in rows if row["trial_id"] not in inside]
+    found = {}
+    for row in rows:
+        top = row
+        if row.get("previous") is None:
+            if row["trial_id"] in inside:
+                start, end = row["started_at"], _closes_at(row, current)
+                top = next(
+                    (o for o in outer if o["started_at"] < start and _closes_at(o, current) >= end),
+                    row,
+                )
+        else:
+            for _ in rows:  # bounded, so a parent cycle in an unverified ledger cannot spin
+                if top.get("parent") not in by_id:
+                    break
+                top = by_id[top["parent"]]
+        found[str(row["trial_id"])] = top
+    return found
+
+
 def _children(rows: list[dict[str, object]], *, current: str | None) -> set[str]:
     """The ids of the rows the `started` rule folds into another run.
 

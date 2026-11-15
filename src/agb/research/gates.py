@@ -16,7 +16,11 @@ docs/architecture/01:
                            symmetric cross-validation over the candidate configurations the
                            ledger holds for this window: how often the configuration that
                            looks best in-sample ranks in the worse half out of sample. Fails
-                           above the threshold (~0.5).
+                           above the threshold (~0.5). Identical series are one candidate,
+                           and below two distinct candidates there is no selection to measure,
+                           so the PBO is undefined and the gate fails with that cause named.
+                           It also fails when a configuration the ledger declares should have
+                           had a series and has none.
     cost-inclusive Sharpe  the annualised net Sharpe across paths; the documents give it no
                            number, so its threshold is the least it can be, positive.
     deflated Sharpe at 2x  the DSR again on the paths rerun at twice the modelled cost, from
@@ -143,13 +147,34 @@ def overfitting_probability(candidates: np.ndarray, blocks: int = 16) -> dict[st
     are cut into `blocks` even blocks, and for every way of taking half of them as the
     in-sample set, the configuration with the best in-sample Sharpe is ranked out of sample
     among all of them. The PBO is the share of those splits where it lands in the worse half.
-    A single candidate has no selection to be fooled by, so its PBO is zero."""
+
+    Identical columns are one configuration read twice, so they are reduced to one before
+    anything is ranked: a duplicate would tie with its twin and pull the rank to the middle.
+    Below two distinct candidates there is no selection to be fooled by, which leaves the PBO
+    undefined rather than zero: an undefined PBO is reported as 1.0 with `defined` false and
+    the `cause` named, so the gate fails and says why. 1.0 rather than none because the
+    certification row records a number in [0, 1] whatever the verdict."""
     matrix = np.asarray(candidates, dtype="float64")
     if matrix.ndim != 2:
         raise GateError("the candidates must be a months-by-configurations matrix")
+    columns = matrix.shape[1]
+    if columns:
+        _, first = np.unique(matrix, axis=1, return_index=True)
+        matrix = matrix[:, np.sort(first)]
     months, count = matrix.shape
     if count < 2:
-        return {"pbo": 0.0, "candidates": count, "blocks": 0, "splits": 0}
+        return {
+            "pbo": 1.0,
+            "defined": False,
+            "cause": (
+                f"PBO undefined: {count} distinct candidate"
+                f"{'' if count == 1 else 's'}, at least two needed"
+            ),
+            "candidates": count,
+            "columns": columns,
+            "blocks": 0,
+            "splits": 0,
+        }
     if months < 2:
         raise GateError("the probability of backtest overfitting needs at least two months")
     used = min(blocks, months - months % 2)
@@ -165,7 +190,10 @@ def overfitting_probability(candidates: np.ndarray, blocks: int = 16) -> dict[st
         logits.append(math.log(relative / (1.0 - relative)))
     return {
         "pbo": float(np.mean(np.array(logits) < 0.0)),
+        "defined": True,
+        "cause": None,
         "candidates": count,
+        "columns": columns,
         "blocks": used,
         "splits": len(logits),
     }
@@ -249,12 +277,16 @@ def evaluate(
     months: Sequence[str],
     participation: Sequence[tuple[float | None, float | None]],
     thresholds: Thresholds | None = None,
+    missing: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Every gate and diagnostic on one model's paths: `net`, `gross` and `net_2x` are
     paths-by-months matrices of monthly returns at one times cost, before cost, and at twice
     cost; `candidates` the months-by-configurations matrix the overfitting gate reads, which
     includes this model; `trials` the ledger's count; `participation` each path's maximum and
-    mean participation. The verdict passes only when every gate does."""
+    mean participation; `missing` the reasons any configuration the ledger declares has no
+    column in `candidates` though it should, each of which fails the overfitting gate, since
+    a PBO over a matrix that leaves out a configuration that was tried is not the PBO of the
+    search. The verdict passes only when every gate does."""
     thresholds = Thresholds() if thresholds is None else thresholds
     net_rows, gross_rows, twice_rows = _paths(net), _paths(gross), _paths(net_2x)
     if not net_rows.shape == gross_rows.shape == twice_rows.shape:
@@ -268,7 +300,7 @@ def evaluate(
     sharpe_gross = path_sharpe(gross_rows)
     gates = {
         "dsr": _gate(deflated["dsr"], thresholds.dsr, "at least"),
-        "pbo": _gate(overfitting["pbo"], thresholds.pbo, "at most"),
+        "pbo": _overfitting_gate(overfitting, thresholds.pbo, missing),
         "sharpe_net": _gate(sharpe_net, thresholds.sharpe, "above"),
         "dsr_2x": _gate(deflated_2x["dsr"], thresholds.dsr, "at least"),
     }
@@ -294,7 +326,7 @@ def evaluate(
         "path_quantiles": path_quantiles(net_rows),
         "deflated_sharpe": deflated,
         "deflated_sharpe_2x": deflated_2x,
-        "overfitting": overfitting,
+        "overfitting": {**overfitting, "missing": list(missing)},
         "declared_trials": trials,
         "months": len(months),
         "paths": len(net_rows),
@@ -308,6 +340,20 @@ def _gate(value: float, threshold: float, rule: str) -> dict[str, Any]:
         "above": value > threshold,
     }[rule]
     return {"value": value, "threshold": threshold, "rule": rule, "passed": bool(passed)}
+
+
+def _overfitting_gate(
+    overfitting: dict[str, Any], threshold: float, missing: Sequence[str]
+) -> dict[str, Any]:
+    """The PBO gate, which also fails, with the cause named, when the PBO is undefined or a
+    declared configuration is missing from the matrix it was computed over."""
+    gate = _gate(overfitting["pbo"], threshold, "at most")
+    causes = [] if overfitting["defined"] else [overfitting["cause"]]
+    causes += [f"candidate missing: {reason}" for reason in missing]
+    if causes:
+        gate["passed"] = False
+    gate["cause"] = "; ".join(causes) or None
+    return gate
 
 
 # Arithmetic -----------------------------------------------------------------------------------

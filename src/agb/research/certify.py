@@ -9,7 +9,13 @@ then replayed at twice the cost, which is a constant, not a trial, and the gates
 every other backtest the ledger holds over the same panel, because a model is overfit
 relative to the configurations that were tried against it: each earlier backtest over the
 same months, partition and cost-model version is a candidate, as its paths' mean monthly
-net return, and the run's own series is one more.
+net return, and the run's own series is one more. The matrix has one column per
+configuration, not per row: a backtest nested inside a certification is that
+certification's configuration, a rerun of a configuration that already has a column adds
+none, and a run of this certification's own configuration is this run. Every series left
+out is reported with its reason, and a configuration that should have had a column and has
+none fails the gate, as does a matrix with fewer than two distinct columns, where the
+probability of backtest overfitting is undefined.
 
 The declared trial count that the deflated Sharpe ratio charges for is the number of
 distinct configurations the ledger says were tried, `trials.RULE`, read off the ledger
@@ -93,7 +99,7 @@ from agb.research.cache import Cache
 from agb.research.panel import Panel
 from agb.research.trials import FILE as LEDGER_FILE
 from agb.research.trials import RULE as TRIAL_RULE
-from agb.research.trials import Ledger, LedgerError, Run, code_version
+from agb.research.trials import Ledger, LedgerError, Run, code_version, configuration, roots
 
 CERTIFIES = gates.CERTIFIES
 CAPITAL = 100_000.0
@@ -118,6 +124,17 @@ class Options:
     def __post_init__(self) -> None:
         if not MODEL_ID.match(self.model_id):
             raise ValueError(f"model id {self.model_id!r}: letters, digits, dot, dash, underscore")
+
+
+@dataclass(frozen=True)
+class Candidates:
+    """The overfitting gate's columns, one per configuration and keyed by the trial id of the
+    row that supplied it, what was left out and why, and which of those leave a declared
+    configuration without the column it should have, which fails the gate."""
+
+    series: dict[str, np.ndarray]
+    dropped: list[dict[str, str]]
+    missing: list[str]
 
 
 @dataclass(frozen=True)
@@ -212,8 +229,14 @@ def run(
         net = _matrix(paths, "net")
         gross = _matrix(paths, "gross")
         net_2x = _matrix(twice, "net")
-        others = candidates(ledger, panel, labels=labels, exclude={trial.trial_id, traded.trial_id})
-        matrix = np.column_stack([net.mean(axis=0), *others.values()])
+        others = candidates(
+            ledger,
+            panel,
+            labels=labels,
+            exclude={trial.trial_id, traded.trial_id},
+            current=trial.trial_id,
+        )
+        matrix = np.column_stack([net.mean(axis=0), *others.series.values()])
         # `current` is this run's own row, which is still `running`: it is open until the run
         # ends, so what it nests is read as nested, and it counts itself.
         declared = ledger.declared(current=trial.trial_id)
@@ -227,6 +250,7 @@ def run(
             months=labels,
             participation=[(p["participation_max"], p["participation_mean"]) for p in paths],
             thresholds=options.thresholds,
+            missing=others.missing,
         )
         # What would trade: the configuration refitted on every month of the panel, the
         # leading ones the backtest could not trade included, since they still carry a label.
@@ -239,7 +263,8 @@ def run(
             "certified_capital": CAPITAL,
             "cpcv_trial_id": fitted.trial_id,
             "backtest_trial_id": traded.trial_id,
-            "candidate_trials": list(others),
+            "candidate_trials": list(others.series),
+            "candidates_dropped": others.dropped,
             "cpcv": fitted.results["summary"],
             "backtest": traded.results["summary"],
             "paths": [
@@ -271,39 +296,90 @@ def candidates(
     *,
     labels: Sequence[str],
     exclude: set[str] = frozenset(),
-) -> dict[str, np.ndarray]:
-    """The monthly net return series of every earlier succeeded backtest over this panel's
-    months, partition and cost-model version, keyed by trial id: the configurations the
-    overfitting gate ranks this model against. A backtest over several paths contributes the
-    paths' mean month.
+    current: str | None = None,
+) -> Candidates:
+    """The monthly net return series the overfitting gate ranks this model against, one per
+    configuration among the succeeded backtests over this panel's months, partition and
+    cost-model version, keyed by the trial id of the run that supplied it. A backtest over
+    several paths contributes the paths' mean month.
+
+    A configuration is what `trials.configuration` says of the run at the root of a backtest's
+    `parent` links (`trials.roots`; by interval for rows from before the chain): every
+    certification trades its scores through a backtest whose own configuration is the same
+    whatever the model, so the backtest's row alone cannot tell two models apart,
+    and the certification around it can. `current` is the certification asking, and anything
+    of its configuration is this run, which is the matrix's first column already; `exclude`
+    names rows to leave out besides. The first usable series of a configuration is its column
+    and later runs of it are reruns, which add none.
 
     A backtest's recorded window is the panel it was handed, while `labels` is the shorter
     window it could trade, so the series a candidate contributes is held to the traded length:
-    two runs whose months differ are not two readings of the same thing."""
+    two runs whose months differ are not two readings of the same thing. Every series left out
+    is in `dropped` with its reason, and a configuration none of whose runs left a usable
+    series is in `missing`, which fails the gate: it was tried, and a PBO without it is not
+    the PBO of the search."""
+    rows = ledger.rows()
+    top = roots(rows, current=current)
+    mine = next((configuration(r) for r in rows if r["trial_id"] == current), None)
     start, end = panel.months[0].as_of, panel.months[-1].as_of
-    found: dict[str, np.ndarray] = {}
-    for row in ledger.rows():
+    series: dict[str, np.ndarray] = {}
+    columns: dict[tuple[object, ...], str] = {}
+    unusable: dict[tuple[object, ...], list[str]] = {}
+    dropped: list[dict[str, str]] = []
+
+    def drop(row: dict[str, Any], reason: str) -> None:
+        dropped.append({"trial_id": str(row["trial_id"]), "reason": reason})
+
+    for row in rows:
+        if row["kind"] not in CANDIDATE_KINDS or row["trial_id"] in exclude:
+            continue
+        if row["status"] != "succeeded":
+            drop(row, f"status {row['status']}")
+            continue
         if (
-            row["kind"] not in CANDIDATE_KINDS
-            or row["status"] != "succeeded"
-            or row["trial_id"] in exclude
-            or row["partition_hash"] != panel.partition_hash
+            row["partition_hash"] != panel.partition_hash
             or row["cost_model_version"] != panel.cost_model_version
             or row["train_start"] != start
             or row["train_end"] != end
-            or not row["results"]
         ):
+            drop(row, "another panel, window or cost model")
             continue
-        results = json.loads(row["results"])
-        if "paths" in results:
-            series = _matrix(results["paths"], "net").mean(axis=0)
-        elif "monthly" in results:
-            series = np.array([month["net"] for month in results["monthly"]], dtype="float64")
-        else:
+        identity = configuration(top[str(row["trial_id"])])
+        if identity == mine:
+            drop(row, "this certification's own configuration")
             continue
-        if len(series) == len(labels) and np.isfinite(series).all():
-            found[row["trial_id"]] = series
-    return found
+        if identity in columns:
+            drop(row, f"rerun of the configuration of {columns[identity]}")
+            continue
+        found, reason = _series(row, labels)
+        if found is None:
+            drop(row, reason)
+            unusable.setdefault(identity, []).append(f"{row['trial_id']}: {reason}")
+            continue
+        columns[identity] = str(row["trial_id"])
+        series[str(row["trial_id"])] = found
+    missing = [
+        "; ".join(reasons) for identity, reasons in unusable.items() if identity not in columns
+    ]
+    return Candidates(series, dropped, missing)
+
+
+def _series(row: dict[str, Any], labels: Sequence[str]) -> tuple[np.ndarray | None, str]:
+    """A candidate row's mean monthly net return series, or none and why it cannot be read."""
+    if not row["results"]:
+        return None, "no results"
+    results = json.loads(row["results"])
+    if "paths" in results:
+        found = _matrix(results["paths"], "net").mean(axis=0)
+    elif "monthly" in results:
+        found = np.array([month["net"] for month in results["monthly"]], dtype="float64")
+    else:
+        return None, "no monthly returns"
+    if len(found) != len(labels):
+        return None, f"{len(found)} months, {len(labels)} traded"
+    if not np.isfinite(found).all():
+        return None, "a month that is not finite"
+    return found, ""
 
 
 # The artifact ---------------------------------------------------------------------------------
@@ -358,6 +434,7 @@ def _write(
             "paths": len(results["paths"]),
             "months": results["months"],
             "candidates": results["overfitting"]["candidates"],
+            "candidates_dropped": results["candidates_dropped"],
         },
         "certified_at": datetime.now(UTC).isoformat(),
         CERTIFIED_PATH: str(directory.resolve()),
@@ -403,8 +480,10 @@ def report(manifest: dict[str, Any]) -> str:
     for name in ("dsr", "pbo", "sharpe_net", "dsr_2x"):
         gate = manifest["gates"][name]
         state = "pass" if gate["passed"] else "FAIL"
+        cause = f" ({gate['cause']})" if gate.get("cause") else ""
         lines.append(
             f"- {name}: {gate['value']:.4f}, {gate['rule']} {gate['threshold']:.4f}: {state}"
+            + cause
         )
     multiple = manifest["break_even_multiple"]
     lines += [
