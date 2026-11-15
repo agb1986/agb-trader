@@ -13,7 +13,7 @@ model against."""
 
 import json
 import shutil
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -253,6 +253,194 @@ def test_the_overfitting_gate_ranks_the_model_against_the_ledgers_backtests(cert
     assert certified.manifest["gates"]["candidates"] == len(PRIORS) + 1
 
 
+# One column per configuration ------------------------------------------------------------------
+
+
+def traded_labels(certification: certify.Certification) -> list[str]:
+    paths = json.loads((certification.directory / certify.PATHS).read_text())
+    return [month["as_of"] for month in paths[0]["monthly"]]
+
+
+def again(row: dict, seconds: float, **changes) -> dict:
+    """`row` run again `seconds` later, with `changes`: a new row with its own id. The row keeps
+    the `parent` it had unless `changes` names another; `ledger_of` links it into the chain."""
+    shift = timedelta(seconds=seconds)
+    moved = {
+        **row,
+        "started_at": row["started_at"] + shift,
+        "finished_at": row["finished_at"] + shift,
+        **changes,
+    }
+    moved["trial_id"] = trials.link({**moved, "trial_id": None})[:16]
+    return moved
+
+
+def ledger_of(
+    certification: certify.Certification, tmp_path, *extra: dict, legacy: bool = False
+) -> Ledger:
+    """The certification's shipped ledger with `extra` appended, each linked to the row before
+    it so the chain holds. `legacy` writes every row as one from before the chain instead, with
+    no `parent` and no `previous`."""
+    ledger = Ledger(tmp_path / trials.FILE)
+    rows = [*Ledger(certification.directory / trials.FILE).rows(), *extra]
+    if legacy:
+        rows = [{**row, "parent": None, "previous": None} for row in rows]
+    else:
+        for index in range(len(rows) - len(extra), len(rows)):
+            rows[index] = {**rows[index], "previous": trials.link(rows[index - 1])}
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.Table.from_pylist(rows, schema=trials.SCHEMA), ledger.path)
+    ledger.verify()
+    return ledger
+
+
+def test_the_certification_counts_each_prior_configuration_once(certified, prior):
+    _, prior_ids = prior
+    dropped = json.loads(
+        Ledger(certified.directory / trials.FILE).get(certified.trial_id)["results"]
+    )["candidates_dropped"]
+    # Its own backtest is the model's column already, so it is not offered; nothing was dropped.
+    assert dropped == certified.manifest["gates"]["candidates_dropped"] == []
+    assert certified.manifest["gates"]["pbo"]["cause"] is None
+    assert len(prior_ids) == len(set(prior_ids)) == len(PRIORS)
+
+
+def test_a_rerun_of_a_configuration_adds_no_column(certified, prior, panel, tmp_path):
+    _, prior_ids = prior
+    shipped = Ledger(certified.directory / trials.FILE)
+    first = shipped.get(prior_ids[0])
+    rerun = again(first, 3600)
+    ledger = ledger_of(certified, tmp_path, rerun)
+    found = certify.candidates(
+        ledger, panel, labels=traded_labels(certified), current=certified.trial_id
+    )
+    assert list(found.series) == prior_ids
+    own = certified.manifest["backtest_trial_id"]
+    assert {"trial_id": own, "reason": "this certification's own configuration"} in found.dropped
+    reason = f"rerun of the configuration of {first['trial_id']}"
+    assert {"trial_id": rerun["trial_id"], "reason": reason} in found.dropped
+    assert found.missing == []
+    # The ledger agrees that the rerun is not another configuration searched.
+    assert ledger.declared() == shipped.declared()
+
+
+def test_backtests_inside_different_certifications_are_different_configurations(
+    certified, prior, panel, tmp_path
+):
+    _, prior_ids = prior
+    shipped = Ledger(certified.directory / trials.FILE)
+    own, inner = (
+        shipped.get(certified.trial_id),
+        shipped.get(certified.manifest["backtest_trial_id"]),
+    )
+    # Another model certified later: its backtest's own row reads exactly like this one's.
+    other = again(own, 3600, config=own["config"].replace(OPTIONS.model_id, "ranker-2024.2"))
+    nested = again(inner, 3600, parent=other["trial_id"])
+    assert trials.configuration(nested) == trials.configuration(inner)
+    ledger = ledger_of(certified, tmp_path, other, nested)
+    asked = certify.candidates(
+        ledger, panel, labels=traded_labels(certified), current=certified.trial_id
+    )
+    assert list(asked.series) == [*prior_ids, nested["trial_id"]]
+    # Certifying the other model: this model's backtest is a candidate, its own is not.
+    theirs = certify.candidates(
+        ledger, panel, labels=traded_labels(certified), current=other["trial_id"]
+    )
+    assert list(theirs.series) == [*prior_ids, inner["trial_id"]]
+
+
+def test_overlapping_certifications_each_keep_their_own_column(certified, prior, panel, tmp_path):
+    """Two models certified at once from two terminals: the second starts just after the first
+    and its backtest runs while the first is still open, so by the clock that backtest sits
+    inside the first certification. Each backtest names the certification that opened it as
+    its parent, and that is whose configuration it is."""
+    _, prior_ids = prior
+    shipped = Ledger(certified.directory / trials.FILE)
+    own, inner = (
+        shipped.get(certified.trial_id),
+        shipped.get(certified.manifest["backtest_trial_id"]),
+    )
+    tick = timedelta(microseconds=1)
+    other = {
+        **again(own, 0, config=own["config"].replace(OPTIONS.model_id, "ranker-2024.2")),
+        "started_at": own["started_at"] + tick,
+        "finished_at": own["finished_at"] + timedelta(hours=1),
+    }
+    theirs = again(inner, tick.total_seconds(), parent=other["trial_id"])
+    assert own["started_at"] < theirs["started_at"] and theirs["finished_at"] <= own["finished_at"]
+    ledger = ledger_of(certified, tmp_path, other, theirs)
+    assert theirs["trial_id"] in trials.nested(ledger.rows())
+    labels = traded_labels(certified)
+    mine = certify.candidates(ledger, panel, labels=labels, current=certified.trial_id)
+    assert list(mine.series) == [*prior_ids, theirs["trial_id"]]
+    assert mine.missing == []
+    other_side = certify.candidates(ledger, panel, labels=labels, current=other["trial_id"])
+    assert list(other_side.series) == [*prior_ids, inner["trial_id"]]
+    # Asked from outside either, both backtests are columns.
+    both = certify.candidates(ledger, panel, labels=labels)
+    assert list(both.series) == [*prior_ids, inner["trial_id"], theirs["trial_id"]]
+
+
+def test_a_backtest_from_before_the_chain_is_still_read_by_its_interval(
+    certified, prior, panel, tmp_path
+):
+    """Rows written before the `parent` column name no parent, so the run around a legacy
+    backtest is the one whose interval holds it, as it always was."""
+    _, prior_ids = prior
+    shipped = Ledger(certified.directory / trials.FILE)
+    own, inner = (
+        shipped.get(certified.trial_id),
+        shipped.get(certified.manifest["backtest_trial_id"]),
+    )
+    other = again(own, 3600, config=own["config"].replace(OPTIONS.model_id, "ranker-2024.2"))
+    nested = again(inner, 3600)
+    ledger = ledger_of(certified, tmp_path, other, nested, legacy=True)
+    assert all(row["previous"] is None and row["parent"] is None for row in ledger.rows())
+    labels = traded_labels(certified)
+    mine = certify.candidates(ledger, panel, labels=labels, current=certified.trial_id)
+    assert list(mine.series) == [*prior_ids, nested["trial_id"]]
+    own_backtest = {
+        "trial_id": inner["trial_id"],
+        "reason": "this certification's own configuration",
+    }
+    assert own_backtest in mine.dropped
+    other_side = certify.candidates(ledger, panel, labels=labels, current=other["trial_id"])
+    assert list(other_side.series) == [*prior_ids, inner["trial_id"]]
+
+
+def test_a_candidate_that_cannot_be_read_is_reported_and_fails_the_gate(
+    certified, prior, panel, tmp_path
+):
+    _, prior_ids = prior
+    first = Ledger(certified.directory / trials.FILE).get(prior_ids[0])
+    results = json.loads(first["results"])
+    results["monthly"][2]["net"] = None
+    broken = again(
+        first,
+        3600,
+        config=first["config"].replace(PRIORS[0], "mom_9_1"),
+        results=trials.encode(results),
+    )
+    ledger = ledger_of(certified, tmp_path, broken)
+    found = certify.candidates(
+        ledger, panel, labels=traded_labels(certified), current=certified.trial_id
+    )
+    assert list(found.series) == prior_ids
+    assert {"trial_id": broken["trial_id"], "reason": "a month that is not finite"} in found.dropped
+    assert found.missing == [f"{broken['trial_id']}: a month that is not finite"]
+    # A short series is reported the same way.
+    results["monthly"] = results["monthly"][1:]
+    short = again(broken, 60, results=trials.encode(results))
+    found = certify.candidates(
+        ledger_of(certified, tmp_path / "short", short),
+        panel,
+        labels=traded_labels(certified),
+        current=certified.trial_id,
+    )
+    months = len(traded_labels(certified))
+    assert found.missing == [f"{short['trial_id']}: {months - 1} months, {months} traded"]
+
+
 def test_the_report_says_what_the_gates_certify(certified):
     report = (certified.directory / certify.REPORT).read_text()
     assert report.startswith(f"# Certification of {OPTIONS.model_id}: PASSED")
@@ -384,6 +572,20 @@ def test_a_failing_run_is_recorded_not_discarded(failed, certified, db):
     row = imported(db, failed.directory)
     assert not row["passed"] and row["declared_trials"] == MANY + 1
     assert row["dsr"] == manifest["dsr"]
+    # The scans carry no monthly returns, so the model is the only candidate and the
+    # overfitting gate has nothing to measure: it fails and says so (issue #166), and the
+    # row still imports, with the undefined PBO recorded as 1.0.
+    assert row["pbo"] == manifest["pbo"] == 1.0
+
+
+def test_a_one_candidate_ledger_fails_certification_with_the_cause_named(failed):
+    gate = failed.manifest["gates"]["pbo"]
+    cause = "PBO undefined: 1 distinct candidate, at least two needed"
+    assert not gate["passed"] and gate["cause"] == cause
+    assert gate["threshold"] == certify.gates.Thresholds().pbo
+    assert failed.manifest["gates"]["candidates"] == 1
+    report = (failed.directory / certify.REPORT).read_text()
+    assert f"- pbo: 1.0000, at most 0.5000: FAIL ({cause})" in report
 
 
 def test_declaring_more_trials_lowers_the_deflated_sharpe(failed, certified):
@@ -563,10 +765,13 @@ def test_an_import_with_no_database_says_where_the_import_runs(certified, monkey
 
 
 def test_the_cli_certifies_and_imports(
-    db, panel, research_lake, certified, tmp_path, monkeypatch, capsys
+    db, panel, research_lake, prior, certified, tmp_path, monkeypatch, capsys
 ):
     research_dir = tmp_path / "research"
     research_dir.mkdir()
+    # The prior backtests give the overfitting gate something to rank the model against; an
+    # empty ledger leaves one candidate and fails it.
+    shutil.copy(prior[0].path, research_dir / trials.FILE)
     panel.save(research_dir / "panel.parquet")
     monkeypatch.setenv("AGB_RESEARCH_DIR", str(research_dir))
     monkeypatch.setenv("AGB_LAKE_DIR", str(research_lake))
