@@ -228,10 +228,17 @@ def release(conn: psycopg.Connection, claim: Claim, detail: str) -> int:
     """Give up a claimed job without ending it, so it can be held again.
 
     For work that stopped on an error and may be tried again, such as a submission that is
-    idempotent at the broker. The `released` event records why.
+    idempotent at the broker. The `released` event records why. Only a live lease can be
+    released this way: one that has run out stays expired for a human (`release_expired`).
     """
     with conn.transaction():
-        _release(conn, claim)
+        released = conn.execute(
+            "UPDATE agb.job SET claimed_by = NULL, lease_until = NULL "
+            "WHERE id = %s AND claimed_by = %s AND lease_until >= now()",
+            (claim.job_id, claim.worker),
+        )
+        if released.rowcount != 1:
+            raise LeaseLost(f"job {claim.job_id}: {claim.worker} no longer holds a live lease")
         return _event(conn, claim.job_id, "released", claim.worker, detail=detail)
 
 

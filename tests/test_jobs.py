@@ -162,6 +162,18 @@ def expire(db, job_id):
     assert state(db, job_id)[2] is True
 
 
+def test_an_expired_lease_cannot_be_released_by_its_worker(db):
+    job_id = add_job(db, kind="submission")
+    execution = db.connect("execution")
+    claim = jobs.claim(execution, ["submission"], "execution", timedelta(0))
+    expire(db, job_id)
+
+    with pytest.raises(jobs.LeaseLost):
+        jobs.release(execution, claim, "connection reset")
+    assert state(db, job_id) == ("lease_expired", "execution", True)
+    assert [event for event, _ in events(db, job_id)] == ["created", "claimed"]
+
+
 def test_an_expired_lease_is_visible_and_not_reclaimed_by_default(db):
     job_id = add_job(db, kind="submission")
     execution = db.connect("execution")
