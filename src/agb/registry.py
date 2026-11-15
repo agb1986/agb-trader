@@ -75,9 +75,11 @@ LEDGER = "trials.parquet"
 # How the certification counted its declared trials, from agb.research.trials, reimplemented
 # here for the same reason as the file names above. A manifest that names no rule was written
 # before there was more than one and declared the ledger's row count. `_IDENTITY` is what makes
-# two rows the same configuration; a row inside another row's interval is that run's own
-# cross-validation or backtest rather than another configuration searched.
-RULES = ("rows", "configurations")
+# two rows the same configuration; a row inside another row's interval, or, under `started`,
+# inside the interval of the parent it names, is that run's own cross-validation or backtest
+# rather than another configuration searched. The ledger's chain is checked by the import, not
+# here.
+RULES = ("rows", "configurations", "started")
 _IDENTITY = (
     "kind", "config", "features", "train_start", "train_end",
     "partition_hash", "cost_model_version", "code_version",
@@ -212,27 +214,45 @@ def declared_trials_of(ledger: Path, rule: str) -> int:
     artifact. `rows` is every row. `configurations` is the distinct configurations that came
     back with a result: rows nested inside another run's interval are that one run's
     cross-validation and backtest, repeats of a configuration are one configuration, and a
-    configuration that never succeeded produced nothing to select on.
+    configuration that never succeeded is left out. `started` is the distinct configurations
+    started, however they ended, with a row folded into the parent it names when the parent's
+    interval holds it; a row from before the chain, which has no `previous`, names no parent
+    and is folded by interval as under `configurations`.
     """
     table = pq.read_table(ledger)
     if rule == "rows":
         return table.num_rows
-    if rule != "configurations":
+    if rule not in ("configurations", "started"):
         raise RegistryError(f"the certification counted its trials by an unknown rule {rule!r}")
-    rows = table.select(["trial_id", "status", "started_at", "finished_at", *_IDENTITY]).to_pylist()
+    # Ledgers from before the chain have neither column, which reads as every row having none.
+    chain = [name for name in ("parent", "previous") if name in table.column_names]
+    columns = ["trial_id", "status", "started_at", "finished_at", *_IDENTITY, *chain]
+    rows = table.select(columns).to_pylist()
     ends = {row["trial_id"]: row["finished_at"] or row["started_at"] for row in rows}
-    counted = set()
-    for row in rows:
-        if row["status"] != "succeeded":
-            continue
-        inside = any(
+    by_id = {row["trial_id"]: row for row in rows}
+
+    def holds(other: dict, row: dict) -> bool:
+        return (
             other["started_at"] < row["started_at"]
             and ends[other["trial_id"]] >= ends[row["trial_id"]]
-            for other in rows
-            if other["trial_id"] != row["trial_id"]
         )
-        if not inside:
-            counted.add(tuple(row[name] for name in _IDENTITY))
+
+    def inside(row: dict) -> bool:
+        return any(holds(o, row) for o in rows if o["trial_id"] != row["trial_id"])
+
+    counted = set()
+    for row in rows:
+        if rule == "configurations":
+            if row["status"] != "succeeded" or inside(row):
+                continue
+        elif row.get("previous") is None:
+            if inside(row):
+                continue
+        else:
+            parent = by_id.get(row.get("parent"))
+            if parent is not None and holds(parent, row):
+                continue
+        counted.add(tuple(row[name] for name in _IDENTITY))
     return len(counted)
 
 

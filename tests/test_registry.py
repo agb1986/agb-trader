@@ -18,6 +18,7 @@ import json
 import logging
 import re
 import shutil
+import threading
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -209,6 +210,48 @@ def test_the_registry_reads_the_layout_the_research_profile_writes(models):
         assert registry.declared_trials_of(ledger, rule) == Ledger(ledger).declared(rule=rule)
     with pytest.raises(registry.RegistryError, match="unknown rule 'guesses'"):
         registry.declared_trials_of(ledger, "guesses")
+
+
+def test_the_registry_counts_failed_nested_and_old_rows_as_the_ledger_does(tmp_path):
+    """The certification's own ledger holds only runs that succeeded, so the counters are also
+    held together over one holding everything the rules treat differently: rows from before the
+    chain, a failure, a rerun, a certification's nested runs and a scan that merely overlapped
+    it from another thread."""
+    window = {
+        "features": ("mom_12_1",), "train_start": date(2024, 1, 31),
+        "train_end": date(2025, 12, 31), "cost_model_version": "v1",
+    }  # fmt: skip
+    old = Ledger(tmp_path / "old.parquet")
+    with old.trial("certification", {"seed": 0}, partition_hash="old", **window):
+        with old.trial("cpcv", {"seed": 0}, partition_hash="old", **window):
+            pass
+    with pytest.raises(RuntimeError):
+        with old.trial("scan", {"seed": 1}, partition_hash="old", **window):
+            raise RuntimeError("boom")
+    path = tmp_path / trials.FILE
+    columns = [f for f in trials.SCHEMA if f.name not in ("parent", "previous")]
+    pq.write_table(pa.Table.from_pylist(old.rows(), schema=pa.schema(columns)), path)
+    ledger = Ledger(path)
+
+    def scan():
+        with ledger.trial("scan", {"seed": 2}, partition_hash="new", **window):
+            pass
+
+    with pytest.raises(RuntimeError):
+        with ledger.trial("backtest", {"seed": 3}, partition_hash="new", **window):
+            raise RuntimeError("boom")
+    with ledger.trial("backtest", {"seed": 3}, partition_hash="new", **window):
+        pass
+    with ledger.trial("certification", {"seed": 4}, partition_hash="new", **window):
+        with ledger.trial("cpcv", {"seed": 4}, partition_hash="new", **window):
+            pass
+        thread = threading.Thread(target=scan)
+        thread.start()
+        thread.join()
+    ledger.verify()
+    counts = {rule: registry.declared_trials_of(path, rule) for rule in trials.RULES}
+    assert counts == {rule: ledger.declared(rule=rule) for rule in trials.RULES}
+    assert counts == {"rows": 8, "configurations": 3, "started": 5}
 
 
 # Promoting ------------------------------------------------------------------------------------

@@ -121,10 +121,18 @@ class Artifact:
         rows = self.ledger().rows()[:-1]
         pq.write_table(pa.Table.from_pylist(rows, schema=trials.SCHEMA), self.ledger().path)
 
-    def drop_first_trial(self) -> None:
+    def drop_first_trial(self, *, relink: bool = True) -> None:
         """Drop the first row, which is a prior backtest: a configuration the search counted,
-        unlike the rows a certification nests."""
-        rows = self.ledger().rows()[1:]
+        unlike the rows a certification nests. A forger who knows the link scheme relinks the
+        rows after it, so the chain holds and only the checks behind it can refuse."""
+        self.drop(0, relink=relink)
+
+    def drop(self, index: int, *, relink: bool = False) -> None:
+        rows = self.ledger().rows()
+        del rows[index]
+        if relink:
+            for i, row in enumerate(rows):
+                row["previous"] = trials.link(rows[i - 1]) if i else trials.GENESIS
         pq.write_table(pa.Table.from_pylist(rows, schema=trials.SCHEMA), self.ledger().path)
 
     def rewrite(self, **changes) -> None:
@@ -407,6 +415,33 @@ def test_a_run_that_raises_leaves_a_failed_trial_and_no_artifact(
     assert not (research_dir / "certifications").exists()
 
 
+def test_a_run_refuses_a_ledger_a_row_was_taken_out_of(panel, research_lake, tmp_path):
+    """A ledger whose chain is broken declares a count nobody can vouch for, so the run refuses
+    it before adding a row of its own or writing anything."""
+    research_dir = tmp_path / "research"
+    ledger = Ledger(research_dir / trials.FILE)
+    for i in range(3):
+        with ledger.trial(
+            "scan", {"scan": i}, features=PRIORS,
+            train_start=panel.months[0].as_of, train_end=panel.months[-1].as_of,
+            partition_hash=panel.partition_hash, cost_model_version=panel.cost_model_version,
+        ):  # fmt: skip
+            pass
+    rows = ledger.rows()
+    del rows[1]
+    pq.write_table(pa.Table.from_pylist(rows, schema=trials.SCHEMA), ledger.path)
+    with pytest.raises(
+        certify.CertificationError,
+        match="the trial ledger cannot be trusted: .* row 1, .* does not link to the row before it",
+    ):
+        certify.run(
+            panel, MODEL, VALIDATION, OPTIONS, ledger,
+            research_dir=research_dir, lake_dir=research_lake,
+        )  # fmt: skip
+    assert ledger.rows() == rows
+    assert not (research_dir / "certifications").exists()
+
+
 # A tampered artifact --------------------------------------------------------------------------
 
 
@@ -435,7 +470,21 @@ def test_a_ledger_that_disagrees_with_the_declared_count_is_refused(db, certifie
     copy.rewrite(ledger_rows=len(PRIORS) + 2)
     with pytest.raises(
         artifact.CertificationError,
-        match="holds 5 trials counted as configurations; the certification declared 6",
+        match=f"holds 5 trials counted as {trials.RULE}; the certification declared 6",
+    ):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
+
+
+@pytest.mark.parametrize("index", [0, 2, -3])
+def test_a_ledger_a_row_was_taken_out_of_is_refused(db, certified, tmp_path, index):
+    # A row taken out of the middle, with the row count and every digest covered over it, still
+    # breaks the chain: the row after it names a link no row left in the ledger has.
+    copy = copied(certified, tmp_path)
+    copy.drop(index)
+    copy.rewrite(ledger_rows=len(PRIORS) + 2)
+    with pytest.raises(
+        artifact.CertificationError,
+        match="trials.parquet cannot be trusted: .* does not link to the row before it",
     ):
         artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
@@ -445,7 +494,7 @@ def test_a_declared_count_the_trial_row_disagrees_with_is_refused(db, certified,
     copy.rewrite(declared_trials=7)
     with pytest.raises(
         artifact.CertificationError,
-        match="holds 6 trials counted as configurations; the certification declared 7",
+        match=f"holds 6 trials counted as {trials.RULE}; the certification declared 7",
     ):
         artifact.import_artifact(db.connect(RESEARCH), copy.directory)
     # Dropping a configuration and lowering the declared count to match leaves the recount and

@@ -12,20 +12,21 @@ same months, partition and cost-model version is a candidate, as its paths' mean
 net return, and the run's own series is one more.
 
 The declared trial count that the deflated Sharpe ratio charges for is the number of
-distinct configurations the ledger says were searched, `trials.RULE`, read off the ledger
+distinct configurations the ledger says were tried, `trials.RULE`, read off the ledger
 after the nested trials have closed and never from anything the run itself says. It is not
-the ledger's row count, which is also recorded, as `ledger_rows`. Three things make a row
-that is not another configuration searched, and counting them charged the model for work
-nobody did: a certification writes three rows, its own and the cross-validation and backtest
-it nests, which is one configuration evaluated once; the same configuration rerun after a
-crash, or rechecked by `reproduce`, writes a row every time; and a configuration no attempt
-of which ever produced a result was never something a result could be selected from. So the
-count drops rows nested inside another run's interval, takes distinct configurations rather
-than rows, and requires at least one that succeeded. Screening scans over raw signals are
-counted, since they are searches whose outcome informed what was certified; the training
-window, the panel's partition digest and the cost-model version are part of a configuration's
-identity, so rebuilding the panel and trying the same model again is another try, not the
-same reading over again.
+the ledger's row count, which is also recorded, as `ledger_rows`. Two things make a row that
+is not another configuration tried, and counting them charged the model for work nobody did:
+a certification writes three rows, its own and the cross-validation and backtest it nests,
+which is one configuration evaluated once; and the same configuration rerun after a crash,
+or rechecked by `reproduce`, writes a row every time. So the count folds each row into the
+run it names as its parent and takes distinct configurations rather than rows. A
+configuration that only ever failed or was abandoned still counts: it was started, and
+whoever chose what to certify saw how it went. The run refuses a ledger whose rows no longer
+chain, since a row taken out of it is a trial the count would quietly lose. Screening scans
+over raw signals are counted, since they are searches whose outcome informed what was
+certified; the training window, the panel's partition digest and the cost-model version are
+part of a configuration's identity, so rebuilding the panel and trying the same model again
+is another try, not the same reading over again.
 
 The count is lower under this rule than under the row count, which lowers the bar the
 deflated Sharpe ratio has to clear, and that is a reason to distrust it rather than a
@@ -92,7 +93,7 @@ from agb.research.cache import Cache
 from agb.research.panel import Panel
 from agb.research.trials import FILE as LEDGER_FILE
 from agb.research.trials import RULE as TRIAL_RULE
-from agb.research.trials import Ledger, Run, code_version
+from agb.research.trials import Ledger, LedgerError, Run, code_version
 
 CERTIFIES = gates.CERTIFIES
 CAPITAL = 100_000.0
@@ -164,6 +165,12 @@ def run(
     months = panel.months
     if not months:
         raise CertificationError("the panel has no months")
+    # A ledger a row was taken out of declares a count it cannot vouch for, so refuse before
+    # the run adds rows of its own to it.
+    try:
+        ledger.verify()
+    except LedgerError as error:
+        raise CertificationError(f"the trial ledger cannot be trusted: {error}") from None
     trading = backtest.Options(
         signal="score",
         size=options.size,
