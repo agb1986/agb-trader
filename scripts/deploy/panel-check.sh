@@ -28,8 +28,8 @@ marker="$keep_dir/broken"
 # The pipeline polls every AGB_HEARTBEAT_SECONDS, 30 by default, so a job inserted now is
 # claimed within a minute. Five minutes is room for the claim, the read and the record.
 wait_seconds=300
-# The nightly sample, when the server does not ask for another.
-default_sample=200
+# The nightly cap on bodies read (panel_audit.SAMPLE), when the server does not ask for another.
+default_sample=100000
 
 die() {
     echo "panel-check: $*" >&2
@@ -69,23 +69,23 @@ sample() {
 }
 
 # Whether the nightly sample is certain to read every body, and so certain to read the broken
-# one. Above the sample it is a lottery of sample/bodies a night, which is no test.
+# one. Once the store outgrows the cap it is a lottery of sample/bodies a night, which is no test.
 certainty() {
     local bodies=$1 sample=$2
     if [ "$bodies" -le "$sample" ]; then
-        echo "the sample of $sample covers all $bodies bodies, so the next audit reads the broken one"
+        echo "the cap of $sample covers all $bodies bodies, so the next audit reads the broken one"
         return 0
     fi
     cat >&2 <<EOF
-panel-check: the store holds $bodies bodies and the sample is $sample, so one audit reads the
-broken body with probability $sample/$bodies. For a check that is certain, raise the sample on
+panel-check: the store holds $bodies bodies and the cap is $sample, so one audit reads the
+broken body with probability $sample/$bodies. For a check that is certain, raise the cap on
 the server and restart the pipeline:
 
   ssh $host "echo AGB_PANEL_AUDIT_SAMPLE=$bodies >> $(q "$dir/env/pipeline.env")"
   ssh $host "$(q "$dir/agb-stack") up -d pipeline"
 
-and put it back to $default_sample when the check is done, so the nightly job stays inside its
-grace period.
+and remove that line when the check is done, so the nightly job goes back to the default
+cap of $default_sample, which keeps it inside its grace period.
 EOF
     return 1
 }
@@ -118,7 +118,7 @@ check() {
     [ "${bodies:-0}" -gt 0 ] ||
         die "the panel tables cite no bodies yet; this needs a rebalance that ran the panel"
     sample=$(sample)
-    echo "the store holds $bodies cited bodies; the nightly sample is $sample"
+    echo "the store holds $bodies cited bodies; the nightly cap is $sample"
     certainty "$bodies" "$sample" || true
     status
 }

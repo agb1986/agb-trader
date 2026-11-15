@@ -191,6 +191,25 @@ def test_each_night_draws_its_own_sample(db, store):
     assert len(drawn) > 3
 
 
+def test_the_default_cap_reads_the_whole_store_and_stays_inside_the_grace():
+    """Sized from the measurement of 2026-11-08: 776 bodies read back in 2 seconds."""
+    measured_bodies, measured_seconds = 776, 2
+    seconds_at_cap = panel_audit.SAMPLE * measured_seconds / measured_bodies
+
+    # The whole store as measured is read, with room to grow, and the bound is still a bound:
+    # reading up to the cap at the measured rate takes under a tenth of the grace period.
+    assert panel_audit.SAMPLE >= 100 * measured_bodies
+    assert seconds_at_cap < schedule.PANEL_AUDIT_GRACE.total_seconds() / 10
+
+
+def test_a_cap_below_the_store_still_draws_a_sample(db, store):
+    cited = panel_bodies(db, store, "AAA", "BBB")
+
+    audit = panel_audit.check(db.connect("pipeline"), store, sample=len(cited) - 1)
+
+    assert (audit.bodies, audit.checked) == (len(cited), len(cited) - 1)
+
+
 def test_an_empty_store_checks_nothing(db, store):
     audit = panel_audit.check(db.connect("pipeline"), store)
 
@@ -278,7 +297,7 @@ def test_a_corrupted_body_completes_the_job_and_raises_one_alert(db, store, tmp_
 
 
 def test_the_sample_can_be_set_on_the_deploy_machine(monkeypatch):
-    """The deliberate-corruption check needs a sample that covers the store, without a release."""
+    """The deliberate-corruption check needs a cap that covers the store, without a release."""
     monkeypatch.delenv(panel_audit.SAMPLE_ENV, raising=False)
     assert sample_from_env() == panel_audit.SAMPLE
     monkeypatch.setenv(panel_audit.SAMPLE_ENV, "5000")

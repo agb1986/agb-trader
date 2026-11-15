@@ -10,7 +10,8 @@ result; the bot turns a missing or corrupt body into an alert.
 Sampling is uniform over distinct referenced hashes, not over rows: a cached model call cites
 the same request body as the call it was answered from, and a body cited twice should not be
 twice as likely to be checked. Each night draws its own sample, so over a month the check
-covers the store many times over without ever spending more than minutes on one night.
+covers the store many times over. While the store is smaller than SAMPLE the sample is the
+whole store, so every night's audit is a statement about all of it.
 """
 
 from dataclasses import dataclass
@@ -19,14 +20,16 @@ import psycopg
 
 from agb.panel_store import PanelStore, StoreError
 
-# How many bodies one night reads back. Set from the measured run time on the deploy machine
-# (docs/build/measured-limits.md): the check shares one slow disk with the household stack, so
-# the sample is sized to finish well inside the nightly job's grace period.
-SAMPLE = 200
+# The most bodies one night reads back, which is the whole store until the store outgrows it.
+# Set from the measured run time on the deploy machine (docs/build/measured-limits.md): 776
+# bodies read back in 2 seconds, about 390 a second, so 100,000 bodies is about four minutes
+# against the nightly job's two-hour grace period. The bound is there because the store grows
+# without bound and the check shares one slow disk with the household stack.
+SAMPLE = 100_000
 
-# The deploy machine may ask for a different sample without a release: a larger one for the
-# deliberate-corruption check, which has to be certain the corrupted body is read, or a
-# smaller one if the measured run time says the nightly job is cutting into its grace period.
+# The deploy machine may ask for a different cap without a release: a smaller one if the
+# measured run time says the nightly job is cutting into its grace period, or a larger one once
+# the store outgrows SAMPLE and the audit should still read all of it.
 SAMPLE_ENV = "AGB_PANEL_AUDIT_SAMPLE"
 
 # Every hash the database refers to, each once. A body cited by several rows is one body here.
