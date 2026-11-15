@@ -6,7 +6,7 @@ tests/panel_fake.py, which writes the rows a real run writes from scores the tes
 
 import json
 import re
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import psycopg
 import pytest
@@ -15,12 +15,13 @@ from market_fake import SECTOR, SIGNAL, Market
 from panel_fake import FakePanel
 from test_basket import EVENING, plan_rebalance, rows, run
 from test_execution import CALENDAR
-from test_gate import move
+from test_gate import LATE, move
 from test_panel import SHORTLIST, FakeAnalyst
 
 from agb import analyst, approval, basket, blend, debate, panel, readout
 from agb.panel_store import PanelStore
 from agb.rebalance import SIZE
+from agb.services.scheduler import Scheduler
 
 # The month 2 rebalance, which proves a shadow basket holds its own names: the Monday after the
 # October close, signalled on the Friday before it.
@@ -28,6 +29,9 @@ NEXT_PERIOD = "2026-11"
 NEXT_TRADE = date(2026, 11, 2)
 NEXT_SIGNAL = date(2026, 10, 30)
 NEXT_EVENING = datetime(2026, 10, 30, 22, 0, tzinfo=UTC)
+# The morning of the session after the October cutoff, when a rerun of a missed basket is built.
+NEXT_MORNING = datetime(2026, 10, 2, 14, 0, tzinfo=UTC)
+MINUTE = timedelta(minutes=1)
 
 LIVE = "(SELECT max(id) FROM agb.basket WHERE kind = 'live')"
 SHADOW = "(SELECT max(id) FROM agb.basket WHERE kind = 'shadow')"
@@ -304,6 +308,41 @@ def test_a_basket_proposed_with_no_panel_is_not_checked_for_coverage(db, tmp_pat
         (None, None, None)
     ]
     assert rows(db, "SELECT count(*) FROM agb.basket_blend") == [(0,)]
+
+
+def test_a_rerun_of_a_blended_basket_is_gated_and_flagged_as_one(db, tmp_path):
+    """A missed panel basket rerun at the next session carries the original's panel run, its
+    configuration, the weight and the blend, so the gate runs its two panel checks on the rerun
+    and the approval request carries the safety scores and the panel's flags again."""
+    approval.set_paper_approval(db.connect("cli"), True, "operator", "rehearse the loop")
+    plan_rebalance(db)
+    fake = fake_panel(db, 0.0, delinquent={"N03": "nt_10k"})
+    root = market(tmp_path).land()
+    run(db, root, runner=fake)
+    [(original,)] = rows(db, f"SELECT {LIVE}")
+    Scheduler(lambda: LATE)(db.connect("scheduler"))
+    assert rows(db, "SELECT state FROM agb.basket_state WHERE id = %s", original) == [("missed",)]
+    source = approval.Source("ada", "cli", "agb rerun 2026-10")
+    approval.request_rerun(db.connect("cli"), "2026-10", source, LATE + MINUTE, CALENDAR)
+
+    run(db, root, runner=fake, clock=lambda: NEXT_MORNING)
+
+    [(rerun,)] = rows(db, "SELECT id FROM agb.basket WHERE reference = '2026-10r1'")
+    panel_of = "SELECT panel_config_id, panel_run_id, panel_w FROM agb.basket WHERE id = %s"
+    assert rows(db, panel_of, rerun) == rows(db, panel_of, original)
+    assert rows(db, panel_of, rerun)[0][1] is not None
+    assert blends(db, rerun) == blends(db, original)
+    gated = (
+        "SELECT c.name, c.passed FROM agb.gate_check c JOIN agb.gate_run r ON r.id = c.run_id"
+        " WHERE r.basket_id = %s AND c.name LIKE 'panel%%' ORDER BY c.name"
+    )
+    assert rows(db, gated, rerun) == [("panel_coverage", True), ("panel_dispersion", True)]
+    assert rows(db, gated, rerun) == rows(db, gated, original)
+    assert len(fake.calls) == 1  # the rerun is the original's blend, not a second panel run
+
+    text = approval.request_text(db.connect("bot"), rerun, NEXT_MORNING, CALENDAR)
+    assert "delinquent filer (nt_10k)" in text.split("FLAGS")[1]
+    assert re.search(r"  \+ N03 .*safety \d+/24", text)
 
 
 # What the operator reads.
