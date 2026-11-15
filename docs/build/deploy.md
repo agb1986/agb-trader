@@ -79,7 +79,11 @@ That runs `scripts/deploy/deploy.sh`, which:
    `releases/<tag>/`.
 6. Runs `agb-stack activate <tag>` on the server. That moves `previous` to the release that
    was running and `current` to the new one, then runs `docker compose up --wait`. `migrate`
-   applies any new migrations before the services start. `--wait` returns only once every
+   applies any new migrations before the services start, and refuses one that is older than
+   the newest already applied, naming both versions. If that migration is safe to run after
+   the newer one, run the activation again with the flag, on the server in the deploy
+   directory: `AGB_MIGRATE_ALLOW_OUT_OF_ORDER=1 ./agb-stack activate <tag>` (see
+   [migrations/README.md](../../migrations/README.md)). `--wait` returns only once every
    service reports healthy, and each app service is healthy only while its own heartbeat is
    younger than five minutes, so a service that crash-loops or never beats fails the deploy
    instead of passing it. Once the stack is up, it prunes old releases and images.
@@ -112,7 +116,10 @@ further, deploy an older commit: check it out and run `make deploy`.
 
 A rollback does not undo migrations. It does not need to: migrations only ever add, so the
 older image runs against the newer schema, and `migrate` ignores ledger entries it has no file
-for. See [migrations/README.md](../../migrations/README.md).
+for. Those entries still count as applied: a later deploy whose new migration is older than
+one the rolled-back release had applied is refused as out of order, and
+`AGB_MIGRATE_ALLOW_OUT_OF_ORDER=1 ./agb-stack activate <tag>` lets it through. See
+[migrations/README.md](../../migrations/README.md).
 
 ## Looking at the stack
 

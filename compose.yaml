@@ -80,6 +80,8 @@ services:
       PGUSER: postgres
       PGPASSWORD: ${POSTGRES_PASSWORD:?set in env/db.env}
       AGB_OWNER_PASSWORD: ${AGB_OWNER_PASSWORD:?set in env/db.env}
+      # Set to 1 on the command line to apply a migration older than the newest applied one.
+      AGB_MIGRATE_ALLOW_OUT_OF_ORDER: ${AGB_MIGRATE_ALLOW_OUT_OF_ORDER:-}
       SCHEDULER_DB_PASSWORD: ${SCHEDULER_DB_PASSWORD:?set in env/db.env}
       PIPELINE_DB_PASSWORD: ${PIPELINE_DB_PASSWORD:?set in env/db.env}
       EXECUTION_DB_PASSWORD: ${EXECUTION_DB_PASSWORD:?set in env/db.env}
