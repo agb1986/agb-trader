@@ -79,7 +79,11 @@ That runs `scripts/deploy/deploy.sh`, which:
    `releases/<tag>/`.
 6. Runs `agb-stack activate <tag>` on the server. That moves `previous` to the release that
    was running and `current` to the new one, then runs `docker compose up --wait`. `migrate`
-   applies any new migrations before the services start. `--wait` returns only once every
+   applies any new migrations before the services start, and refuses one that is older than
+   the newest already applied, naming both versions. If that migration is safe to run after
+   the newer one, run the activation again with the flag, on the server in the deploy
+   directory: `AGB_MIGRATE_ALLOW_OUT_OF_ORDER=1 ./agb-stack activate <tag>` (see
+   [migrations/README.md](../../migrations/README.md)). `--wait` returns only once every
    service reports healthy, and each app service is healthy only while its own heartbeat is
    younger than five minutes, so a service that crash-loops or never beats fails the deploy
    instead of passing it. Once the stack is up, it prunes old releases and images.
@@ -112,7 +116,10 @@ further, deploy an older commit: check it out and run `make deploy`.
 
 A rollback does not undo migrations. It does not need to: migrations only ever add, so the
 older image runs against the newer schema, and `migrate` ignores ledger entries it has no file
-for. See [migrations/README.md](../../migrations/README.md).
+for. Those entries still count as applied: a later deploy whose new migration is older than
+one the rolled-back release had applied is refused as out of order, and
+`AGB_MIGRATE_ALLOW_OUT_OF_ORDER=1 ./agb-stack activate <tag>` lets it through. See
+[migrations/README.md](../../migrations/README.md).
 
 ## Looking at the stack
 
@@ -201,13 +208,19 @@ lake/tickers/snapshot=YYYY-MM-DD/part.parquet  the tickers table as it stood tha
 ```
 
 The scheduler plans a `data_pull` job for every session. It becomes claimable two hours after
-the close, and its expected event is due at the next open. The service pulls the session's
-prices, the fundamentals the vendor changed in the week to it, and the tickers table,
-delisted tickers included. It records each partition's date and SHA-256 in
-`agb.lake_snapshot`. If the vendor has not published the session yet, the service tries
-again every 15 minutes. A pull that fails is recorded as a failed job. A pull that fails, or
-never runs, shows in the overdue view from the next open. Re-running a pull for a session that
-already landed writes the same bytes, so it leaves each file and its hash as they were.
+the close, and its expected event is due at the next open. The service pulls the prices for
+every session since the last one that landed, so a session missed to a vendor error is picked
+up by the next pull. It also pulls the fundamentals the vendor changed since a week before the
+last pull, and the tickers table, delisted tickers included. It records each partition's date
+and SHA-256 in `agb.lake_snapshot`. If the vendor has not published a session yet, or has
+published fewer than 90% of the rows the session before it had, the service lands the
+complete sessions before it and tries again every 15 minutes, without an alert of its own.
+A request that meets a vendor error is tried up to three times with backoff, honouring
+`Retry-After`; an error that outlasts the tries fails the job and raises a
+`pipeline_job_failed` alert. A pull that fails, or never completes, shows in the overdue
+view from the next open. A gap of more than 45 days is left to the backfill below. Re-running
+a pull for a session that already landed writes the same bytes, so it leaves each file and
+its hash as they were.
 
 The first time, land the history from 1998 on. It downloads the vendor's full exports, so
 it takes a while, and it is safe to run again:

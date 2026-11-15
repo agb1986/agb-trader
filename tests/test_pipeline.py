@@ -17,7 +17,7 @@ import registry_fake
 from market_fake import Market
 from panel_fake import FakePanel
 from psycopg import errors
-from sharadar_fake import sample, sep_row
+from sharadar_fake import sample, sep_row, status
 from test_approval_loop import NEXT_MORNING, cli_main
 from test_basket import CAPITAL, EVENING, LIMITS, job_state, plan_rebalance
 from test_basket import rows as cli_rows
@@ -78,6 +78,10 @@ def snapshots(db):
         """)
         .fetchall()
     )
+
+
+def no_wait(seconds):
+    """A sleep for the lake client's retries that does not wait."""
 
 
 def landed(root):
@@ -175,7 +179,7 @@ def test_a_failed_pull_lands_nothing_and_is_overdue(db, tmp_path, setup, detail)
     key = setup(vendor)
     due = plan_pull(db)
 
-    Pipeline(tmp_path, key, opener=vendor)(db.connect("pipeline"))
+    Pipeline(tmp_path, key, opener=vendor, sleep=no_wait)(db.connect("pipeline"))
 
     assert pull_state(db) == "failed"
     [(failure,)] = (
@@ -189,6 +193,58 @@ def test_a_failed_pull_lands_nothing_and_is_overdue(db, tmp_path, setup, detail)
     assert snapshots(db) == []
     assert late_pulls(db, due - MINUTE) == []
     assert late_pulls(db, due + MINUTE) == [(PERIOD,)]
+
+
+def test_a_vendor_error_then_an_answer_completes_the_pull(db, tmp_path):
+    vendor = sample()
+    vendor.errors = [status(503)]
+    waits = []
+    due = plan_pull(db)
+
+    Pipeline(tmp_path, KEY, opener=vendor, sleep=waits.append)(db.connect("pipeline"))
+
+    assert waits == [lake.BACKOFF]
+    assert pull_state(db) == "completed"
+    assert "sep/date=2026-09-14" in landed(tmp_path)
+    assert late_pulls(db, due + MINUTE) == []
+    assert alerts(db) == []
+
+
+def test_a_vendor_error_past_every_retry_fails_the_pull_with_an_alert(db, tmp_path):
+    vendor = sample()
+    vendor.fail = lambda url: status(503)
+    plan_pull(db)
+
+    Pipeline(tmp_path, KEY, opener=vendor, sleep=no_wait)(db.connect("pipeline"))
+
+    assert pull_state(db) == "failed"
+    assert len(vendor.urls) == lake.ATTEMPTS
+    [(kind, subject, period, body, raised_by)] = alerts(db)
+    assert (kind, subject, period, raised_by) == (JOB_FAILED, "data_pull", PERIOD, "pipeline")
+    assert f"failed after {lake.ATTEMPTS} attempts" in body
+    assert KEY not in body
+    assert landed(tmp_path) == []
+
+
+def test_a_deferred_pull_records_the_missed_sessions_it_landed(db, tmp_path):
+    # The lake has the 10th; the vendor has the 11th, and only AAPL of the 14th so far.
+    vendor = sample()
+    vendor.rows["stocks"] = [r for r in vendor.rows["stocks"] if r["date"] != "2026-09-14"]
+    vendor.rows["stocks"] += [
+        sep_row("AAPL", "2026-09-10", "320"),
+        sep_row("MSFT", "2026-09-10", "500"),
+        sep_row("AAPL", "2026-09-14", "328.21"),
+    ]
+    lake.pull(tmp_path, lake.Sharadar(KEY, vendor), date(2026, 9, 10))
+    due = plan_pull(db)
+
+    Pipeline(tmp_path, KEY, opener=vendor)(db.connect("pipeline"))
+
+    assert pull_state(db) == "claimed"
+    assert [(r[0], r[2], r[4]) for r in snapshots(db)] == [(SESSION, "sep/date=2026-09-11", 2)]
+    assert "sep/date=2026-09-14" not in landed(tmp_path)
+    assert alerts(db) == []
+    assert late_pulls(db, due + MINUTE) == [(PERIOD,)]  # until the 14th lands
 
 
 def test_a_pull_that_never_runs_is_overdue(db):

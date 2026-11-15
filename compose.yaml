@@ -12,6 +12,8 @@
 #     is beating; db and vpn check themselves; the one-shots disable it and are judged by their
 #     exit status. Only fields Docker Engine 20.10 knows are used: no `start_interval`.
 #   - No service mounts the Docker socket, and `db` publishes no host port.
+#   - `core` is internal. Only `pipeline`, `execution` and `reconcile` join `outbound`, the
+#     network with a route to the internet; `ui` joins `ui-port` for its published port alone.
 #   - No `container_name`, so several copies of the stack can run side by side under
 #     different project names.
 #   - Each service's block stays contiguous; shared settings live in the x- anchors below.
@@ -80,6 +82,8 @@ services:
       PGUSER: postgres
       PGPASSWORD: ${POSTGRES_PASSWORD:?set in env/db.env}
       AGB_OWNER_PASSWORD: ${AGB_OWNER_PASSWORD:?set in env/db.env}
+      # Set to 1 on the command line to apply a migration older than the newest applied one.
+      AGB_MIGRATE_ALLOW_OUT_OF_ORDER: ${AGB_MIGRATE_ALLOW_OUT_OF_ORDER:-}
       SCHEDULER_DB_PASSWORD: ${SCHEDULER_DB_PASSWORD:?set in env/db.env}
       PIPELINE_DB_PASSWORD: ${PIPELINE_DB_PASSWORD:?set in env/db.env}
       EXECUTION_DB_PASSWORD: ${EXECUTION_DB_PASSWORD:?set in env/db.env}
@@ -115,8 +119,10 @@ services:
   # The local UI: server-rendered pages over the database, read-only. It publishes on the
   # loopback address alone, so nothing on the network reaches it; the operator views it through
   # an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 casaos.local`), and SSH is the authentication.
-  # It holds no broker keys and no Telegram token, and it is on core only: a page that cannot
-  # reach the internet cannot leak the book to it.
+  # It holds no broker keys and no Telegram token, and it has no route to the internet: a page
+  # that cannot reach the internet cannot leak the book to it. It reads the database on core,
+  # which is internal, and the publication needs a network that is not, so it is also on
+  # ui-port, whose bridge translates no address (see the networks at the end of this file).
   ui:
     <<: *app-image
     command: ["python", "-m", "agb.services.ui"]
@@ -135,7 +141,7 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-    networks: [core]
+    networks: [core, ui-port]
     restart: unless-stopped
     # The heartbeat loop runs beside the HTTP server's thread, so the UI's check also asks the
     # server itself. HEAD / answers from the routing table without reading the database, which
@@ -222,9 +228,10 @@ services:
 
   # Takes the scheduler's data_pull job for each session and lands Sharadar's SEP, SF1 and
   # TICKERS in the Parquet lake. It is the only service that holds the Sharadar key, which
-  # comes from env/pipeline.env, and it reaches the vendor directly. It runs as the host user
-  # that owns the lake directory: `make up` and `agb-stack` set AGB_PIPELINE_USER to the
-  # caller's uid:gid. `python -m agb.lake "SQL"` inside it queries the lake with DuckDB.
+  # comes from env/pipeline.env, and it reaches the vendor directly, through outbound, as it does
+  # the panel's other outside services. It runs as the host user that owns the lake directory:
+  # `make up` and `agb-stack` set AGB_PIPELINE_USER to the caller's uid:gid.
+  # `python -m agb.lake "SQL"` inside it queries the lake with DuckDB.
   # The panel store, the content-addressed bodies behind the panel's database rows, sits
   # beside the lake on the same data disk. Each rebalance ranks with the promoted
   # certification's artifact under /models, which it only reads.
@@ -248,14 +255,14 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-    networks: [core]
+    networks: [core, outbound]
     restart: unless-stopped
     healthcheck: *heartbeat-check
     mem_limit: 2176m
 
   # Execution: the only service with broker keys. It submits the approved basket's
   # market-on-close orders and reads the fills back. No lake, no proxy: it talks to the
-  # broker directly.
+  # broker directly, through outbound.
   execution:
     <<: *app-image
     command: ["python", "-m", "agb.services.execution"]
@@ -268,7 +275,7 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-    networks: [core]
+    networks: [core, outbound]
     restart: unless-stopped
     healthcheck: *heartbeat-check
     mem_limit: 192m
@@ -325,7 +332,8 @@ services:
   # `make reconcile REF=2026-10`, after a submission died mid-flight. It asks the broker what
   # it knows about each of the basket's orders by client_order_id and appends what it learns.
   # It runs as `execution` because that is the role holding the broker's keys and the one that
-  # owns the order events; the `cli` service is never given those keys.
+  # owns the order events; the `cli` service is never given those keys. Like `execution`, it
+  # reaches the broker through outbound.
   reconcile:
     <<: *app-image
     profiles: [cli]
@@ -338,7 +346,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    networks: [core]
+    networks: [core, outbound]
     restart: "no"
     healthcheck: *no-healthcheck
     mem_limit: 256m
@@ -377,9 +385,26 @@ services:
 volumes:
   pgdata:
 
+# A service on two networks reaches everything on both, so what a service can reach outside
+# the stack is decided by the networks other than core it joins.
 networks:
-  # Every service. The database lives here and nowhere else. It is not internal: `pipeline`
-  # reaches the vendor's API through it.
+  # Every service but `vpn` and `research`. The database lives here and nowhere else. It is
+  # internal: Docker gives it no route off the host, so a service on core alone (db, migrate,
+  # scheduler, backup, cli, certification-import) cannot reach the internet.
   core:
+    internal: true
+  # `pipeline`, `execution` and `reconcile`, the services that call outside the stack directly:
+  # the pipeline its vendors, the other two the broker. Not the vpn, so that no service with the
+  # broker's keys has a route to the proxy.
+  outbound:
+  # The `ui` alone, and only so that its port can be published: Docker publishes no port from an
+  # internal network. Its bridge does no masquerading, so a connection the UI opens to an
+  # outside address leaves with the container's private address and no reply finds its way
+  # back. That is a second line behind the UI having no reason and no credential to call out,
+  # not a guarantee: the host itself, and anything that routes the bridge's subnet back to it,
+  # can still answer.
+  ui-port:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
   # Only `vpn` and `bot`: the bot reaches Telegram through the VPN's HTTP proxy.
   egress:

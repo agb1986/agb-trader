@@ -55,13 +55,25 @@ Whatever the gates decide, the run leaves an artifact directory,
                      live pipeline ranks with once the certification is promoted
     trials.parquet   the ledger as it stood at certification, so the declared count and the
                      rule it was counted under can be rechecked by anyone holding the artifact
-    paths.json       each path's monthly net and gross returns at 1x cost and net at 2x
+    paths.json       each path's monthly net and gross returns at 1x cost and net at 2x,
+                     and the benchmark's return over the same month, or null where the
+                     lake has none
     report.md        the verdict in prose, stating what the gates certify
 
 A run whose gates fail is recorded exactly like one that passes, with `passed` false, in
 the ledger, the artifact and the database: a failed certification is a fact about the
 model, not something that never happened. Promotion is a separate step that must require
 `passed`.
+
+The deflated Sharpe gates and the cost-inclusive Sharpe gate read returns in excess of SPY
+(issue #167, `gates.EXCESS_DEFINITION`), and the manifest says so as `sharpe_basis`
+`excess_spy`, with the total-return Sharpe beside it as `sharpe_total`. The benchmark's return
+for a month comes from the validation backtest, marked on the same two sessions as the path's
+own. If the lake lacks it for any month of any path, the benchmark is missing for the whole
+run: the months are neither dropped nor counted as zero, the three gates fail with the cause
+named, and the artifact is still written, because a failed certification is still a record
+and the paper-only waiver needs one to waive. Certifications written before the change carry
+no `sharpe_basis` and are read as `total`.
 
 Reading an artifact back and inserting its row is `agb.research.artifact`, which is separate
 because the import has to run where the server's database is reachable and nothing there may
@@ -229,6 +241,7 @@ def run(
         net = _matrix(paths, "net")
         gross = _matrix(paths, "gross")
         net_2x = _matrix(twice, "net")
+        benchmark, benchmark_missing = _benchmark(paths)
         others = candidates(
             ledger,
             panel,
@@ -251,6 +264,8 @@ def run(
             participation=[(p["participation_max"], p["participation_mean"]) for p in paths],
             thresholds=options.thresholds,
             missing=others.missing,
+            benchmark=benchmark,
+            benchmark_missing=benchmark_missing,
         )
         # What would trade: the configuration refitted on every month of the panel, the
         # leading ones the backtest could not trade included, since they still carry a label.
@@ -418,6 +433,9 @@ def _write(
         "pbo": results["pbo"],
         "sharpe_net": results["sharpe_net"],
         "dsr_2x": results["dsr_2x"],
+        "sharpe_basis": results["sharpe_basis"],
+        "excess": results["excess"],
+        "sharpe_total": results["sharpe_total"],
         "break_even_multiple": results["break_even_multiple"],
         "sharpe_gross": results["sharpe_gross"],
         "gross_sharpe_flag": results["gross_sharpe_flag"],
@@ -476,28 +494,30 @@ def report(manifest: dict[str, Any]) -> str:
         "",
         "## Gates, on returns net of 1x modelled cost",
         "",
+        *_basis(manifest),
+        "",
     ]
     for name in ("dsr", "pbo", "sharpe_net", "dsr_2x"):
         gate = manifest["gates"][name]
         state = "pass" if gate["passed"] else "FAIL"
         cause = f" ({gate['cause']})" if gate.get("cause") else ""
-        lines.append(
-            f"- {name}: {gate['value']:.4f}, {gate['rule']} {gate['threshold']:.4f}: {state}"
-            + cause
-        )
+        value = "undefined" if gate.get("defined") is False else f"{gate['value']:.4f}"
+        lines.append(f"- {name}: {value}, {gate['rule']} {gate['threshold']:.4f}: {state}" + cause)
     multiple = manifest["break_even_multiple"]
+    total = manifest.get("sharpe_total", manifest["sharpe_net"])
     lines += [
         "",
         "## Diagnostics",
         "",
-        f"- gross Sharpe {manifest['sharpe_gross']:.4f}, net Sharpe {manifest['sharpe_net']:.4f},"
+        f"- gross Sharpe {manifest['sharpe_gross']:.4f}, total-return Sharpe {total:.4f},"
         f" suspicion flag {'raised' if manifest['gross_sharpe_flag'] else 'clear'}",
         f"- break-even cost multiple {'none charged' if multiple is None else f'{multiple:.2f}'}",
         f"- participation max {manifest['participation_max']:.4f},"
         f" mean {manifest['participation_mean']:.4f}",
         f"- start dates {'stable' if manifest['gates']['start_date_stable'] else 'unstable'}: "
         + ", ".join(
-            f"{start['start']} {start['sharpe_net']:.3f}"
+            f"{start['start']} "
+            + ("undefined" if start["sharpe_net"] is None else f"{start['sharpe_net']:.3f}")
             for start in manifest["gates"]["start_dates"]
         ),
         "",
@@ -518,6 +538,41 @@ def report(manifest: dict[str, Any]) -> str:
 
 def _config(options: Options) -> dict[str, Any]:
     return {**asdict(options), "certified_capital": CAPITAL, "certifies": CERTIFIES}
+
+
+def _basis(manifest: dict[str, Any]) -> list[str]:
+    """What the Sharpe gates were measured on, in the report's words."""
+    if manifest.get("sharpe_basis", gates.TOTAL) == gates.TOTAL:
+        return ["The deflated Sharpe and Sharpe gates read total returns."]
+    excess = manifest["excess"]
+    lines = [
+        f"The deflated Sharpe and Sharpe gates read returns in excess of"
+        f" {excess['benchmark']}: the {excess['definition']}. The overfitting gate ranks"
+        " the candidates on total returns.",
+    ]
+    if not excess["defined"]:
+        lines += [
+            "",
+            f"Those three gates fail ({excess['cause']})."
+            f" They record {gates.UNDEFINED_SHARPE:.1f} for the Sharpe and"
+            f" {gates.UNDEFINED_DSR:.1f} for each DSR so the row holds a number, and the"
+            " number is not a measurement.",
+        ]
+    return lines
+
+
+def _benchmark(paths: list[dict[str, Any]]) -> tuple[np.ndarray | None, str | None]:
+    """The benchmark's return over each path's months, or why there is none: any month of any
+    path the lake has no benchmark return for makes the whole benchmark missing, because a gate
+    over the months that happen to be covered is not the gate over the run."""
+    values = [[month.get("benchmark") for month in path["monthly"]] for path in paths]
+    absent = sum(value is None for row in values for value in row)
+    if absent:
+        total = sum(len(row) for row in values)
+        return None, (
+            f"the lake holds no {gates.BENCHMARK} return for {absent} of {total} traded path-months"
+        )
+    return np.array(values, dtype="float64"), None
 
 
 def _matrix(paths: list[dict[str, Any]], key: str) -> np.ndarray:

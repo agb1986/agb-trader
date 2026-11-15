@@ -22,6 +22,12 @@ Three details make the result point-in-time rather than merely historical:
     price screen and market cap use `closeunadj`, the close as traded, against `sharesbas`, the
     share count as reported. Dollar volume uses `close * volume`, both adjusted the same way,
     which makes the product split-invariant.
+  * **The share count is put on the price's split basis.** `sharesbas` is as the filing reported
+    it, so a split after the filing leaves it counting shares of the old size. It is scaled by
+    the splits since the filing, read off SEP as the move in `closeunadj / close` between the
+    session of the filing and the snapshot session; a ten-for-one split between filings leaves
+    market capitalisation where it was instead of cutting it tenfold. A filing with no session
+    in the days before it is taken as unsplit, as before.
   * **A name is in the universe only if it traded on the snapshot session.** Nothing is carried
     forward from a last known price, so a name delisted in 2008 is in every universe up to its
     last print and in none after it.
@@ -55,6 +61,18 @@ MIN_PRICE = 5.0
 # Sessions in the dollar-volume window: the 60 most recent the lake holds up to the rebalance
 # date, not 60 calendar days, so a holiday-shortened month does not shorten the window.
 LIQUIDITY_SESSIONS = 60
+# Sessions a name must have inside that window for its median to count. A median of three
+# sessions is not a liquidity measure, and a name that has just listed would pass on a handful
+# of heavy first days. Two thirds of the window keeps a name listed in the last quarter and
+# drops one listed last week.
+MIN_LIQUIDITY_SESSIONS = 40
+# Why a name that cleared every other screen was left out.
+THIN_HISTORY = (
+    f"fewer than {MIN_LIQUIDITY_SESSIONS} sessions in the {LIQUIDITY_SESSIONS}-session window"
+)
+# Calendar days before a filing's `datekey` in which its session is looked for; a filing dated
+# on a weekend or holiday is priced at the session before it.
+FILING_SESSION_DAYS = 10
 # The pre-trade gate's provenance band (docs/architecture/04-risk-and-approval.md). A universe
 # outside it is a provenance failure, not a small universe. The band is measured against the
 # lake rather than estimated: the filters above yield 2,432 names on 2026-08-31, and between
@@ -85,7 +103,7 @@ WITH recent AS (
 ),
 span AS (SELECT min(date) AS earliest, max(date) AS latest FROM recent),
 liquidity AS (
-    SELECT sep.ticker, median(sep.close * sep.volume) AS dollar_volume
+    SELECT sep.ticker, median(sep.close * sep.volume) AS dollar_volume, count(*) AS sessions
     FROM sep, span
     WHERE sep.date BETWEEN span.earliest AND span.latest
       AND sep.close IS NOT NULL
@@ -98,7 +116,7 @@ traded AS (
     WHERE sep.date = span.latest AND sep.closeunadj IS NOT NULL AND sep.volume > 0
 ),
 filed AS (
-    SELECT ticker, sharesbas * coalesce(sharefactor, 1.0) AS shares
+    SELECT ticker, datekey, sharesbas * coalesce(sharefactor, 1.0) AS shares
     FROM sf1_as_of(?)
     WHERE dimension IN ('ARQ', 'ARY')
       AND sharesbas IS NOT NULL
@@ -117,13 +135,38 @@ common AS (
       AND category IN ({", ".join("?" for _ in COMMON)})
       AND coalesce(industry, '') NOT LIKE 'REIT%'
       AND coalesce(siccode, '') <> ?
+),
+-- The split factor of each filing's session: what one share then is worth in today's adjusted
+-- shares, 1 when the lake holds no session just before the filing. Only the names that clear
+-- the cheaper screens are looked up.
+screened AS (
+    SELECT ticker, price, dollar_volume, sessions, shares, datekey
+    FROM traded
+    JOIN liquidity USING (ticker)
+    JOIN filed USING (ticker)
+    JOIN common USING (ticker)
+    WHERE price > ? AND dollar_volume > ?
+),
+filing_session AS (
+    SELECT screened.ticker, sep.closeunadj / sep.close AS factor
+    FROM screened
+    JOIN sep ON sep.ticker = screened.ticker
+        AND sep.date BETWEEN screened.datekey - INTERVAL {FILING_SESSION_DAYS} DAY
+                         AND screened.datekey
+    WHERE sep.close > 0 AND sep.closeunadj > 0
+    QUALIFY row_number() OVER (PARTITION BY screened.ticker ORDER BY sep.date DESC) = 1
+),
+latest_session AS (
+    SELECT sep.ticker, sep.closeunadj / sep.close AS factor
+    FROM sep, span
+    WHERE sep.date = span.latest AND sep.close > 0 AND sep.closeunadj > 0
 )
-SELECT ticker, price, dollar_volume, price * shares AS market_cap
-FROM traded
-JOIN liquidity USING (ticker)
-JOIN filed USING (ticker)
-JOIN common USING (ticker)
-WHERE price > ? AND dollar_volume > ? AND price * shares > ?
+SELECT ticker, price, dollar_volume, sessions,
+       price * shares * coalesce(filing_session.factor / latest_session.factor, 1.0) AS market_cap
+FROM screened
+LEFT JOIN filing_session USING (ticker)
+LEFT JOIN latest_session USING (ticker)
+WHERE price * shares * coalesce(filing_session.factor / latest_session.factor, 1.0) > ?
 ORDER BY ticker
 """
 
@@ -143,6 +186,14 @@ class Member:
 
 
 @dataclass(frozen=True)
+class Exclusion:
+    """A name that cleared every screen but one, and the reason it was left out."""
+
+    ticker: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class Universe:
     """The investable universe for one rebalance date, and where it came from."""
 
@@ -150,6 +201,9 @@ class Universe:
     snapshot_date: date  # the session its prices came from, at or before `as_of`
     partition_hash: str  # a digest of the lake partitions it was built from
     members: tuple[Member, ...]
+    # Names that passed the price, size, liquidity and common-stock screens but lacked the
+    # sessions for a liquidity median, so a thin listing is visible rather than silently absent.
+    excluded: tuple[Exclusion, ...] = ()
 
     @property
     def size(self) -> int:
@@ -214,15 +268,35 @@ def snapshot(
         as_of=as_of,
         snapshot_date=session,
         partition_hash=lake.partition_digest(lake_dir, session, hashes=hashes),
-        members=tuple(Member(str(t), float(p), float(v), float(c)) for t, p, v, c in rows),
+        members=tuple(
+            Member(str(t), float(p), float(v), float(c))
+            for t, p, v, n, c in rows
+            if n >= MIN_LIQUIDITY_SESSIONS
+        ),
+        excluded=tuple(
+            Exclusion(str(t), THIN_HISTORY) for t, _, _, n, _ in rows if n < MIN_LIQUIDITY_SESSIONS
+        ),
     )
+
+
+def _last_finished_session(now: datetime | None = None) -> date:
+    """Today's trading date if its session has closed, otherwise the day before it, which
+    `month_ends` then resolves to a session. Today on a weekend or holiday is no session, so the
+    calendar's last month-end is unaffected."""
+    now = now or datetime.now(UTC)
+    today = nyse.trading_date(now)
+    calendar = nyse.NyseCalendar(today - timedelta(days=10), today)
+    if calendar.sessions(today, today) and now < calendar.close_at(today):
+        return today - timedelta(days=1)
+    return today
 
 
 def month_ends(start: date = lake.SINCE, end: date | None = None) -> list[date]:
     """The last NYSE session of each month from `start` to `end`: the rebalance dates a research
-    run walks. Sharadar's SEP coverage starts in 1998, so that is the default start, and today's
-    trading date the default end. A month whose last session has not happened yet is left out."""
-    end = end or nyse.trading_date(datetime.now(UTC))
+    run walks. Sharadar's SEP coverage starts in 1998, so that is the default start, and the last
+    finished session the default end. A month whose last session has not happened yet is left
+    out, and so is one that is still being traded: today counts only once it has closed."""
+    end = end or _last_finished_session()
     if end < start:
         return []
     # A month's last session can fall a few days before its last day, so widen the calendar

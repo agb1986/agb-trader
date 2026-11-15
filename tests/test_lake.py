@@ -1,6 +1,7 @@
 """The Parquet lake: the vendor's CSV in the lake's types, partitions whose bytes and hash are
 the same each time they land, the bulk backfill from 1998, and DuckDB over the result."""
 
+import http.client
 import io
 import urllib.error
 import zipfile
@@ -10,7 +11,16 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from sharadar_fake import HEADERS, FakeVendor, sample, sep_row, sf1_row, ticker_row, to_csv
+from sharadar_fake import (
+    HEADERS,
+    FakeVendor,
+    sample,
+    sep_row,
+    sf1_row,
+    status,
+    ticker_row,
+    to_csv,
+)
 
 from agb import lake
 from agb.lake import SEP, SF1, TICKERS, ZIP_MAGIC, LakeError, NotYet, Sharadar
@@ -19,8 +29,17 @@ SESSION = date(2026, 9, 14)
 KEY = "k3y-not-a-real-one"
 
 
-def client(vendor, page=lake.PAGE):
-    return Sharadar(KEY, vendor, page=page)
+def client(vendor, page=lake.PAGE, waits=None):
+    """A client of `vendor` that waits for nothing between attempts, noting each wait it was
+    asked for in `waits`."""
+    waits = [] if waits is None else waits
+    return Sharadar(KEY, vendor, page=page, sleep=waits.append)
+
+
+def trading(vendor, *days, tickers=("AAPL", "MSFT")):
+    """Give `vendor` a price for each of `tickers` on each of `days`."""
+    vendor.rows["stocks"] += [sep_row(t, day, "300") for day in days for t in tickers]
+    return vendor
 
 
 def read(root, path):
@@ -29,6 +48,10 @@ def read(root, path):
 
 def mtimes(root):
     return {p: p.stat().st_mtime_ns for p in root.rglob("*") if p.is_file()}
+
+
+def landed(root):
+    return sorted(str(p.parent.relative_to(root)) for p in root.rglob(lake.FILE))
 
 
 def bulk(tmp_path, vendor, dataset, root):
@@ -97,14 +120,108 @@ def test_a_missing_key_is_refused():
         Sharadar("", sample())
 
 
+def test_a_query_ends_on_the_vendors_cursor():
+    # Four rows in pages of two: the second page is full, and only its empty cursor says it is
+    # the last, so no third request is made.
+    vendor = FakeVendor(stocks=[sep_row("AAPL", f"2026-09-0{d}", "300") for d in range(1, 5)])
+    table = client(vendor, page=2).query(SEP, {"ticker": "AAPL"})
+    assert table.column("date").to_pylist() == [date(2026, 9, d) for d in range(1, 5)]
+    assert len(vendor.urls) == 2
+    assert "qopts.cursor_id=c2" in vendor.urls[1]
+    assert "skip" not in vendor.urls[1]
+
+
+def test_a_query_of_a_vendor_without_cursors_pages_by_skip():
+    vendor = FakeVendor(
+        stocks=[sep_row("AAPL", f"2026-09-0{d}", "300") for d in range(1, 5)], cursors=False
+    )
+    table = client(vendor, page=2).query(SEP, {"ticker": "AAPL"})
+    assert table.num_rows == 4
+    assert [u.split("skip=")[1].split("&")[0] for u in vendor.urls] == ["0", "2", "4"]
+
+
+def test_a_cursor_that_does_not_move_is_refused():
+    def opener(url):
+        answer = io.BytesIO(to_csv(HEADERS["stocks"], [sep_row("AAPL", "2026-09-01", "300")]))
+        answer.headers = {"cursor_id": "stuck"}
+        return answer
+
+    with pytest.raises(LakeError, match="cursor did not move"):
+        client(opener, page=1).query(SEP, {"ticker": "AAPL"})
+
+
 def test_no_error_shows_the_key():
     vendor = sample()
     vendor.fail = lambda url: urllib.error.URLError(f"timed out fetching {url}")
+    waits = []
     with pytest.raises(LakeError) as caught:
-        client(vendor).query(SEP, {"date": SESSION})
+        client(vendor, waits=waits).query(SEP, {"date": SESSION})
     assert "timed out" in str(caught.value)
+    assert f"after {lake.ATTEMPTS} attempts" in str(caught.value)
     assert KEY not in str(caught.value)
     assert KEY in vendor.urls[0]  # the check is not vacuous
+    assert len(vendor.urls) == lake.ATTEMPTS
+    assert waits == [lake.BACKOFF, 2 * lake.BACKOFF]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        status(503),
+        status(429),
+        urllib.error.URLError("timed out"),
+        http.client.RemoteDisconnected("closed"),
+        http.client.IncompleteRead(b"ticker,da"),
+    ],
+    ids=["503", "429", "timeout", "dropped", "cut-short"],
+)
+def test_a_vendor_error_then_an_answer_lands_the_session(tmp_path, error):
+    vendor = sample()
+    vendor.errors = [error]
+    waits = []
+
+    partitions = lake.pull(tmp_path, client(vendor, waits=waits), SESSION)
+
+    assert ("sep/date=2026-09-14", 2) in [(p.path, p.rows) for p in partitions]
+    assert waits == [lake.BACKOFF]
+    assert vendor.urls[0] == vendor.urls[1]
+
+
+def test_the_vendors_retry_after_is_waited_out():
+    vendor = sample()
+    vendor.errors = [status(429, retry_after=30), status(503, retry_after="soon")]
+    waits = []
+    assert client(vendor, waits=waits).query(SEP, {"date": SESSION}).num_rows == 2
+    # The HTTP-date form, or anything else that is not a number, leaves the backoff in charge.
+    assert waits == [30.0, 2 * lake.BACKOFF]
+
+
+def test_a_retry_after_past_the_cap_is_not_waited_out():
+    vendor = sample()
+    vendor.errors = [status(503, retry_after=lake.RETRY_AFTER_CAP + 1)]
+    waits = []
+    with pytest.raises(LakeError, match="status 503"):
+        client(vendor, waits=waits).query(SEP, {"date": SESSION})
+    assert waits == []
+    assert len(vendor.urls) == 1
+
+
+def test_a_refusal_is_not_tried_again():
+    vendor = sample()
+    vendor.errors = [status(403)]
+    waits = []
+    with pytest.raises(LakeError, match="status 403") as caught:
+        client(vendor, waits=waits).query(SEP, {"date": SESSION})
+    assert "attempts" not in str(caught.value)
+    assert waits == []
+    assert len(vendor.urls) == 1
+
+
+def test_a_bulk_download_is_tried_again_from_the_start(tmp_path):
+    vendor = sample()
+    vendor.errors = [http.client.IncompleteRead(b"PK")]
+    archive = client(vendor).bulk(SEP, tmp_path / "sep.zip")
+    assert zipfile.ZipFile(archive).namelist() == ["SHARADAR_stocks.csv"]
 
 
 def test_a_response_that_is_not_csv_is_refused():
@@ -181,7 +298,10 @@ def test_sf1_keeps_each_version_and_the_view_shows_the_latest(tmp_path):
     assert lake.file_hash(partition) == landed
     assert pq.read_table(partition).column("ticker").to_pylist() == ["AAPL", "MSFT"]
 
-    vendor.rows["stocks"].append(sep_row("AAPL", "2026-09-15", "330.1"))
+    vendor.rows["stocks"] += [
+        sep_row("AAPL", "2026-09-15", "330.1"),
+        sep_row("MSFT", "2026-09-15", "513"),
+    ]
     lake.pull(tmp_path, client(vendor), date(2026, 9, 15))
     versions = lake.connect(tmp_path).sql(
         "SELECT revenue FROM read_parquet(?) WHERE ticker = 'AAPL' AND dimension = 'ARQ' "
@@ -206,7 +326,10 @@ def test_sf1_as_of_a_day_serves_each_row_as_known_that_day(tmp_path):
     vendor.rows["fundamentals"][4] = sf1_row(
         "AAPL", "ARQ", "2026-07-31", "2026-09-15", "94100000000", "1.58"
     )
-    vendor.rows["stocks"].append(sep_row("AAPL", "2026-09-15", "330.1"))
+    vendor.rows["stocks"] += [
+        sep_row("AAPL", "2026-09-15", "330.1"),
+        sep_row("MSFT", "2026-09-15", "513"),
+    ]
     lake.pull(tmp_path, client(vendor), date(2026, 9, 15))
     conn = lake.connect(tmp_path)
 
@@ -228,7 +351,10 @@ def test_sf1_as_of_today_is_the_view(tmp_path):
     vendor.rows["fundamentals"][4] = sf1_row(
         "AAPL", "ARQ", "2026-07-31", "2026-09-15", "94100000000", "1.58"
     )
-    vendor.rows["stocks"].append(sep_row("AAPL", "2026-09-15", "330.1"))
+    vendor.rows["stocks"] += [
+        sep_row("AAPL", "2026-09-15", "330.1"),
+        sep_row("MSFT", "2026-09-15", "513"),
+    ]
     lake.pull(tmp_path, client(vendor), date(2026, 9, 15))
     conn = lake.connect(tmp_path)
 
@@ -436,3 +562,119 @@ def test_the_query_command_prints_rows(tmp_path, capsys):
     lake.pull(tmp_path, client(sample()), SESSION)
     lake.main(["--lake", str(tmp_path), "SELECT ticker, close FROM sep ORDER BY ticker"])
     assert capsys.readouterr().out == "ticker\tclose\nAAPL\t328.21\nMSFT\t512.3\n"
+
+
+def sep_partitions(partitions):
+    return [p.path for p in partitions if p.dataset == "sep"]
+
+
+def test_a_pull_after_a_gap_lands_each_session_it_missed(tmp_path):
+    # The lake has the 9th. The pulls of the 10th and 11th failed; the 14th's lands all three.
+    vendor = trading(sample(), "2026-09-09", "2026-09-10")
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 9))
+    vendor.urls.clear()
+
+    partitions = lake.pull(tmp_path, client(vendor), SESSION)
+
+    assert sep_partitions(partitions) == [
+        "sep/date=2026-09-10",
+        "sep/date=2026-09-11",
+        "sep/date=2026-09-14",
+    ]
+    for day in ("2026-09-10", "2026-09-11", "2026-09-14"):
+        assert read(tmp_path, f"sep/date={day}").column("ticker").to_pylist() == ["AAPL", "MSFT"]
+    [sep] = [u for u in vendor.urls if "/stocks?" in u]
+    assert "date.gte=2026-09-10" in sep and "date.lte=2026-09-14" in sep
+
+
+def test_a_pull_again_after_a_gap_changes_nothing(tmp_path):
+    vendor = trading(sample(), "2026-09-10")
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 10))
+    first = lake.pull(tmp_path, client(vendor), SESSION)
+    before = mtimes(tmp_path)
+    # Re-run, the pull of the 14th looks back to the 11th, the last session before it.
+    again = lake.pull(tmp_path, client(vendor), SESSION)
+    assert sep_partitions(again) == ["sep/date=2026-09-14"]
+    assert {p.path: p.sha256 for p in again} == {
+        p.path: p.sha256 for p in first if p.path != "sep/date=2026-09-11"
+    }
+    assert mtimes(tmp_path) == before
+
+
+def test_a_session_still_being_published_is_deferred_not_landed(tmp_path):
+    # The lake has the 10th. The vendor has all of the 11th, but only AAPL of the 14th so far:
+    # the 11th lands, and the 14th waits, with nothing of SF1 or the tickers landed for it.
+    vendor = sample()
+    vendor.rows["stocks"] = [r for r in vendor.rows["stocks"] if r["date"] != "2026-09-14"]
+    trading(vendor, "2026-09-10")
+    trading(vendor, "2026-09-14", tickers=("AAPL",))
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 10))
+    before = landed(tmp_path)
+
+    with pytest.raises(
+        NotYet, match="1 SEP prices for 2026-09-14, short of 90% of the 2"
+    ) as caught:
+        lake.pull(tmp_path, client(vendor), SESSION)
+
+    assert [p.path for p in caught.value.landed] == ["sep/date=2026-09-11"]
+    assert landed(tmp_path) == sorted([*before, "sep/date=2026-09-11"])
+
+    trading(vendor, "2026-09-14", tickers=("MSFT",))
+    partitions = lake.pull(tmp_path, client(vendor), SESSION)
+    assert sep_partitions(partitions) == ["sep/date=2026-09-14"]
+    assert read(tmp_path, "sep/date=2026-09-14").num_rows == 2
+
+
+def test_a_session_missing_from_the_middle_of_a_gap_is_waited_for(tmp_path):
+    vendor = trading(sample(), "2026-09-10")
+    vendor.rows["stocks"] = [r for r in vendor.rows["stocks"] if r["date"] != "2026-09-11"]
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 10))
+
+    with pytest.raises(NotYet, match="no SEP prices for 2026-09-11 yet") as caught:
+        lake.pull(tmp_path, client(vendor), SESSION)
+
+    assert caught.value.landed == []
+    assert "sep/date=2026-09-14" not in landed(tmp_path)
+
+
+def test_a_gap_too_long_to_page_is_left_to_the_backfill(tmp_path):
+    vendor = trading(sample(), "2026-07-01")
+    lake.pull(tmp_path, client(vendor), date(2026, 7, 1))
+    vendor.urls.clear()
+    with pytest.raises(LakeError, match="land the gap with the backfill"):
+        lake.pull(tmp_path, client(vendor), SESSION)
+    assert vendor.urls == []
+
+
+def test_sf1_is_fetched_from_a_week_before_the_last_pull(tmp_path):
+    # The lake was last pulled on the 1st. A row first stamped on the 3rd, more than a week
+    # before the 14th, lands with the 14th's pull; a row landed on the 1st and fetched again
+    # lands once; and the version of a row the vendor has since restated is kept.
+    days = ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04", "2026-09-08", "2026-09-09"]
+    vendor = trading(sample(), *days, "2026-09-10")
+    vendor.rows["fundamentals"] += [
+        sf1_row("MSFT", "ARY", "2026-06-30", "2026-08-28", "281000000000", "12.1"),
+        sf1_row("AAPL", "ARQ", "2026-06-27", "2026-09-01", "94000000000", "1.55"),
+    ]
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 1))
+    vendor.rows["fundamentals"][-1] = sf1_row(
+        "AAPL", "ARQ", "2026-06-27", "2026-09-03", "94200000000", "1.56"
+    )
+    vendor.urls.clear()
+
+    partitions = lake.pull(tmp_path, client(vendor), SESSION)
+
+    [sf1] = [u for u in vendor.urls if "/fundamentals?" in u]
+    assert f"lastupdated.gte={date(2026, 9, 1) - lake.SF1_LOOKBACK}" in sf1
+    assert "sf1/lastupdated=2026-09-03" in [p.path for p in partitions]
+    rows = lake.connect(tmp_path).sql(
+        "SELECT ticker, dimension, datekey, lastupdated, eps FROM read_parquet(?)"
+        " WHERE datekey < '2026-07-01' AND datekey > '2026-01-01'"
+        " ORDER BY ticker, lastupdated",
+        params=[str(tmp_path / "sf1/*" / lake.FILE)],
+    )
+    assert rows.fetchall() == [
+        ("AAPL", "ARQ", date(2026, 6, 27), date(2026, 9, 1), 1.55),
+        ("AAPL", "ARQ", date(2026, 6, 27), date(2026, 9, 3), 1.56),
+        ("MSFT", "ARY", date(2026, 6, 30), date(2026, 8, 28), 12.1),
+    ]

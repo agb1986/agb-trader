@@ -295,7 +295,7 @@ _FILING = """
 """
 
 
-def certify(db) -> int:
+def certify(db, gates: dict | None = None) -> int:
     """The research side's certification of the stand-in model, holding the gate record and the
     path distribution the Validation view reads."""
     [(certification_id,)] = (
@@ -311,7 +311,7 @@ def certify(db) -> int:
                 "cost_model_version": cost.CURRENT.version,
                 "certified_capital": CERTIFIED,
                 "path_quantiles": Jsonb(PATHS),
-                "gates": Jsonb(GATES),
+                "gates": Jsonb(GATES if gates is None else gates),
                 "certified_at": CERTIFIED_AT,
             },
         )
@@ -620,12 +620,25 @@ def test_the_validation_view_shows_every_gate_beside_the_threshold_it_was_applie
     assert "on 2010-01-01\u20132025-12-31 at $100,000.00 under cost model 1." in page
     assert "Deflated Sharpe" in page and "0.970" in page and "at least 0.950" in page
     assert "Probability of backtest overfitting" in page and "at most 0.500" in page
-    assert "Cost-inclusive Sharpe" in page and "above 0.50" in page
+    assert "Cost-inclusive Sharpe (total return)" in page and "above 0.50" in page
     assert "Deflated Sharpe at 2x cost" in page and "0.960" in page
     assert "FAIL" not in page and page.count(">pass<") == 4, "four gates, every one passed"
     assert "Declared trials 1,200, which is what the deflated Sharpe is deflated by" in page
     assert "Break-even cost multiple 3.00" in page
     assert "Gross Sharpe 1.00, unflagged." in page
+
+
+def test_the_validation_view_names_the_returns_the_sharpe_gate_read(conn, db):
+    """Issue #167: the cost-inclusive Sharpe is labelled with its basis, read from the gate the
+    research profile recorded; a record without one is a certification that gated total
+    returns."""
+    sharpe = {**GATES["sharpe_net"], "basis": "excess_spy", "defined": True, "cause": None}
+    certify(db, {**GATES, "sharpe_net": sharpe})
+
+    page = html.unescape(ui.validation(conn, LATER))
+
+    assert "Cost-inclusive Sharpe (excess over SPY)" in page
+    assert "(total return)" not in page
 
 
 def test_the_validation_view_ends_by_naming_what_the_certification_does_not_cover(conn, certified):

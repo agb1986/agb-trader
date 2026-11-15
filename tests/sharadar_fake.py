@@ -1,8 +1,11 @@
 """A stand-in for the vendor's table API. It serves CSV the way the real API does, with its
 column filters, sort order and paging, and the full export as a zip holding one CSV. Its
-headers are the real ones, cut down to a few metrics for SF1."""
+headers are the real ones, cut down to a few metrics for SF1. Each page names the next in a
+`cursor_id` header, empty on the last, as the vendor's table API does; a vendor made with
+`cursors=False` sends none, and pages only by `skip`."""
 
 import csv
+import http.client
 import io
 import operator
 import zipfile
@@ -27,7 +30,7 @@ HEADERS = {
         "secfilings", "companysite",
     ],
 }  # fmt: skip
-PAGING = {"api_key", "sort", "limit", "skip"}
+PAGING = {"api_key", "sort", "limit", "skip", "qopts.cursor_id"}
 OPS = {"": operator.eq, "gte": operator.ge, "lte": operator.le}
 
 
@@ -63,6 +66,24 @@ def ticker_row(table, permaticker, ticker, name, *, delisted=False, lastupdated=
     return row
 
 
+def status(code, retry_after=None) -> HTTPError:
+    """The error urllib raises for an answer with status `code`."""
+    headers = http.client.HTTPMessage()
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
+    return HTTPError("https://data.example/tables", code, f"status {code}", headers, None)
+
+
+class Answer(io.BytesIO):
+    """A response body with headers, as urllib's response has."""
+
+    def __init__(self, body: bytes, cursor: str | None) -> None:
+        super().__init__(body)
+        self.headers = http.client.HTTPMessage()
+        if cursor is not None:
+            self.headers["cursor_id"] = cursor
+
+
 def to_csv(header, rows) -> bytes:
     out = io.StringIO()
     writer = csv.DictWriter(out, header, lineterminator="\n")
@@ -73,9 +94,10 @@ def to_csv(header, rows) -> bytes:
 
 class FakeVendor:
     """The opener a Sharadar client is given in tests. `urls` lists what was asked for, and
-    `fail`, when set, makes each request raise what it returns for the URL."""
+    `fail`, when set, makes each request raise what it returns for the URL. `errors` holds
+    errors the next requests raise, one each, before the vendor answers again."""
 
-    def __init__(self, stocks=(), fundamentals=(), tickers=()):
+    def __init__(self, stocks=(), fundamentals=(), tickers=(), *, cursors=True):
         self.rows = {
             "stocks": list(stocks),
             "fundamentals": list(fundamentals),
@@ -83,11 +105,15 @@ class FakeVendor:
         }
         self.urls: list[str] = []
         self.fail: Callable[[str], Exception] | None = None
+        self.errors: list[Exception] = []
+        self.cursors = cursors
 
     def __call__(self, url):
         self.urls.append(url)
         if self.fail is not None:
             raise self.fail(url)
+        if self.errors:
+            raise self.errors.pop(0)
         parts = urlsplit(url)
         table = parts.path.rsplit("/", 1)[-1]
         params = dict(parse_qsl(parts.query, keep_blank_values=True))
@@ -108,8 +134,13 @@ class FakeVendor:
             if field:
                 column, _, direction = field.partition(".")
                 rows = sorted(rows, key=operator.itemgetter(column), reverse=direction == "desc")
-        skip, limit = int(params.get("skip", 0)), int(params.get("limit", 10_000))
-        return io.BytesIO(to_csv(header, rows[skip : skip + limit]))
+        limit = int(params.get("limit", 10_000))
+        cursor = params.get("qopts.cursor_id")
+        skip = int(cursor.removeprefix("c")) if cursor else int(params.get("skip", 0))
+        body = to_csv(header, rows[skip : skip + limit])
+        if not self.cursors:
+            return io.BytesIO(body)
+        return Answer(body, f"c{skip + limit}" if skip + limit < len(rows) else "")
 
 
 def sample() -> FakeVendor:

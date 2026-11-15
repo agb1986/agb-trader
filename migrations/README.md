@@ -19,6 +19,15 @@ does.
 
 - **File names** are `YYYYMMDDHHMMSS_slug.sql`, with a UTC timestamp and a lowercase slug. The
   timestamp prefix keeps parallel branches from colliding.
+- **Migrations apply in order.** `migrate` refuses a pending file whose version is older than
+  the newest version in the ledger, and names both. This happens when two branches each add a
+  migration and the one with the older timestamp merges second. Prefer renaming the file with
+  a newer timestamp (`date -u +%Y%m%d%H%M%S`) before it reaches main. If it is already on main
+  or applied elsewhere, and is safe to run after the newer one, apply it on purpose with
+  `AGB_MIGRATE_ALLOW_OUT_OF_ORDER=1` (on the server, `AGB_MIGRATE_ALLOW_OUT_OF_ORDER=1
+  ./agb-stack activate <tag>`) or `python -m agb.migrate --allow-out-of-order`. A ledger
+  version with no file is fine: that is an older image after a rollback. Concurrent runs queue
+  on one advisory lock, which `migrate` takes before it touches the roles.
 - **A migration is never edited once it is on main.** `migrate` refuses to run if an applied
   file's checksum has changed. Fix a mistake with a new migration.
 - **Schema-qualify everything** as `agb.<name>`.

@@ -413,6 +413,45 @@ def test_a_submission_in_flight_is_cancelled_and_its_basket_halted(db, operator,
     )
 
 
+def test_an_order_still_being_cancelled_is_named_when_a_liquidation_halts_its_basket(
+    db, operator, clock
+):
+    """Issue #149: the broker took the cancel of one order but had not carried it out when the
+    liquidation went on to close the account. The order may have filled, so the halted basket
+    names it with its status instead of reporting every order cancelled."""
+    conn = db.connect("execution")
+    fake = broker(("H01", *NAMES))
+    target = submitted(db, conn, fake)
+    sent = len(fake.orders)
+    fake.cancel_pending.add("ord-0001")
+    pending = fake.orders["ord-0001"]
+    named = f"{pending.side} {pending.qty} {pending.symbol} (pending_cancel, 0 filled)"
+    clock.now = BEFORE_DEADLINE
+    token = issued(operator.says("/liquidate"))
+    operator.says(f"/liquidate {token}")
+
+    cycle(db, fake, BEFORE_DEADLINE)
+
+    assert state(db, target.id)[0] == "halted"
+    reason = (
+        f"paused mid-submission: {sent - 1} of {sent} orders cancelled; "
+        f"still live or filled at the broker: {named}"
+    )
+    [halted] = [line for line in result(db)[1].splitlines() if line.startswith("basket ")]
+    assert halted.startswith(f"basket {target.reference} halted at ")
+    assert halted.endswith(f": {reason}")
+    assert alert(db, "partial_rebalance_paused") == (
+        f"basket {target.reference} halted by a pause mid-submission; still live or filled at "
+        f"the broker: {named}"
+    )
+    assert rows(
+        db,
+        "SELECT s.kind, s.status FROM agb.order_state s"
+        " JOIN agb.broker_order o ON o.id = s.order_id WHERE o.client_order_id = %s",
+        pending.client_order_id,
+    ) == [("status", "pending_cancel")]
+
+
 # -- the schema --------------------------------------------------------------------------------
 
 

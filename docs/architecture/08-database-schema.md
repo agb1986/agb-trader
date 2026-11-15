@@ -60,7 +60,7 @@ Rejected: a single global `audit_log` table written in the same transaction as e
 
 `/resume` clears every open cause but writes **one clear row per cause**, attributed, and its reply lists what it cleared. A pause cleared together with an unexplained gate breach therefore stays visible afterwards.
 
-Execution **re-reads the latch before each individual order**, not only when it claims the job, so a `/pause` at 15:44 stops every order not yet sent. **A pause mid-submission also cancels what was already sent** while it is still before 15:50 ET (the cancellation-window rules are in [04](04-risk-and-approval.md)); if a cancel does not land, a partial-rebalance alert names what remains live.
+Execution **re-reads the latch before each individual order**, not only when it claims the job, so a `/pause` at 15:44 stops every order not yet sent. **A pause mid-submission also cancels what was already sent** while it is still before 15:50 ET (the cancellation-window rules are in [04](04-risk-and-approval.md)); if a cancel does not land, is still pending at the broker, or an order filled before it landed, a partial-rebalance alert names what remains live or filled.
 
 **The broker latch is observed, not assumed.** Each cycle, execution records the `suspend_trade` value it reads from Alpaca in `broker_state`. A mismatch with the database latch raises an alert, in either direction.
 

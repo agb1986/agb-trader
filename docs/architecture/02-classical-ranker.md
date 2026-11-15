@@ -17,10 +17,12 @@ The cascade resolves a chicken-and-egg problem: the panel's output is a feature 
 
 Applied point-in-time at each rebalance date:
 
-- Market capitalisation > $300M
-- 60-day median dollar volume > $1M
+- Market capitalisation > $300M, the share count from the latest filing scaled by the splits since it, so price and shares are on the same basis
+- 60-day median dollar volume > $1M, over at least 40 of the 60 sessions; a name with fewer is left out and reported as `thin history`
 - Price > $5
 - Common stock only (no ETFs, ADRs, or REITs)
+
+The rebalance dates are the last finished NYSE session of each month: a session still trading, or not yet closed, is never a month-end.
 
 Yields roughly 2,400 names today, and between 1,700 and 2,500 at month-ends since mid-1998, measured against the Sharadar lake. (The three quantitative screens alone pass just over 3,000 names today; the common-stock test removes the ADRs, REITs and Canadian listings among them.) The small/mid-cap band is retained deliberately because that is where the documented cross-sectional edge lives; the cascade means panel cost no longer scales with universe size, so there is no cost argument for restricting to large caps.
 

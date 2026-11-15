@@ -12,6 +12,8 @@ short basket it makes legitimate, tests/test_basket.py the live rebalance end to
 tests/test_backtest.py the same four cases in a simulation.
 """
 
+import threading
+import time
 from dataclasses import replace
 from datetime import date
 from decimal import Decimal
@@ -213,6 +215,44 @@ def test_a_second_event_of_the_same_kind_for_the_same_name_and_period_is_refused
         "refused",
         f"N04 already has a halt recorded for 2026-11, by ada on {filed:%Y-%m-%d}",
     )
+
+
+def test_two_filings_of_the_same_event_at_once_leave_one_row_and_one_refusal(db):
+    """At READ COMMITTED a check before the insert finds nothing for either of two callers
+    that run together, so both would insert. A third connection holds the event's lock until
+    both callers wait on it, which shows the lock is taken before the check; let go, one
+    records the event and the other is refused."""
+    holder = db.connect("cli")
+    outcomes: list[object] = []
+
+    def file(detail: str) -> None:
+        try:
+            outcomes.append(
+                corporate.record(db.connect("cli"), replace(HALTED, detail=detail), SOURCE)
+            )
+        except CorporateError as exc:
+            outcomes.append(exc)
+
+    with holder.transaction():
+        holder.execute(corporate._LOCK, corporate._lock_key(HALTED))
+        callers = [threading.Thread(target=file, args=(f"filing {n}",)) for n in (1, 2)]
+        for caller in callers:
+            caller.start()
+        deadline = time.monotonic() + 10
+        while holder.execute(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted"
+        ).fetchone() != (2,):
+            assert time.monotonic() < deadline, "both callers should be waiting on the lock"
+            time.sleep(0.02)
+    for caller in callers:
+        caller.join(10)
+
+    assert sorted(type(o).__name__ for o in outcomes) == ["CorporateError", "int"]
+    assert rows(db, "SELECT count(*) FROM agb.forced_event") == [(1,)]
+    assert rows(db, "SELECT outcome FROM agb.command ORDER BY outcome") == [
+        ("accepted",),
+        ("refused",),
+    ]
 
 
 def test_the_same_name_can_have_a_second_event_of_another_kind(db):

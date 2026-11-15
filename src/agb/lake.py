@@ -15,6 +15,16 @@ there is left untouched, so re-running a pull for a date that already landed cha
 A SEP partition takes the vendor's corrections; an SF1 partition keeps each row the vendor
 has since restated; a tickers snapshot, once landed, is never rewritten.
 
+A pull lands every session since the last one the lake holds, not only its own, so a session
+missed to an outage lands with the next pull that runs. A session is landed only once it looks
+complete: it has at least FLOOR of the rows the session before it had, so a session the vendor
+is still publishing is left for a later try rather than landed short. SF1 is fetched from a
+week before the last pull that landed, so an outage loses no fundamentals.
+
+A request the vendor did not answer, or answered with a 429 or 5xx, is made again with a
+doubling backoff, or after the vendor's own `Retry-After`. A refusal (a 403 for a bad key) is
+not. Each query pages on the vendor's cursor; see `Sharadar.query`.
+
 SF1 keeps the vendor's `date` column, the SEC filing date, under the name `datekey`, so research
 can use only what had been filed by a given day, and its `lastupdated` column, so research can
 use each filing as the vendor showed it on that day rather than as since restated. Delisted
@@ -32,6 +42,8 @@ import os
 import re
 import shutil
 import tempfile
+import time
+import urllib.error
 import urllib.request
 import zipfile
 from collections.abc import Callable, Iterator, Mapping
@@ -48,14 +60,36 @@ import pyarrow.compute as pc
 import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 
+from agb import nyse
+
 BASE_URL = "https://api.sharadar.com/v1.0/data"
 PAGE = 10_000  # the most rows the API returns for one request
 TIMEOUT = 300  # seconds
 # The backfill keeps SEP from this session and SF1 from this filing date on.
 SINCE = date(1998, 1, 1)
-# Each pull re-lands SF1 for the week to its session, to pick up rows the vendor stamped with a
-# day after that day's pull ran, or on a weekend.
+# Each pull re-lands SF1 from this long before the last pull that landed, to pick up rows the
+# vendor stamped with a day after that pull ran, or on a weekend.
 SF1_LOOKBACK = timedelta(days=7)
+# A pull fills a gap back to the lake's last session, but not one longer than this: a lake that
+# far behind needs the backfill, which is one download rather than thousands of pages.
+MAX_GAP = timedelta(days=45)
+# A session is complete once it has at least this share of the rows of the session before it.
+# The count of listed stocks moves by a few a day; a session the vendor is still publishing is
+# short by far more.
+FLOOR = 0.9
+# How many times a request is made before its failure stands, the wait before the second
+# attempt, doubling for each one after it, and the longest `Retry-After` waited out. Asked to
+# wait longer, the pull fails and the next day's pull lands the session.
+ATTEMPTS = 3
+BACKOFF = 10.0  # seconds
+RETRY_AFTER_CAP = 120.0  # seconds
+# The statuses worth another attempt: the vendor's rate limit, a request timeout and its own
+# failures. Any other status is a refusal that asking again would not change.
+RETRY_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+# The response header that carries the next page's cursor, and the parameter that asks for it,
+# as the vendor's table API (Nasdaq Data Link's datatables) names them for a CSV answer.
+CURSOR_HEADER = "cursor_id"
+CURSOR_PARAM = "qopts.cursor_id"
 # The tables whose tickers the lake keeps. TICKERS also lists the vendor's other tables.
 TICKER_TABLES = ("stocks", "fundamentals")
 DEFAULT_DIR = Path("/lake")
@@ -92,7 +126,12 @@ class LakeError(Exception):
 
 
 class NotYet(LakeError):
-    """The vendor has not yet published the session a pull asked for."""
+    """The vendor has not yet published, or not yet finished publishing, the session a pull
+    asked for. `landed` holds the partitions of the earlier sessions the pull did land."""
+
+    def __init__(self, message: str, landed: list["Partition"] | None = None) -> None:
+        super().__init__(message)
+        self.landed = landed or []
 
 
 @dataclass(frozen=True)
@@ -218,11 +257,19 @@ def urlopen(url: str) -> AbstractContextManager[BinaryIO]:
 
 
 class Sharadar:
-    """The vendor's table API. `opener` fetches a URL, following redirects; tests pass a fake.
-    The key goes in each URL, so no error message this raises includes a URL with it."""
+    """The vendor's table API. `opener` fetches a URL, following redirects; tests pass a fake,
+    and a `sleep` that does not wait. The key goes in each URL, so no error message this
+    raises includes a URL with it."""
 
     def __init__(
-        self, api_key: str, opener: Opener = urlopen, base_url: str = BASE_URL, page: int = PAGE
+        self,
+        api_key: str,
+        opener: Opener = urlopen,
+        base_url: str = BASE_URL,
+        page: int = PAGE,
+        *,
+        attempts: int = ATTEMPTS,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not api_key:
             raise LakeError("SHARADAR_API_KEY is not set in the pipeline's env file")
@@ -230,24 +277,51 @@ class Sharadar:
         self.opener = opener
         self.base_url = base_url
         self.page = page
+        self.attempts = attempts
+        self.sleep = sleep
 
-    def _fetch(self, table: str, params: Mapping[str, object], out: BinaryIO) -> None:
+    def _fetch(self, table: str, params: Mapping[str, object], out: BinaryIO) -> str | None:
+        """Write the answer to `out`, trying again on a transient failure. Returns the cursor
+        header the answer carried: None when it had none, "" when it was empty."""
         url = f"{self.base_url}/{table}?{urlencode({**params, 'api_key': self.api_key})}"
-        try:
-            with self.opener(url) as response:
-                shutil.copyfileobj(response, out, CHUNK)
-        except (OSError, http.client.HTTPException) as exc:
-            detail = str(exc).replace(self.api_key, "***")
-            raise LakeError(f"GET {table}?{urlencode(params)} failed: {detail}") from None
+        wait = BACKOFF
+        for attempt in range(1, self.attempts + 1):
+            try:
+                with self.opener(url) as response:
+                    shutil.copyfileobj(response, out, CHUNK)
+                    headers = getattr(response, "headers", None)
+                    return None if headers is None else headers.get(CURSOR_HEADER)
+            except (OSError, http.client.HTTPException) as exc:
+                detail = str(exc).replace(self.api_key, "***")
+                after = _wait_for(exc, wait)
+                if attempt == self.attempts or after is None:
+                    tries = f" after {attempt} attempts" if attempt > 1 else ""
+                    raise LakeError(
+                        f"GET {table}?{urlencode(params)} failed{tries}: {detail}"
+                    ) from None
+                self.sleep(after)
+                wait *= 2
+                out.seek(0)
+                out.truncate()
+        raise AssertionError("unreachable: the loop returns or raises")
 
     def query(self, dataset: Dataset, filters: Mapping[str, object]) -> pa.Table:
-        """Every row of `dataset` that matches `filters`, fetched a page at a time."""
+        """Every row of `dataset` that matches `filters`, fetched a page at a time.
+
+        Each answer names the next page's cursor in its CURSOR_HEADER, and the last page names
+        none, so paging ends when the vendor says the rows have run out, whatever the length of
+        the page it ends on. A vendor that sends no cursor at all is paged by `skip` instead,
+        and its rows are taken to have run out on the first page shorter than `page`."""
         pages: list[pa.Table] = []
+        cursor: str | None = None
         while True:
-            skip = sum(page.num_rows for page in pages)
-            params = {**filters, "sort": dataset.sort, "limit": self.page, "skip": skip}
+            params: dict[str, object] = {**filters, "sort": dataset.sort, "limit": self.page}
+            if cursor:
+                params[CURSOR_PARAM] = cursor
+            else:
+                params["skip"] = sum(page.num_rows for page in pages)
             out = io.BytesIO()
-            self._fetch(dataset.api, params, out)
+            following = self._fetch(dataset.api, params, out)
             data = out.getvalue()
             if data.lstrip()[:1] in (b"{", b"<"):
                 shown = data[:300].decode(errors="replace").replace(self.api_key, "***")
@@ -255,7 +329,15 @@ class Sharadar:
                     f"GET {dataset.api}?{urlencode(params)} did not return CSV: {shown}"
                 )
             pages.append(parse(dataset, data))
-            if pages[-1].num_rows < self.page:
+            if cursor or following is not None:
+                # The vendor pages by cursor: it has said where the next page starts, or that
+                # there is none.
+                if not following:
+                    return pa.concat_tables(pages)
+                if following == cursor:
+                    raise LakeError(f"GET {dataset.api}: the vendor's cursor did not move")
+                cursor = following
+            elif pages[-1].num_rows < self.page:
                 return pa.concat_tables(pages)
 
     def tickers(self) -> pa.Table:
@@ -276,6 +358,32 @@ class Sharadar:
                 f"{target.stat().st_size} bytes starting: {shown}"
             )
         return target
+
+
+def _wait_for(exc: BaseException, backoff: float) -> float | None:
+    """How long to wait before trying a failed request again, or None if it should not be.
+    A status other than RETRY_STATUS is a refusal. The vendor's own `Retry-After` wins over the
+    backoff when it sent one, unless it asks for longer than RETRY_AFTER_CAP."""
+    if not isinstance(exc, urllib.error.HTTPError):
+        return backoff  # no answer: a timeout, a refused or dropped connection
+    if exc.code not in RETRY_STATUS:
+        return None
+    after = _seconds(exc.headers.get("Retry-After") if exc.headers else None)
+    if after is None:
+        return backoff
+    return after if after <= RETRY_AFTER_CAP else None
+
+
+def _seconds(value: object) -> float | None:
+    """A `Retry-After` header in its number-of-seconds form. The HTTP-date form is not read,
+    and leaves the backoff in charge."""
+    if value is None:
+        return None
+    try:
+        seconds = float(str(value).strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
 
 
 @dataclass(frozen=True)
@@ -419,20 +527,67 @@ def land(lake: Path, dataset: Dataset, table: pa.Table, snapshot: date) -> list[
     ]
 
 
+def _last(lake: Path, dataset: Dataset, before: date) -> tuple[date, Path] | None:
+    """The newest partition of `dataset` dated before `before`, and its file."""
+    cutoff = before.isoformat()
+    for path in sorted(lake.glob(f"{dataset.name}/{dataset.partition}=*/{FILE}"), reverse=True):
+        value = path.parent.name.partition("=")[2]
+        if value < cutoff:
+            return date.fromisoformat(value), path
+    return None
+
+
 def pull(lake: Path, client: Sharadar, session: date) -> list[Partition]:
-    """Land one session: its SEP prices, the SF1 rows the vendor changed in the week to it,
-    and the tickers table as it stands. Nothing is written unless every fetch succeeds.
-    Raises NotYet if the vendor has no prices for the session."""
-    sep = client.query(SEP, {"date": session})
-    if sep.num_rows == 0:
-        raise NotYet(f"the vendor has no SEP prices for {session} yet")
-    sf1 = client.query(SF1, {"lastupdated.gte": session - SF1_LOOKBACK, "lastupdated.lte": session})
+    """Land `session` and every session since the last one the lake holds: their SEP prices,
+    the SF1 rows the vendor changed from a week before the last pull to `session`, and the
+    tickers table as it stands. Nothing is written unless every fetch succeeds.
+
+    Sessions land in order, each once it has at least FLOOR of the rows of the session before
+    it. The first that is missing or short stops the pull, which raises NotYet carrying the
+    partitions of the sessions before it that did land; SF1 and the tickers land only with
+    `session` itself. Raises LakeError if the lake's last session is more than MAX_GAP before
+    `session`."""
+    previous = _last(lake, SEP, session)
+    if previous is not None and session - previous[0] > MAX_GAP:
+        raise LakeError(
+            f"the lake's last session before {session} is {previous[0]}, more than"
+            f" {MAX_GAP.days} days back; land the gap with the backfill"
+        )
+    if previous is None:
+        expected = [session]
+        sep = client.query(SEP, {"date": session})
+        floor = 0
+    else:
+        start = previous[0] + timedelta(days=1)
+        calendar = nyse.NyseCalendar(previous[0] - timedelta(days=7), session + timedelta(days=7))
+        expected = [*calendar.sessions(start, session), session]
+        sep = client.query(SEP, {"date.gte": start, "date.lte": session})
+        floor = pq.ParquetFile(previous[1]).metadata.num_rows
+    by_session = {date.fromisoformat(value): rows for value, rows in split(sep, SEP.key)}
+    complete: list[tuple[date, pa.Table]] = []
+    for day in sorted({*expected, *by_session}):
+        rows = by_session.get(day)
+        count = 0 if rows is None else rows.num_rows
+        if count == 0 or count < FLOOR * floor:
+            landed = [p for d, r in complete for p in land(lake, SEP, r, d)]
+            if count == 0:
+                raise NotYet(f"the vendor has no SEP prices for {day} yet", landed)
+            raise NotYet(
+                f"the vendor has {count} SEP prices for {day}, short of {FLOOR:.0%} of the"
+                f" {floor} the session before it had; it is still publishing",
+                landed,
+            )
+        complete.append((day, rows))
+        floor = count
+    last_pull = _last(lake, TICKERS, session)
+    since = min(session, last_pull[0]) if last_pull else session
+    sf1 = client.query(SF1, {"lastupdated.gte": since - SF1_LOOKBACK, "lastupdated.lte": session})
     sf1 = sf1.filter(pc.greater_equal(sf1.column("datekey"), pa.scalar(SINCE)))
     tickers = client.tickers()
     if tickers.num_rows == 0:
         raise LakeError("the vendor returned no tickers")
     return [
-        *land(lake, SEP, sep, session),
+        *(p for day, rows in complete for p in land(lake, SEP, rows, day)),
         *land(lake, SF1, sf1, session),
         *land(lake, TICKERS, tickers, session),
     ]

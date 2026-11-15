@@ -134,6 +134,29 @@ def test_documents_cut_the_text_to_the_request_budget(monkeypatch):
     assert sent == [6, 4, 0]
 
 
+def test_truncation_keeps_the_newest_8k_and_cuts_the_oldest_first(monkeypatch):
+    monkeypatch.setattr(analyst, "MAX_CHARS", 20)
+
+    docs, sent = analyst.documents(
+        [
+            ("10-K", "2026-02-20", "Item 1A", "a" * 8),
+            ("10-Q", "2026-05-01", "Full text", "q" * 4),
+            ("8-K", "2026-06-10", "Full text", "o" * 6),
+            ("8-K", "2026-08-15", "Full text", "m" * 6),
+            ("8-K", "2026-09-01", "Full text", "n" * 6),
+        ]
+    )
+
+    # 12 characters of 10-K and 10-Q leave 8 for the 8-Ks: the newest in full, the next in part.
+    assert sent == [8, 4, 0, 2, 6]
+    assert [(d.id, d.filed, d.text) for d in docs] == [
+        ("D1", "2026-02-20", "a" * 8),
+        ("D2", "2026-05-01", "q" * 4),
+        ("D4", "2026-08-15", "mm"),
+        ("D5", "2026-09-01", "n" * 6),
+    ]
+
+
 def test_the_template_hash_changes_with_the_prompt(monkeypatch):
     before = analyst.template_hash()
     assert len(before) == 64

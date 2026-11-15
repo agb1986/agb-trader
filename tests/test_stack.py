@@ -4,6 +4,7 @@ Builds the app image and brings the stack up under a Compose project name unique
 worktree, with the committed example env files, then tears it down with its volume.
 """
 
+import http.client
 import os
 import shutil
 import subprocess
@@ -113,3 +114,54 @@ def test_cli_lists_the_heartbeat_and_it_advances(compose, service):
 def test_heartbeat_reports_the_image_version(compose, image_tag):
     # The image is built with AGB_VERSION set to its tag, and the scheduler reports it.
     assert status_line(compose, "scheduler")[-1] == image_tag
+
+
+# Issue #170. Opens a connection to an outside address by number, so no name has to resolve,
+# and prints the errno's name when it fails. A container with no route off the host fails at
+# once with ENETUNREACH, whatever the host's own connection to the internet is doing.
+CONNECT_OUT = """
+import errno, socket
+try:
+    socket.create_connection(("1.1.1.1", 443), timeout=5).close()
+except OSError as exc:
+    print(errno.errorcode.get(exc.errno, repr(exc)))
+else:
+    print("connected")
+"""
+
+# Prints whether the container's routing table holds a default route.
+DEFAULT_ROUTE = """
+with open("/proc/net/route") as table:
+    print(any(line.split()[1] == "00000000" for line in list(table)[1:]))
+"""
+
+
+def in_container(run, service, script) -> str:
+    return run("exec", "-T", service, "python", "-c", script).stdout.strip()
+
+
+@pytest.mark.parametrize("service", ["scheduler", "backup"])
+def test_a_service_on_core_alone_cannot_reach_the_internet(compose, service):
+    assert in_container(compose, service, DEFAULT_ROUTE) == "False"
+    assert in_container(compose, service, CONNECT_OUT) == "ENETUNREACH"
+
+
+@pytest.mark.parametrize("service", ["pipeline", "execution"])
+def test_the_services_that_call_out_have_a_route_off_the_host(compose, service):
+    """The control for the test above: the same probe sees a route where outbound gives one.
+    Only the route is checked, so the test does not depend on the host being online."""
+    assert in_container(compose, service, DEFAULT_ROUTE) == "True"
+
+
+def test_the_ui_answers_on_the_loopback_address(compose):
+    """The UI is on the internal core network and on ui-port, which carries its publication.
+    The request is addressed as the operator's tunnel addresses it."""
+    address = compose("port", "ui", "8080").stdout.strip()
+    host, port = address.rsplit(":", 1)
+    assert host == "127.0.0.1", address
+    connection = http.client.HTTPConnection(host, int(port), timeout=10)
+    try:
+        connection.request("HEAD", "/", headers={"Host": "127.0.0.1:8080"})
+        assert connection.getresponse().status == 200
+    finally:
+        connection.close()
