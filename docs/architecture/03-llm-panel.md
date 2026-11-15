@@ -46,6 +46,8 @@ A single Analyst covers all sources rather than one per source type. Splitting m
 - Latest 10-Q
 - Any 8-K filed since
 
+EDGAR's `recent` list holds only a filer's newest filings, so for a filer busy enough that it does not reach a 10-K, the older submission pages are read until one does. When the documents together exceed the Analyst's request budget, the periodic filings keep their place and the 8-Ks share the rest newest first: the oldest 8-Ks are cut, never the latest.
+
 Filings are the highest-signal source for the impairment question, they are free, and each carries an unambiguous filing date, so point-in-time gating is exact and matches the `datekey` discipline applied to Sharadar SF1.
 
 News is deferred to a later, separately logged experiment. It is where contamination and cost bite hardest: publication dates are frequently unreliable, aggregators backfill and revise, and a news API adds a paid dependency for a signal that largely restates what the filing already said.
@@ -103,7 +105,8 @@ Every message that shows a panel score to a human states that the panel scored a
 
 Governing principle: **absence of data is neutral; evidence of delinquency is a finding.**
 
-- **EDGAR unreachable, parse failure, malformed document** — the system broke, not the company. Neutral 0.5 per the ranker's failure rule. Logged.
+- **EDGAR unreachable, parse failure, malformed document** — the system broke, not the company. Neutral 0.5 per the ranker's failure rule. Logged. A transient error (HTTP 429 or 5xx, a dropped connection) is first retried a few times with a growing pause, each attempt inside the fair-access rate limit, so one 503 does not cost a name its score.
+- **A 10-K or prospectus whose section heading is not found** — the filer's wording, not a broken system. The whole document is read instead and the section is labelled "Whole document (… not found)", so the name is still scored.
 - **Delinquent filer** — a 10-K more than roughly 15 months past fiscal year end, or an NT 10-K (late-filing notification) on file. This is not missing data, it is data. An NT 10-K is among the strongest distress signals in the public record and routinely precedes restatements, auditor resignations and delistings. It scores directly into dimensions 1 and 2.
 - **Recent IPO with no 10-K yet** — score from the S-1 or prospectus risk factors. Dimension 6 has no prior filing to compare against and scores a neutral 2.
 

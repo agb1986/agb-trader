@@ -12,7 +12,14 @@ latest 10-K's fiscal year ended more than about 15 months ago. That is a finding
 scores (docs/architecture/03, "Missing and stale filings"), so it is recorded, and the name's
 filings are still read. EDGAR being unreachable, or a document that cannot be parsed, is the
 system failing rather than the company: `retrieve` returns it as an `edgar_failure` outcome,
-and the blend gives the name the neutral 0.5.
+and the blend gives the name the neutral 0.5. A transient error (HTTP 429 or 5xx, a dropped
+connection, a timeout) is retried a few times, with a growing pause, before it counts as a
+failure; each attempt takes its own slot in the rate limit.
+
+`submissions.filings.recent` holds only the newest filings. When it does not reach back to a
+10-K filed on or before the as-of date, the older pages it lists are read too. A 10-K or
+prospectus whose Item or Risk Factors heading cannot be found is read whole, and the section is
+named as such, rather than failing the name.
 
 The SEC's fair-access policy requires every request to declare a User-Agent with a name and a
 contact email, and limits a client to ten requests a second. The client takes the User-Agent
@@ -24,6 +31,7 @@ from __future__ import annotations
 
 import calendar
 import html.parser
+import http.client
 import json
 import os
 import re
@@ -39,8 +47,17 @@ from typing import Any, BinaryIO
 
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
+OLDER_URL = "https://data.sec.gov/submissions/{name}"
 ARCHIVES_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}"
 TIMEOUT = 30.0
+# A transient error is retried this many times after the first attempt, pausing BACKOFF seconds
+# before the first retry and twice as long before each one after, or as long as a Retry-After
+# header says (at most MAX_PAUSE).
+RETRIES = 3
+BACKOFF = 1.0
+MAX_PAUSE = 30.0
+# HTTP statuses worth another try: too many requests, and the server's own errors.
+TRANSIENT = frozenset({429, 500, 502, 503, 504})
 # Requests a second, kept clear of the SEC's limit of ten.
 RATE = 8.0
 # A 10-K is late when its fiscal year ended more than this many months ago.
@@ -64,6 +81,14 @@ def urlopen(request: urllib.request.Request) -> AbstractContextManager[BinaryIO]
 
 class EdgarError(Exception):
     """EDGAR unreachable, or an answer or document that could not be parsed."""
+
+
+def _retry_after(exc: urllib.error.HTTPError) -> float | None:
+    """The seconds a Retry-After header asks for, when it gives a plain number."""
+    try:
+        return max(0.0, float(exc.headers["Retry-After"]))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
 
 
 class Throttle:
@@ -93,7 +118,11 @@ class Throttle:
 
 class Edgar:
     def __init__(
-        self, user_agent: str, opener: Opener = urlopen, throttle: Throttle | None = None
+        self,
+        user_agent: str,
+        opener: Opener = urlopen,
+        throttle: Throttle | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not user_agent or not user_agent.strip():
             raise ValueError(
@@ -103,22 +132,36 @@ class Edgar:
         self.user_agent = user_agent.strip()
         self._opener = opener
         self._throttle = throttle or Throttle(RATE)
+        self._sleep = sleep
         self._ciks: dict[str, str] | None = None
+        self._ciks_lock = threading.Lock()
 
     @classmethod
     def from_env(cls) -> Edgar:
         return cls(os.environ.get("EDGAR_USER_AGENT", ""))
 
     def get(self, url: str) -> bytes:
+        """The body at `url`. A transient error is retried; any other, or the last, is raised."""
         request = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
-        self._throttle.wait()
-        try:
-            with self._opener(request) as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            raise EdgarError(f"{url}: HTTP {exc.code}") from None
-        except (urllib.error.URLError, OSError) as exc:
-            raise EdgarError(f"{url}: {getattr(exc, 'reason', exc)}") from None
+        pause = BACKOFF
+        for attempt in range(RETRIES + 1):
+            # Every attempt, a retry too, takes a slot in the rate limit.
+            self._throttle.wait()
+            try:
+                with self._opener(request) as response:
+                    return response.read()
+            except urllib.error.HTTPError as exc:
+                error = EdgarError(f"{url}: HTTP {exc.code}")
+                transient = exc.code in TRANSIENT
+                wait = _retry_after(exc)
+            except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+                error = EdgarError(f"{url}: {getattr(exc, 'reason', exc)}")
+                transient, wait = True, None
+            if not transient or attempt == RETRIES:
+                raise error from None
+            self._sleep(min(wait if wait is not None else pause, MAX_PAUSE))
+            pause *= 2
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def get_json(self, url: str) -> Any:
         try:
@@ -128,20 +171,26 @@ class Edgar:
 
     def cik(self, ticker: str) -> str | None:
         """The ticker's ten-digit CIK, or None when EDGAR does not list it."""
-        if self._ciks is None:
-            listing = self.get_json(TICKERS_URL)
-            try:
-                self._ciks = {
-                    str(entry["ticker"]).upper(): f"{int(entry['cik_str']):010d}"
-                    for entry in listing.values()
-                }
-            except (AttributeError, KeyError, TypeError, ValueError):
-                raise EdgarError(f"{TICKERS_URL}: unexpected shape") from None
+        with self._ciks_lock:
+            if self._ciks is None:
+                listing = self.get_json(TICKERS_URL)
+                try:
+                    self._ciks = {
+                        str(entry["ticker"]).upper(): f"{int(entry['cik_str']):010d}"
+                        for entry in listing.values()
+                    }
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    raise EdgarError(f"{TICKERS_URL}: unexpected shape") from None
+            ciks = self._ciks
         # EDGAR writes class shares with a dash (BRK-B) where some vendors use a dot.
-        return self._ciks.get(ticker.upper()) or self._ciks.get(ticker.upper().replace(".", "-"))
+        return ciks.get(ticker.upper()) or ciks.get(ticker.upper().replace(".", "-"))
 
     def submissions(self, cik: str) -> dict[str, Any]:
         return self.get_json(SUBMISSIONS_URL.format(cik=cik))
+
+    def older_page(self, name: str) -> dict[str, Any]:
+        """One of the older filing pages a submissions answer lists under `filings.files`."""
+        return self.get_json(OLDER_URL.format(name=name))
 
     def document(self, cik: str, accession: str, name: str) -> bytes:
         url = ARCHIVES_URL.format(cik=int(cik), accession=accession.replace("-", ""), document=name)
@@ -185,22 +234,56 @@ def filings(submissions: dict[str, Any], as_of: date) -> list[Filing]:
     """The filings EDGAR lists in `recent`, filed on or before `as_of`, newest first."""
     try:
         recent = submissions["filings"]["recent"]
+    except (KeyError, TypeError) as exc:
+        raise EdgarError(f"submissions: unexpected shape ({exc})") from None
+    return _newest_first(_listed(recent), as_of)
+
+
+def _listed(block: Any) -> list[Filing]:
+    """The filings in one page of parallel arrays, the shape of `recent` and of an older page."""
+    try:
         rows = zip(
-            recent["form"],
-            recent["accessionNumber"],
-            recent["filingDate"],
-            recent["reportDate"],
-            recent["primaryDocument"],
+            block["form"],
+            block["accessionNumber"],
+            block["filingDate"],
+            block["reportDate"],
+            block["primaryDocument"],
             strict=True,
         )
-        out = [
+        return [
             Filing(form, accession, date.fromisoformat(filed), _date(report), document)
             for form, accession, filed, report, document in rows
         ]
     except (KeyError, TypeError, ValueError) as exc:
         raise EdgarError(f"submissions: unexpected shape ({exc})") from None
-    out = [f for f in out if f.filed <= as_of]
+
+
+def _newest_first(listed: list[Filing], as_of: date) -> list[Filing]:
+    out = [f for f in listed if f.filed <= as_of]
     return sorted(out, key=lambda f: (f.filed, f.accession), reverse=True)
+
+
+def history(edgar: Edgar, submissions: dict[str, Any], as_of: date) -> list[Filing]:
+    """The filings filed on or before `as_of`, newest first, reading the older pages too when
+    `recent` does not reach a 10-K. The 10-K is the lookback: the plan reads from it and the
+    delinquency test needs it, and a name busy enough with 8-Ks pushes it off `recent`."""
+    listed = filings(submissions, as_of)
+    try:
+        pages = [
+            (str(page["name"]), str(page.get("filingFrom") or ""), str(page.get("filingTo") or ""))
+            for page in submissions["filings"].get("files") or []
+        ]
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise EdgarError(f"submissions: unexpected shape ({exc})") from None
+    # Newest page first, so that the search stops at the first page that holds a 10-K. A page
+    # that starts after `as_of` holds nothing the panel may read.
+    for name, first, _ in sorted(pages, key=lambda page: page[2], reverse=True):
+        if _latest(listed, ANNUAL):
+            break
+        if first > as_of.isoformat():
+            continue
+        listed = _newest_first(listed + _listed(edgar.older_page(name)), as_of)
+    return listed
 
 
 def _date(text: str) -> date | None:
@@ -265,7 +348,7 @@ def retrieve(edgar: Edgar, ticker: str, as_of: date) -> Retrieval:
         ]
         result.aliases = [alias for alias in result.aliases if alias]
         result.tickers = sorted({ticker, *(str(t) for t in submissions.get("tickers") or [])})
-        listed = filings(submissions, as_of)
+        listed = history(edgar, submissions, as_of)
         result.delinquent = delinquency(listed, as_of)
         chosen, result.ipo = plan(listed)
         for filing in chosen:
@@ -288,18 +371,22 @@ def retrieve(edgar: Edgar, ticker: str, as_of: date) -> Retrieval:
 
 
 def sections(filing: Filing, raw: bytes) -> list[Section]:
-    """The parts of one filing the Analyst reads."""
+    """The parts of one filing the Analyst reads. A heading that cannot be found sends the whole
+    document instead, in a section named for what was missed, so the name is still scored."""
     text = html_to_text(raw)
     if not text.strip():
         raise EdgarError(f"{filing.form} {filing.accession}: empty document")
     if filing.form in ANNUAL:
-        return [
-            Section(filing, "Item 1A", _cut(filing, text, *ITEM_1A), raw),
-            Section(filing, "Item 7", _cut(filing, text, *ITEM_7), raw),
-        ]
-    if filing.form in IPO:
-        return [Section(filing, "Risk Factors", _cut(filing, text, *RISK_FACTORS), raw)]
-    return [Section(filing, "Full text", text, raw)]
+        wanted = [ITEM_1A, ITEM_7]
+    elif filing.form in IPO:
+        wanted = [RISK_FACTORS]
+    else:
+        return [Section(filing, "Full text", text, raw)]
+    cut = [(name, _cut(text, name, start, end)) for name, start, end in wanted]
+    missed = [name for name, found in cut if found is None]
+    if missed:
+        return [Section(filing, f"Whole document ({', '.join(missed)} not found)", text, raw)]
+    return [Section(filing, name, found or "", raw) for name, found in cut]
 
 
 # Each section is (name, start heading, end heading). The table of contents repeats every
@@ -318,7 +405,8 @@ RISK_FACTORS = (
 _HEADING = r"(?:^|\n)[ \t]*(?:{})"
 
 
-def _cut(filing: Filing, text: str, name: str, start: str, end: str) -> str:
+def _cut(text: str, name: str, start: str, end: str) -> str | None:
+    """The section `name`, or None when no heading of it is found."""
     starts = [m.start() for m in re.finditer(_HEADING.format(start), text, re.IGNORECASE)]
     ends = [m.start() for m in re.finditer(_HEADING.format(end), text, re.IGNORECASE)]
     best = ""
@@ -326,9 +414,7 @@ def _cut(filing: Filing, text: str, name: str, start: str, end: str) -> str:
         stop = next((e for e in ends if e > begin), len(text))
         if stop - begin > len(best):
             best = text[begin:stop]
-    if not best.strip():
-        raise EdgarError(f"{filing.form} {filing.accession}: {name} not found")
-    return best.strip()
+    return best.strip() or None
 
 
 _BLOCK = {
