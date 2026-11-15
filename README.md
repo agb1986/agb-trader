@@ -52,6 +52,13 @@ make lint
 The tests start their own throwaway Postgres container on a random local port and never
 touch the stack's database, so several worktrees can run them at once.
 
+GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs three checks on
+every pull request, whatever branch it targets, and on every push to `main`: `lint` (what
+`make lint` runs), `fast-tests` (what `make test-fast` runs) and `image-build` (`docker build
+--target app .`). CI sets no `AGB_LIVE_*` variable and holds no secret, so the live tests never
+run there; the stack test is not run there either. Dependabot opens one grouped pull request a
+week for the `uv` lockfile and one for the pinned actions.
+
 Tests marked `live` talk to real services, so no default run collects them: `make test`,
 `make test-fast` and a plain `uv run pytest` all deselect them, whatever is exported in the
 shell. `make test-live` (or `uv run pytest -m live`) collects them, and each module still runs

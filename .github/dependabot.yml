@@ -1,0 +1,19 @@
+# Weekly dependency updates, one grouped pull request per ecosystem. Each one gets the CI
+# checks like any other pull request.
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      uv:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
