@@ -21,9 +21,9 @@ The gate runs every check that does not need the broker, in three groups:
     judgement. A basket short a slot keeps the same weight per name and leaves the missing
     slot's weight in cash, so its weights sum to its share of the twenty.
   * **Each order.** Its symbol is in the universe, its side agrees with the book (a buy opens
-    a position, a sell closes one it holds), its notional is at most 8% of equity, it is
-    market-on-close, and the clock is before the session's MOC cutoff (15:45 ET on a full
-    day).
+    a position, a sell closes one it holds), a buy's notional is at most 8% of equity (a
+    sell is exempt, because it reduces exposure), it is market-on-close, and the clock is
+    before the session's MOC cutoff (15:45 ET on a full day).
 
 Every check is recorded with what it measured and the threshold it had to meet, whether it
 passed or not, so the result reads check by check. A single failure halts the whole
@@ -474,13 +474,15 @@ def _order(
             "a buy opens a position; a sell closes at most what is held",
             side_ok,
         ),
+        # The cap bounds the exposure a buy adds. A sell takes exposure off, so it is exempt:
+        # a held name that has grown past the cap and leaves the ranking is sold whole.
         Check(
             ORDER,
             "notional",
             symbol,
             f"{share:.2%} of {_dollars(target.capital)}",
-            f"<= {limits.notional:.0%}",
-            share <= limits.notional,
+            f"<= {limits.notional:.0%}" if order.side == "buy" else "none on a sell",
+            order.side != "buy" or share <= limits.notional,
         ),
         Check(ORDER, "tif", symbol, order.tif, "cls", order.tif == "cls"),
         Check(ORDER, "clock", symbol, _eastern(now), f"before {_eastern(cutoff)}", now < cutoff),
