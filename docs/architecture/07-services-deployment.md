@@ -22,7 +22,7 @@ The specific argument is CPCV. It refits the model roughly 120 times per split-s
 - **`pipeline`** — the Sharadar pull, feature construction, ranker inference, the LLM panel, and the pre-trade gate. Ends by writing a proposed basket (and the shadow basket). Holds the Sharadar and Anthropic credentials.
 - **`execution`** — the only service with Alpaca credentials. Polls for approved-and-unsubmitted baskets, submits MOC orders, reconciles fills, takes daily position snapshots, records `broker_state`, and owns the broker-side halt levers (`suspend_trade`, `DELETE /v2/positions`).
 - **`bot`** — the only service with the Telegram token ([05 — Telegram bot](05-telegram-bot.md)). Evaluates the health of every other service and sends the alerts.
-- **`ui`** — the local UI ([06 — Local UI](06-local-ui.md)). Read-mostly, server-rendered, no broker credentials, no outbound network at all.
+- **`ui`** — the local UI ([06 — Local UI](06-local-ui.md)). Read-mostly, server-rendered, no broker credentials, no route to the internet.
 - **`vpn`** — agb-trader's own gluetun, with its own WireGuard key.
 - **`backup`** — claims the scheduler's nightly backup job and writes a `pg_dump` of the database to a dated file on `/mnt/data`. It connects as its own `backup` role, which reads every table through Postgres's `pg_read_all_data` and writes nothing but its heartbeat and its job's events. It is a service of its own so that no role which writes trading state also holds read access to everything, and so that only this container needs the Postgres client tools.
 
@@ -40,12 +40,16 @@ The database-only rule also means there is no internal HTTP surface to secure, n
 
 ## Networks
 
-Two networks:
+Four networks. A service on two networks reaches everything on both, so what a service can reach outside the stack is decided by the networks other than `core` it joins.
 
-- **`core`** — `db`, `scheduler`, `pipeline`, `execution`, `bot`, `ui`, `backup`.
+- **`core`** — every service but `vpn` and `research`: `db`, `migrate`, `scheduler`, `pipeline`, `execution`, `bot`, `ui`, `backup`, and the operator's one-shots `cli`, `certification-import` and `reconcile`. It is **internal**: Docker gives it no route off the host, so `db`, `migrate`, `scheduler`, `backup`, `cli` and `certification-import`, which need only the database, have no egress.
+- **`outbound`** — `pipeline`, `execution`, `reconcile`: the services that call outside the stack directly, the pipeline its vendors and the other two the broker. It is an ordinary bridge with a route to the internet.
+- **`ui-port`** — `ui` alone, for its published port: Docker publishes no port from an internal network. Its bridge is created with masquerading off (`com.docker.network.bridge.enable_ip_masquerade=false`), so a connection the UI opens to an outside address leaves with the container's private address and no reply comes back. That is defence in depth behind the UI having no credential and no reason to call out, not a guarantee: the host itself, and anything that routes the bridge's subnet back to it, can still answer.
 - **`egress`** — `vpn`, `bot`.
 
-`bot` is the only service on both. This makes the most important constraint structural rather than conventional: **`execution` must never route broker traffic through the VPN.** Submitting Alpaca orders from a foreign VPN exit invites account flags. With two networks, a stray `HTTPS_PROXY` in the wrong env file causes a connection failure rather than silently tunnelling live orders, because `execution` has no route to the proxy at all. torrent-agent already carries the scar of a proxy variable reaching calls that should not have used it; there, `NO_PROXY=127.0.0.1,localhost` is load-bearing.
+`research` has no network at all (`network_mode: none`).
+
+`bot` is the only service on both `core` and `egress`, and the vpn shares no network with `execution` or `reconcile`. This makes the most important constraint structural rather than conventional: **`execution` must never route broker traffic through the VPN.** Submitting Alpaca orders from a foreign VPN exit invites account flags. Because the vpn sits on a network of its own, a stray `HTTPS_PROXY` in the wrong env file causes a connection failure rather than silently tunnelling live orders, because `execution` has no route to the proxy at all. torrent-agent already carries the scar of a proxy variable reaching calls that should not have used it; there, `NO_PROXY=127.0.0.1,localhost` is load-bearing.
 
 ## The bot's egress
 
@@ -72,7 +76,7 @@ env/vpn.env         WIREGUARD_PRIVATE_KEY
 env/research.env    workstation only
 ```
 
-The file list *is* the credential inventory. Under one shared `.env`, the UI, which needs no credentials and has no outbound network, would still hold the Alpaca keys and the Telegram token in its environment, which is exactly the boundary this decomposition exists to draw. Each file ships with a `.example` template; none is committed.
+The file list *is* the credential inventory. Under one shared `.env`, the UI, which needs no credentials and has no route to the internet, would still hold the Alpaca keys and the Telegram token in its environment, which is exactly the boundary this decomposition exists to draw. Each file ships with a `.example` template; none is committed.
 
 ## Resource limits
 
