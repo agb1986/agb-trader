@@ -18,8 +18,8 @@ submitted.
 Reconciliation, after the close. Each order is read back and every status change appended;
 each fill the account reports is one `fill` row carrying the regulatory fees the shared
 schedule charges on that fill alone; and the basket is filled once the broker is done with
-every order. A basket that could not be traded in full raises a `partial_rebalance` alert
-naming what happened.
+every order. A basket that filled short raises a `partial_rebalance_short_fill` alert naming
+what happened.
 
 The daily snapshot, once per closed session: the broker's positions and the account flags,
 so the halt latch can be compared with the broker's `suspend_trade`, and a snapshot with the
@@ -87,6 +87,15 @@ RECONCILED = "reconciled"
 UNSENT = "unsent"
 # Broker order states from which nothing more will come.
 DONE = frozenset({"filled", "canceled", "expired", "rejected", "done_for_day"})
+# A basket left short raises one alert per cause, each its own kind: an alert is keyed on
+# (kind, subject, period), so causes sharing a kind would let the first one raised hide the
+# rest. Refused at submission, halted mid-submission with orders still live, halted by a
+# pause with orders still live, and filled short at the close.
+PARTIAL_REFUSED = "partial_rebalance_refused"
+PARTIAL_HALTED = "partial_rebalance_halted"
+PARTIAL_PAUSED = "partial_rebalance_paused"
+PARTIAL_SHORT_FILL = "partial_rebalance_short_fill"
+# The kind all four shared until they were split, still on the alerts raised before then.
 PARTIAL_REBALANCE = "partial_rebalance"
 # A pause cancels a submitted basket's orders only up to this long before the close.
 CANCEL_BEFORE = timedelta(minutes=10)
@@ -535,7 +544,7 @@ def _stop(
         names = ", ".join(f"{o.side} {o.qty} {o.symbol}" for o in remaining)
         raise_alert(
             conn,
-            PARTIAL_REBALANCE,
+            PARTIAL_HALTED,
             basket.reference,
             basket.period,
             f"basket {basket.reference} halted mid-submission; still live at the broker: {names}",
@@ -639,7 +648,7 @@ def submit(conn: psycopg.Connection, broker: Broker, basket: Basket, now: dateti
         names = ", ".join(f"{o.side} {o.qty} {o.symbol}" for o in rejected)
         raise_alert(
             conn,
-            PARTIAL_REBALANCE,
+            PARTIAL_REFUSED,
             basket.reference,
             basket.period,
             f"basket {basket.reference} submitted with {len(rejected)} of {count} orders "
@@ -721,7 +730,7 @@ def reconcile(conn: psycopg.Connection, broker: Broker, basket: Basket, now: dat
         names = ", ".join(f"{o.side} {o.qty} {o.symbol} filled {o.filled_qty}" for o in short)
         raise_alert(
             conn,
-            PARTIAL_REBALANCE,
+            PARTIAL_SHORT_FILL,
             basket.reference,
             basket.period,
             f"basket {basket.reference} filled short on {len(short)} of {len(orders)} orders: "
@@ -811,7 +820,7 @@ def cancel_in_flight(
         if remaining:
             raise_alert(
                 conn,
-                PARTIAL_REBALANCE,
+                PARTIAL_PAUSED,
                 basket.reference,
                 basket.period,
                 f"basket {basket.reference} halted by a pause mid-submission; still live at "

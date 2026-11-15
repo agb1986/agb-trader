@@ -8,7 +8,8 @@ module measures each one from what paper trading recorded:
     fee_arithmetic  each fill's recorded fees reproduce under the fee schedule of the
                     cost-model version they were priced with
     partial_fills   a short fill happened and was handled: the rebalance raised the
-                    partial-rebalance alert rather than passing in silence
+                    partial-rebalance alert for the cause that left it short rather than
+                    passing in silence
 
 Each result is appended to `agb.paper_check`, which `agb.live_status` reads for the newest
 result of each name, so re-running a check appends and never overwrites. Nothing here passes
@@ -104,18 +105,37 @@ _FILLS = """
     WHERE r.mode = 'paper'
     ORDER BY f.id
 """
+# The partial-rebalance alert that says a settled rebalance was left short, by the state it
+# settled in: a filled one filled short at the close, a halted one was halted with orders
+# still live. Each with the start of the body the same alert carried under the one kind every
+# cause shared before they were split, which is how an alert raised then is told from the
+# submission's refusal alert that shared its key.
+_CAUSES = (
+    ("filled", execution.PARTIAL_SHORT_FILL, "filled short on "),
+    ("halted", execution.PARTIAL_HALTED, "halted mid-submission; "),
+    ("halted", execution.PARTIAL_PAUSED, "halted by a pause mid-submission; "),
+)
 # Every order of a settled paper rebalance the broker did not fill in full, and whether the
-# rebalance it belongs to raised the partial-rebalance alert.
+# rebalance it belongs to raised the partial-rebalance alert for the cause that left it short.
+# Another cause's alert is not evidence: a basket that alerted at submission and then filled
+# short has said nothing about the short fill.
 _SHORT = """
     SELECT r.basket_id, r.reference, o.symbol, o.side, o.qty,
            coalesce(sum(f.qty), 0) AS filled,
-           EXISTS (SELECT 1 FROM agb.alert a
-                   WHERE a.kind = %s AND a.subject = r.reference) AS alerted
+           EXISTS (SELECT 1
+                   FROM unnest(%(states)s::text[], %(kinds)s::text[], %(bodies)s::text[])
+                        AS c(state, kind, body)
+                   JOIN agb.alert a ON a.subject = r.reference
+                   WHERE c.state = r.state
+                     AND (a.kind = c.kind
+                          OR (a.kind = %(legacy)s
+                              AND starts_with(a.body, 'basket ' || r.reference || ' ' || c.body))))
+               AS alerted
     FROM agb.ladder_rebalance r
     JOIN agb.broker_order o ON o.basket_id = r.basket_id
     LEFT JOIN agb.fill f ON f.order_id = o.id
     WHERE r.mode = 'paper'
-    GROUP BY r.basket_id, r.reference, o.id, o.symbol, o.side, o.qty
+    GROUP BY r.basket_id, r.reference, r.state, o.id, o.symbol, o.side, o.qty
     HAVING coalesce(sum(f.qty), 0) < o.qty
     ORDER BY r.basket_id, o.id
 """
@@ -249,7 +269,16 @@ def partial_fills(conn: psycopg.Connection) -> Result:
     """Short fills in the paper record, and whether each rebalance that had one said so. The
     check needs a short fill to have happened: paper that filled everything in full proves
     nothing about the handling of one."""
-    short = conn.execute(_SHORT, (execution.PARTIAL_REBALANCE,)).fetchall()
+    states, kinds, bodies = (list(column) for column in zip(*_CAUSES, strict=True))
+    short = conn.execute(
+        _SHORT,
+        {
+            "states": states,
+            "kinds": kinds,
+            "bodies": bodies,
+            "legacy": execution.PARTIAL_REBALANCE,
+        },
+    ).fetchall()
     if not short:
         raise MechanicsError(
             "every paper order filled in full, so there is no partial fill to check the handling of"
@@ -265,7 +294,10 @@ def partial_fills(conn: psycopg.Connection) -> Result:
             if not silent
             else f"{len({row[1] for row in silent})} of them raised no alert"
         ),
-        threshold=f"every rebalance with a short fill raises {execution.PARTIAL_REBALANCE}",
+        threshold=(
+            f"every rebalance with a short fill raises {execution.PARTIAL_SHORT_FILL}, "
+            f"or {execution.PARTIAL_HALTED} or {execution.PARTIAL_PAUSED} if it was halted"
+        ),
         detail={
             "orders": len(short),
             "rebalances": sorted(baskets),
