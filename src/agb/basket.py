@@ -28,7 +28,8 @@ A missed basket may be rerun at a later session's close when the operator asks (
 agb.approval): `rerun` copies it, ranks, targets and orders as they were, under a new
 reference such as `2026-10r1` whose `deviation_of` names the original, and proposes it for
 the new session. The signal and the provenance are the original's, so the gate checks the
-same universe and marks.
+same universe and marks. So are the panel run, its configuration, the weight and the blend,
+so a rerun of a blended basket gets the panel checks and flags the original did.
 
 Stage 2 joins here when a panel configuration exists (agb.panel, agb.blend): the top N of
 the stage-1 ranking is shortlisted, the panel scores it, and the basket is selected from
@@ -192,15 +193,16 @@ _SHADOW_BOOK = """
 """
 
 
-# A rerun: the missed basket's provenance under a new reference and session.
+# A rerun: the missed basket's provenance under a new reference and session. The panel
+# columns and the blend come too, so a rerun of a blended basket is gated as one.
 _INSERT_RERUN = """
     INSERT INTO agb.basket
         (reference, period, deviation_of, job_id, session_date, signal_date, snapshot_date,
          partition_hash, universe_size, ranker, model_certification_id, model_sha256,
-         cost_model_version, capital_usd, actor)
+         cost_model_version, capital_usd, actor, panel_config_id, panel_run_id, panel_w)
     SELECT %(reference)s, period, id, NULL, %(session)s, signal_date, snapshot_date,
            partition_hash, universe_size, ranker, model_certification_id, model_sha256,
-           cost_model_version, capital_usd, %(actor)s
+           cost_model_version, capital_usd, %(actor)s, panel_config_id, panel_run_id, panel_w
     FROM agb.basket WHERE id = %(original)s
     ON CONFLICT (reference) DO NOTHING
     RETURNING id
@@ -208,6 +210,15 @@ _INSERT_RERUN = """
 _COPY_RANKS = """
     INSERT INTO agb.basket_rank (basket_id, symbol, rank, score)
     SELECT %(basket)s, symbol, rank, score FROM agb.basket_rank
+    WHERE basket_id = %(original)s ORDER BY id
+"""
+_COPY_BLEND = """
+    INSERT INTO agb.basket_blend
+        (basket_id, symbol, stage1_rank, stage1_rank_pct, panel_score_id, llm_total, llm_score,
+         llm_score_pct, neutral, final_score)
+    SELECT %(basket)s, symbol, stage1_rank, stage1_rank_pct, panel_score_id, llm_total,
+           llm_score, llm_score_pct, neutral, final_score
+    FROM agb.basket_blend
     WHERE basket_id = %(original)s ORDER BY id
 """
 _COPY_TARGETS = """
@@ -724,6 +735,7 @@ def rerun(
         basket_id = row[0]
         copy = {"basket": basket_id, "original": original, "reference": reference}
         conn.execute(_COPY_RANKS, copy)
+        conn.execute(_COPY_BLEND, copy)
         conn.execute(_COPY_TARGETS, copy)
         conn.execute(_COPY_ORDERS, copy)
         reason = f"rerun of basket {original}, as asked by command {command_id}"
