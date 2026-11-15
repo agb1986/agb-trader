@@ -16,7 +16,9 @@ A SEP partition takes the vendor's corrections; an SF1 partition keeps each row 
 has since restated; a tickers snapshot, once landed, is never rewritten.
 
 SF1 keeps the vendor's `date` column, the SEC filing date, under the name `datekey`, so research
-can use only what had been filed by a given day. Delisted tickers are never filtered out.
+can use only what had been filed by a given day, and its `lastupdated` column, so research can
+use each filing as the vendor showed it on that day rather than as since restated. Delisted
+tickers are never filtered out.
 
 `connect` opens DuckDB over the lake, and `python -m agb.lake "SQL"` runs one query.
 """
@@ -144,7 +146,9 @@ SF1 = Dataset(
     api="fundamentals",
     partition="lastupdated",
     key="lastupdated",
-    primary_key=("ticker", "dimension", "datekey"),
+    # One filing can report more than one period, as when a late filer catches up on two
+    # quarters in a day, so the period it reports is part of the key.
+    primary_key=("ticker", "dimension", "datekey", "reportperiod"),
     sort="ticker.asc,dimension.asc,date.asc",
     types={
         "ticker": STRING,
@@ -517,16 +521,33 @@ def land_bulk(
 
 
 # The lake keeps every day's version of an SF1 row; the view shows the latest.
+_SF1_PERIOD = ", ".join(SF1.primary_key)
 _VIEW_FILTER = {
-    SF1.name: "QUALIFY row_number() OVER "
-    "(PARTITION BY ticker, dimension, datekey ORDER BY lastupdated DESC) = 1",
+    SF1.name: (
+        f"QUALIFY row_number() OVER (PARTITION BY {_SF1_PERIOD} ORDER BY lastupdated DESC) = 1"
+    ),
 }
+# `sf1_as_of(d)` is SF1 as it was known on day `d`: the rows filed by then, each in the latest
+# version the vendor had stamped by then. A row the lake first saw after `d` is served in the
+# earliest version it has, since nothing older was ever landed: the backfill holds each row only
+# as the vendor showed it on the day of the export, so a row filed before the lake began has no
+# earlier version to fall back to.
+_SF1_AS_OF = f"""
+CREATE MACRO sf1_as_of(as_of) AS TABLE
+SELECT * FROM {{source}}
+WHERE datekey <= as_of
+QUALIFY row_number() OVER (
+    PARTITION BY {_SF1_PERIOD}
+    ORDER BY CASE WHEN lastupdated <= as_of THEN lastupdated END DESC NULLS LAST, lastupdated
+) = 1
+"""
 
 
 def connect(lake: Path = DEFAULT_DIR) -> duckdb.DuckDBPyConnection:
     """An in-memory DuckDB with a view over the lake for each dataset that has landed:
     `sep`, every session's prices; `sf1`, the latest version of each fundamentals row; and
-    `tickers`, the newest snapshot as of this call.
+    `tickers`, the newest snapshot as of this call. A query that stands on a past day reads
+    `sf1_as_of(day)` instead of `sf1`, the fundamentals as they were known that day.
 
     A query that runs out of memory spills to DuckDB's temp directory, which defaults to `.tmp`
     under the working directory. The service image's working directory is not writable, so spill
@@ -545,6 +566,8 @@ def connect(lake: Path = DEFAULT_DIR) -> duckdb.DuckDBPyConnection:
             source = f"read_parquet('{_sql(pattern)}', hive_partitioning = false)"
         view_filter = _VIEW_FILTER.get(dataset.name, "")
         conn.execute(f"CREATE VIEW {dataset.name} AS SELECT * FROM {source} {view_filter}")
+        if dataset is SF1:
+            conn.execute(_SF1_AS_OF.format(source=source))
     return conn
 
 

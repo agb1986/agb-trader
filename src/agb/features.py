@@ -213,16 +213,16 @@ liquidity AS (
 filed AS (
     SELECT sf1.ticker, calendardate, netinc, revenue, fcf, gp, assets, equity, debt, cashneq,
            liabilities
-    FROM sf1 JOIN {_MEMBERS} m USING (ticker)
-    WHERE dimension = 'ART' AND datekey <= $as_of
+    FROM sf1_as_of($as_of) sf1 JOIN {_MEMBERS} m USING (ticker)
+    WHERE dimension = 'ART'
     QUALIFY row_number() OVER (PARTITION BY ticker ORDER BY calendardate DESC, datekey DESC) = 1
 ),
 prior AS (
     SELECT sf1.ticker, sf1.assets, sf1.cashneq, sf1.liabilities, sf1.debt
-    FROM sf1 JOIN filed
+    FROM sf1_as_of($as_of) sf1 JOIN filed
       ON sf1.ticker = filed.ticker
      AND sf1.calendardate = CAST(filed.calendardate - INTERVAL 1 YEAR AS DATE)
-    WHERE sf1.dimension = 'ART' AND sf1.datekey <= $as_of
+    WHERE sf1.dimension = 'ART'
     QUALIFY row_number() OVER (PARTITION BY sf1.ticker ORDER BY sf1.datekey DESC) = 1
 ),
 listing AS (

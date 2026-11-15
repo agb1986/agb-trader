@@ -20,7 +20,8 @@ _SEP = pa.schema([
 ])  # fmt: skip
 _SF1 = pa.schema([
     ("ticker", pa.string()), ("dimension", pa.string()), ("datekey", pa.date32()),
-    ("lastupdated", pa.date32()), ("sharesbas", pa.float64()), ("sharefactor", pa.float64()),
+    ("lastupdated", pa.date32()), ("reportperiod", pa.date32()), ("sharesbas", pa.float64()),
+    ("sharefactor", pa.float64()),
 ])  # fmt: skip
 _TICKERS = pa.schema([
     ("table", pa.string()), ("permaticker", pa.int64()), ("ticker", pa.string()),
@@ -53,8 +54,14 @@ class Market:
             self.rows["sep"].append((ticker, day, price if close is None else close, price, volume))
         return self
 
-    def files(self, ticker, *, datekey, shares=100_000_000.0, dimension="ARQ", sharefactor=1.0):
-        self.rows["sf1"].append((ticker, dimension, datekey, SESSION, shares, sharefactor))
+    def files(
+        self, ticker, *, datekey, shares=100_000_000.0, dimension="ARQ", sharefactor=1.0,
+        lastupdated=SESSION, reportperiod=None,
+    ):  # fmt: skip
+        period = datekey if reportperiod is None else reportperiod
+        self.rows["sf1"].append(
+            (ticker, dimension, datekey, lastupdated, period, shares, sharefactor)
+        )
         return self
 
     def listed(
@@ -252,6 +259,18 @@ def test_a_session_landed_after_the_date_leaves_the_digest_alone(tmp_path):
     assert universe.snapshot(date(2026, 9, 1), root).partition_hash != before.partition_hash
 
 
+def test_a_share_count_restated_later_is_not_read_before_then(tmp_path):
+    # The vendor corrects GOOD's share count in place after the month-end. The month-end's
+    # universe reads the count as it stood.
+    sessions = weekdays(SESSION, 60)
+    built = Market(tmp_path).name("GOOD", sessions)
+    built.files("GOOD", datekey=sessions[0], shares=3e8, lastupdated=date(2026, 9, 15))
+
+    [member] = universe.snapshot(MONTH_END, built.land()).members
+
+    assert member.market_cap == pytest.approx(2_000_000_000.0)  # 100M shares at 20
+
+
 def test_a_restated_filing_moves_the_digest(tmp_path):
     # SF1 is partitioned by the day the vendor last changed a row, so a restatement lands in a
     # new partition. The digest covers every SF1 partition, so the gate sees the lake move.
@@ -260,7 +279,8 @@ def test_a_restated_filing_moves_the_digest(tmp_path):
 
     table = pa.Table.from_pylist(
         [{"ticker": "GOOD", "dimension": "ARQ", "datekey": date(2026, 6, 30),
-          "lastupdated": date(2026, 9, 30), "sharesbas": 9e7, "sharefactor": 1.0}],
+          "lastupdated": date(2026, 9, 30), "reportperiod": date(2026, 6, 30),
+          "sharesbas": 9e7, "sharefactor": 1.0}],
         schema=_SF1,
     )  # fmt: skip
     lake.land(root, lake.SF1, table, SESSION)
@@ -338,9 +358,10 @@ def test_a_lake_missing_a_column_says_which(tmp_path):
     root = Market(tmp_path).name("GOOD", shares=None).land()
     thin = pa.Table.from_pylist(
         [{"ticker": "GOOD", "dimension": "ARQ", "datekey": date(2026, 6, 30),
-          "lastupdated": date(2026, 9, 30)}],
+          "lastupdated": date(2026, 9, 30), "reportperiod": date(2026, 6, 30)}],
         schema=pa.schema([("ticker", pa.string()), ("dimension", pa.string()),
-                          ("datekey", pa.date32()), ("lastupdated", pa.date32())]),
+                          ("datekey", pa.date32()), ("lastupdated", pa.date32()),
+                          ("reportperiod", pa.date32())]),
     )  # fmt: skip
     lake.land(root, lake.SF1, thin, SESSION)
 

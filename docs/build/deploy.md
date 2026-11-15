@@ -227,7 +227,8 @@ To query the lake with DuckDB, and to see the latest snapshots:
 ```
 
 The views are `sep`, `sf1`, which shows the latest version of each fundamentals row, and
-`tickers`, which shows the newest snapshot.
+`tickers`, which shows the newest snapshot. `sf1_as_of('2020-06-30')` shows the fundamentals
+as they were known on that day, which is what research and replays read.
 
 ## Promoting a model
 

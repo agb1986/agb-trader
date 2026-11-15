@@ -99,14 +99,16 @@ traded AS (
 ),
 filed AS (
     SELECT ticker, sharesbas * coalesce(sharefactor, 1.0) AS shares
-    FROM sf1
-    WHERE datekey <= ?
-      AND dimension IN ('ARQ', 'ARY')
+    FROM sf1_as_of(?)
+    WHERE dimension IN ('ARQ', 'ARY')
       AND sharesbas IS NOT NULL
       AND sharesbas > 0
     -- The latest filing on or before the rebalance date. ARQ beats ARY where a company filed
-    -- both the same day, because the quarterly cover page carries the newer share count.
-    QUALIFY row_number() OVER (PARTITION BY ticker ORDER BY datekey DESC, dimension ASC) = 1
+    -- both the same day, because the quarterly cover page carries the newer share count, and
+    -- of two periods filed the same day the later one wins, for the same reason.
+    QUALIFY row_number() OVER (
+        PARTITION BY ticker ORDER BY datekey DESC, dimension ASC, reportperiod DESC
+    ) = 1
 ),
 common AS (
     SELECT DISTINCT ticker

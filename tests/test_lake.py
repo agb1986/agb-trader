@@ -199,6 +199,72 @@ def test_sf1_keeps_each_version_and_the_view_shows_the_latest(tmp_path):
     ]
 
 
+def test_sf1_as_of_a_day_serves_each_row_as_known_that_day(tmp_path):
+    vendor = sample()
+    lake.pull(tmp_path, client(vendor), SESSION)
+    # AAPL's quarter is restated the next day.
+    vendor.rows["fundamentals"][4] = sf1_row(
+        "AAPL", "ARQ", "2026-07-31", "2026-09-15", "94100000000", "1.58"
+    )
+    vendor.rows["stocks"].append(sep_row("AAPL", "2026-09-15", "330.1"))
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 15))
+    conn = lake.connect(tmp_path)
+
+    def eps(as_of):
+        query = "SELECT eps FROM sf1_as_of(?) WHERE ticker = 'AAPL' AND dimension = 'ARQ'"
+        return conn.sql(query, params=[as_of]).fetchall()
+
+    assert eps(SESSION) == [(1.57,)]
+    assert eps(date(2026, 9, 15)) == [(1.58,)]
+    # A row the lake first saw after the day, as every row of the backfill is, is served as
+    # first seen, while one filed after the day is not served at all.
+    assert eps(date(2026, 9, 1)) == [(1.57,)]
+    assert eps(date(2026, 7, 30)) == []
+
+
+def test_sf1_as_of_today_is_the_view(tmp_path):
+    vendor = sample()
+    lake.pull(tmp_path, client(vendor), SESSION)
+    vendor.rows["fundamentals"][4] = sf1_row(
+        "AAPL", "ARQ", "2026-07-31", "2026-09-15", "94100000000", "1.58"
+    )
+    vendor.rows["stocks"].append(sep_row("AAPL", "2026-09-15", "330.1"))
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 15))
+    conn = lake.connect(tmp_path)
+
+    view = conn.sql("SELECT * FROM sf1 ORDER BY ALL").fetchall()
+    assert conn.sql("SELECT * FROM sf1_as_of(current_date) ORDER BY ALL").fetchall() == view
+    assert [(row[0], row[-1]) for row in view] == [("AAPL", 1.58), ("MSFT", 3.65)]
+
+
+def test_two_periods_filed_on_one_day_both_survive(tmp_path):
+    vendor = sample()
+    # A late filer catches up on two quarters in one filing.
+    earlier = sf1_row("AAPL", "ARQ", "2026-07-31", "2026-09-14", "90000000000", "1.40")
+    earlier["reportperiod"] = "2026-03-31"
+    vendor.rows["fundamentals"].append(earlier)
+    lake.pull(tmp_path, client(vendor), SESSION)
+    conn = lake.connect(tmp_path)
+
+    expected = [(date(2026, 3, 31), 1.40), (date(2026, 7, 31), 1.57)]
+    partition = pq.read_table(tmp_path / "sf1/lastupdated=2026-09-14" / lake.FILE)
+    assert (
+        sorted(
+            (row["reportperiod"], row["eps"])
+            for row in partition.to_pylist()
+            if row["ticker"] == "AAPL"
+        )
+        == expected
+    )
+    for source in ("sf1", "sf1_as_of(DATE '2026-09-14')"):
+        rows = conn.sql(
+            f"SELECT reportperiod, eps FROM {source} "
+            "WHERE ticker = 'AAPL' AND dimension = 'ARQ' AND datekey = DATE '2026-07-31' "
+            "ORDER BY reportperiod"
+        )
+        assert rows.fetchall() == expected
+
+
 def test_a_landed_tickers_snapshot_is_kept(tmp_path):
     vendor = sample()
     lake.pull(tmp_path, client(vendor), SESSION)
