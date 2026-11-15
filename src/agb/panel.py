@@ -38,7 +38,7 @@ from typing import Any
 import psycopg
 
 from agb import analyst, debate, edgar
-from agb.panel_store import PanelStore
+from agb.panel_store import PanelStore, StoreError
 from agb.scrubber import SCRUBBER_VERSION, Scrubber
 
 log = logging.getLogger(__name__)
@@ -451,15 +451,22 @@ def cached(
     usable: Callable[[analyst.Completion], object],
 ) -> analyst.Completion | None:
     """The answer to an earlier identical request, if one was made, its body is stored and
-    `usable` accepts it. An answer that was cut off, refused or garbled is logged with its call
-    but never replayed, so the next run asks again instead of inheriting the failure."""
+    sound, and `usable` accepts it. An answer that was cut off, refused or garbled is logged
+    with its call but never replayed, and neither is one whose body has gone bad, so the next
+    run asks again instead of inheriting the failure."""
     for (response_sha256,) in conn.execute(
         "SELECT response_sha256 FROM agb.panel_model_call WHERE request_sha256 = %s ORDER BY id",
         (request_sha256,),
     ):
         if not store.has(response_sha256):
             continue
-        completion = analyst.Completion(**json.loads(store.get(response_sha256)))
+        try:
+            completion = analyst.Completion(**json.loads(store.get(response_sha256)))
+        except StoreError as exc:
+            # A corrupt body is not a cache hit: the model is asked again, and storing its
+            # answer rewrites the body if the answer is the same one.
+            log.warning("cached answer %s is unreadable, asking again: %s", response_sha256, exc)
+            continue
         try:
             usable(completion)
         except (analyst.AnalystError, debate.DebateError):

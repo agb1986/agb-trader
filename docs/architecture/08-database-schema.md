@@ -152,7 +152,7 @@ Rejected: everything in Postgres, which grows the dump by hundreds of megabytes 
 | panel pre-flight results, spot-check verdicts | cli (all four checks, verdicts), pipeline (recall runs) | no |
 | `heartbeat` | every service | upsert |
 | `expected_event` | scheduler (create), fulfilling service (completion reference) | completion by append or reference, never rewrite |
-| `alert`, `alert_event` | bot, ui, execution, scheduler | no |
+| `alert`, `alert_event` | bot, ui, execution, scheduler, pipeline (`alert` only, for a job that failed) | no |
 | `dividend` | cli, ui (the operator, from a broker statement) | no |
 
 Views: current basket state, open halt causes, audit log, shortfall, eligibility (ladder and mode), overdue expected events, reconcile state (each planned order beside what the broker last said about it), per-fill and live cost shortfall, equity by New York month, and the promoted certification's alert thresholds.
