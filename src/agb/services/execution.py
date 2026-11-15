@@ -12,11 +12,17 @@ minutes, so the bot can compare the broker's
 `suspend_trade` with the halt latch.
 
 Without keys it beats and does nothing else, so the stack starts whole before the operator
-has an Alpaca account. Errors reaching the broker end the cycle, not the service: the next
-cycle starts from what the database says, which is why every row is written before the
-call it records. Each basket's submission, each reconcile and the snapshot are their own
-step: one that fails is logged and alerted on at once, and the steps after it still run. An
-error from the database is the exception, and ends the process as it does in every service.
+has an Alpaca account. With them it will not start, and stops, unless ALPACA_BASE_URL is the
+trading endpoint of the mode in force (`agb.alpaca.TRADING_APIS`): the paper host in paper
+mode, the live host in live mode. The check runs before the first heartbeat and again every
+cycle, so a mode that changes under a running service ends it, and Compose restarts it into
+the same refusal until the URL and the mode agree.
+
+Errors reaching the broker end the cycle, not the service: the next cycle starts from what
+the database says, which is why every row is written before the call it records. Each
+basket's submission, each reconcile and the snapshot are their own step: one that fails is
+logged and alerted on at once, and the steps after it still run. An error from the database
+is the exception, and ends the process as it does in every service.
 """
 
 import logging
@@ -26,12 +32,14 @@ from datetime import UTC, date, datetime, timedelta
 import psycopg
 
 from agb import execution, jobs, nyse, recovery, schedule
-from agb.alpaca import Alpaca, AlpacaError, Broker
+from agb.alpaca import Alpaca, AlpacaError, Broker, check_mode
 from agb.execution import ROLE, ExecutionError
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.nyse import NyseCalendar, trading_date
 
 log = logging.getLogger(__name__)
+
+_MODE = "SELECT mode FROM agb.current_mode"
 
 # How often the account's flags are observed when nothing else is happening.
 OBSERVE_EVERY = timedelta(minutes=5)
@@ -72,6 +80,7 @@ class Execution:
         self,
         broker: Broker | None,
         *,
+        base_url: str | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         settle: timedelta = execution.SETTLE,
         observe_every: timedelta = OBSERVE_EVERY,
@@ -81,6 +90,9 @@ class Execution:
         lease: timedelta = execution.SUBMISSION_LEASE,
     ) -> None:
         self.broker = broker
+        # The broker's trading endpoint, checked against the trading mode; None for a broker
+        # that is not Alpaca's, such as a test's fake.
+        self.base_url = base_url
         self.clock = clock
         self.settle = settle
         self.observe_every = observe_every
@@ -106,7 +118,18 @@ class Execution:
 
     @classmethod
     def from_env(cls) -> "Execution":
-        return cls(Alpaca.from_env() if Alpaca.configured() else None)
+        if not Alpaca.configured():
+            return cls(None)
+        broker = Alpaca.from_env()
+        return cls(broker, base_url=broker.trading)
+
+    def check_mode(self, conn: psycopg.Connection) -> None:
+        """Refuse, with a `BaseUrlError` that ends the process, a trading endpoint that is not
+        the one for the trading mode in force."""
+        if self.base_url is None:
+            return
+        row = conn.execute(_MODE).fetchone()
+        check_mode(self.base_url, row[0] if row else None)
 
     def calendar(self, now: datetime) -> NyseCalendar:
         start, end = schedule.calendar_window(trading_date(now))
@@ -120,6 +143,7 @@ class Execution:
                 log.warning("ALPACA_API_KEY and ALPACA_SECRET_KEY are not set: beating only")
                 self._warned = True
             return
+        self.check_mode(conn)
         try:
             self.cycle(conn)
         except (AlpacaError, ExecutionError, OSError) as exc:
@@ -342,7 +366,11 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    serve(ROLE, interval_from_env(), stop_on_signals(), Execution.from_env())
+    service = Execution.from_env()
+    # Refuse before the first heartbeat, so a service that will not start never looks alive.
+    with psycopg.connect(application_name=ROLE, autocommit=True) as conn:
+        service.check_mode(conn)
+    serve(ROLE, interval_from_env(), stop_on_signals(), service)
 
 
 if __name__ == "__main__":
