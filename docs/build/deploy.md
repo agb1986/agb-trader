@@ -132,12 +132,19 @@ ssh -N -L 8080:127.0.0.1:8080 casaos.local   # then open http://127.0.0.1:8080
 
 SSH is the authentication: there is no login page, and nothing outside the server can open the
 port. The home page is the decision log, one row per rebalance with the health banner above it;
-`Rebalance`, `Positions`, `Gate` and `Alerts` are the views behind it. Nothing on these pages
-writes to the database — the connection is read-only in Postgres — so approving a basket and the
-kill switch stay in Telegram until the write path lands.
+`Rebalance`, `Positions`, `Gate` and `Alerts` are the views behind it. A page is read on a
+connection that is read-only in Postgres; approving or rejecting a basket and the kill switch are
+forms that post to the UI's write routes, the same answers Telegram gives.
 
 Set `AGB_UI_PORT` in the deploy directory's `.env` if 8080 is taken on the server; the container
 still listens on 8080, so the tunnel's right-hand side does not change.
+
+Open the UI as `http://127.0.0.1:8080` or `http://localhost:8080`, so keep the tunnel's left-hand
+side on local port 8080. The UI answers only requests addressed to those two names and refuses
+any other `Host` with a 421. This is what stops a page on another site that rebinds its own name
+to the loopback address. A write must also send an `Origin` naming one of them, so a POST from
+curl needs `-H 'Origin: http://127.0.0.1:8080'`. The `AGB_UI_ALLOWED_HOSTS` variable
+(comma-separated `host:port`), set in the deploy directory's `.env`, replaces the list.
 
 ## Backups
 

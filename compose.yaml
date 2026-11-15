@@ -108,6 +108,7 @@ services:
       # below: the host's loopback address. A loopback bind here would answer nothing, since
       # the published port arrives on the container's own address.
       AGB_UI_HOST: 0.0.0.0
+      AGB_UI_ALLOWED_HOSTS: ${AGB_UI_ALLOWED_HOSTS:-}
     ports:
       - "127.0.0.1:${AGB_UI_PORT:-8080}:8080"
     depends_on:
