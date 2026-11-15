@@ -10,7 +10,7 @@ import urllib.error
 
 import pytest
 
-from agb.alpaca import BACKOFF, RETRIES, Alpaca, AlpacaError
+from agb.alpaca import BACKOFF, FEED, RETRIES, Alpaca, AlpacaError
 
 KEY = "key-aaa"
 SECRET = "secret-bbb"
@@ -178,3 +178,17 @@ def test_an_answer_of_the_wrong_shape_is_a_broker_error():
     with pytest.raises(AlpacaError) as caught:
         client(broker, Clock()).account()
     assert "account: the broker's answer is malformed" in str(caught.value)
+
+
+def test_every_quote_request_names_its_feed():
+    """Issue #147: the feed is named rather than left to the account's plan; IEX unless the
+    client is built with another."""
+    answer = b'{"quotes": {"AAA": {"bp": 9.99, "ap": 10.01, "t": "2026-10-01T19:34:59Z"}}}'
+    broker = FakeBroker(answer, answer)
+    assert FEED == "iex"
+    assert set(client(broker, Clock()).latest_quotes(["AAA", "BBB"])) == {"AAA"}
+    client(broker, Clock(), feed="sip").latest_quotes(["AAA"])
+    assert broker.requests == [
+        ("GET", "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=AAA%2CBBB&feed=iex"),
+        ("GET", "https://data.alpaca.markets/v2/stocks/quotes/latest?symbols=AAA&feed=sip"),
+    ]

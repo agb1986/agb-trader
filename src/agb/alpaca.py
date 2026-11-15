@@ -40,6 +40,10 @@ log = logging.getLogger(__name__)
 
 TRADING_API = "https://paper-api.alpaca.markets"
 DATA_API = "https://data.alpaca.markets"
+# The market data feed every quote request names. IEX is the one a free data plan serves in
+# real time; it is the IEX exchange's own book rather than the consolidated NBBO, which is the
+# `sip` feed and needs a paid plan. Naming it keeps Alpaca from choosing one for the account.
+FEED = "iex"
 TIMEOUT = 15.0
 # How many extra attempts a read gets when the broker does not answer or answers that it could
 # not serve the request. Reads only, so an attempt that may have reached the broker is never
@@ -308,6 +312,7 @@ class Alpaca:
         *,
         trading: str = TRADING_API,
         data: str = DATA_API,
+        feed: str = FEED,
         timeout: float = TIMEOUT,
         opener: urllib.request.OpenerDirector | None = None,
         retries: int = RETRIES,
@@ -324,6 +329,7 @@ class Alpaca:
         }
         self._trading = trading.rstrip("/")
         self._data = data.rstrip("/")
+        self._feed = feed
         self._timeout = timeout
         self._retries = max(0, retries)
         self._backoff = backoff
@@ -476,11 +482,15 @@ class Alpaca:
 
     @_parsed
     def latest_quotes(self, symbols: Sequence[str]) -> dict[str, Quote]:
-        """The latest NBBO quote per symbol. A symbol with no quote is absent."""
+        """The latest quote per symbol from the client's feed, all in one request. A symbol
+        with no quote is absent."""
         if not symbols:
             return {}
         raw = self._call(
-            "GET", self._data, "/v2/stocks/quotes/latest", query={"symbols": ",".join(symbols)}
+            "GET",
+            self._data,
+            "/v2/stocks/quotes/latest",
+            query={"symbols": ",".join(symbols), "feed": self._feed},
         )
         quotes = {}
         for symbol, q in (raw.get("quotes") or {}).items():
