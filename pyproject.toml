@@ -52,7 +52,9 @@ module-name = "agb"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers"
+# A live test runs only when asked for with `-m live` (make test-live): a later -m replaces
+# this one, so a target that passes its own -m must keep "not live" in it.
+addopts = "-ra --strict-markers -m 'not live'"
 markers = [
     "stack: brings up the Compose stack (builds the app image)",
     "live: needs the real vendor API or the real lake; each module names the variable that enables it",
