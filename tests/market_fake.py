@@ -26,7 +26,8 @@ _SEP = pa.schema([
 ])  # fmt: skip
 _SF1 = pa.schema([
     ("ticker", pa.string()), ("dimension", pa.string()), ("datekey", pa.date32()),
-    ("lastupdated", pa.date32()), ("sharesbas", pa.float64()), ("sharefactor", pa.float64()),
+    ("lastupdated", pa.date32()), ("reportperiod", pa.date32()), ("sharesbas", pa.float64()),
+    ("sharefactor", pa.float64()),
 ])  # fmt: skip
 _TICKERS = pa.schema([
     ("table", pa.string()), ("permaticker", pa.int64()), ("ticker", pa.string()),
@@ -73,7 +74,9 @@ class Market:
             self.rows["sep"].append(
                 (ticker, day, close, close * 1.01, close * 0.99, close, close, volume)
             )
-        self.rows["sf1"].append((ticker, "ARQ", self.sessions[0], self.end, shares, 1.0))
+        self.rows["sf1"].append(
+            (ticker, "ARQ", self.sessions[0], self.end, self.sessions[0], shares, 1.0)
+        )
         self.permaticker += 1
         self.rows["tickers"].append(
             ("stocks", self.permaticker, ticker, category, sector, "Software", "7372")

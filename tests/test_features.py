@@ -27,11 +27,11 @@ _SEP = pa.schema([
 ])  # fmt: skip
 _SF1 = pa.schema([
     ("ticker", pa.string()), ("dimension", pa.string()), ("calendardate", pa.date32()),
-    ("datekey", pa.date32()), ("lastupdated", pa.date32()), ("sharesbas", pa.float64()),
-    ("sharefactor", pa.float64()), ("netinc", pa.float64()), ("revenue", pa.float64()),
-    ("fcf", pa.float64()), ("gp", pa.float64()), ("assets", pa.float64()),
-    ("equity", pa.float64()), ("debt", pa.float64()), ("cashneq", pa.float64()),
-    ("liabilities", pa.float64()),
+    ("datekey", pa.date32()), ("lastupdated", pa.date32()), ("reportperiod", pa.date32()),
+    ("sharesbas", pa.float64()), ("sharefactor", pa.float64()), ("netinc", pa.float64()),
+    ("revenue", pa.float64()), ("fcf", pa.float64()), ("gp", pa.float64()),
+    ("assets", pa.float64()), ("equity", pa.float64()), ("debt", pa.float64()),
+    ("cashneq", pa.float64()), ("liabilities", pa.float64()),
 ])  # fmt: skip
 _TICKERS = pa.schema([
     ("table", pa.string()), ("permaticker", pa.int64()), ("ticker", pa.string()),
@@ -79,11 +79,15 @@ class Lake:
             ))  # fmt: skip
         return self
 
-    def files(self, ticker, *, calendardate, datekey, dimension="ART", shares=None, **figures):
-        values = [figures.get(column) for column in _SF1.names[7:]]
-        self.rows["sf1"].append(
-            (ticker, dimension, calendardate, datekey, SESSION, shares, 1.0, *values)
-        )
+    def files(
+        self, ticker, *, calendardate, datekey, dimension="ART", shares=None,
+        lastupdated=SESSION, reportperiod=None, **figures,
+    ):  # fmt: skip
+        values = [figures.get(column) for column in _SF1.names[8:]]
+        period = calendardate if reportperiod is None else reportperiod
+        self.rows["sf1"].append((
+            ticker, dimension, calendardate, datekey, lastupdated, period, shares, 1.0, *values
+        ))  # fmt: skip
         return self
 
     def listed(self, ticker, sector="Technology", *, category="Domestic Common Stock"):
@@ -400,6 +404,26 @@ def test_no_fundamental_is_visible_before_its_datekey(tmp_path):
 
     assert on_the_day["earnings_yield"] == pytest.approx(0.05)
     assert the_day_before["earnings_yield"] == pytest.approx(0.01)  # only March is filed yet
+
+
+def test_a_filing_restated_later_is_read_as_first_filed_before_then(tmp_path):
+    # The vendor corrects June's figures in place on the 20th: same filing, a later
+    # `lastupdated`. A rebalance before the 20th reads the figures as they stood.
+    built = Lake(tmp_path).trades("VAL", flat(LIQUIDITY)).listed("VAL")
+    june, filed, corrected = date(2026, 6, 30), date(2026, 8, 10), date(2026, 8, 20)
+    built.files("VAL", calendardate=june, datekey=filed, lastupdated=filed, **STATEMENTS)
+    built.files(
+        "VAL", calendardate=june, datekey=filed, lastupdated=corrected,
+        **STATEMENTS | {"netinc": 90e6},
+    )  # fmt: skip
+    root = built.land()
+    before = date(2026, 8, 19)
+
+    then = raw(features.compute(universe_of("VAL", as_of=before, session=before), root), "VAL")
+    now = raw(features.compute(universe_of("VAL"), root), "VAL")
+
+    assert then["earnings_yield"] == pytest.approx(0.05)
+    assert now["earnings_yield"] == pytest.approx(0.09)
 
 
 def test_a_year_ago_filing_counts_only_once_filed(tmp_path):
