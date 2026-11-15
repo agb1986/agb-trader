@@ -35,7 +35,7 @@ from test_gate import (
     targets,
 )
 
-from agb import cost, execution, health
+from agb import cost, execution, health, recovery
 from agb.alpaca import AlpacaError, Asset
 from agb.execution import ExecutionError
 from agb.nyse import NyseCalendar
@@ -283,7 +283,7 @@ def test_a_halt_cause_opened_mid_submission_stops_the_remaining_orders(db):
     fake = broker(on_submit=pause_after_five)
     outcome = execution.submit(conn, fake, target, NOW)
 
-    reason = "halt open mid-submission (pause): 5 of 20 orders sent, 0 not cancelled"
+    reason = "halt open mid-submission (pause): 5 of 20 orders sent, 0 still live or filled"
     assert outcome == execution.Outcome(target.id, "halted", 5, reason)
     assert state(db, target.id) == ("halted", 3, "execution", "execution")
     assert rows(
@@ -317,7 +317,7 @@ def test_an_order_that_will_not_cancel_is_named_in_a_partial_rebalance_alert(db)
 
     assert outcome.state == "halted"
     assert outcome.reason == (
-        "halt open mid-submission (pause): 2 of 20 orders sent, 1 not cancelled"
+        "halt open mid-submission (pause): 2 of 20 orders sent, 1 still live or filled"
     )
     assert [e[0] for e in events(db, order_id(db, f"{PERIOD}-N02"))] == [
         "ack",
@@ -331,7 +331,91 @@ def test_an_order_that_will_not_cancel_is_named_in_a_partial_rebalance_alert(db)
             "partial_rebalance_halted",
             PERIOD,
             PERIOD,
-            f"basket {PERIOD} halted mid-submission; still live at the broker: buy 240 N02",
+            f"basket {PERIOD} halted mid-submission; still live or filled at the broker: "
+            "buy 240 N02",
+        )
+    ]
+
+
+def test_an_order_still_being_cancelled_stays_open_and_its_later_fill_is_recorded(db):
+    """Issue #149: the broker has taken the cancel but not carried it out, and fills the order
+    at the close. The halt does not record it as final: it stays open, is named in the alert,
+    and its fill reaches `agb.fill` through the daily snapshot and the operator's reconcile."""
+    conn = db.connect("execution")
+    target = approved(db)
+
+    def pause_after_two(fake, client_order_id):
+        if len(fake.submits()) == 2:
+            db.connect("bot").execute(PAUSE)
+
+    fake = broker(on_submit=pause_after_two)
+    fake.cancel_pending.add("ord-0002")
+    outcome = execution.submit(conn, fake, target, NOW)
+
+    assert outcome.reason == (
+        "halt open mid-submission (pause): 2 of 20 orders sent, 1 still live or filled"
+    )
+    n02 = order_id(db, f"{PERIOD}-N02")
+    assert [e[:2] for e in events(db, n02)] == [
+        ("ack", "accepted"),
+        ("cancel_requested", "pending_cancel"),
+        ("status", "pending_cancel"),
+    ]
+    assert alerts(db) == [
+        (
+            "partial_rebalance_halted",
+            PERIOD,
+            PERIOD,
+            f"basket {PERIOD} halted mid-submission; still live or filled at the broker: "
+            "buy 240 N02 (pending_cancel, 0 filled)",
+        )
+    ]
+
+    fake.close(CLOSE_AT)
+    assert execution.snapshot(conn, fake, TRADE, CALENDAR) is True
+    assert rows(
+        db,
+        "SELECT o.symbol, f.qty FROM agb.fill f JOIN agb.broker_order o ON o.id = f.order_id",
+    ) == [("N02", 240)]
+
+    report = recovery.recover(conn, fake, target.reference, "cli:agb")
+    assert [(w.symbol, w.outcome) for w in report.walked][:2] == [
+        ("N01", recovery.CLOSED),
+        ("N02", recovery.FILLED),
+    ]
+    assert events(db, n02)[-1][:2] == ("reconciled", "filled")
+
+
+def test_an_order_cancelled_after_a_partial_fill_is_named_as_having_moved_the_book(db):
+    """Issue #149: an order the broker cancelled after filling part of it is done, but it moved
+    the book, so the halt names it with its fill rather than counting it among the unmoved."""
+    conn = db.connect("execution")
+    target = approved(db)
+
+    def fill_then_pause(fake, client_order_id):
+        if len(fake.submits()) == 2:
+            fake._set("ord-0001", status="partially_filled", filled_qty=Decimal(100))
+            db.connect("bot").execute(PAUSE)
+
+    fake = broker(on_submit=fill_then_pause)
+    outcome = execution.submit(conn, fake, target, NOW)
+
+    assert outcome.reason == (
+        "halt open mid-submission (pause): 2 of 20 orders sent, 1 still live or filled"
+    )
+    assert {o.status for o in fake.orders.values()} == {"canceled"}
+    assert rows(
+        db,
+        "SELECT kind, status, filled_qty FROM agb.order_state WHERE order_id = %s",
+        order_id(db, f"{PERIOD}-N01"),
+    ) == [("cancelled", "canceled", 100)]
+    assert alerts(db) == [
+        (
+            "partial_rebalance_halted",
+            PERIOD,
+            PERIOD,
+            f"basket {PERIOD} halted mid-submission; still live or filled at the broker: "
+            "buy 240 N01 (canceled, 100 filled)",
         )
     ]
 
@@ -421,7 +505,7 @@ def test_a_pause_set_before_submission_halts_as_a_pause_not_a_gate_breach(db):
 
     outcome = execution.submit(conn, fake, target, NOW)
 
-    reason = "halt open before submission (pause): 0 of 20 orders sent, 0 not cancelled"
+    reason = "halt open before submission (pause): 0 of 20 orders sent, 0 still live or filled"
     assert outcome == execution.Outcome(target.id, "halted", 0, reason)
     assert state(db, target.id) == ("halted", 3, "execution", "execution")
     assert [cause for cause, *_ in halts(db)] == ["pause"]

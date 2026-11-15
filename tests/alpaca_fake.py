@@ -3,13 +3,15 @@
 It behaves as Alpaca paper does at the edges the service cares about: a `client_order_id` it
 has seen is refused with 422 and Alpaca's duplicate code, a fractional quantity on a
 market-on-close order is refused, an order it does not hold is a 404, and a cancel of an order
-that can no longer be cancelled is refused. `close` fills the accepted orders as the closing
-auction would, in as many pieces as the test asks for, and reports each piece as a FILL
-activity. `close_all` answers as Alpaca's 207 Multi-Status does, one entry per position, and
-a symbol in `close_fails` is an entry with a failing status and the broker's message rather
-than an error of the call. The `on_submit` hook runs before each order is accepted, so a
-test can look at the database at that moment, open the halt latch, or lose the broker's
-answer; `on_close_all` does the same before a close-all.
+that can no longer be cancelled is refused. A cancel of an id in `cancel_pending` is taken but
+not carried out, leaving the order `pending_cancel`. `close` fills the accepted orders, those
+still pending a cancel among them, as the closing auction would, in as many pieces as the
+test asks for, and reports each piece as a FILL activity. `close_all` answers as Alpaca's 207
+Multi-Status does, one entry per position, and a symbol in `close_fails` is an entry with a
+failing status and the broker's message rather than an error of the call. The `on_submit`
+hook runs before each order is accepted, so a test can look at the database at that moment,
+open the halt latch, or lose the broker's answer; `on_close_all` does the same before a
+close-all.
 """
 
 from collections.abc import Callable
@@ -66,6 +68,9 @@ class FakeBroker:
     # Symbols whose orders the broker refuses, and broker order ids whose cancel fails.
     refuse: set[str] = field(default_factory=set)
     cancel_fails: set[str] = field(default_factory=set)
+    # Broker order ids whose cancel is accepted but not yet carried out: the order is left
+    # `pending_cancel`, so the closing auction can still fill it.
+    cancel_pending: set[str] = field(default_factory=set)
     # When set, a change to the configuration is refused with this error.
     suspend_fails: AlpacaError | None = None
     # Symbols a close-all cannot close, with the broker's message for each, and an error
@@ -174,7 +179,9 @@ class FakeBroker:
                 status=422,
                 code=42210000,
             )
-        self._set(order_id, status="canceled")
+        self._set(
+            order_id, status="pending_cancel" if order_id in self.cancel_pending else "canceled"
+        )
 
     def _set(self, order_id: str, **changes) -> Order:
         order = self.orders[order_id]
