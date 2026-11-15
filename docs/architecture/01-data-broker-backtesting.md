@@ -150,6 +150,7 @@ Alpaca's paper environment has no costs to compare with, so the cost check is sp
 **Live validates cost.**
 
 - Every live order records a reference price at submission: the NBBO mid at around 15:45 ET.
+  As built, the quotes for every order in a basket are read in one request before the first order goes out, so a name without a quote sends nothing. The request names its feed: `iex` by default, which a free data plan serves in real time but which is the IEX book rather than the consolidated NBBO; the NBBO is the `sip` feed and needs a paid plan.
 - Per-fill shortfall is fill price minus reference, signed by side. It is a database view over the fill and its reference, never a stored column.
 - Once at least 50 live fills exist, the rolling mean shortfall is compared with the rolling mean modelled cost. If it exceeds the model by more than two standard errors, an alert fires. It notifies and never acts, and feeds the same monitoring layer as the tracking alert.
 
