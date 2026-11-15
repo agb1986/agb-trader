@@ -7,6 +7,10 @@
 #   - Every long-running service sets `restart: unless-stopped`. The only one-shots are
 #     `migrate`, `cli`, `certification-import`, `reconcile` and `research`.
 #   - Every service sets an explicit `mem_limit`.
+#   - Every service declares a healthcheck. Each long-running app service checks its own
+#     heartbeat's age (`python -m agb.heartbeat`), so `up --wait` only passes once every service
+#     is beating; db and vpn check themselves; the one-shots disable it and are judged by their
+#     exit status. Only fields Docker Engine 20.10 knows are used: no `start_interval`.
 #   - No service mounts the Docker socket, and `db` publishes no host port.
 #   - No `container_name`, so several copies of the stack can run side by side under
 #     different project names.
@@ -22,6 +26,21 @@ name: agb-trader
 
 x-app-image: &app-image
   image: ${AGB_IMAGE:-agb-trader-app}:${AGB_IMAGE_TAG:-dev}
+
+# Healthy while the row of the role the service connects as is younger than
+# AGB_STALE_AFTER_SECONDS (default five minutes). The first probe runs one interval after the
+# container starts, and a restart starts the count again, so a service that dies inside its
+# first interval never turns healthy.
+x-heartbeat-check: &heartbeat-check
+  test: ["CMD", "python", "-m", "agb.heartbeat"]
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 60s
+
+# The one-shots finish or fail; their exit status is what Compose waits on.
+x-no-healthcheck: &no-healthcheck
+  disable: true
 
 x-pg: &pg
   PGHOST: db
@@ -74,6 +93,7 @@ services:
         condition: service_healthy
     networks: [core]
     restart: "no"
+    healthcheck: *no-healthcheck
     mem_limit: 256m
 
   scheduler:
@@ -89,6 +109,7 @@ services:
         condition: service_completed_successfully
     networks: [core]
     restart: unless-stopped
+    healthcheck: *heartbeat-check
     mem_limit: 192m
 
   # The local UI: server-rendered pages over the database, read-only. It publishes on the
@@ -108,6 +129,7 @@ services:
       # below: the host's loopback address. A loopback bind here would answer nothing, since
       # the published port arrives on the container's own address.
       AGB_UI_HOST: 0.0.0.0
+      AGB_UI_ALLOWED_HOSTS: ${AGB_UI_ALLOWED_HOSTS:-}
     ports:
       - "127.0.0.1:${AGB_UI_PORT:-8080}:8080"
     depends_on:
@@ -115,6 +137,14 @@ services:
         condition: service_completed_successfully
     networks: [core]
     restart: unless-stopped
+    # The heartbeat loop runs beside the HTTP server's thread, so the UI's check also asks the
+    # server itself. HEAD / answers from the routing table without reading the database, which
+    # the heartbeat half has already shown is reachable. The UI refuses a Host it does not know
+    # with a 421, so the check sends the first name in AGB_UI_ALLOWED_HOSTS when that is set,
+    # and the URL's own, 127.0.0.1:8080, one of the default names, when it is not.
+    healthcheck:
+      <<: *heartbeat-check
+      test: ["CMD", "python", "-m", "agb.heartbeat", "http://127.0.0.1:8080/"]
     mem_limit: 192m
 
   # Takes the scheduler's nightly backup job and writes a dated pg_dump into the backup
@@ -138,6 +168,7 @@ services:
         condition: service_completed_successfully
     networks: [core]
     restart: unless-stopped
+    healthcheck: *heartbeat-check
     mem_limit: 160m
 
   # agb-trader's own VPN tunnel: ProtonVPN over WireGuard, with no port forwarding. It exists
@@ -156,6 +187,14 @@ services:
     devices: ["/dev/net/tun:/dev/net/tun"]
     networks: [egress]
     restart: unless-stopped
+    # gluetun's own check, which its image declares too, spelled out here so that every
+    # service's healthcheck is in this file.
+    healthcheck:
+      test: ["CMD-SHELL", "/gluetun-entrypoint healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     mem_limit: 384m
 
   # The Telegram bot, the only service on both networks: it reads the database on core and
@@ -178,6 +217,7 @@ services:
         condition: service_healthy
     networks: [core, egress]
     restart: unless-stopped
+    healthcheck: *heartbeat-check
     mem_limit: 192m
 
   # Takes the scheduler's data_pull job for each session and lands Sharadar's SEP, SF1 and
@@ -210,6 +250,7 @@ services:
         condition: service_completed_successfully
     networks: [core]
     restart: unless-stopped
+    healthcheck: *heartbeat-check
     mem_limit: 2176m
 
   # Execution: the only service with broker keys. It submits the approved basket's
@@ -229,6 +270,7 @@ services:
         condition: service_completed_successfully
     networks: [core]
     restart: unless-stopped
+    healthcheck: *heartbeat-check
     mem_limit: 192m
 
   # The operator CLI: `make status`, or `make agb CMD="..."`. `agb promote` verifies the
@@ -243,6 +285,9 @@ services:
       PGUSER: cli
       PGPASSWORD: ${CLI_DB_PASSWORD:?set in env/db.env}
       AGB_MODELS_DIR: /models
+      # Who `agb status` insists is beating; empty means every service. `make status` leaves
+      # the bot out unless the telegram profile runs.
+      AGB_EXPECTED_SERVICES: ${AGB_EXPECTED_SERVICES:-}
     volumes:
       - ${AGB_MODELS_DIR:-./models}:/models:ro
     depends_on:
@@ -250,6 +295,7 @@ services:
         condition: service_healthy
     networks: [core]
     restart: "no"
+    healthcheck: *no-healthcheck
     mem_limit: 256m
 
   # The one service that runs as `research`: recording a certification is the research
@@ -273,6 +319,7 @@ services:
         condition: service_healthy
     networks: [core]
     restart: "no"
+    healthcheck: *no-healthcheck
     mem_limit: 256m
 
   # `make reconcile REF=2026-10`, after a submission died mid-flight. It asks the broker what
@@ -293,6 +340,7 @@ services:
         condition: service_healthy
     networks: [core]
     restart: "no"
+    healthcheck: *no-healthcheck
     mem_limit: 256m
 
   # Workstation research: `make research CMD="cpcv"`. It reads a lake `make sync-lake` has
@@ -323,6 +371,7 @@ services:
     # feed of every name any of them could trade, which is tens of millions of daily bars held
     # as engine objects at once. Sixteen gigabytes killed it seventy minutes in. This is the
     # workstation's own limit and is not what the server's sizing run measures.
+    healthcheck: *no-healthcheck
     mem_limit: 40g
 
 volumes:

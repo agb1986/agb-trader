@@ -79,9 +79,13 @@ That runs `scripts/deploy/deploy.sh`, which:
    `releases/<tag>/`.
 6. Runs `agb-stack activate <tag>` on the server. That moves `previous` to the release that
    was running and `current` to the new one, then runs `docker compose up --wait`. `migrate`
-   applies any new migrations before the services start. Once the stack is up, it prunes old
-   releases and images.
-7. Prints `agb-stack status`: each service's last heartbeat and the version it runs.
+   applies any new migrations before the services start. `--wait` returns only once every
+   service reports healthy, and each app service is healthy only while its own heartbeat is
+   younger than five minutes, so a service that crash-loops or never beats fails the deploy
+   instead of passing it. Once the stack is up, it prunes old releases and images.
+7. Prints `agb-stack status`: each service's last heartbeat and the version it runs. It exits
+   1, and so fails the deploy, if any service has never beaten or last beat more than five
+   minutes ago.
 
 `AGB_DEPLOY_HOST` (default `casaos.local`) and `AGB_DEPLOY_DIR` (default
 `/mnt/data/AppData/agb-trader`) point it elsewhere:
@@ -93,7 +97,8 @@ AGB_DEPLOY_HOST=other.local make deploy
 Deploying the commit that is already running restarts nothing that has not changed.
 
 If the stack does not come up, the deploy stops with an error. `current` already points at the
-new release, so `make rollback` returns to the one that was running.
+new release, so `make rollback` returns to the one that was running. A rollback ends with the
+same `status`, so it too fails while a service is stale.
 
 ## Rolling back
 
@@ -114,12 +119,26 @@ for. See [migrations/README.md](../../migrations/README.md).
 On the server, in the deploy directory:
 
 ```sh
-./agb-stack status                 # each service's last heartbeat and its age
+./agb-stack status                 # each service's last heartbeat and its age; exits 1 if one is stale
 ./agb-stack tags                   # the current and previous release
 ./agb-stack ps                     # the containers
 ./agb-stack logs --follow backup   # any other command goes to docker compose
 ./agb-stack agb <command>          # run an agb CLI command
 ```
+
+`status` names on stderr each service that has never beaten or last beat longer ago than
+`AGB_STALE_AFTER_SECONDS` (default 300), and exits 1 if there is one. On the server every
+service is expected, the bot included. `AGB_EXPECTED_SERVICES`, a list of service names, narrows
+that: `make status` on the workstation sets it to every service but the bot unless
+`COMPOSE_PROFILES` includes `telegram`.
+
+`./agb-stack ps` shows each container's health. A long-running app service runs
+`python -m agb.heartbeat` every 30 seconds, which fails once the service's own heartbeat is
+stale; three failures in a row mark it unhealthy. The UI's check also sends its own server a
+`HEAD http://127.0.0.1:8080/`, because that server runs in a thread beside the heartbeat loop
+and could stop answering while the loop still beats. The request is addressed to the first name
+in `AGB_UI_ALLOWED_HOSTS` when that is set, so replacing the list does not fail the check. Docker does not restart an unhealthy
+container, so an unhealthy service is a signal to read its logs, not something that heals itself.
 
 ## The local UI
 
@@ -132,12 +151,19 @@ ssh -N -L 8080:127.0.0.1:8080 casaos.local   # then open http://127.0.0.1:8080
 
 SSH is the authentication: there is no login page, and nothing outside the server can open the
 port. The home page is the decision log, one row per rebalance with the health banner above it;
-`Rebalance`, `Positions`, `Gate` and `Alerts` are the views behind it. Nothing on these pages
-writes to the database — the connection is read-only in Postgres — so approving a basket and the
-kill switch stay in Telegram until the write path lands.
+`Rebalance`, `Positions`, `Gate` and `Alerts` are the views behind it. A page is read on a
+connection that is read-only in Postgres; approving or rejecting a basket and the kill switch are
+forms that post to the UI's write routes, the same answers Telegram gives.
 
 Set `AGB_UI_PORT` in the deploy directory's `.env` if 8080 is taken on the server; the container
 still listens on 8080, so the tunnel's right-hand side does not change.
+
+Open the UI as `http://127.0.0.1:8080` or `http://localhost:8080`, so keep the tunnel's left-hand
+side on local port 8080. The UI answers only requests addressed to those two names and refuses
+any other `Host` with a 421. This is what stops a page on another site that rebinds its own name
+to the loopback address. A write must also send an `Origin` naming one of them, so a POST from
+curl needs `-H 'Origin: http://127.0.0.1:8080'`. The `AGB_UI_ALLOWED_HOSTS` variable
+(comma-separated `host:port`), set in the deploy directory's `.env`, replaces the list.
 
 ## Backups
 
@@ -201,7 +227,8 @@ To query the lake with DuckDB, and to see the latest snapshots:
 ```
 
 The views are `sep`, `sf1`, which shows the latest version of each fundamentals row, and
-`tickers`, which shows the newest snapshot.
+`tickers`, which shows the newest snapshot. `sf1_as_of('2020-06-30')` shows the fundamentals
+as they were known on that day, which is what research and replays read.
 
 ## Promoting a model
 

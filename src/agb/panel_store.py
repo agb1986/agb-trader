@@ -6,9 +6,11 @@ once, under the SHA-256 of its uncompressed bytes, and the database refers to it
 
     <root>/<sha[:2]>/<sha>.zst
 
-A body is written to a temporary file in its directory and renamed into place, so a reader
-never sees a partial file. Storing bytes that are already present is a no-op: the hash names
-the content, so the file on disk is already right.
+A body is written to a temporary file in its directory and renamed into place, and the
+directory is synced after the rename, so a reader never sees a partial file and a crash cannot
+lose a body the database already names. Storing bytes that are already present is a no-op when
+the file on disk still decompresses to them; a body that has gone bad (truncated, bit-rotted,
+overwritten) is rewritten from the bytes in hand, so the next run repairs it.
 """
 
 from __future__ import annotations
@@ -34,6 +36,15 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _sync_dir(directory: Path) -> None:
+    """Make a rename in `directory` durable: the file's own fsync does not cover its entry."""
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class PanelStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
@@ -42,11 +53,17 @@ class PanelStore:
         return self.root / digest[:2] / f"{digest}.zst"
 
     def put(self, data: bytes) -> str:
-        """Store `data` and return its SHA-256. Storing identical content again writes nothing."""
+        """Store `data` and return its SHA-256. Storing identical content again writes nothing,
+        unless the body on disk no longer matches its hash, in which case it is rewritten."""
         digest = sha256(data)
         target = self.path(digest)
         if target.exists():
-            return digest
+            try:
+                self.get(digest)
+            except StoreError:
+                pass
+            else:
+                return digest
         target.parent.mkdir(parents=True, exist_ok=True)
         compressed = zstandard.ZstdCompressor(level=LEVEL).compress(data)
         fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{digest}.", suffix=".tmp")
@@ -59,6 +76,7 @@ class PanelStore:
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
+        _sync_dir(target.parent)
         return digest
 
     def put_text(self, text: str) -> str:

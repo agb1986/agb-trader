@@ -10,7 +10,7 @@ Needs Docker with Compose v2, GNU Make and [uv](https://docs.astral.sh/uv/).
 ```sh
 make env      # copy each env/*.env.example to env/*.env; set real passwords in env/db.env
 make up       # build the image, create the roles, migrate, start the services
-make status   # each service's last heartbeat and its age
+make status   # each service's last heartbeat and its age; fails if one is stale or missing
 make down     # stop the stack; the database volume is kept
 ```
 

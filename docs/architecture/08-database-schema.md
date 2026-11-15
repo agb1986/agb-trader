@@ -68,7 +68,7 @@ Rejected: a single boolean latch with a free-text reason, where a second cause a
 
 ## Orders, fills and positions
 
-**Order intent is written before the broker is called.** The `order` row is inserted before the HTTP call. It holds the deterministic `client_order_id`, symbol, side, quantity and time-in-force `cls`. It also holds the modelled cost in basis points with its cost-model version, frozen at basket construction because σ and ADV depend on the snapshot. The NBBO reference mid is captured on it at submission. A crash between the call and the acknowledgement is then recovered by lookup rather than guesswork.
+**Order intent is written before the broker is called.** The `order` row is inserted before the HTTP call. It holds the deterministic `client_order_id`, symbol, side, quantity and time-in-force `cls`. It also holds the modelled cost in basis points with its cost-model version, frozen at basket construction because σ and ADV depend on the snapshot. The reference mid is captured on it at submission, from quotes read for the whole basket in one request before its first order is sent. A crash between the call and the acknowledgement is then recovered by lookup rather than guesswork.
 
 `order_event` is append-only: the broker acknowledgement with Alpaca's order id, status changes, and cancel requests and their results. Each broker fill is its own `fill` row, so a partial fill is several rows, with price, quantity, timestamp and the regulatory fees computed from the schedule.
 
@@ -152,7 +152,7 @@ Rejected: everything in Postgres, which grows the dump by hundreds of megabytes 
 | panel pre-flight results, spot-check verdicts | cli (all four checks, verdicts), pipeline (recall runs) | no |
 | `heartbeat` | every service | upsert |
 | `expected_event` | scheduler (create), fulfilling service (completion reference) | completion by append or reference, never rewrite |
-| `alert`, `alert_event` | bot, ui, execution, scheduler | no |
+| `alert`, `alert_event` | bot, ui, execution, scheduler, pipeline (`alert` only, for a job that failed) | no |
 | `dividend` | cli, ui (the operator, from a broker statement) | no |
 
 Views: current basket state, open halt causes, audit log, shortfall, eligibility (ladder and mode), overdue expected events, reconcile state (each planned order beside what the broker last said about it), per-fill and live cost shortfall, equity by New York month, and the promoted certification's alert thresholds.

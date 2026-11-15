@@ -54,12 +54,101 @@ def test_status_reads_heartbeats_as_the_cli_role(db):
     assert lines[2].split()[:2] == ["pipeline", "never"]
 
 
-def test_main_status(db, monkeypatch, capsys):
+def beat_every(db, services=cli.SERVICES):
+    for service in services:
+        heartbeat.beat(db.connect(service), datetime.now(UTC), "abc123")
+
+
+def beat_long_ago(db, service, age="6 minutes"):
+    conn = db.connect(service)
+    heartbeat.beat(conn, datetime.now(UTC), "abc123")
+    conn.execute(
+        "UPDATE agb.heartbeat SET beat_at = now() - %s::interval WHERE service = current_user",
+        [age],
+    )
+
+
+@pytest.fixture
+def as_cli(db, monkeypatch):
     for key, value in db.pg_env("cli").items():
         monkeypatch.setenv(key, value)
+    monkeypatch.delenv("AGB_EXPECTED_SERVICES", raising=False)
+    monkeypatch.delenv("AGB_STALE_AFTER_SECONDS", raising=False)
+
+
+def test_main_status(db, as_cli, capsys):
+    beat_every(db)
 
     assert cli.main(["status"]) == 0
-    assert "SERVICE" in capsys.readouterr().out
+    out, err = capsys.readouterr()
+    assert "SERVICE" in out
+    assert err == ""
+
+
+def test_main_status_fails_on_a_stale_heartbeat(db, as_cli, capsys):
+    beat_every(db, [s for s in cli.SERVICES if s != "execution"])
+    beat_long_ago(db, "execution")
+
+    assert cli.main(["status"]) == 1
+    out, err = capsys.readouterr()
+    assert "execution" in out, "the table is still printed"
+    assert err.splitlines() == ["agb: execution is stale: last beat 6m 0s ago"]
+
+
+def test_main_status_fails_on_a_service_that_never_beat(db, as_cli, capsys):
+    beat_every(db, [s for s in cli.SERVICES if s != "bot"])
+
+    assert cli.main(["status"]) == 1
+    assert capsys.readouterr().err.splitlines() == ["agb: bot has never beaten"]
+
+
+def test_main_status_expects_only_the_named_services(db, as_cli, monkeypatch, capsys):
+    """Where the telegram profile is off there is no bot to wait for."""
+    beat_every(db, [s for s in cli.SERVICES if s != "bot"])
+    monkeypatch.setenv("AGB_EXPECTED_SERVICES", "scheduler,pipeline execution ui backup")
+
+    assert cli.main(["status"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_main_status_takes_the_stale_window_from_the_environment(db, as_cli, monkeypatch):
+    beat_every(db, [s for s in cli.SERVICES if s != "ui"])
+    beat_long_ago(db, "ui", "2 minutes")
+
+    assert cli.main(["status"]) == 0
+    monkeypatch.setenv("AGB_STALE_AFTER_SECONDS", "60")
+    assert cli.main(["status"]) == 1
+
+
+def test_unhealthy_names_each_expected_service_that_is_stale_or_missing():
+    beat_at = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    rows = [
+        ("scheduler", beat_at, timedelta(seconds=30), None),
+        ("pipeline", beat_at, timedelta(minutes=5), None),
+        ("ui", beat_at, timedelta(minutes=5, seconds=1), None),
+        ("zeta", beat_at, timedelta(days=1), None),
+    ]
+
+    found = cli.unhealthy(rows, ("scheduler", "pipeline", "ui", "bot"), timedelta(minutes=5))
+
+    assert found == ["ui is stale: last beat 5m 1s ago", "bot has never beaten"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, cli.SERVICES),
+        ("", cli.SERVICES),
+        ("scheduler ui", ("scheduler", "ui")),
+        (" scheduler, ui ,backup", ("scheduler", "ui", "backup")),
+    ],
+)
+def test_expected_services_come_from_the_environment(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("AGB_EXPECTED_SERVICES", raising=False)
+    else:
+        monkeypatch.setenv("AGB_EXPECTED_SERVICES", value)
+    assert cli.expected_services() == expected
 
 
 def test_main_reports_connection_errors(db, monkeypatch, capsys):

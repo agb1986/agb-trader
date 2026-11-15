@@ -17,11 +17,15 @@ the UI declares and nothing else. The pages are server-rendered HTML with no Jav
 there is nothing to build and nothing to serve besides the pages themselves.
 
 A form on another site can post here without any cookie of ours, since the tunnel is the only
-credential and the browser already holds it, so a cross-origin POST is refused before the form
-is read: a request that declares an `Origin` must declare this one. The refusal is logged and
-not recorded, because such a request names no operator and the audit log records what operators
-did. A request that sends no `Origin` at all is a client that is not a browser form, which on
-this surface is the operator's own curl.
+credential and the browser already holds it. Comparing a request's `Origin` with its own `Host`
+is not enough: a page that rebinds its own name to the loopback address sends a matching pair.
+So every request must be addressed to one of the names in `AGB_UI_ALLOWED_HOSTS` — by default
+the two the tunnel is opened as, `127.0.0.1:8080` and `localhost:8080` — and anything else is a
+421 before a page is rendered. A write must also declare an `Origin`, and it must be one of the
+same names; one that declares none, or another, is refused before the form is read. The
+refusals are logged and not recorded, because such a request names no operator and the audit
+log records what operators did. Every response forbids framing, content-type sniffing and the
+`Referer`, since a page here carries one-click writes and the basket reference.
 
 The main thread runs the heartbeat loop on its own connection, since a heartbeat is a write;
 the server runs in a daemon thread beside it. SIGTERM stops the loop, which shuts the server
@@ -50,10 +54,41 @@ PORT = 8080
 ACTOR = "ui"
 # The most a posted form may carry. The longest field any page has is a rejection reason.
 BODY_MAX = 4096
+# The names a request may be addressed to: the two the operator's tunnel opens the UI as. A
+# tunnel forwarded to another local port sets AGB_UI_ALLOWED_HOSTS, comma-separated host:port.
+ALLOWED_HOSTS = ("127.0.0.1:8080", "localhost:8080")
+# Sent on every response, refusals and the stdlib's own errors included. The pages are inline
+# HTML and CSS posting forms to themselves, so the policy allows exactly that and nothing else.
+# The referrer policy is `same-origin`, not `no-referrer`: under `no-referrer` a browser sends
+# `Origin: null` on the page's own form posts, which the write check refuses, so every form here
+# would fail. `same-origin` still sends no `Referer` to any other site.
+SECURITY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": (
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; "
+        "frame-ancestors 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+}
 
 
 def host_from_env() -> str:
     return os.environ.get("AGB_UI_HOST", HOST)
+
+
+def allowed_hosts_from_env() -> frozenset[str]:
+    """The `Host` values this server answers, lower-cased: AGB_UI_ALLOWED_HOSTS when it names
+    any, the tunnel's two names otherwise."""
+    configured = os.environ.get("AGB_UI_ALLOWED_HOSTS", "")
+    names = [name.strip().lower() for name in configured.split(",") if name.strip()]
+    return frozenset(names or ALLOWED_HOSTS)
+
+
+class Server(ThreadingHTTPServer):
+    """The HTTP server, carrying the `Host` names its handlers answer."""
+
+    allowed_hosts: frozenset[str] = frozenset(ALLOWED_HOSTS)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -66,6 +101,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         """One of the UI's write paths. The handler is passed the fields the form posted and
         answers with a page carrying the reply."""
+        if not self._allowed_host():
+            return
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         write = ui.WRITES.get(path)
         if write is None:
@@ -75,6 +112,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(404, ui.not_found(path))
             return
         if not self._same_origin():
+            self.close_connection = True
             self._respond(403, "<!doctype html>\n<p>That request did not come from here.\n")
             return
         fields = self._fields()
@@ -90,19 +128,27 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._respond(200, body)
 
+    def _allowed_host(self) -> bool:
+        """Whether the request is addressed to one of the allowed names, answering a 421 when it
+        is not. A browser sends the name it looked up, so a page on another site that rebinds
+        its own name to this address arrives carrying that name and is refused here."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        if host in self.server.allowed_hosts:
+            return True
+        log.warning("refused a %s to %s addressed to host %r", self.command, self.path, host)
+        # A refused POST's body is never read, so the connection cannot carry another request.
+        self.close_connection = True
+        self._respond(421, "<!doctype html>\n<p>That request was not addressed to this server.\n")
+        return False
+
     def _same_origin(self) -> bool:
-        """Whether a POST that declares an origin declares this server's. A browser sends
-        `Origin` on every form post, so an origin that is not the host the request was addressed
-        to is another site's form. Comparing against the request's own `Host` is what makes the
-        tunnel work: the operator reaches the same server as localhost on whatever port they
-        forwarded it to."""
-        origin = self.headers.get("Origin")
-        if origin is None:
+        """Whether a POST declares an origin that is one of the allowed names. A browser sends
+        `Origin` on every form post, so one that is missing or names another host is not a form
+        from one of these pages; the operator's own curl passes `-H 'Origin: ...'`."""
+        origin = (self.headers.get("Origin") or "").strip().lower()
+        if origin in {f"http://{host}" for host in self.server.allowed_hosts}:
             return True
-        host = self.headers.get("Host")
-        if host and origin in (f"http://{host}", f"https://{host}"):
-            return True
-        log.warning("refused a %s to %s from origin %s", self.command, self.path, origin)
+        log.warning("refused a %s to %s from origin %r", self.command, self.path, origin or None)
         return False
 
     def _fields(self) -> dict[str, str] | None:
@@ -119,6 +165,8 @@ class Handler(BaseHTTPRequestHandler):
         return {key: values[0] for key, values in parse_qs(body, keep_blank_values=True).items()}
 
     def do_GET(self) -> None:  # noqa: N802  (the stdlib's method name)
+        if not self._allowed_host():
+            return
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         view = ui.ROUTES.get(path)
         try:
@@ -133,6 +181,8 @@ class Handler(BaseHTTPRequestHandler):
         self._respond(200 if view else 404, body)
 
     def do_HEAD(self) -> None:  # noqa: N802
+        if not self._allowed_host():
+            return
         self._respond(200 if ui.ROUTES.get(self.path.rstrip("/") or "/") else 404, "", head=True)
 
     def _respond(
@@ -150,13 +200,21 @@ class Handler(BaseHTTPRequestHandler):
         if not head:
             self.wfile.write(encoded)
 
+    def end_headers(self) -> None:
+        """Every response's headers end here, the stdlib's own error pages included, so this is
+        where the framing, sniffing and referrer protections are added."""
+        for name, value in SECURITY_HEADERS.items():
+            self.send_header(name, value)
+        super().end_headers()
+
     def log_message(self, format: str, *args) -> None:
         log.info("%s %s", self.address_string(), format % args)
 
 
-def server() -> ThreadingHTTPServer:
-    httpd = ThreadingHTTPServer((host_from_env(), PORT), Handler)
+def server() -> Server:
+    httpd = Server((host_from_env(), PORT), Handler)
     httpd.daemon_threads = True
+    httpd.allowed_hosts = allowed_hosts_from_env()
     return httpd
 
 

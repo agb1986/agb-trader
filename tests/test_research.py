@@ -6,10 +6,15 @@ two dozen names from 2022 to August 2026, so thirty month-ends from January 2024
 settled label."""
 
 import json
+import subprocess
+import sys
+import threading
 from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from research_fake import END, PANEL_START, Market
 
@@ -322,10 +327,9 @@ def test_the_declared_count_is_configurations_searched_not_rows(ledger):
     """Eight rows, four configurations searched.
 
     The scan, the backtest and the walkforward are three. The backtest that crashed, the rerun
-    of it and the reproduction of that are the same configuration however often it is run, and
-    the attempt that never produced a result is nothing to select on. The certification is the
-    fourth; the cross-validation and the backtest it ran inside itself are how it was evaluated,
-    not two more configurations tried.
+    of it and the reproduction of that are the same configuration however often it is run. The
+    certification is the fourth; the cross-validation and the backtest it ran inside itself are
+    how it was evaluated, not two more configurations tried.
     """
     with open_trial(ledger, kind="scan"):
         pass
@@ -344,6 +348,7 @@ def test_the_declared_count_is_configurations_searched_not_rows(ledger):
         pass
     assert ledger.count() == 8
     assert ledger.declared() == 4
+    assert ledger.declared(rule="configurations") == 4
     # What every certification up to lgbm-2026-10 declared, and what their manifests are still
     # read under.
     assert ledger.declared(rule="rows") == 8
@@ -361,8 +366,247 @@ def test_a_run_killed_without_writing_its_end_does_not_swallow_the_trials_after_
     with open_trial(ledger, kind="walkforward"):
         pass
     rows = [killed, *ledger.rows()[1:]]
+    assert trials.declared(rows, rule="configurations") == 2
+    assert trials.declared(rows, rule="configurations", current=killed["trial_id"]) == 1
+    # The scan and the walkforward name no parent, so they are their own runs whichever row is
+    # open, and the killed certification was started, so it counts too.
+    assert trials.declared(rows) == 3
+    assert trials.declared(rows, current=killed["trial_id"]) == 3
+
+
+def test_a_failed_trial_counts_as_one_more_trial(ledger):
+    """A configuration tried once that fell over is a trial the search spent, so a failure, or
+    an interrupt, raises the declared count by one where the configuration rule ignored it."""
+    with open_trial(ledger, kind="scan"):
+        pass
+    before = ledger.declared()
+    with pytest.raises(RuntimeError, match="boom"):
+        with open_trial(ledger, kind="backtest"):
+            raise RuntimeError("boom")
+    assert ledger.declared() == before + 1
+    with pytest.raises(KeyboardInterrupt):
+        with open_trial(ledger, kind="walkforward"):
+            raise KeyboardInterrupt
+    assert ledger.declared() == before + 2
+    assert ledger.declared(rule="configurations") == before
+
+
+def test_a_trial_inside_another_names_it_as_its_parent(ledger, tmp_path):
+    with open_trial(ledger, kind="certification") as outer:
+        with open_trial(ledger, kind="cpcv") as inner:
+            with open_trial(Ledger(tmp_path / "other.parquet"), kind="scan"):
+                pass
+        with open_trial(ledger, kind="backtest"):
+            pass
+    with open_trial(ledger, kind="scan"):
+        pass
+    parents = {row["kind"]: row["parent"] for row in ledger.rows()}
+    assert parents == {
+        "certification": None,
+        "cpcv": outer.trial_id,
+        "backtest": outer.trial_id,
+        "scan": None,
+    }
+    assert ledger.get(inner.trial_id)["parent"] == outer.trial_id
+    # A trial on another ledger is nobody's child here, nor is the trial open there its parent.
+    [other] = Ledger(tmp_path / "other.parquet").rows()
+    assert other["parent"] is None
+
+
+def test_a_run_that_overlaps_another_without_being_its_child_still_counts(ledger):
+    """A scan started from another terminal while a certification was open sits inside its
+    interval, which the clock rule read as one of its children. It was not opened inside the
+    certification, so it names no parent and counts. A thread starts with a fresh context, as
+    another process would."""
+
+    def other_terminal():
+        with open_trial(ledger, kind="scan", features=("mom_6_1",)):
+            pass
+
+    with open_trial(ledger, kind="certification") as outer:
+        with open_trial(ledger, kind="cpcv"):
+            pass
+        thread = threading.Thread(target=other_terminal)
+        thread.start()
+        thread.join()
+    rows = ledger.rows()
+    assert {r["kind"]: r["parent"] for r in rows} == {
+        "certification": None,
+        "cpcv": outer.trial_id,
+        "scan": None,
+    }
+    assert trials.declared(rows, rule="configurations") == 1
     assert trials.declared(rows) == 2
-    assert trials.declared(rows, current=killed["trial_id"]) == 1
+
+
+def test_a_row_is_rooted_at_the_run_it_names_as_its_parent_not_the_run_around_it(ledger):
+    """A certification started from another terminal while one is open runs its backtest inside
+    the first one's interval, and its root is still the certification that opened it. Rows from
+    before the chain are rooted by their interval."""
+    legacy = [{**row, "parent": None, "previous": None} for row in _legacy_rows(ledger)]
+
+    def other_terminal(opened):
+        with open_trial(ledger, kind="certification", features=("mom_6_1",)) as theirs:
+            with open_trial(ledger, kind="backtest") as backtest:
+                opened.extend([theirs.trial_id, backtest.trial_id])
+
+    opened: list[str] = []
+    with open_trial(ledger, kind="certification") as outer:
+        with open_trial(ledger, kind="backtest") as mine:
+            pass
+        thread = threading.Thread(target=other_terminal, args=(opened,))
+        thread.start()
+        thread.join()
+    theirs, their_backtest = opened
+    rows = ledger.rows()
+    assert their_backtest in trials.nested(rows, current=None)
+    roots = trials.roots(rows)
+    assert roots[mine.trial_id]["trial_id"] == outer.trial_id
+    assert roots[their_backtest]["trial_id"] == theirs
+    assert roots[theirs]["trial_id"] == theirs
+    by_kind = {row["kind"]: row for row in legacy}
+    old = trials.roots(legacy)
+    assert old[by_kind["cpcv"]["trial_id"]] == by_kind["certification"]
+    assert all(old[r["trial_id"]] is r for r in legacy if r["kind"] != "cpcv")
+
+
+def test_the_started_count_never_falls_below_the_configuration_count(ledger):
+    """Over a ledger holding every kind of row the change could affect, the new rule counts at
+    least as many trials as the rule it replaces: rows from before the chain, a run killed before
+    it wrote its end and the runs inside it, failures, reruns and nested runs."""
+    legacy = [{**row, "parent": None, "previous": None} for row in _legacy_rows(ledger)]
+    with open_trial(ledger, kind="scan"):
+        pass
+    with pytest.raises(RuntimeError):
+        with open_trial(ledger, kind="backtest", features=("mom_6_1",)):
+            raise RuntimeError("boom")
+    with open_trial(ledger, kind="backtest", features=("mom_6_1",)):
+        pass
+    with open_trial(ledger, kind="certification") as outer:
+        with open_trial(ledger, kind="cpcv"):
+            pass
+        with open_trial(ledger, kind="backtest"):
+            pass
+        killed = ledger.get(outer.trial_id)
+    chained = ledger.rows()
+    rows = [*legacy, *[killed if r["trial_id"] == killed["trial_id"] else r for r in chained]]
+    for current in (None, killed["trial_id"]):
+        for upto in range(len(rows) + 1):
+            prefix = rows[:upto]
+            assert trials.declared(prefix, current=current) >= trials.declared(
+                prefix, rule="configurations", current=current
+            )
+
+
+def _legacy_rows(ledger: Ledger) -> list[dict]:
+    """Rows as a ledger from before the chain holds them: a certification and what it nested,
+    a scan that failed, and a scan that succeeded, with no parent and no link."""
+    scratch = Ledger(ledger.path.with_name("legacy.parquet"))
+    with open_trial(scratch, kind="certification", partition_hash="old"):
+        with open_trial(scratch, kind="cpcv", partition_hash="old"):
+            pass
+    with pytest.raises(RuntimeError):
+        with open_trial(scratch, kind="scan", partition_hash="old"):
+            raise RuntimeError("boom")
+    with open_trial(scratch, kind="scan", partition_hash="old", features=("mom_6_1",)):
+        pass
+    return scratch.rows()
+
+
+def test_every_row_links_to_the_one_before(ledger):
+    with open_trial(ledger, kind="certification"):
+        with open_trial(ledger, kind="cpcv"):
+            pass
+    with pytest.raises(RuntimeError):
+        with open_trial(ledger, kind="scan"):
+            raise RuntimeError("boom")
+    rows = ledger.rows()
+    assert rows[0]["previous"] == trials.GENESIS
+    assert [r["previous"] for r in rows[1:]] == [trials.link(r) for r in rows[:-1]]
+    ledger.verify()
+
+
+@pytest.mark.parametrize(
+    ("tamper", "problem"),
+    [
+        (lambda rows: [rows[0], *rows[2:]], "row 1, trial .* does not link to the row before it"),
+        (lambda rows: rows[1:], "row 0, trial .* does not link to the row before it"),
+        (lambda rows: [rows[0], rows[2], rows[1], rows[3]], "does not link"),
+        (lambda rows: [*rows[:2], {**rows[2], "kind": "scan"}, rows[3]], "row 3, .* does not link"),
+        (lambda rows: [*rows, rows[1]], "appears twice"),
+        (
+            lambda rows: [*rows[:3], {**rows[3], "previous": None}],
+            "has no link but follows rows that do",
+        ),
+    ],
+    ids=["middle row removed", "first row removed", "rows swapped", "row rewritten",
+         "row repeated", "link stripped"],
+)  # fmt: skip
+def test_a_ledger_whose_chain_is_broken_is_refused(ledger, tamper, problem):
+    for kind in ("scan", "backtest", "walkforward", "cpcv"):
+        with open_trial(ledger, kind=kind):
+            pass
+    rows = tamper(ledger.rows())
+    ledger._write(rows)
+    with pytest.raises(LedgerError, match=f"chain through .* is broken: .*{problem}"):
+        ledger.verify()
+
+
+def test_rows_from_before_the_chain_are_read_and_the_chain_starts_after_them(ledger):
+    """A ledger written before the `parent` and `previous` columns existed reads with both
+    empty, and the first trial appended to it links to its last row."""
+    legacy = _legacy_rows(ledger)
+    old = trials.SCHEMA.remove(trials.SCHEMA.get_field_index("previous"))
+    old = old.remove(old.get_field_index("parent"))
+    pq.write_table(pa.Table.from_pylist(legacy, schema=old), ledger.path)
+    assert [r["previous"] for r in ledger.rows()] == [None] * len(legacy)
+    ledger.verify()
+    before = ledger.declared(rule="configurations")
+    with open_trial(ledger, kind="walkforward"):
+        pass
+    rows = ledger.rows()
+    assert rows[-1]["previous"] == trials.link(rows[-2])
+    ledger.verify()
+    assert ledger.declared() >= before + 1
+
+
+_WRITER = """
+import sys
+from datetime import date
+from pathlib import Path
+
+from agb.research.trials import Ledger
+
+ledger = Ledger(Path(sys.argv[1]))
+for i in range(int(sys.argv[3])):
+    with ledger.trial(
+        sys.argv[2], {"i": i}, features=("mom_12_1",), train_start=date(2024, 1, 31),
+        train_end=date(2025, 12, 31), partition_hash="abc", cost_model_version="v1",
+    ):
+        pass
+"""
+
+
+def test_two_writers_at_once_both_keep_their_rows(ledger):
+    """Two processes appending to one ledger at the same time: every row of each lands, the
+    rows still chain, and no temporary file is left behind."""
+    each = 25
+    writers = [
+        subprocess.Popen([sys.executable, "-c", _WRITER, str(ledger.path), kind, str(each)])
+        for kind in ("scan", "backtest")
+    ]
+    assert [writer.wait(timeout=300) for writer in writers] == [0, 0]
+    rows = ledger.rows()
+    assert len(rows) == 2 * each
+    assert {(r["kind"], r["status"]) for r in rows} == {
+        ("scan", "succeeded"),
+        ("backtest", "succeeded"),
+    }
+    assert sorted(json.loads(r["config"])["i"] for r in rows if r["kind"] == "scan") == list(
+        range(each)
+    )
+    ledger.verify()
+    assert not list(ledger.path.parent.glob("*.tmp"))
 
 
 def test_an_unknown_trial_count_rule_is_refused(ledger):

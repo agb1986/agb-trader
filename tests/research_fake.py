@@ -31,11 +31,11 @@ _SEP = pa.schema([
 ])  # fmt: skip
 _SF1 = pa.schema([
     ("ticker", pa.string()), ("dimension", pa.string()), ("calendardate", pa.date32()),
-    ("datekey", pa.date32()), ("lastupdated", pa.date32()), ("sharesbas", pa.float64()),
-    ("sharefactor", pa.float64()), ("netinc", pa.float64()), ("revenue", pa.float64()),
-    ("fcf", pa.float64()), ("gp", pa.float64()), ("assets", pa.float64()),
-    ("equity", pa.float64()), ("debt", pa.float64()), ("cashneq", pa.float64()),
-    ("liabilities", pa.float64()),
+    ("datekey", pa.date32()), ("lastupdated", pa.date32()), ("reportperiod", pa.date32()),
+    ("sharesbas", pa.float64()), ("sharefactor", pa.float64()), ("netinc", pa.float64()),
+    ("revenue", pa.float64()), ("fcf", pa.float64()), ("gp", pa.float64()),
+    ("assets", pa.float64()), ("equity", pa.float64()), ("debt", pa.float64()),
+    ("cashneq", pa.float64()), ("liabilities", pa.float64()),
 ])  # fmt: skip
 _TICKERS = pa.schema([
     ("table", pa.string()), ("permaticker", pa.int64()), ("ticker", pa.string()),
@@ -113,7 +113,17 @@ class Market:
             }
             for dimension in ("ARQ", "ART"):
                 self.rows["sf1"].append(
-                    (ticker, dimension, quarter, filed, filed, shares, 1.0, *figures.values())
+                    (
+                        ticker,
+                        dimension,
+                        quarter,
+                        filed,
+                        filed,
+                        quarter,
+                        shares,
+                        1.0,
+                        *figures.values(),
+                    )
                 )
         self.permaticker += 1
         self.rows["tickers"].append(

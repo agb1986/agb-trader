@@ -28,6 +28,9 @@ MODEL = train.Config(num_boost_round=20, min_data_in_leaf=5)
 OTHER = train.Config(num_boost_round=21, min_data_in_leaf=5)
 VALIDATION = cpcv.Options(groups=6, test_groups=2, embargo_months=1)
 SIZE, HOLD_THROUGH = 6, 10
+# Plain-signal backtests the first certification is ranked against: with no other candidate
+# the overfitting gate has nothing to measure and fails (issue #166).
+PRIORS = ("mom_12_1", "mom_6_1", "rev_1m", "vol_12m", "log_mktcap")
 # The manifest fields a rerun is entitled to differ on: when it ran, where it ran, its own
 # trial row, and everything downstream of the ledger that row was appended to. Every other
 # field -- every gate value and diagnostic, the paths, the nested trial ids, the declared
@@ -103,8 +106,12 @@ def panel(research_panel) -> Panel:
 
 @pytest.fixture(scope="module")
 def first(panel, research_lake, tmp_path_factory):
-    """A research directory with one certification in it, and its cache."""
+    """A research directory with one certification in it, the backtests it was ranked
+    against, and its cache."""
     ledger = Ledger(tmp_path_factory.mktemp("cache-research") / trials.FILE)
+    for signal in PRIORS:
+        options = backtest.Options(signal=signal, size=SIZE, hold_through=HOLD_THROUGH)
+        backtest.run(panel, options, ledger, lake_dir=research_lake)
     return ledger, certify_run(panel, ledger, research_lake, MODEL_ID)
 
 

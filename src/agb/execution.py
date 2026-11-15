@@ -6,11 +6,16 @@ an approved basket, in three parts that the service runs each cycle.
 Submission, in the quarter hour before the MOC cutoff of the basket's trade session. First the
 broker's own data is checked the way the gate checks the basket: the account is active and
 nothing is blocked or suspended, every name is tradable, and fractionable where the quantity
-needs it. A failed check halts the basket with a `gate_breach`, exactly as a failed gate
-check does, and the checks are recorded once so a later cycle reads the verdict back. Then
-one order at a time: the halt latch is read again before each, so a cause opened partway
-through stops every order not yet sent and cancels those already sent; the order's row is
-written and committed, with the NBBO mid read just before, before the broker is called; and
+needs it. The halt latch is read before those checks, so an open cause halts the basket as
+itself and a pause the broker carries as `suspend_trade` is never taken for a failed check.
+A failed check halts the basket with a `gate_breach`, exactly as a failed gate check does,
+and the checks are recorded once so a later cycle reads the verdict back; the broker is read
+outside the transaction that records them. Then every quote the orders need is read in one
+request on the named feed: a name without a quote sends nothing at all, and the error raises
+the one `submission_failed` alert the service raises for a failed step and is tried again
+next cycle. Then one order at a time: the halt latch is read again before each, so a cause
+opened partway through stops every order not yet sent and cancels those already sent; the
+order's row is written and committed, with the quoted mid, before the broker is called; and
 the broker's answer is appended as an event. A `client_order_id` the broker has already seen
 is looked up under that id and never sent twice. When every order has an answer the basket is
 submitted.
@@ -421,20 +426,30 @@ def describe(check: Check) -> str:
     return f"{name} measured {check.measured}, needs {check.threshold}"
 
 
+def _verdict(conn: psycopg.Connection, run_id: int) -> tuple[bool, str | None]:
+    checks = [Check(*c) for c in conn.execute(_CHECKS, (run_id,)).fetchall()]
+    failed = [c for c in checks if not c.passed]
+    if failed:
+        return False, "broker checks failed: " + "; ".join(describe(c) for c in failed)
+    return True, None
+
+
 def check(conn: psycopg.Connection, broker: Broker, basket: Basket) -> tuple[bool, str | None]:
     """Run the broker checks once for `basket` and record them; halt the basket on any
     failure, in the same transaction as the verdict. A basket already checked reads its
-    verdict back. Returns (passed, reason)."""
+    verdict back. Returns (passed, reason).
+
+    The broker is read before the transaction opens, so no database lock waits on the
+    network; the transaction then looks for a verdict once more and records this one only
+    when there is none."""
+    recorded = conn.execute(_CHECK_RUN, (basket.id,)).fetchone()
+    if recorded is not None:
+        return _verdict(conn, recorded[0])
+    checks = broker_checks(broker, planned(conn, basket.id))
     with conn.transaction():
         recorded = conn.execute(_CHECK_RUN, (basket.id,)).fetchone()
         if recorded is not None:
-            checks = [Check(*c) for c in conn.execute(_CHECKS, (recorded[0],)).fetchall()]
-            failed = [c for c in checks if not c.passed]
-            if failed:
-                return False, "broker checks failed: " + "; ".join(describe(c) for c in failed)
-            return True, None
-        orders = planned(conn, basket.id)
-        checks = broker_checks(broker, orders)
+            return _verdict(conn, recorded[0])
         (run_id,) = conn.execute(_INSERT_CHECK_RUN, (basket.id, len(checks), ACTOR)).fetchone()
         with conn.cursor() as cur:
             cur.executemany(
@@ -491,11 +506,17 @@ def raise_alert(conn: psycopg.Connection, kind: str, subject: str, period: str, 
     conn.execute(_RAISE, (kind, subject, period, body, ACTOR))
 
 
-def _quote(broker: Broker, symbol: str) -> Quote:
-    quotes = broker.latest_quotes([symbol])
-    if symbol not in quotes:
-        raise ExecutionError(f"no NBBO quote for {symbol}")
-    return quotes[symbol]
+def _quotes(broker: Broker, symbols: Sequence[str]) -> dict[str, Quote]:
+    """Every symbol's quote in one request, or an error naming each symbol without one. It
+    is read before the first order goes out, so a missing quote sends nothing."""
+    wanted = list(dict.fromkeys(symbols))
+    if not wanted:
+        return {}
+    quotes = broker.latest_quotes(wanted)
+    missing = [s for s in wanted if s not in quotes]
+    if missing:
+        raise ExecutionError(f"no quote for {', '.join(missing)}; no order sent")
+    return quotes
 
 
 def _cancel_sent(conn: psycopg.Connection, broker: Broker, orders: Sequence[Sent]) -> list[Sent]:
@@ -529,13 +550,14 @@ def _cancel_sent(conn: psycopg.Connection, broker: Broker, orders: Sequence[Sent
 def _stop(
     conn: psycopg.Connection, broker: Broker, basket: Basket, causes: Sequence[str]
 ) -> Outcome:
-    """A halt cause opened mid-submission: cancel what was sent, halt the basket, and alert
-    on anything that stayed live."""
+    """A halt cause open at or during submission: cancel what was sent, halt the basket, and
+    alert on anything that stayed live."""
     already = sent(conn, basket.id)
     remaining = _cancel_sent(conn, broker, already)
     live = [o for o in already if o.live]
+    when = "mid-submission" if live else "before submission"
     reason = (
-        f"halt open mid-submission ({', '.join(causes)}): {len(live)} of "
+        f"halt open {when} ({', '.join(causes)}): {len(live)} of "
         f"{len(planned(conn, basket.id))} orders sent, {len(remaining)} not cancelled"
     )
     with conn.transaction():
@@ -557,15 +579,25 @@ def submit(conn: psycopg.Connection, broker: Broker, basket: Basket, now: dateti
     """Send the basket's orders, one at a time, and move it to submitted when each has an
     answer. `conn` is in autocommit mode: each order's row is committed before the broker is
     called, so a crash between the call and the answer leaves a row to look up under its
-    client_order_id, and never a second order."""
+    client_order_id, and never a second order.
+
+    The halt latch is read before the broker checks, so a pause the broker already carries
+    as `suspend_trade` halts the basket as a pause rather than as a failed check. Every quote
+    an unsent order needs is read in one request before the first order goes out; a symbol
+    without one raises, and nothing is sent."""
+    causes = open_halts(conn)
+    if causes:
+        return _stop(conn, broker, basket, causes)
     passed, reason = check(conn, broker, basket)
     if not passed:
         log.warning("basket %s: %s", basket.reference, reason)
         return Outcome(basket.id, "halted", 0, reason)
     answered = {s.basket_order_id: s for s in sent(conn, basket.id)}
+    orders = planned(conn, basket.id)
+    quotes = _quotes(broker, [o.symbol for o in orders if o.id not in answered])
     rejected: list[Sent] = []
     count = 0
-    for order in planned(conn, basket.id):
+    for order in orders:
         existing = answered.get(order.id)
         if existing is not None and existing.answered:
             if existing.kind == "rejected":
@@ -588,7 +620,7 @@ def submit(conn: psycopg.Connection, broker: Broker, basket: Basket, now: dateti
                 count += 1
                 continue
         else:
-            quote = _quote(broker, order.symbol)
+            quote = quotes[order.symbol]
             (order_id,) = conn.execute(
                 _INSERT_ORDER,
                 (

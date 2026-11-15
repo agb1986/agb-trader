@@ -379,6 +379,57 @@ def test_a_failed_broker_check_halts_the_basket_like_a_gate_failure(db):
     assert finding.facts.endswith(f"by execution, basket {target.id}: {reason}")
 
 
+def test_every_quote_is_read_in_one_request_before_the_first_order(db):
+    """Issue #147: the broker sees one quote request per basket, naming every symbol, and
+    it comes before any order."""
+    conn = db.connect("execution")
+    target = approved(db)
+    fake = broker()
+
+    execution.submit(conn, fake, target, NOW)
+
+    quotes = [i for i, c in enumerate(fake.calls) if c[0] == "latest_quotes"]
+    assert [fake.calls[i] for i in quotes] == [("latest_quotes", tuple(NAMES))]
+    first_order = next(i for i, c in enumerate(fake.calls) if c[0] == "submit")
+    assert quotes[0] < first_order
+
+
+def test_a_missing_quote_sends_no_order_at_all(db):
+    """Issue #147: one name without a quote stops the basket before its first order, and
+    the error names every name without one."""
+    conn = db.connect("execution")
+    target = approved(db)
+    fake = broker()
+    del fake.quotes["N14"], fake.quotes["N03"]
+
+    with pytest.raises(ExecutionError, match=r"^no quote for N03, N14; no order sent$"):
+        execution.submit(conn, fake, target, NOW)
+
+    assert fake.submits() == []
+    assert rows(db, "SELECT count(*) FROM agb.broker_order") == [(0,)]
+    assert state(db, target.id)[0] == "approved"
+
+
+def test_a_pause_set_before_submission_halts_as_a_pause_not_a_gate_breach(db):
+    """Issue #147: the latch is read before the broker checks. A pause the broker already
+    carries as `suspend_trade` halts the basket as the pause, records no check and opens no
+    `gate_breach`."""
+    conn = db.connect("execution")
+    target = approved(db)
+    db.connect("bot").execute(PAUSE)
+    fake = broker(suspend_trade=True)
+
+    outcome = execution.submit(conn, fake, target, NOW)
+
+    reason = "halt open before submission (pause): 0 of 20 orders sent, 0 not cancelled"
+    assert outcome == execution.Outcome(target.id, "halted", 0, reason)
+    assert state(db, target.id) == ("halted", 3, "execution", "execution")
+    assert [cause for cause, *_ in halts(db)] == ["pause"]
+    assert rows(db, "SELECT count(*) FROM agb.broker_check_run") == [(0,)]
+    assert fake.submits() == []
+    assert fake.calls == []
+
+
 def test_a_fractional_quantity_needs_a_fractionable_asset():
     fake = broker(["N01", "N02"])
     fake.assets["N02"] = Asset("N02", "active", True, False)
@@ -777,7 +828,7 @@ def test_a_basket_whose_window_has_closed_stays_approved_with_a_warning(db, capl
     assert state(db, target.id)[0] == "approved"
     assert fake.submits() == []
     warning = (
-        f"basket {PERIOD}: its submission window closed at 2026-10-01 15:45 ET; leaving it approved"
+        f"basket {PERIOD}: its submission window closed at 2026-10-01 15:45 ET; not trying it again"
     )
     assert caplog.text.count(warning) == 1
     assert alerts(db) == [
@@ -786,8 +837,8 @@ def test_a_basket_whose_window_has_closed_stays_approved_with_a_warning(db, capl
             PERIOD,
             PERIOD,
             f"basket {PERIOD} was still approved when its submission window closed at "
-            f"2026-10-01 15:45 ET, so none of its orders went in for {TRADE}. It is left "
-            "approved and is not tried again.",
+            f"2026-10-01 15:45 ET, so none of its orders went in for {TRADE}. It is not "
+            "tried again, and the scheduler marks it missed at the close.",
         )
     ]
 
@@ -844,6 +895,33 @@ def test_an_error_at_the_broker_ends_the_cycle_and_the_next_one_carries_on(db, c
         "claimed",
         "completed",
     ]
+    assert len(alerts(db)) == 1
+
+
+def test_a_missing_quote_raises_one_alert_and_the_next_cycle_carries_on(db, caplog):
+    """Issue #147: the service raises one `submission_failed` alert naming the symbol,
+    sends nothing, and submits the whole basket once the quote is back."""
+    conn = db.connect("execution")
+    target = approved(db)
+    fake = broker()
+    missing = fake.quotes.pop("N14")
+    service = Execution(fake, clock=Clock(NOW))
+
+    with caplog.at_level(logging.ERROR):
+        service(conn)
+        service(conn)
+
+    assert fake.submits() == []
+    assert rows(db, "SELECT count(*) FROM agb.broker_order") == [(0,)]
+    assert state(db, target.id)[0] == "approved"
+    [(kind, subject, period, body)] = alerts(db)
+    assert (kind, subject, period) == ("submission_failed", PERIOD, PERIOD)
+    assert body.endswith("the error: ExecutionError: no quote for N14; no order sent")
+
+    fake.quotes["N14"] = missing
+    service(conn)
+    assert state(db, target.id)[0] == "submitted"
+    assert len(fake.orders) == 20
     assert len(alerts(db)) == 1
 
 

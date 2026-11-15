@@ -308,12 +308,13 @@ class Execution:
             log.error("submission job for %s not released: %s", claim.period, exc)
 
     def window_missed(self, conn: psycopg.Connection, basket: execution.Basket, end: datetime):
-        """A basket still approved after its window closed: warn and alert once for it."""
+        """A basket still approved after its window closed: warn and alert once for it. The
+        scheduler's sweep marks it missed at the session's close, under the same alert."""
         if basket.id in self._missed:
             return
         closed = end.astimezone(nyse.NEW_YORK).strftime("%Y-%m-%d %H:%M ET")
         log.warning(
-            "basket %s: its submission window closed at %s; leaving it approved",
+            "basket %s: its submission window closed at %s; not trying it again",
             basket.reference,
             closed,
         )
@@ -324,7 +325,7 @@ class Execution:
             basket.period,
             f"basket {basket.reference} was still approved when its submission window closed "
             f"at {closed}, so none of its orders went in for {basket.session_date}. It is "
-            f"left approved and is not tried again.",
+            f"not tried again, and the scheduler marks it missed at the close.",
         )
         self._missed.add(basket.id)
 

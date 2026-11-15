@@ -94,6 +94,24 @@ def _wait_for(cluster: Cluster, timeout: float = 60.0) -> None:
             time.sleep(0.2)
 
 
+# The tests run their baskets on sessions in the past, with the services' clocks injected, but
+# the database judges an approval against its own clock (agb.approval_clock). This pins that
+# clock to whatever a connection sets `agb.test_clock` to, and to the distant past when it
+# sets nothing, so a basket is never too late unless a test says so. Only the template is
+# changed; a deployed database keeps clock_timestamp().
+_PINNED_CLOCK = """
+    CREATE OR REPLACE FUNCTION agb.approval_clock() RETURNS timestamptz
+    LANGUAGE sql VOLATILE AS $$
+        SELECT coalesce(nullif(current_setting('agb.test_clock', true), '')::timestamptz,
+                        '-infinity')
+    $$
+"""
+
+
+def pin_approval_clock(owner: psycopg.Connection) -> None:
+    owner.execute(_PINNED_CLOCK)
+
+
 @pytest.fixture(scope="session")
 def cluster() -> Iterator[Cluster]:
     passwords = {role: secrets.token_hex(16) for role in (SUPERUSER, *ALL_ROLES)}
@@ -118,6 +136,7 @@ def cluster() -> Iterator[Cluster]:
             migrate.bootstrap(admin, passwords)
         with cluster.connect(TEMPLATE, OWNER) as owner:
             migrate.apply(owner, migrate.migrations_dir())
+            pin_approval_clock(owner)
         yield cluster
     finally:
         subprocess.run(["docker", "rm", "--force", name], capture_output=True)

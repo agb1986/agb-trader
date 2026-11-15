@@ -35,6 +35,19 @@ building and gating.
 Data the vendor has not yet published is not a failure: the service keeps the job and shortens
 its lease to RETRY, so the work is tried again once the lease runs out, until it lands.
 
+A job that fails on its own data -- a corrupt panel body, a database error, an unreadable
+Parquet file, or any of the errors each job names -- fails with the cause named in its
+`failed` event (`StoreError: body ... does not match its hash`), and the service raises a
+`pipeline_job_failed` alert for it and moves on to the next cycle. A failed job is not taken
+again, so the alert is raised once. Only a database connection that has gone away is left to
+stop the service, so it restarts with a new one. A job whose lease was lost -- it ran out and
+another worker reclaimed it -- is left to that worker: the cycle logs it and ends without
+failing the job. A rerun that fails is logged and raises a `pipeline_rerun_failed` alert, once
+per rerun; it has no job to fail, so it is tried again each cycle. That includes a gate that
+refuses to approve a basket past its cutoff (the `transition_timely` trigger's
+`CheckViolation`). A rerun whose basket was built but never gated, and has since been retired
+as missed by the approval sweep, is skipped: the sweep has already alerted on it.
+
     python -m agb.services.pipeline             run the service
     python -m agb.services.pipeline backfill    land the vendor's history from 1998, then exit
 """
@@ -72,7 +85,7 @@ from agb.gate import GateError
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.lake import LakeError, NotYet, Partition, Sharadar
 from agb.panel import PanelError
-from agb.panel_store import PanelStore
+from agb.panel_store import PanelStore, StoreError
 from agb.ranker import Ranker
 from agb.registry import RegistryError
 from agb.roles import PIPELINE
@@ -87,6 +100,25 @@ RETRY = timedelta(minutes=15)
 
 _RERUNS = """
     SELECT command_id, actor, basket_id, reference, session_date FROM agb.rerun_pending
+"""
+
+# Raised when a job fails, once per job: a failed job is not taken again.
+JOB_FAILED = "pipeline_job_failed"
+# Raised when a rerun fails, once per rerun: a rerun has no job to fail, so it is tried again
+# each cycle, and the alert says so the first time.
+RERUN_FAILED = "pipeline_rerun_failed"
+
+# The state of the basket already built under a rerun's reference, if there is one.
+_RERUN_STATE = """
+    SELECT s.state
+    FROM agb.basket b JOIN agb.basket_state s ON s.id = b.id
+    WHERE b.reference = %s
+"""
+
+_RAISE = """
+    INSERT INTO agb.alert (kind, subject, period, body, raised_by)
+    VALUES (%s, %s, %s, %s, %s)
+    ON CONFLICT (kind, subject, period) DO NOTHING
 """
 
 _RECORD = """
@@ -109,6 +141,40 @@ def record(
     with conn.transaction(), conn.cursor() as cur:
         cur.executemany(_RECORD, rows)
         return cur.rowcount
+
+
+def cause(exc: BaseException) -> str:
+    """A failure as the job's `failed` event records it: the error's type, then its message."""
+    return f"{type(exc).__name__}: {exc}"
+
+
+def fail(conn: psycopg.Connection, claim: jobs.Claim, what: str, exc: Exception) -> None:
+    """Fail `claim` with `exc` named as its cause and raise an alert for it.
+
+    A database error on a connection that has gone away is re-raised instead: nothing more
+    can be written on it, and the service restarts with a new one. A job whose lease was lost
+    raises `jobs.LeaseLost`, which the cycle handles. The job is failed before the alert is
+    raised, so an alert always names a job that has stopped.
+    """
+    if isinstance(exc, psycopg.Error) and (conn.closed or conn.broken):
+        raise exc
+    detail = cause(exc)
+    jobs.fail(conn, claim, detail)
+    log.error("%s %s failed: %s", what, claim.period, detail)
+    body = f"The {what} for {claim.period} failed and will not be tried again: {detail}"
+    alert(conn, JOB_FAILED, claim.kind, claim.period, body)
+
+
+def alert(conn: psycopg.Connection, kind: str, subject: str, period: str, body: str) -> None:
+    """Raise an alert, once: one already raised for the same kind, subject and period is kept.
+    An alert that cannot be written is logged, unless the connection has gone away, which is
+    re-raised so the service restarts."""
+    try:
+        conn.execute(_RAISE, (kind, subject, period, body, PIPELINE))
+    except psycopg.Error as exc:
+        if conn.closed or conn.broken:
+            raise
+        log.error("%s %s %s: could not raise its alert: %s", kind, subject, period, exc)
 
 
 def sample_from_env() -> int:
@@ -222,12 +288,22 @@ class Pipeline:
         )
         if claim is None:
             return
-        if claim.kind == schedule.REBALANCE:
-            self.rebalance(conn, claim)
-        elif claim.kind == schedule.PANEL_AUDIT:
-            self.audit(conn, claim)
-        else:
-            self.pull(conn, claim)
+        try:
+            if claim.kind == schedule.REBALANCE:
+                self.rebalance(conn, claim)
+            elif claim.kind == schedule.PANEL_AUDIT:
+                self.audit(conn, claim)
+            else:
+                self.pull(conn, claim)
+        except jobs.LeaseLost as exc:
+            # Another worker reclaimed the job after the lease ran out; the job is its to
+            # finish, and nothing here is broken, so the cycle ends quietly.
+            log.error(
+                "%s %s: lease lost, leaving the job to its holder: %s",
+                claim.kind,
+                claim.period,
+                exc,
+            )
 
     def rebalance(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
         try:
@@ -265,12 +341,14 @@ class Pipeline:
             RegistryError,
             UniverseError,
             LakeError,
+            StoreError,
             OSError,
             ValueError,
             duckdb.Error,
+            psycopg.Error,
+            pa.ArrowException,
         ) as exc:
-            jobs.fail(conn, claim, str(exc))
-            log.error("rebalance %s failed: %s", claim.period, exc)
+            fail(conn, claim, "rebalance", exc)
             return
         jobs.complete(conn, claim)
         log.info(
@@ -310,6 +388,12 @@ class Pipeline:
         reference: str,
         session_date: date,
     ) -> None:
+        state = conn.execute(_RERUN_STATE, (reference,)).fetchone()
+        if state is not None and state[0] != "proposed":
+            # Built, never gated, and retired since -- the approval sweep marks such a basket
+            # missed at its cutoff and alerts on it. The gate would refuse it every cycle.
+            log.debug("rerun %s is already %s; not gating it", reference, state[0])
+            return
         try:
             proposal = basket.rerun(
                 conn, original, reference, session_date, command_id, self.lake_dir
@@ -327,11 +411,22 @@ class Pipeline:
             GateError,
             UniverseError,
             LakeError,
+            StoreError,
             OSError,
             ValueError,
             duckdb.Error,
+            psycopg.Error,
+            pa.ArrowException,
         ) as exc:
-            log.error("rerun %s, asked for by %s, failed: %s", reference, actor, exc)
+            if isinstance(exc, psycopg.Error) and (conn.closed or conn.broken):
+                raise
+            detail = cause(exc)
+            log.error("rerun %s, asked for by %s, failed: %s", reference, actor, detail)
+            body = (
+                f"The rerun {reference} of basket {original}, asked for by {actor} for"
+                f" {session_date}, failed and is tried again each cycle: {detail}"
+            )
+            alert(conn, RERUN_FAILED, reference, session_date.isoformat(), body)
             return
         log.info(
             "rerun %s of basket %d, asked for by %s, is basket %d for %s: %s, %s",
@@ -355,9 +450,8 @@ class Pipeline:
         try:
             audit = panel_audit.check(conn, store, self.sample)
             panel_audit.record(conn, claim.period, claim.job_id, audit, PIPELINE)
-        except (OSError, psycopg.Error) as exc:
-            jobs.fail(conn, claim, str(exc))
-            log.error("panel audit %s failed: %s", claim.period, exc)
+        except (StoreError, OSError, psycopg.Error) as exc:
+            fail(conn, claim, "panel audit", exc)
             return
         jobs.complete(conn, claim)
         if audit.unsound:
@@ -387,9 +481,8 @@ class Pipeline:
             jobs.renew(conn, claim, self.retry)
             log.info("data pull %s: %s; trying again in %s", claim.period, exc, self.retry)
             return
-        except (LakeError, OSError, pa.ArrowException) as exc:
-            jobs.fail(conn, claim, str(exc))
-            log.error("data pull %s failed: %s", claim.period, exc)
+        except (LakeError, OSError, pa.ArrowException, psycopg.Error) as exc:
+            fail(conn, claim, "data pull", exc)
             return
         added = record(conn, session, partitions, claim.job_id)
         jobs.complete(conn, claim)

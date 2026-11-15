@@ -234,7 +234,7 @@ def test_alert_event_rules(db, telegram, rebalance_ahead):
         )
 
 
-@pytest.mark.parametrize("role", ["pipeline", "cli"])
+@pytest.mark.parametrize("role", ["cli"])
 def test_only_the_alerting_services_raise_alerts(db, role):
     with pytest.raises(errors.InsufficientPrivilege):
         db.connect(role).execute(
@@ -243,7 +243,7 @@ def test_only_the_alerting_services_raise_alerts(db, role):
         )
 
 
-@pytest.mark.parametrize("role", ["scheduler", "execution", "bot", "ui"])
+@pytest.mark.parametrize("role", ["scheduler", "execution", "bot", "ui", "pipeline"])
 def test_each_alerting_service_can_raise_an_alert(db, role):
     db.connect(role).execute(
         "INSERT INTO agb.alert (kind, subject, period, body, raised_by) "

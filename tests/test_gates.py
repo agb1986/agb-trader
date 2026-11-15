@@ -98,13 +98,49 @@ def test_configurations_that_only_shine_in_sample_fail():
     assert result["splits"] == comb(8, 4)
 
 
-def test_a_single_candidate_cannot_be_overfit_by_selection():
+def test_a_single_candidate_leaves_the_overfitting_probability_undefined():
+    # Operator decision on issue #166: with nothing to select among, the PBO measures nothing,
+    # so it is reported as undefined and fails, where it used to read as a clean zero.
     assert gates.overfitting_probability(STRONG.mean(axis=0)[:, np.newaxis]) == {
-        "pbo": 0.0,
+        "pbo": 1.0,
+        "defined": False,
+        "cause": "PBO undefined: 1 distinct candidate, at least two needed",
         "candidates": 1,
+        "columns": 1,
         "blocks": 0,
         "splits": 0,
     }
+    assert gates.overfitting_probability(np.empty((MONTHS, 0)))["cause"] == (
+        "PBO undefined: 0 distinct candidates, at least two needed"
+    )
+
+
+def test_identical_columns_are_one_candidate():
+    series = STRONG.mean(axis=0)
+    twins = gates.overfitting_probability(np.column_stack([series, series, series]))
+    assert twins["candidates"] == 1 and twins["columns"] == 3 and not twins["defined"]
+    padded = gates.overfitting_probability(np.column_stack([robust(), robust()[:, :3]]))
+    assert padded["candidates"] == 10 and padded["columns"] == 13
+    assert padded["pbo"] == gates.overfitting_probability(robust())["pbo"]
+
+
+def test_a_single_candidate_fails_the_verdict_and_names_the_cause():
+    verdict = verdict_for(candidates=STRONG.mean(axis=0)[:, np.newaxis])
+    gate = verdict["gates"]["pbo"]
+    assert not gate["passed"] and not verdict["passed"]
+    assert gate["cause"] == "PBO undefined: 1 distinct candidate, at least two needed"
+    # The threshold is the one in force, not loosened or tightened to make the case fail.
+    assert gate["threshold"] == gates.Thresholds().pbo
+    assert all(verdict["gates"][name]["passed"] for name in ("dsr", "sharpe_net", "dsr_2x"))
+
+
+def test_a_declared_configuration_without_a_column_fails_the_overfitting_gate():
+    verdict = verdict_for(missing=["t1: a month that is not finite"])
+    gate = verdict["gates"]["pbo"]
+    assert gate["value"] <= gate["threshold"] and not gate["passed"]
+    assert gate["cause"] == "candidate missing: t1: a month that is not finite"
+    assert verdict["overfitting"]["missing"] == ["t1: a month that is not finite"]
+    assert verdict_for()["gates"]["pbo"]["cause"] is None
 
 
 def test_the_blocks_never_outnumber_the_months():
