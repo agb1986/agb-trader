@@ -18,6 +18,12 @@ ONE_SHOT = {"migrate", "cli", "certification-import", "reconcile", "research"}
 ENV_NAMES = {"db", "pipeline", "execution", "bot", "vpn", "research"}
 # Every service that mounts the models directory, each of them read-only.
 MODEL_READERS = {"pipeline", "cli", "certification-import"}
+# Issue #170: the services with a route to the internet, each for a reason. The pipeline calls
+# its vendors, execution and reconcile the broker, and vpn carries the bot's Telegram traffic.
+# The bot is on vpn's network to reach its proxy. Every other service reads the database and
+# nothing else, and has only the internal network.
+REACHES_INTERNET = {"pipeline", "execution", "reconcile", "vpn", "bot"}
+NO_MASQUERADE = "com.docker.network.bridge.enable_ip_masquerade"
 
 
 @pytest.fixture(scope="module")
@@ -109,8 +115,67 @@ def test_the_database_is_not_published(resolved):
 def test_networks(resolved):
     # Resolved config drops networks no service joins yet, so read the declarations raw.
     declared = yaml.safe_load((ROOT / "compose.yaml").read_text())["networks"]
-    assert {"core", "egress"} <= set(declared)
+    assert set(declared) == {"core", "outbound", "ui-port", "egress"}
     assert set(resolved["services"]["db"]["networks"]) == {"core"}
+
+
+def reaches_internet(network: dict) -> bool:
+    """Whether a container on this network has a translated route off the host. An internal
+    network has no route at all; a bridge that does no masquerading has one, but what leaves by
+    it carries the container's private address and finds no way back."""
+    return (
+        not network.get("internal") and network.get("driver_opts", {}).get(NO_MASQUERADE) != "false"
+    )
+
+
+def test_the_core_network_is_internal(resolved):
+    """Issue #170: the database's network has no route off the host, so a service on it alone
+    has no egress. Removing `internal` gives every one of them the internet."""
+    assert resolved["networks"]["core"].get("internal") is True
+    on_core = {n for n, s in resolved["services"].items() if "core" in s.get("networks", ())}
+    assert on_core == set(resolved["services"]) - {"vpn", "research"}
+
+
+def test_only_the_services_that_call_out_can_reach_the_internet(resolved):
+    """A service on two networks reaches everything on both, so a service can reach the
+    internet when any of its networks can. Putting a database-only service on a network with a
+    route out, or giving the core network one, fails here."""
+    networks = resolved["networks"]
+    reach = {
+        name
+        for name, service in resolved["services"].items()
+        if any(reaches_internet(networks[network]) for network in service.get("networks", ()))
+    }
+    assert reach == REACHES_INTERNET
+    database_only = {"db", "migrate", "scheduler", "backup", "cli", "certification-import"}
+    for name in database_only:
+        assert set(resolved["services"][name]["networks"]) == {"core"}, name
+
+
+def test_the_ui_port_network_carries_the_published_port_and_no_route_out(resolved):
+    """Docker publishes no port from an internal network, so the UI joins one more network for
+    its publication alone, and that network's bridge translates nothing on the way out."""
+    networks = resolved["networks"]
+    assert not networks["ui-port"].get("internal"), "a published port needs a routed network"
+    assert networks["ui-port"]["driver_opts"][NO_MASQUERADE] == "false"
+    services = resolved["services"]
+    assert set(services["ui"]["networks"]) == {"core", "ui-port"}
+    assert {n for n, s in services.items() if "ui-port" in s.get("networks", ())} == {"ui"}
+    assert [n for n, s in services.items() if s.get("ports")] == ["ui"]
+
+
+def test_nothing_with_the_broker_keys_shares_a_network_with_the_proxy(resolved):
+    """Broker traffic must never leave through the VPN, so execution and reconcile have no
+    route to the vpn's proxy at all, and the network that takes them out does not carry it."""
+    services = resolved["services"]
+    assert {n for n, s in services.items() if "outbound" in s.get("networks", ())} == {
+        "pipeline",
+        "execution",
+        "reconcile",
+    }
+    vpn = set(services["vpn"]["networks"])
+    for name in ("execution", "reconcile"):
+        assert not set(services[name]["networks"]) & vpn, name
 
 
 def test_backup_writes_to_a_host_directory_as_its_owner(resolved):
@@ -120,7 +185,6 @@ def test_backup_writes_to_a_host_directory_as_its_owner(resolved):
     assert (volume["type"], volume["target"]) == ("bind", "/backups")
     assert backup["environment"]["AGB_BACKUP_DIR"] == "/backups"
     assert backup["environment"]["PGUSER"] == "backup"
-    assert set(backup["networks"]) == {"core"}
 
 
 def test_pipeline_writes_the_lake_and_panel_store_to_host_directories_as_their_owner(resolved):
@@ -131,7 +195,6 @@ def test_pipeline_writes_the_lake_and_panel_store_to_host_directories_as_their_o
     assert pipeline["environment"]["AGB_LAKE_DIR"] == "/lake"
     assert pipeline["environment"]["AGB_PANEL_DIR"] == "/panel"
     assert pipeline["environment"]["PGUSER"] == "pipeline"
-    assert set(pipeline["networks"]) == {"core"}
 
 
 def test_the_services_that_see_the_certified_models_only_read_them(resolved):
@@ -160,7 +223,7 @@ def test_the_import_is_the_one_service_that_runs_as_the_research_role(resolved):
     ] == ["certification-import"]
     assert importer["image"] == services["migrate"]["image"], "the app image, not the research one"
     assert importer["entrypoint"] == ["agb", "import-certification"]
-    assert set(importer["networks"]) == {"core"}
+    assert "core" in importer["networks"]
     assert importer["profiles"] == ["cli"], "it runs only when the operator asks for it"
     assert "import <model id>" in (ROOT / "scripts/deploy/agb-stack").read_text()
 
@@ -184,7 +247,7 @@ def test_the_ui_is_published_on_the_loopback_address_alone(resolved):
     # the container's own address; the publication above is what keeps it off the network.
     assert ui["environment"]["AGB_UI_HOST"] == "0.0.0.0"
     assert ui["image"] == resolved["services"]["migrate"]["image"]
-    assert set(ui["networks"]) == {"core"}, "no egress: the UI makes no outbound connection"
+    assert "egress" not in ui["networks"], "no proxy: the UI makes no outbound connection"
     assert not ui.get("volumes")
     env = ui["environment"]
     assert (env["PGHOST"], env["PGUSER"]) == ("db", "ui")
