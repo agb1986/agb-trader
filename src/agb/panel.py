@@ -21,15 +21,16 @@ Every run references a panel_config row, made only by `agb panel-config create`,
 one whose prompt hashes, rubric or scrubber version are not the code's. Every body (filing
 documents and texts, requests, responses, extracts) goes to the content-addressed panel store,
 and Postgres holds the structured rows that refer to them. Each name is written in its own
-transaction, after its network calls have finished.
+transaction as soon as its network calls have landed, so a pass that fails part-way keeps what
+it finished and has paid for; how each pass ended is recorded in agb.panel_run_state.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from typing import Any
@@ -50,22 +51,6 @@ WORKERS = 4
 
 def _nothing() -> None:
     """The default beat: a run nobody is watching the liveness of."""
-
-
-def _gather[T, R](
-    pool: ThreadPoolExecutor, work: Callable[[T], R], items: Iterable[T], beat: Callable[[], None]
-) -> list[R]:
-    """Run `work` over `items` on `pool` and return the results in `items` order, beating as
-    each one lands. A stretch of model calls takes far longer than the heartbeat's staleness
-    window, and the service cannot beat from its own loop while it is inside this one."""
-    futures: dict[Future[R], int] = {}
-    for index, item in enumerate(items):
-        futures[pool.submit(work, item)] = index
-    results: list[R] = [None] * len(futures)  # type: ignore[list-item]
-    for future in as_completed(futures):
-        results[futures[future]] = future.result()
-        beat()
-    return results
 
 
 class PanelError(Exception):
@@ -251,8 +236,12 @@ def run(
 ) -> int:
     """Gather the evidence for each name on `shortlist` as of `as_of`; returns the run's id.
 
-    `beat` is called as each retrieval and each model call lands, for a caller whose liveness
-    is watched while this runs."""
+    Each name is written as soon as its retrieval and its Analyst call have landed, so a pass
+    that fails part-way keeps every name it finished, and the pass is recorded in
+    agb.panel_run_state as completed or interrupted. A retry of the same job resumes the run
+    it started, under the same configuration and date, and works only on the names that run
+    has not stored. `beat` is called as each retrieval and each model call lands, for a caller
+    whose liveness is watched while this runs."""
     config = load_config(conn, config_id)
     check(config)
     if len(shortlist) > config.shortlist_n:
@@ -260,37 +249,173 @@ def run(
             f"shortlist of {len(shortlist)} names exceeds panel_config {config.id}'s N of "
             f"{config.shortlist_n}"
         )
-    row = conn.execute(
-        "INSERT INTO agb.panel_run (panel_config_id, job_id, as_of, actor) "
-        "VALUES (%s, %s, %s, %s) RETURNING id",
-        (config.id, job_id, as_of, ACTOR),
-    ).fetchone()
-    assert row is not None
-    run_id = row[0]
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        retrieve = _gather(
-            pool, lambda symbol: edgar.retrieve(client, symbol, as_of), shortlist, beat
+    run_id, stored = _resumable(conn, config.id, job_id, as_of, shortlist)
+    if run_id is None:
+        row = conn.execute(
+            "INSERT INTO agb.panel_run (panel_config_id, job_id, as_of, actor) "
+            "VALUES (%s, %s, %s, %s) RETURNING id",
+            (config.id, job_id, as_of, ACTOR),
+        ).fetchone()
+        assert row is not None
+        run_id = row[0]
+    else:
+        log.info(
+            "panel run %d: resuming job %d with %d of %d names stored",
+            run_id,
+            job_id,
+            len(stored),
+            len(shortlist),
         )
-        names = [Name(r) for r in retrieve]
-        for name in names:
-            _prepare(conn, name, config.models["analyst"], store)
-        missed = [n for n in names if n.request is not None and n.completion is None]
-        answers = _gather(pool, lambda n: _call(model, n), missed, beat)
-        for name, outcome in zip(missed, answers, strict=True):
-            name.completion, name.failure = outcome
+    pending = [symbol for symbol in shortlist if symbol not in stored]
 
-    for name in names:
-        with conn.transaction():
-            _write(conn, run_id, name, store)
+    try:
+        asked, hits = _evidence(
+            conn,
+            run_id,
+            pending,
+            as_of,
+            client,
+            model,
+            config.models["analyst"],
+            store,
+            workers,
+            beat,
+        )
+    except BaseException as exc:
+        _interrupted(conn, run_id, "evidence", exc)
+        raise
+    _mark(conn, run_id, "evidence", "completed")
     log.info(
-        "panel run %d: %d names, %d model calls, %d from cache",
-        run_id,
-        len(names),
-        len(missed),
-        sum(n.cached for n in names),
+        "panel run %d: %d names, %d model calls, %d from cache", run_id, len(pending), asked, hits
     )
     return run_id
+
+
+def _resumable(
+    conn: psycopg.Connection,
+    config_id: int,
+    job_id: int | None,
+    as_of: date,
+    shortlist: Sequence[str],
+) -> tuple[int | None, set[str]]:
+    """The run an earlier pass of this job started, and the names it stored; or no run, when
+    there was none or it stored a name this shortlist no longer has."""
+    if job_id is None:
+        return None, set()
+    row = conn.execute(
+        "SELECT id FROM agb.panel_run WHERE panel_config_id = %s AND job_id = %s AND as_of = %s "
+        "ORDER BY id DESC LIMIT 1",
+        (config_id, job_id, as_of),
+    ).fetchone()
+    if row is None:
+        return None, set()
+    stored = {
+        symbol
+        for (symbol,) in conn.execute(
+            "SELECT symbol FROM agb.panel_retrieval WHERE run_id = %s", (row[0],)
+        )
+    }
+    if not stored <= set(shortlist):
+        return None, set()
+    return row[0], stored
+
+
+def _evidence(
+    conn: psycopg.Connection,
+    run_id: int,
+    symbols: Sequence[str],
+    as_of: date,
+    client: edgar.Edgar,
+    model: analyst.Model,
+    model_id: str,
+    store: PanelStore,
+    workers: int,
+    beat: Callable[[], None],
+) -> tuple[int, int]:
+    """Retrieve, ask and write each of `symbols`, each name in its own transaction as soon as
+    its network calls have landed; returns the model calls made and the answers from the cache.
+
+    On any failure the calls already in flight are waited for and the names they answer
+    written, since they are paid for either way, and nothing else is started."""
+    asked = hits = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        retrievals = {
+            pool.submit(edgar.retrieve, client, symbol, as_of): symbol for symbol in symbols
+        }
+        calls: dict[Future[tuple[analyst.Completion | None, str | None]], Name] = {}
+        try:
+            while retrievals or calls:
+                done, _ = wait([*retrievals, *calls], return_when=FIRST_COMPLETED)
+                for future in done:
+                    beat()
+                    if future in retrievals:
+                        del retrievals[future]
+                        name = Name(future.result())
+                        _prepare(conn, name, model_id, store)
+                        hits += name.cached
+                        if name.request is not None and name.completion is None:
+                            calls[pool.submit(_call, model, name)] = name
+                            asked += 1
+                            continue
+                    else:
+                        name = calls.pop(future)
+                        name.completion, name.failure = future.result()
+                    with conn.transaction():
+                        _write(conn, run_id, name, store)
+        except BaseException:
+            pool.shutdown(wait=False, cancel_futures=True)
+            _salvage(calls, lambda name, outcome: _keep(conn, run_id, name, outcome, store))
+            raise
+    return asked, hits
+
+
+def _keep(
+    conn: psycopg.Connection,
+    run_id: int,
+    name: Name,
+    outcome: tuple[analyst.Completion | None, str | None],
+    store: PanelStore,
+) -> None:
+    name.completion, name.failure = outcome
+    with conn.transaction():
+        _write(conn, run_id, name, store)
+
+
+def _salvage[T, R](futures: Mapping[Future[R], T], keep: Callable[[T, R], None]) -> None:
+    """After a pass has failed: wait for the model calls in `futures` that were already in
+    flight, and `keep` each that answered. Stops at the first that cannot be kept, which means
+    the database is what failed.
+
+    The pool must already be shut down with its queued calls cancelled. Those are left out
+    before waiting: `shutdown(cancel_futures=True)` cancels them without notifying waiters, so
+    `as_completed` would wait for them forever."""
+    started = [future for future in futures if not future.cancelled()]
+    for future in as_completed(started):
+        if future.exception() is not None:
+            continue
+        try:
+            keep(futures[future], future.result())
+        except Exception:
+            log.exception("could not keep an answer that landed after the panel failed")
+            return
+
+
+def _mark(
+    conn: psycopg.Connection, run_id: int, stage: str, state: str, detail: str | None = None
+) -> None:
+    conn.execute(
+        "INSERT INTO agb.panel_run_state (run_id, stage, state, detail, actor) "
+        "VALUES (%s, %s, %s, %s, %s)",
+        (run_id, stage, state, detail, ACTOR),
+    )
+
+
+def _interrupted(conn: psycopg.Connection, run_id: int, stage: str, exc: BaseException) -> None:
+    """Record that a pass stopped on `exc`, without hiding `exc` if the record fails too."""
+    try:
+        _mark(conn, run_id, stage, "interrupted", f"{type(exc).__name__}: {exc}")
+    except psycopg.Error:
+        log.exception("panel run %d: could not record that the %s pass stopped", run_id, stage)
 
 
 def _prepare(conn: psycopg.Connection, name: Name, model_id: str, store: PanelStore) -> None:
@@ -306,18 +431,40 @@ def _prepare(conn: psycopg.Connection, name: Name, model_id: str, store: PanelSt
         retrieval.name or retrieval.ticker, retrieval.ticker, name.documents, model_id
     )
     name.request_sha256 = analyst.cache_key(name.request)
-    name.completion = cached(conn, store, name.request_sha256)
+    name.completion = cached(conn, store, name.request_sha256, USABLE["analyst"])
     name.cached = name.completion is not None
 
 
-def cached(conn: psycopg.Connection, store: PanelStore, request_sha256: str) -> Any:
-    """The answer to an earlier identical request, if one was made and its body is stored."""
+# What makes a stored answer worth replaying, by role: one that raises is asked for again.
+USABLE: dict[str, Callable[[analyst.Completion], object]] = {
+    "analyst": analyst.parse,
+    "prosecutor": debate.answer,
+    "defender": debate.answer,
+    "judge": debate.parse,
+}
+
+
+def cached(
+    conn: psycopg.Connection,
+    store: PanelStore,
+    request_sha256: str,
+    usable: Callable[[analyst.Completion], object],
+) -> analyst.Completion | None:
+    """The answer to an earlier identical request, if one was made, its body is stored and
+    `usable` accepts it. An answer that was cut off, refused or garbled is logged with its call
+    but never replayed, so the next run asks again instead of inheriting the failure."""
     for (response_sha256,) in conn.execute(
         "SELECT response_sha256 FROM agb.panel_model_call WHERE request_sha256 = %s ORDER BY id",
         (request_sha256,),
     ):
-        if store.has(response_sha256):
-            return analyst.Completion(**json.loads(store.get(response_sha256)))
+        if not store.has(response_sha256):
+            continue
+        completion = analyst.Completion(**json.loads(store.get(response_sha256)))
+        try:
+            usable(completion)
+        except (analyst.AnalystError, debate.DebateError):
+            continue
+        return completion
     return None
 
 
@@ -512,6 +659,7 @@ class Call:
     request_sha256: str
     completion: analyst.Completion | None = None
     cached: bool = False
+    id: int | None = None
 
 
 @dataclass
@@ -545,13 +693,42 @@ def score(
     The roles speak in turn, each stage for every name at once: the Prosecutor, then the
     Defender answering the Prosecutor, then the Judge reading both. A request made before is
     answered from the store. A name whose call fails or whose answer is unusable is recorded as
-    a debate failure, with no score."""
+    a debate failure, with no score. Each call is logged as it lands and each name's score is
+    written as its Judge answers, so a pass that fails part-way keeps what it finished and a
+    rerun answers those calls from the store; the pass is recorded in agb.panel_run_state."""
     row = conn.execute(
         "SELECT panel_config_id FROM agb.panel_run WHERE id = %s", (run_id,)
     ).fetchone()
     if row is None:
         raise PanelError(f"no panel_run {run_id}")
-    config = load_config(conn, row[0])
+    try:
+        debated, scored, asked = _debate(conn, run_id, row[0], sectors, model, store, workers, beat)
+    except BaseException as exc:
+        _interrupted(conn, run_id, "score", exc)
+        raise
+    _mark(conn, run_id, "score", "completed")
+    log.info(
+        "panel run %d: %d names debated, %d scored, %d model calls",
+        run_id,
+        debated,
+        scored,
+        asked,
+    )
+    return debated
+
+
+def _debate(
+    conn: psycopg.Connection,
+    run_id: int,
+    config_id: int,
+    sectors: Mapping[str, str],
+    model: analyst.Model,
+    store: PanelStore,
+    workers: int,
+    beat: Callable[[], None],
+) -> tuple[int, int, int]:
+    """The body of `score`; returns the names debated and scored, and the model calls made."""
+    config = load_config(conn, config_id)
     check(config)
     rows = conn.execute(
         """
@@ -581,34 +758,70 @@ def score(
 
     asked = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for role in debate.ROLES:
-            live = [d for d in debates if d.failure is None]
-            for d in live:
-                request = _debate_request(role, config.models[role], d)
-                call = Call(role, request, analyst.cache_key(request))
-                call.completion = cached(conn, store, call.request_sha256)
-                call.cached = call.completion is not None
-                d.calls.append(call)
-            missed = [d for d in live if d.calls[-1].completion is None]
-            asked += len(missed)
-            answers = _gather(pool, lambda d: _ask(model, d), missed, beat)
-            for d, outcome in zip(missed, answers, strict=True):
-                d.calls[-1].completion, d.failure = outcome
-            for d in live:
-                if d.failure is None:
-                    _read(d, d.calls[-1])
+        pending: dict[Future[tuple[analyst.Completion | None, str | None]], Debate] = {}
+        try:
+            for role in debate.ROLES:
+                for d in [d for d in debates if d.failure is None]:
+                    request = _debate_request(role, config.models[role], d)
+                    call = Call(role, request, analyst.cache_key(request))
+                    call.completion = cached(conn, store, call.request_sha256, USABLE[role])
+                    call.cached = call.completion is not None
+                    d.calls.append(call)
+                    if call.completion is None:
+                        pending[pool.submit(_ask, model, d)] = d
+                    else:
+                        _land(conn, run_id, config.id, d, store)
+                asked += len(pending)
+                for future in as_completed(list(pending)):
+                    beat()
+                    d = pending.pop(future)
+                    d.calls[-1].completion, d.failure = future.result()
+                    _land(conn, run_id, config.id, d, store)
+        except BaseException:
+            pool.shutdown(wait=False, cancel_futures=True)
+            _salvage(
+                pending, lambda d, outcome: _keep_debate(conn, run_id, config.id, d, outcome, store)
+            )
+            raise
+    return len(debates), sum(d.failure is None for d in debates), asked
 
-    for d in debates:
-        with conn.transaction():
-            _write_score(conn, run_id, config.id, d, store)
-    log.info(
-        "panel run %d: %d names debated, %d scored, %d model calls",
-        run_id,
-        len(debates),
-        sum(d.failure is None for d in debates),
-        asked,
-    )
-    return len(debates)
+
+def _land(
+    conn: psycopg.Connection, run_id: int, config_id: int, d: Debate, store: PanelStore
+) -> None:
+    """Log the call `d` has just had answered and take its answer, then write the name's score
+    if this was its last call: the Judge's, or one that failed."""
+    call = d.calls[-1]
+    with conn.transaction():
+        if call.completion is not None:
+            call.id = log_call(
+                conn,
+                run_id,
+                d.retrieval_id,
+                call.role,
+                call.request,
+                call.request_sha256,
+                call.completion,
+                call.cached,
+                store,
+            )
+            _read(d, call)
+        if d.failure is not None or call.role == "judge":
+            _write_score(conn, run_id, config_id, d)
+
+
+def _keep_debate(
+    conn: psycopg.Connection,
+    run_id: int,
+    config_id: int,
+    d: Debate,
+    outcome: tuple[analyst.Completion | None, str | None],
+    store: PanelStore,
+) -> None:
+    """Keep an answer that landed after the pass failed: log the call, so a rerun answers it
+    from the store, and write the name's score if that was its last call."""
+    d.calls[-1].completion, d.failure = outcome
+    _land(conn, run_id, config_id, d, store)
 
 
 def _debate_request(role: str, model_id: str, d: Debate) -> dict[str, Any]:
@@ -643,24 +856,8 @@ def _read(d: Debate, call: Call) -> None:
         d.failure = f"{call.role}: {exc}"
 
 
-def _write_score(
-    conn: psycopg.Connection, run_id: int, config_id: int, d: Debate, store: PanelStore
-) -> None:
-    call_ids = {
-        call.role: log_call(
-            conn,
-            run_id,
-            d.retrieval_id,
-            call.role,
-            call.request,
-            call.request_sha256,
-            call.completion,
-            call.cached,
-            store,
-        )
-        for call in d.calls
-        if call.completion is not None
-    }
+def _write_score(conn: psycopg.Connection, run_id: int, config_id: int, d: Debate) -> None:
+    call_ids = {call.role: call.id for call in d.calls if call.id is not None}
     result = d.score
     row = conn.execute(
         """

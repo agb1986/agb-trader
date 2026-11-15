@@ -527,3 +527,78 @@ def test_each_role_has_its_own_prompt_hash_in_the_config(db, config):
     assert set(hashes) == {"analyst", "prosecutor", "defender", "judge"}
     assert hashes["judge"] == debate.template_hash("judge")
     assert len(set(hashes.values())) == 4
+
+
+def test_an_unusable_debate_answer_is_asked_again_on_the_next_run(db, config, store):
+    broken = {("ACME", "judge"): "prose", ("NEWCO", "judge"): "max_tokens"}
+    debated(db, config, store, FakeDebate(broken))
+
+    again = FakeDebate()
+    run_id, n = debated(db, config, store, again)
+
+    # The arguments both judges read were usable and come from the store; only the two
+    # answers that could not be read are asked for again.
+    assert n == 4
+    assert sorted((s, role) for s, role, _ in again.requests) == [
+        ("ACME", "judge"),
+        ("NEWCO", "judge"),
+    ]
+    assert {symbol: s[0] for symbol, s in scores(db, run_id).items()} == {
+        symbol: "scored" for symbol in DEBATED
+    }
+
+
+# The names the Analyst extracts, and so the names the debate scores.
+DEBATED = {"ACME", "LATE", "NEWCO", "STALE"}
+
+
+class Crash(FakeDebate):
+    """Answers like FakeDebate until asked to judge ACME, then fails the way a lost process or
+    database would, ending the pass rather than failing one name."""
+
+    def complete(self, request):
+        answer = super().complete(request)
+        if self.requests[-1][:2] == ("ACME", "judge"):
+            raise RuntimeError("connection to the pipeline lost")
+        return answer
+
+
+def test_a_score_that_dies_keeps_each_finished_name_and_a_rescore_finishes_it(db, config, store):
+    run_id = run(db, config, store, FakeAnalyst(), NAMES)
+    pipeline = db.connect("pipeline")
+    with pytest.raises(RuntimeError, match="connection to the pipeline lost"):
+        panel.score(pipeline, run_id, SECTORS, Crash(), store, workers=1)
+
+    states = "SELECT stage, state, detail FROM agb.panel_run_state WHERE run_id = %s ORDER BY id"
+    assert rows(db, states, run_id) == [
+        ("evidence", "completed", None),
+        ("score", "interrupted", "RuntimeError: connection to the pipeline lost"),
+    ]
+    kept = scores(db, run_id)
+    assert "ACME" not in kept and all(s[0] == "scored" for s in kept.values())
+
+    # A rescore pays only for what was not stored: ACME's judge and the judges still to come.
+    model = FakeDebate()
+    assert panel.score(pipeline, run_id, SECTORS, model, store) == len(DEBATED) - len(kept)
+    assert {role for _, role, _ in model.requests} == {"judge"}
+    assert sorted(s for s, _, _ in model.requests) == sorted(DEBATED - set(kept))
+    assert sorted(scores(db, run_id)) == sorted(DEBATED)
+    assert rows(db, states, run_id)[-1] == ("score", "completed", None)
+
+
+def test_no_panel_run_is_left_without_a_terminal_state(db, config, store):
+    debated(db, config, store, FakeDebate({("LATE", "defender"): "error"}))
+    with pytest.raises(panel.PanelError, match="no sector"):
+        debated(db, config, store, FakeDebate(), sectors={})
+
+    assert rows(
+        db,
+        """
+        SELECT r.id, s.stage, s.state FROM agb.panel_run r
+        LEFT JOIN LATERAL (
+            SELECT stage, state FROM agb.panel_run_state WHERE run_id = r.id
+            ORDER BY id DESC LIMIT 1
+        ) s ON true
+        ORDER BY r.id
+        """,
+    ) == [(1, "score", "completed"), (2, "score", "interrupted")]
