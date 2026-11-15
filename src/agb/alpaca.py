@@ -4,7 +4,10 @@ The execution service is the only process that holds the keys, and this is the o
 that uses them. Every answer is turned into a plain value with the fields the service needs,
 and every failure is an `AlpacaError` that carries the HTTP status and Alpaca's own error
 code, so the service can tell a duplicate `client_order_id` (422, code 40010001) or an order
-it cannot find (404) from a broken network. No error message ever carries a key.
+it cannot find (404) from a broken network. No error message ever carries a key. An answer
+that parses as JSON but lacks a field the service needs, or carries one of the wrong shape, is
+an `AlpacaError` too, with no status: the broker's answer cannot be read, so for a write it
+is as if no answer came.
 
 A read that does not get an answer the broker stands by -- a timeout, a dropped connection,
 a 429 or a 5xx -- is attempted again, twice at most, with a doubling backoff and the
@@ -17,6 +20,7 @@ quantities reach the broker as written; Alpaca accepts them on day orders only, 
 fractional market-on-close order, which the service records as a rejection.
 """
 
+import functools
 import http.client
 import json
 import logging
@@ -274,6 +278,28 @@ def _order(raw: dict[str, Any]) -> Order:
     )
 
 
+# What reading a broker's answer raises when a field is missing or of the wrong shape: a key
+# that is not there, a None or a list where an object was expected, a number that does not
+# parse.
+_MALFORMED = (KeyError, IndexError, TypeError, ValueError, AttributeError, ArithmeticError)
+
+
+def _parsed(method):
+    """Turn a malformed answer into an `AlpacaError` naming the call, so the service sees one
+    kind of broker failure however the answer went wrong."""
+
+    @functools.wraps(method)
+    def wrapper(self: "Alpaca", *args: Any, **kwargs: Any) -> Any:
+        try:
+            return method(self, *args, **kwargs)
+        except _MALFORMED as exc:
+            raise AlpacaError(
+                self._scrub(f"{method.__name__}: the broker's answer is malformed: {exc!r}")
+            ) from None
+
+    return wrapper
+
+
 class Alpaca:
     def __init__(
         self,
@@ -405,6 +431,7 @@ class Alpaca:
         except (OSError, ValueError, http.client.HTTPException) as exc:
             raise AlpacaError(self._scrub(f"{method} {path}: {exc}")) from None
 
+    @_parsed
     def account(self) -> Account:
         raw = self._call("GET", self._trading, "/v2/account")
         return Account(
@@ -416,12 +443,14 @@ class Alpaca:
             buying_power=_decimal(raw.get("buying_power")),
         )
 
+    @_parsed
     def configuration(self) -> Configuration:
         raw = self._call("GET", self._trading, "/v2/account/configurations")
         return Configuration(
             suspend_trade=bool(raw.get("suspend_trade")), no_shorting=bool(raw.get("no_shorting"))
         )
 
+    @_parsed
     def suspend(self, suspend_trade: bool) -> Configuration:
         """Set or unset the account's `suspend_trade`, which blocks new orders at the broker.
         Returns the configuration the broker answers with."""
@@ -435,6 +464,7 @@ class Alpaca:
             suspend_trade=bool(raw.get("suspend_trade")), no_shorting=bool(raw.get("no_shorting"))
         )
 
+    @_parsed
     def asset(self, symbol: str) -> Asset:
         raw = self._call("GET", self._trading, f"/v2/assets/{urllib.parse.quote(symbol)}")
         return Asset(
@@ -444,6 +474,7 @@ class Alpaca:
             fractionable=bool(raw.get("fractionable")),
         )
 
+    @_parsed
     def latest_quotes(self, symbols: Sequence[str]) -> dict[str, Quote]:
         """The latest NBBO quote per symbol. A symbol with no quote is absent."""
         if not symbols:
@@ -458,6 +489,7 @@ class Alpaca:
                 quotes[symbol] = Quote(symbol, bid, ask, at)
         return quotes
 
+    @_parsed
     def submit(self, symbol: str, qty: Decimal, side: str, client_order_id: str) -> Order:
         """Send a market-on-close order. A client_order_id the broker has seen raises an
         `AlpacaError` whose `duplicate` is true; the caller looks the order up instead."""
@@ -471,6 +503,7 @@ class Alpaca:
         }
         return _order(self._call("POST", self._trading, "/v2/orders", body=body))
 
+    @_parsed
     def order_by_client_id(self, client_order_id: str) -> Order:
         raw = self._call(
             "GET",
@@ -480,6 +513,7 @@ class Alpaca:
         )
         return _order(raw)
 
+    @_parsed
     def order(self, order_id: str) -> Order:
         return _order(
             self._call("GET", self._trading, f"/v2/orders/{urllib.parse.quote(order_id)}")
@@ -488,6 +522,7 @@ class Alpaca:
     def cancel(self, order_id: str) -> None:
         self._call("DELETE", self._trading, f"/v2/orders/{urllib.parse.quote(order_id)}")
 
+    @_parsed
     def positions(self) -> list[Position]:
         raw = self._call("GET", self._trading, "/v2/positions") or []
         return [
@@ -500,6 +535,7 @@ class Alpaca:
             for p in raw
         ]
 
+    @_parsed
     def close_all(self) -> list[Closed]:
         """Close every position at market, cancelling every open order first. Alpaca answers
         207 Multi-Status with one entry per symbol, and a symbol it could not close (a halted
@@ -508,6 +544,7 @@ class Alpaca:
             self._call("DELETE", self._trading, "/v2/positions", query={"cancel_orders": "true"})
         )
 
+    @_parsed
     def fills(self, after: datetime) -> list[Fill]:
         """Every execution after `after`, oldest first, across as many pages as it takes."""
         fills: list[Fill] = []

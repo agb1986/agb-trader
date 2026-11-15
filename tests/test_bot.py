@@ -285,6 +285,95 @@ def test_only_the_configured_chat_is_answered(db, telegram, rebalance_ahead, cap
     ]
 
 
+# One failing duty does not stop the cycle.
+
+
+def test_a_raising_findings_duty_still_delivers_the_pending_alerts(
+    db, telegram, rebalance_ahead, monkeypatch, caplog
+):
+    """A duty that raises stops only itself: the cycle goes on, delivery included, and the
+    failure raises one alert for its run of failures, however many cycles it lasts."""
+    conn = db.connect("bot")
+    bot = Bot(telegram, CHAT, lambda: NOW)
+    bot.raise_alert(conn, "overdue", "approval_request", "2026-10", "an alert already pending")
+
+    def boom(*_):
+        raise TypeError("unsupported operand type(s) for *: 'NoneType' and 'Decimal'")
+
+    monkeypatch.setattr(bot, "findings", boom)
+    with caplog.at_level(logging.ERROR, logger="agb.services.bot"):
+        bot(conn)
+        bot(conn)
+    assert "the findings duty failed" in caplog.text
+
+    assert alerts(db) == [
+        ("overdue", "approval_request", "2026-10"),
+        ("cycle_failure", "findings", "2026-09-15T16:00:00Z"),
+    ]
+    assert [text for _, text in telegram.sent] == [
+        "an alert already pending",
+        "HEALTH ALERT — nothing has been done and nothing will be.\n\n"
+        "  bot duty failed: findings\n"
+        "    TypeError: unsupported operand type(s) for *: 'NoneType' and 'Decimal';"
+        " failing since 2026-09-15 12:00 ET, the rest of the cycle still runs",
+    ]
+    assert [(kind, event) for kind, event, *_ in events(db)] == [
+        ("overdue", "delivered"),
+        ("cycle_failure", "delivered"),
+    ]
+
+
+def test_a_duty_that_recovers_and_fails_again_raises_a_new_alert(db, telegram, rebalance_ahead):
+    now = NOW
+    conn = db.connect("bot")
+    bot = Bot(telegram, CHAT, lambda: now)
+    findings = bot.findings
+
+    def boom(*_):
+        raise RuntimeError("boom")
+
+    bot.findings = boom
+    bot(conn)
+    now += timedelta(minutes=1)
+    bot.findings = findings
+    bot(conn)
+    now += timedelta(minutes=1)
+    bot.findings = boom
+    bot(conn)
+
+    assert alerts(db) == [
+        ("cycle_failure", "findings", "2026-09-15T16:00:00Z"),
+        ("cycle_failure", "findings", "2026-09-15T16:02:00Z"),
+    ]
+
+
+def test_every_duty_after_a_failing_one_still_runs(db, telegram, rebalance_ahead, monkeypatch):
+    conn = db.connect("bot")
+    bot = Bot(telegram, CHAT, lambda: NOW)
+    ran: list[str] = []
+    for duty in ("rebalances", "approvals", "preflight"):
+        monkeypatch.setattr(bot, duty, lambda *_, duty=duty: ran.append(duty))
+
+    def boom(*_):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(bot, "poll", boom)
+    bot(conn)
+
+    assert ran == ["rebalances", "approvals", "preflight"]
+    assert alerts(db) == [("cycle_failure", "poll", "2026-09-15T16:00:00Z")]
+    assert [kind for kind, *_ in events(db)] == ["cycle_failure"]
+
+
+def test_a_lost_connection_still_ends_the_cycle(db, telegram):
+    """No later duty could reach a database that is gone, so that error propagates and
+    Compose restarts the service, as before."""
+    conn = db.connect("bot")
+    conn.close()
+    with pytest.raises(errors.OperationalError, match="the connection is closed"):
+        Bot(telegram, CHAT, lambda: NOW)(conn)
+
+
 def test_telegram_unreachable_does_not_stop_the_cycle(db, telegram, rebalance_ahead, caplog):
     expect(db, "approval_request", "2026-10", NOW - timedelta(minutes=1))
     telegram.fail = "getUpdates: timed out"

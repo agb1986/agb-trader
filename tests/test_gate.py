@@ -285,6 +285,41 @@ def test_a_sell_may_close_no_more_than_the_book_holds():
     assert (side.measured, side.passed) == ("sell 301, holding 300", False)
 
 
+# Ten names held at $4,800 and one, H01, that has grown to $12,000, 12% of equity, and left the
+# ranking: the rebalance sells it whole and buys the ten names the book lacks.
+OVERSIZED = Case(
+    replace(
+        BASE,
+        orders=(sell("H01", qty=Decimal(600), notional=Decimal(12000)),)
+        + tuple(buy(s) for s in NAMES[10:]),
+    ),
+    members=MEMBERS | {"H01"},
+    marks=MARKS | {"H01": Decimal(20)},
+    book={"H01": Decimal(600)} | {s: Decimal(240) for s in NAMES[:10]},
+)
+
+
+def test_a_sell_of_a_holding_past_the_cap_passes_the_gate():
+    """The cap bounds the exposure a buy adds. A sell takes exposure off, so a held name that
+    has grown past 8% and dropped out of the ranking is sold whole rather than halting the
+    rebalance every month until a human steps in."""
+    checks = evaluate(OVERSIZED)
+    [notional] = [c for c in checks if c.name == "notional" and c.symbol == "H01"]
+
+    assert (notional.measured, notional.threshold) == ("12.00% of 100000.00", "none on a sell")
+    assert notional.passed
+    assert [c for c in checks if not c.passed] == []
+
+
+def test_a_buy_past_the_cap_still_fails_the_gate():
+    sold, _, *bought = OVERSIZED.target.orders
+    orders = (sold, buy("N11", qty=Decimal(600), notional=Decimal(12000)), *bought)
+    case = replace(OVERSIZED, target=replace(OVERSIZED.target, orders=orders))
+    failed = [(c.name, c.symbol, c.measured, c.threshold) for c in evaluate(case) if not c.passed]
+
+    assert failed == [("notional", "N11", "12.00% of 100000.00", "<= 8%")]
+
+
 # A forced corporate event, recorded (agb.corporate): the halt whose incumbent the rebalance
 # carried, and the cash acquisition that terminated a position and left the basket a name short.
 HALTED = corporate.Event(

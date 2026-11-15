@@ -269,7 +269,7 @@ that its bytes have rotted — the hash in the row is what the file was, not wha
 
 So the scheduler plans a `panel_audit` job every night at **04:00 New York**, an hour after the
 backup, with a two-hour grace period. The pipeline claims it, draws a random sample of up to
-200 of the hashes the panel tables reference, reads each body back out of the store, and records
+100,000 of the hashes (the whole store, at its present size) the panel tables reference, reads each body back out of the store, and records
 what it found in `agb.panel_audit`: how many bodies are referenced, how many were checked, how
 many read back sound, and the hashes of any that were missing or corrupt.
 
@@ -278,14 +278,25 @@ not hash to its name, including when the file does not decompress at all — `Pa
 turns a `ZstdError` into the same `StoreError` a hash mismatch raises, so broken compression is
 reported as corruption and not as a crash.
 
-The sample exists because the store grows without bound and the box is a Celeron: reading every
-body every night would eventually be the largest thing the server does. Each night draws its own
-sample, so the store is covered over time rather than at a point in time, and a cited body is
-counted once however many rows cite it.
+The audit reads the whole store each night, up to a cap (`panel_audit.SAMPLE`, 100,000 bodies),
+so each night's result is a statement about the store and not about the bodies drawn. The cap
+is there because the store grows without bound and the box is a Celeron. Past it, each night
+draws its own random sample, so the store is covered over time rather than at a point in time.
+A cited body is counted once however many rows cite it.
+
+The cap is sized from a reading. On 2026-11-08 the job was run on the server with
+`AGB_PANEL_AUDIT_SAMPLE=776`, the whole store: it was claimed at 10:44:12Z and the check
+finished at 10:44:14Z, so **776 bodies read back in 2 seconds**, about 390 bodies a second. The
+earlier sample of 200 was a guess against the two-hour grace period, and that reading put it
+four orders of magnitude under it. At the measured rate 100,000 bodies is about four minutes,
+under 4% of the grace, so the cap stays honest until the store is well over a hundred times its
+present size. When `agb runtimes` shows `panel_audit` approaching a fifth of the grace, lower
+the cap with `AGB_PANEL_AUDIT_SAMPLE`, which is the escape hatch for a machine where the
+measurement no longer holds.
 
 The job **completes** even when it finds an unsound body: the finding is the store's, not the
 job's, and a failed job would be reclaimed and re-run to find the same thing again. What raises
-the alarm is `health.panel_bodies`, which reads the most recent row and returns a
+the alarm is `health.panel_bodies`, which reads the most recently recorded row and returns a
 `panel_body_unsound` finding when anything in it was missing or corrupt. The bot sends that as
 a health alert naming the counts and the first unsound hash, once, and the UI shows it.
 
@@ -311,21 +322,25 @@ unless the restored file hashes to what the marker recorded, which is the differ
 putting a body back and losing it. The store is the only copy of a panel body: the database
 holds hashes, not bytes.
 
-`run` inserts the `panel_audit` job as the scheduler would, for tomorrow's period by default,
-and waits up to five minutes for the pipeline to claim it, read the sample, and record the row.
-Then it prints the row and the bot's lines naming the store. It takes a period explicitly —
-`make panel-check CMD="run 2026-10-26"` — because `(kind, period)` is unique, so a period that
-already has an audit job inserts nothing instead of auditing twice.
+`run` inserts a `panel_audit` job now and waits up to five minutes for the pipeline to claim it,
+read the sample, and record the row. Then it prints the row and the bot's lines naming the
+store. The scheduler plans a `panel_audit` for every night 45 days ahead, so every bare date
+already has a job and `(kind, period)` is unique: the default period is therefore today's date
+plus a suffix, `YYYY-MM-DD-drill-HHMMSS`, which the scheduler never plans. `agb.panel_audit`
+admits that form, and `health.panel_bodies` reads the row recorded last rather than the
+highest period, so the drill's audit is the one it alerts on. `run` takes a period explicitly
+too, `make panel-check CMD="run 2026-11-15-again"`; a bare date will be refused as taken.
 
 ### Making the check certain
 
-With a sample of 200, a single corrupted body in a large store is read on any one night with
-probability 200/bodies, so the nightly job finds it within days rather than on the first night.
-That is the right behaviour for the nightly job and no use as a test.
+While the store holds fewer bodies than the cap, one audit reads all of them, so a single
+corrupted body is found on the first night and the drill needs no change on the server. Past the
+cap a corrupted body is read on any one night with probability cap/bodies, which is right for
+the nightly job and no use as a test.
 
-So the sample is settable on the deploy machine, with `AGB_PANEL_AUDIT_SAMPLE` in
-`env/pipeline.env`. `check` and `corrupt` read the store's size and the sample in force, and
-`corrupt` refuses to break anything when the sample does not cover the store, printing the two
+So the cap is settable on the deploy machine, with `AGB_PANEL_AUDIT_SAMPLE` in
+`env/pipeline.env`. `check` and `corrupt` read the store's size and the cap in force, and
+`corrupt` refuses to break anything when the cap does not cover the store, printing the two
 commands that fix it:
 
 ```
@@ -333,8 +348,8 @@ ssh casaos.local "echo AGB_PANEL_AUDIT_SAMPLE=<bodies> >> /mnt/data/AppData/agb-
 ssh casaos.local "/mnt/data/AppData/agb-trader/agb-stack up -d pipeline"
 ```
 
-Put it back to 200 when the check is done: the nightly job has a two-hour grace period and
-shares one slow disk with the household stack, and a sample sized for a test is not sized for
+Remove the line when the check is done: the nightly job has a two-hour grace period and
+shares one slow disk with the household stack, and a cap sized for a test is not sized for
 every night. The variable is deliberately absent from `env/pipeline.env.example`, since
 `deploy.sh` requires the server to set every name the example does and this one is a temporary
 override, not a setting the stack needs.

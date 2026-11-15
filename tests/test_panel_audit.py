@@ -8,14 +8,17 @@ check finds each one, that the pipeline's nightly job records what it found, and
 turns a body it could not read back into one alert.
 """
 
+import re
 import shutil
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from psycopg import errors
 from test_bot import CHAT, FakeTelegram, alerts
 
 from agb import health, jobs, panel, panel_audit, schedule
+from agb.nyse import NyseCalendar
 from agb.panel_store import PanelStore
 from agb.schedule import Expected, Planned
 from agb.services.bot import ALERT_HEADER, Bot
@@ -191,6 +194,25 @@ def test_each_night_draws_its_own_sample(db, store):
     assert len(drawn) > 3
 
 
+def test_the_default_cap_reads_the_whole_store_and_stays_inside_the_grace():
+    """Sized from the measurement of 2026-11-08: 776 bodies read back in 2 seconds."""
+    measured_bodies, measured_seconds = 776, 2
+    seconds_at_cap = panel_audit.SAMPLE * measured_seconds / measured_bodies
+
+    # The whole store as measured is read, with room to grow, and the bound is still a bound:
+    # reading up to the cap at the measured rate takes under a tenth of the grace period.
+    assert panel_audit.SAMPLE >= 100 * measured_bodies
+    assert seconds_at_cap < schedule.PANEL_AUDIT_GRACE.total_seconds() / 10
+
+
+def test_a_cap_below_the_store_still_draws_a_sample(db, store):
+    cited = panel_bodies(db, store, "AAA", "BBB")
+
+    audit = panel_audit.check(db.connect("pipeline"), store, sample=len(cited) - 1)
+
+    assert (audit.bodies, audit.checked) == (len(cited), len(cited) - 1)
+
+
 def test_an_empty_store_checks_nothing(db, store):
     audit = panel_audit.check(db.connect("pipeline"), store)
 
@@ -278,7 +300,7 @@ def test_a_corrupted_body_completes_the_job_and_raises_one_alert(db, store, tmp_
 
 
 def test_the_sample_can_be_set_on_the_deploy_machine(monkeypatch):
-    """The deliberate-corruption check needs a sample that covers the store, without a release."""
+    """The deliberate-corruption check needs a cap that covers the store, without a release."""
     monkeypatch.delenv(panel_audit.SAMPLE_ENV, raising=False)
     assert sample_from_env() == panel_audit.SAMPLE
     monkeypatch.setenv(panel_audit.SAMPLE_ENV, "5000")
@@ -288,3 +310,95 @@ def test_the_sample_can_be_set_on_the_deploy_machine(monkeypatch):
         monkeypatch.setenv(panel_audit.SAMPLE_ENV, refused)
         with pytest.raises(SystemExit, match="not a number"):
             sample_from_env()
+
+
+# The drill: an audit the operator drives on demand (scripts/deploy/panel-check.sh run).
+
+SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "deploy" / "panel-check.sh"
+DRILL = f"{PERIOD}-drill-143012"
+
+
+def drill_audit(db, store, period=DRILL):
+    """What `panel-check.sh run` does: insert a job for `period`, as the operator, and let the
+    pipeline claim it."""
+    db.connect("scheduler").execute(
+        "INSERT INTO agb.job (kind, period, session_date, not_before, created_by)"
+        " VALUES ('panel_audit', %s, %s, now(), 'operator')",
+        (period, period[:10]),
+    )
+
+
+def drill_default_period(now):
+    """The period the script's `run` defaults to at `now`, from the format string it holds."""
+    (fmt,) = re.findall(r"^drill_format=(\S+)$", SCRIPT.read_text(), re.MULTILINE)
+    return now.strftime(fmt)
+
+
+@pytest.fixture(scope="module")
+def cal():
+    return NyseCalendar(date(2026, 1, 1), date(2027, 12, 31))
+
+
+def test_the_drill_default_is_a_period_the_scheduler_never_plans(cal):
+    # The scheduler plans every night out to LOOKAHEAD, so a bare date is always taken, and
+    # that is permanent: the default must stay outside what plan() can ever name.
+    today = date(2026, 11, 15)
+    planned = {p.period for p in schedule.plan(cal, today) if p.kind == schedule.PANEL_AUDIT}
+    assert len(planned) == schedule.LOOKAHEAD.days
+    assert (today + timedelta(days=1)).isoformat() in planned
+
+    default = drill_default_period(datetime(2026, 11, 15, 14, 30, 12, tzinfo=UTC))
+    assert default == "2026-11-15-drill-143012"
+    assert default not in planned
+    # And the table admits it, which the date-only check did not.
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}(-[a-z0-9][a-z0-9-]*)?", default)
+
+
+def test_a_drilled_audit_is_recorded_and_alerts_even_beside_a_later_planned_period(
+    db, store, tmp_path
+):
+    cited = panel_bodies(db, store, "AAA", "BBB")
+    # The scheduler has planned tonight's audit and every night after, out to the lookahead.
+    plan_audit(db, "2026-12-23", start=datetime.now(UTC) + timedelta(days=30))
+    garble(store, cited[0])
+    drill_audit(db, store)
+    conn = db.connect("pipeline")
+
+    Pipeline(tmp_path / "lake", panel_dir=store.root)(conn)
+
+    assert audits(db) == [
+        (DRILL, len(cited), len(cited), len(cited) - 1, [], [cited[0]], "pipeline")
+    ]
+    assert (
+        conn.execute(
+            "SELECT state FROM agb.job_state WHERE kind = 'panel_audit' AND period = %s", (DRILL,)
+        ).fetchone()[0]
+        == "completed"
+    )
+    # The audit just driven is the newest recorded, so it is the one the bot alerts on, though
+    # its period sorts before a later date.
+    [finding] = health.panel_bodies(db.connect("bot"))
+    assert (finding.kind, finding.period) == ("panel_body_unsound", DRILL)
+
+
+def test_the_newest_recorded_audit_is_read_not_the_highest_period(db, store):
+    panel_bodies(db, store, "AAA")
+    conn = db.connect("pipeline")
+    for period, missing in (("2026-12-24", []), (DRILL, ["a" * 64])):
+        drill_audit(db, store, period)
+        claim = jobs.claim(conn, [schedule.PANEL_AUDIT], "pipeline", timedelta(minutes=5))
+        audit = panel_audit.Audit(2, 1, 1 - len(missing), tuple(missing), ())
+        panel_audit.record(conn, claim.period, claim.job_id, audit, "pipeline")
+
+    [finding] = health.panel_bodies(db.connect("bot"))
+    assert finding.period == DRILL
+
+
+@pytest.mark.parametrize("period", ["2026-11-15-", "2026-11-15 drill", "2026-11-15-Drill", "x"])
+def test_a_period_that_is_not_a_day_with_a_suffix_is_refused(db, period):
+    with pytest.raises(errors.CheckViolation):
+        db.connect("pipeline").execute(
+            "INSERT INTO agb.panel_audit (period, job_id, bodies, checked, sound, actor)"
+            " VALUES (%s, 1, 0, 0, 0, 'pipeline')",
+            (period,),
+        )

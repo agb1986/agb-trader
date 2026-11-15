@@ -10,6 +10,7 @@ from decimal import Decimal
 
 import pytest
 import registry_fake
+from conftest import SUPERUSER
 from market_fake import PERIOD, TRADE
 from psycopg import errors
 from test_bot import CHAT, FakeTelegram, events
@@ -171,6 +172,17 @@ def test_each_command_answers_from_the_database_after_a_paper_rebalance(db, pape
 
     assert help_ == help_text()
     assert blocks(help_)[0] == "COMMANDS"
+
+
+def test_status_says_the_mode_is_not_set_when_there_is_no_mode_row(db):
+    """The migrations record paper, and the append-only rule keeps it; a superuser bypassing
+    that rule is the only way to lose it, and /status still answers."""
+    with db.cluster.connect(db.name, SUPERUSER) as conn:
+        conn.execute("SET session_replication_role = replica")
+        conn.execute("DELETE FROM agb.mode_event")
+    [status] = ask(db, "/status")
+    assert_style(status)
+    assert blocks(status)[0] == "agb-trader — MODE NOT SET · ACTIVE"
 
 
 def test_status_says_the_live_model_is_live_under_the_paper_waiver(db, paper):
@@ -516,6 +528,51 @@ def test_the_fill_confirmation_arrives_after_the_close_and_only_once(db):
     assert [e[:3] for e in events(db) if e[0] == "fill_confirmation"] == [
         ("fill_confirmation", "delivered", "telegram")
     ]
+
+
+class Canned:
+    """A connection that answers each query with the rows given for it, for states the
+    schema does not let a test write."""
+
+    def __init__(self, answers):
+        self.answers = answers
+
+    def execute(self, query, params=None):
+        self.rows = self.answers[query]
+        return self
+
+    def fetchall(self):
+        return self.rows
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+
+def filled(*orders):
+    return readout.filled_text(
+        Canned({readout._ORDERS: list(orders), readout._APPROVED: []}), 1, PERIOD
+    )
+
+
+@pytest.mark.parametrize(
+    "unmeasured",
+    [
+        ("N02", "buy", Decimal(10), Decimal(10), Decimal(100), None, Decimal(2), Decimal(0)),
+        ("N02", "buy", Decimal(10), Decimal(10), Decimal(100), Decimal(5), None, Decimal(0)),
+    ],
+    ids=["no shortfall", "no modelled cost"],
+)
+def test_the_fill_confirmation_weighs_only_the_orders_it_can_measure(unmeasured):
+    measured = ("N01", "buy", Decimal(10), Decimal(10), Decimal(100), Decimal(5), Decimal(2), 0)
+
+    assert blocks(filled(measured, unmeasured))[3] == (
+        "  2 of 2 orders filled in full\n"
+        "    shortfall +5.0 bp vs mid, modelled 2.0 bp (1 not measured);"
+        " $2,000.00 traded, fees $0.00"
+    )
+    assert blocks(filled(unmeasured))[3] == (
+        "  1 of 1 orders filled in full\n    shortfall not measured; $1,000.00 traded, fees $0.00"
+    )
 
 
 def test_a_position_the_fills_do_not_explain_raises_a_mismatch_alert(db, paper):

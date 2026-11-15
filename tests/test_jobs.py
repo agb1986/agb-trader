@@ -83,6 +83,29 @@ def test_a_failed_job_is_not_claimed_again(db):
     ).fetchone() == ("vendor 503",)
 
 
+def test_a_released_job_can_be_held_again_and_the_release_says_why(db):
+    job_id = add_job(db, kind="submission")
+    worker = db.connect("execution")
+    claim = jobs.hold(worker, "submission", "2026-10", "execution", LEASE)
+    jobs.release(worker, claim, "connection reset")
+
+    assert state(db, job_id)[:2] == ("pending", None)
+    assert db.connect("cli").execute(
+        "SELECT detail FROM agb.job_event WHERE event = 'released'"
+    ).fetchone() == ("connection reset",)
+    again = jobs.hold(worker, "submission", "2026-10", "execution", LEASE)
+    jobs.complete(worker, again)
+    assert [event for event, _ in events(db, job_id)] == [
+        "created",
+        "claimed",
+        "released",
+        "claimed",
+        "completed",
+    ]
+    with pytest.raises(jobs.LeaseLost):
+        jobs.release(worker, again, "too late")
+
+
 def test_only_due_jobs_of_the_asked_kinds_are_claimed(db):
     add_job(db, "rebalance", "2026-11", due="now() + interval '1 day'")
     add_job(db, "data_pull", "2026-09-30")
@@ -137,6 +160,18 @@ def expire(db, job_id):
     """Wait out a zero-length lease."""
     time.sleep(0.05)
     assert state(db, job_id)[2] is True
+
+
+def test_an_expired_lease_cannot_be_released_by_its_worker(db):
+    job_id = add_job(db, kind="submission")
+    execution = db.connect("execution")
+    claim = jobs.claim(execution, ["submission"], "execution", timedelta(0))
+    expire(db, job_id)
+
+    with pytest.raises(jobs.LeaseLost):
+        jobs.release(execution, claim, "connection reset")
+    assert state(db, job_id) == ("lease_expired", "execution", True)
+    assert [event for event, _ in events(db, job_id)] == ["created", "claimed"]
 
 
 def test_an_expired_lease_is_visible_and_not_reclaimed_by_default(db):

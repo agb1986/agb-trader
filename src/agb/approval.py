@@ -635,8 +635,10 @@ _RERUNS = """
     UNION ALL
     SELECT reference FROM agb.rerun_pending WHERE reference LIKE %(period)s || '%%'
 """
+# A basket's reruns, made or asked for. A shadow basket also names the live one it shadows in
+# `deviation_of`, but it is not a rerun, so it does not count.
 _RERUN_OF = """
-    SELECT reference FROM agb.basket WHERE deviation_of = %(id)s
+    SELECT reference FROM agb.basket WHERE deviation_of = %(id)s AND kind = 'live'
     UNION ALL
     SELECT reference FROM agb.rerun_pending WHERE basket_id = %(id)s
 """

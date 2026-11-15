@@ -2,9 +2,11 @@ import json
 import re
 import threading
 
+import edgar_fake
 import psycopg
 import pytest
 from edgar_fake import AS_OF, FakeEdgar, client
+from test_jobs import add_job
 
 from agb import analyst, cli, panel
 from agb.analyst import AnalystError, Completion, normalise
@@ -311,9 +313,10 @@ def test_a_rerun_on_identical_inputs_is_answered_from_the_cache(db, config, stor
     second = run(db, config, store, model)
 
     assert len(model.calls) == 3
+    # Names are written as they finish, so the order is the request's, not the retrieval's.
     calls = (
         "SELECT request_sha256, response_sha256, cached FROM agb.panel_model_call "
-        "WHERE run_id = %s ORDER BY retrieval_id"
+        "WHERE run_id = %s ORDER BY request_sha256"
     )
     before, after = rows(db, calls, first), rows(db, calls, second)
     assert [c[:2] for c in after] == [c[:2] for c in before]
@@ -355,9 +358,13 @@ def test_a_failed_or_garbled_answer_is_an_analyst_failure(db, config, store):
     )
     assert logged == [("ACME", False), ("LATE", True), ("NEWCO", True)]
 
-    # A call that failed left nothing to answer from, so the next run asks again.
-    run(db, config, store, FakeAnalyst())
+    # A call that failed left nothing to answer from, and an answer that could not be read is
+    # not replayed, so the next run asks again for both; LATE's good answer is replayed.
+    again = FakeAnalyst()
+    run(db, config, store, again)
+    assert sorted(again.calls) == ["ACME", "NEWCO"]
     assert extract(db, store, "ACME", run_id + 1)[0] == "extracted"
+    assert extract(db, store, "NEWCO", run_id + 1)[0] == "extracted"
 
 
 def test_a_missing_body_is_not_a_cache_hit(db, config, store):
@@ -377,3 +384,130 @@ def test_edgar_is_asked_with_the_user_agent_and_nothing_after_the_as_of_date(db,
 
     assert {agent for _, agent in fake.requests} == {"agb-trader test test@example.com"}
     assert not any(url.endswith("/q3.htm") for url, _ in fake.requests)
+
+
+class Crash(FakeAnalyst):
+    """Answers until its `at`th call, then fails the way a lost process or database would: not
+    with an AnalystError, which is a name's failure, but with an error that ends the pass."""
+
+    def __init__(self, at):
+        super().__init__()
+        self.at = at
+
+    def complete(self, request):
+        answer = super().complete(request)
+        if len(self.calls) >= self.at:
+            raise RuntimeError("connection to the pipeline lost")
+        return answer
+
+
+def states(db, run_id):
+    return rows(
+        db,
+        "SELECT stage, state, detail FROM agb.panel_run_state WHERE run_id = %s ORDER BY id",
+        run_id,
+    )
+
+
+def test_a_pass_that_dies_keeps_each_finished_name_and_its_retry_resumes(
+    db, config, store, monkeypatch
+):
+    # Fifty regular filers, each with ACME's filings under its own CIK and ticker.
+    shortlist = [f"Q{chr(65 + n // 26)}{chr(65 + n % 26)}" for n in range(50)]
+    for n, ticker in enumerate(shortlist):
+        company = {**edgar_fake.COMPANIES["ACME"], "cik": 5000 + n, "name": f"{ticker} CORP"}
+        monkeypatch.setitem(edgar_fake.COMPANIES, ticker, company | {"tickers": [ticker]})
+    fake = FakeEdgar()
+    job_id = add_job(db)
+
+    def go(model):
+        return panel.run(
+            db.connect("pipeline"),
+            config,
+            shortlist,
+            AS_OF,
+            client(fake),
+            model,
+            store,
+            job_id=job_id,
+            workers=1,
+        )
+
+    # The 49th call dies; the 48 names answered before it are each in the database already.
+    crash = Crash(at=49)
+    with pytest.raises(RuntimeError, match="connection to the pipeline lost"):
+        go(crash)
+
+    [(run_id,)] = rows(db, "SELECT id FROM agb.panel_run")
+    stored = rows(
+        db,
+        "SELECT r.symbol FROM agb.panel_retrieval r JOIN agb.panel_extract e "
+        "ON e.retrieval_id = r.id WHERE r.run_id = %s AND e.outcome = 'extracted' ORDER BY r.id",
+        run_id,
+    )
+    stored = {symbol for (symbol,) in stored}
+    assert len(stored) == 48
+    assert states(db, run_id) == [
+        ("evidence", "interrupted", "RuntimeError: connection to the pipeline lost")
+    ]
+
+    # The retry of the same job resumes the run and asks only for the two names it lacks.
+    retry = FakeAnalyst()
+    assert go(retry) == run_id
+    assert len(retry.calls) == 2
+    assert set(retry.calls) == set(shortlist) - stored
+    assert rows(db, "SELECT count(*) FROM agb.panel_run") == [(1,)]
+    assert rows(
+        db,
+        "SELECT count(*), count(*) FILTER (WHERE e.outcome = 'extracted') "
+        "FROM agb.panel_retrieval r JOIN agb.panel_extract e ON e.retrieval_id = r.id "
+        "WHERE r.run_id = %s",
+        run_id,
+    ) == [(50, 50)]
+    assert states(db, run_id)[-1] == ("evidence", "completed", None)
+
+
+def test_a_run_outside_a_job_or_for_another_shortlist_starts_afresh(db, config, store):
+    job_id = add_job(db)
+    pipeline = db.connect("pipeline")
+    model = FakeAnalyst()
+
+    first = panel.run(pipeline, config, ["ACME"], AS_OF, client(), model, store, job_id=job_id)
+    # A shortlist without a name the earlier pass stored is not the same pass.
+    second = panel.run(pipeline, config, ["LATE"], AS_OF, client(), model, store, job_id=job_id)
+    third = run(db, config, store, model, ["ACME"])
+
+    assert len({first, second, third}) == 3
+    for run_id in (first, second, third):
+        assert states(db, run_id) == [("evidence", "completed", None)]
+
+
+def test_every_pass_ends_completed_or_interrupted(db, config, store):
+    with pytest.raises(RuntimeError):
+        run(db, config, store, Crash(at=1))
+    done = run(db, config, store, FakeAnalyst())
+    with pytest.raises(panel.PanelError, match="exceeds"):
+        run(db, config, store, FakeAnalyst(), [f"X{n}" for n in range(51)])
+
+    assert states(db, done - 1) == [
+        ("evidence", "interrupted", "RuntimeError: connection to the pipeline lost")
+    ]
+    assert states(db, done) == [("evidence", "completed", None)]
+    # A shortlist refused before anything was started leaves no run at all.
+    assert rows(db, "SELECT count(*) FROM agb.panel_run") == [(2,)]
+    assert (
+        rows(
+            db,
+            "SELECT r.id FROM agb.panel_run r WHERE NOT EXISTS "
+            "(SELECT 1 FROM agb.panel_run_state s WHERE s.run_id = r.id)",
+        )
+        == []
+    )
+    with pytest.raises(psycopg.Error):
+        db.connect("pipeline").execute("UPDATE agb.panel_run_state SET state = 'completed'")
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        db.connect("cli").execute(
+            "INSERT INTO agb.panel_run_state (run_id, stage, state, actor) "
+            "VALUES (%s, 'evidence', 'completed', 'cli')",
+            (done,),
+        )

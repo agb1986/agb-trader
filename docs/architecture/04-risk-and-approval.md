@@ -52,6 +52,7 @@ Checks span three levels, because a basket can be perfectly self-consistent and 
 - Alpaca reports the asset tradable, and fractionable where fractional shares are used.
 - Side consistent with the current position.
 - Per-order notional at or below roughly 8% of equity, the band absorbing intra-month drift around the 5% target.
+  - Exception: sells are exempt. The cap bounds the exposure a buy adds, and a sell takes exposure off. A held name that has drifted past 8% and leaves the ranking is sold whole in one order, not split into orders under the cap; holding it to the cap would halt that rebalance, and every one after it, until a human intervened. The check is still recorded on a sell, with its measured share and the threshold `none on a sell`.
 - Time-in-force is `cls`.
 - Submission clock earlier than 15:45 ET, five minutes of pad on Alpaca's approximately 15:50 cutoff.
 
