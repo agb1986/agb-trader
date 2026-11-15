@@ -680,6 +680,9 @@ GATES = (
     ("sharpe_net", "Cost-inclusive Sharpe", 2),
     ("dsr_2x", "Deflated Sharpe at 2x cost", 3),
 )
+# The returns a Sharpe gate read, as each gate records it (issue #167). Certifications up to
+# lgbm-2026-10 recorded no basis and gated total returns.
+BASES = {"total": "total return", "excess_spy": "excess over SPY"}
 # The CPCV path distribution: what each measure is called, whether it reads as a percentage, and
 # whether a lower live reading is the worse one. The last decides which end of the distribution
 # the live column is marked against.
@@ -805,6 +808,9 @@ def validation(conn: psycopg.Connection, now: datetime) -> str:
             if applied.get("threshold") is not None
             else "—"
         )
+        if key == "sharpe_net":
+            basis = applied.get("basis", "total")
+            label = f"{label} ({BASES.get(basis, basis)})"
         gate_rows.append(
             (
                 label,
