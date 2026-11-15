@@ -23,6 +23,8 @@ END = date(2026, 8, 31)
 PANEL_START = date(2024, 1, 1)
 COMMON = "Domestic Common Stock"
 NAMES = 24
+# The ticker backtest.BENCHMARK and gates.BENCHMARK name.
+BENCHMARK = "SPY"
 
 _SEP = pa.schema([
     ("ticker", pa.string()), ("date", pa.date32()), ("open", pa.float64()),
@@ -146,6 +148,12 @@ class Market:
             drift = 0.001 - 0.002 * (i - 1) / max(count - 1, 1)
             self.name(f"{prefix}{i:02d}", drift=drift, **kwargs)
         return self
+
+    def benchmark(self, *, drift=0.0, noise=0.002):
+        """The index fund the gates measure excess returns over, as an ETF the universe leaves
+        out: priced, never ranked or traded. Its drift is the names' average, so it stands for
+        the market they make up, and a book of the better names beats it."""
+        return self.name(BENCHMARK, drift=drift, noise=noise, category="ETF")
 
     def land(self):
         for dataset, schema in ((lake.SEP, _SEP), (lake.SF1, _SF1), (lake.TICKERS, _TICKERS)):

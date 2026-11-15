@@ -283,3 +283,66 @@ def test_mismatched_paths_are_refused():
 def test_bad_thresholds_are_refused(bad):
     with pytest.raises(ValueError):
         gates.Thresholds(**bad)
+
+
+# The excess basis (issue #167) ----------------------------------------------------------------
+
+
+def test_a_book_that_is_the_benchmark_has_no_excess_sharpe_and_fails():
+    """Acceptance: a long-only book whose every month is the benchmark's month has a strong
+    total-return Sharpe from beta alone, and nothing over the benchmark, so the excess Sharpe
+    is 0 and the gate fails where the total-return gate passed it."""
+    verdict = verdict_for(benchmark=STRONG)
+
+    assert verdict["sharpe_basis"] == gates.EXCESS
+    assert verdict["sharpe_net"] == 0.0
+    assert verdict["sharpe_total"] == pytest.approx(gates.path_sharpe(STRONG))
+    assert verdict["sharpe_total"] > 0.5
+    assert not verdict["gates"]["sharpe_net"]["passed"] and not verdict["passed"]
+    assert all(verdict["gates"][key]["basis"] == gates.EXCESS for key in ("dsr", "sharpe_net"))
+    assert verdict["gates"]["pbo"]["basis"] == gates.TOTAL, "candidates are ranked on total"
+    assert verdict["excess"]["benchmark"] == "SPY" and verdict["excess"]["defined"]
+    assert verdict_for()["gates"]["sharpe_net"]["passed"], "the same book on total returns"
+
+
+def test_a_book_that_beats_the_benchmark_passes_on_excess_returns():
+    verdict = verdict_for(benchmark=paths(0.002, 0.005, seed=3))
+
+    assert verdict["passed"] and verdict["sharpe_basis"] == gates.EXCESS
+    assert verdict["sharpe_net"] < verdict["sharpe_total"]
+    assert all(start["sharpe_total"] is not None for start in verdict["start_dates"])
+
+
+def test_without_a_benchmark_argument_the_gates_read_total_returns():
+    verdict = verdict_for()
+
+    assert verdict["sharpe_basis"] == gates.TOTAL
+    assert verdict["sharpe_net"] == verdict["sharpe_total"]
+    assert verdict["excess"] == {
+        "benchmark": None, "definition": None, "defined": True, "cause": None
+    }  # fmt: skip
+
+
+def test_a_missing_benchmark_fails_the_three_sharpe_gates_and_names_the_cause():
+    """The coordinator's rule: no benchmark is a failed gate, not an error, so the artifact is
+    written and the paper-only waiver has something to waive. The stored values are finite."""
+    verdict = verdict_for(benchmark_missing="the lake holds no SPY return for 3 of 48")
+
+    assert not verdict["passed"] and verdict["sharpe_basis"] == gates.EXCESS
+    for key in ("dsr", "sharpe_net", "dsr_2x"):
+        gate = verdict["gates"][key]
+        assert not gate["passed"] and gate["defined"] is False
+        assert gate["cause"] == "excess Sharpe undefined: the lake holds no SPY return for 3 of 48"
+    assert verdict["gates"]["pbo"]["passed"], "the overfitting gate does not read the benchmark"
+    assert (verdict["dsr"], verdict["sharpe_net"], verdict["dsr_2x"]) == (0.0, 0.0, 0.0)
+    assert verdict["excess"]["defined"] is False and "3 of 48" in verdict["excess"]["cause"]
+    assert verdict["sharpe_total"] > 0.5, "the total-return Sharpe is still reported"
+    assert not verdict["start_date_stable"]
+    assert all(start["sharpe_net"] is None for start in verdict["start_dates"])
+
+
+def test_a_benchmark_and_a_missing_benchmark_together_are_refused():
+    with pytest.raises(gates.GateError):
+        verdict_for(benchmark=STRONG, benchmark_missing="both")
+    with pytest.raises(gates.GateError, match="the paths' shape"):
+        verdict_for(benchmark=STRONG[:, :12])

@@ -139,6 +139,12 @@ def load(directory: Path) -> dict[str, Any]:
         raise CertificationError(f"trial {row['trial_id']} is not a succeeded certification")
     if results.get("declared_trials") != count or results.get("passed") != manifest["passed"]:
         raise CertificationError("the manifest disagrees with the certification's own trial row")
+    # Certifications up to lgbm-2026-10 gated total returns and said no basis, so a manifest
+    # without one is read as total and still verifies (issue #167). The names are gates.BASES,
+    # spelled out so verifying an artifact does not import the research stack.
+    basis = manifest.get("sharpe_basis", "total")
+    if basis not in ("total", "excess_spy"):
+        raise CertificationError(f"{MANIFEST} names an unknown Sharpe basis: {basis!r}")
     return manifest
 
 

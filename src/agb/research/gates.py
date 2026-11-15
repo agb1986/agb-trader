@@ -3,8 +3,26 @@ certified, and the diagnostics reported beside them.
 
 Every gate reads returns net of one times the modelled cost, and the whole set certifies
 stage 1 of the ranker only, the classical LightGBM ranker. The LLM panel and the blend ride
-on top unbacktested, and nothing here says anything about them. The gates, from
-docs/architecture/01:
+on top unbacktested, and nothing here says anything about them.
+
+Given the benchmark's monthly returns, the two deflated Sharpe gates and the cost-inclusive
+Sharpe gate read excess returns (issue #167): each path's monthly net return minus the
+benchmark's total return over the same month, measured between the same two sessions. A
+long-only book holds the market's beta, and on total returns that beta alone clears a
+positive-Sharpe bar, so the gates would certify the market rather than the ranker. The basis
+is `excess_spy` there and `total` when no benchmark is handed in, as for every certification
+written before the change; the total-return Sharpe is reported beside the gated one either
+way. When the caller says the benchmark is missing, which certification does if the lake
+lacks SPY's return for any traded month, the excess Sharpe is undefined: the three gates fail
+with `defined` false and the cause named, and record a finite number that fails them, 0.0 for
+the Sharpe (what `sharpe` gives a series with no evidence, and not above the bar) and 0.0 for
+both DSRs (no probability of a real edge, and below the bar), because the certification row
+holds a number for each whatever the verdict. The overfitting gate keeps total returns: its
+candidates are the ledger's backtests, whose rows written before the change carry no
+benchmark month, and a matrix with some columns on one basis and some on the other would rank
+the basis rather than the configuration.
+
+The gates, from docs/architecture/01:
 
     deflated Sharpe        Bailey and López de Prado's DSR: the probability that the observed
                            Sharpe beats the best Sharpe that `trials` independent tries of
@@ -21,16 +39,20 @@ docs/architecture/01:
                            so the PBO is undefined and the gate fails with that cause named.
                            It also fails when a configuration the ledger declares should have
                            had a series and has none.
-    cost-inclusive Sharpe  the annualised net Sharpe across paths; the documents give it no
-                           number, so its threshold is the least it can be, positive.
+    cost-inclusive Sharpe  the annualised net Sharpe across paths, of excess returns when
+                           the benchmark is given; the documents give it no number, so its
+                           threshold is the least it can be, positive.
     deflated Sharpe at 2x  the DSR again on the paths rerun at twice the modelled cost, from
                            the same trial count: the specification wants DSR to pass there
                            too, and the 2x pass adds no trial.
 
-Reported beside them: the break-even cost multiple, the gross-Sharpe suspicion flag, the
-participation the paths needed, the net Sharpe from later start dates, and the path
+Reported beside them: the total-return net Sharpe, the break-even cost multiple, the
+gross-Sharpe suspicion flag, the participation the paths needed, the gated net Sharpe from
+later start dates, and the path
 distribution of maximum drawdown, longest losing run and tracking dispersion, whose quantiles
-become the live performance alerts' thresholds (docs/architecture/04).
+become the live performance alerts' thresholds (docs/architecture/04). The break-even multiple
+and the path distribution stay on total returns: a live month is compared against them as it
+is, not net of the benchmark.
 
 The arithmetic is on monthly returns: a path is one row of monthly net returns, and a Sharpe
 here is the monthly mean over the monthly standard deviation, annualised by the square root
@@ -53,6 +75,18 @@ MONTHS_PER_YEAR = 12
 EULER_GAMMA = 0.5772156649015329
 QUANTILES = (0.05, 0.25, 0.5, 0.75, 0.95)
 _NORMAL = NormalDist()
+# The Sharpe basis a verdict records, and the benchmark the excess basis is measured over:
+# `total` is the net return itself, `excess_spy` the net return minus SPY's over the same month.
+TOTAL, EXCESS = "total", "excess_spy"
+BASES = (TOTAL, EXCESS)
+BENCHMARK = "SPY"
+EXCESS_DEFINITION = (
+    "excess return: each month's return net of modelled cost minus SPY's total return"
+    " (split- and dividend-adjusted close to close) between the same two sessions"
+)
+# What an undefined excess Sharpe records, so the row holds a number that fails its gate.
+UNDEFINED_SHARPE = 0.0
+UNDEFINED_DSR = 0.0
 
 
 class GateError(Exception):
@@ -278,6 +312,8 @@ def evaluate(
     participation: Sequence[tuple[float | None, float | None]],
     thresholds: Thresholds | None = None,
     missing: Sequence[str] = (),
+    benchmark: np.ndarray | None = None,
+    benchmark_missing: str | None = None,
 ) -> dict[str, Any]:
     """Every gate and diagnostic on one model's paths: `net`, `gross` and `net_2x` are
     paths-by-months matrices of monthly returns at one times cost, before cost, and at twice
@@ -286,43 +322,97 @@ def evaluate(
     mean participation; `missing` the reasons any configuration the ledger declares has no
     column in `candidates` though it should, each of which fails the overfitting gate, since
     a PBO over a matrix that leaves out a configuration that was tried is not the PBO of the
-    search. The verdict passes only when every gate does."""
+    search. The verdict passes only when every gate does.
+
+    `benchmark`, a paths-by-months matrix of the benchmark's return over each path's months,
+    puts the DSR, 2x DSR and Sharpe gates on excess returns; `benchmark_missing`, the reason
+    there is no such matrix, puts them on the excess basis undefined, failing with that cause.
+    Neither leaves them on total returns. `sharpe_net` is the gated Sharpe, on the basis the
+    verdict's `sharpe_basis` names, `sharpe_total` the total-return net Sharpe whatever the
+    basis, and `sharpe_gross` the total-return Sharpe before cost."""
     thresholds = Thresholds() if thresholds is None else thresholds
     net_rows, gross_rows, twice_rows = _paths(net), _paths(gross), _paths(net_2x)
     if not net_rows.shape == gross_rows.shape == twice_rows.shape:
         raise GateError("the net, gross and 2x paths must have the same shape")
     if net_rows.shape[1] != len(months):
         raise GateError("one month label per column")
-    deflated = deflated_sharpe(net_rows, trials)
-    deflated_2x = deflated_sharpe(twice_rows, trials)
-    overfitting = overfitting_probability(candidates, thresholds.blocks)
-    sharpe_net = path_sharpe(net_rows)
+    if benchmark is not None and benchmark_missing is not None:
+        raise GateError("a benchmark is either given or missing, not both")
+    basis = TOTAL if benchmark is None and benchmark_missing is None else EXCESS
+    cause = None
+    if benchmark_missing is not None:
+        cause = f"excess Sharpe undefined: {benchmark_missing}"
+    if benchmark is not None:
+        bench_rows = _paths(benchmark)
+        if bench_rows.shape != net_rows.shape:
+            raise GateError("the benchmark must have the paths' shape")
+        gated, gated_2x = net_rows - bench_rows, twice_rows - bench_rows
+    else:
+        gated, gated_2x = net_rows, twice_rows
+    sharpe_total = path_sharpe(net_rows)
     sharpe_gross = path_sharpe(gross_rows)
+    if cause is None:
+        deflated = {**deflated_sharpe(gated, trials), "defined": True, "cause": None}
+        deflated_2x = {**deflated_sharpe(gated_2x, trials), "defined": True, "cause": None}
+        sharpe_net = path_sharpe(gated)
+        starts = [
+            {**start, "sharpe_total": total["sharpe_net"]}
+            for start, total in zip(
+                start_date_sensitivity(gated, months),
+                start_date_sensitivity(net_rows, months),
+                strict=True,
+            )
+        ]
+        stable = all(start["sharpe_net"] > thresholds.sharpe for start in starts)
+    else:
+        deflated = deflated_2x = {
+            "dsr": UNDEFINED_DSR,
+            "defined": False,
+            "cause": cause,
+            "months": net_rows.shape[1],
+            "trials": trials,
+            "paths": len(net_rows),
+        }
+        sharpe_net = UNDEFINED_SHARPE
+        starts = [
+            {**start, "sharpe_net": None, "sharpe_total": start["sharpe_net"]}
+            for start in start_date_sensitivity(net_rows, months)
+        ]
+        stable = False
+    overfitting = overfitting_probability(candidates, thresholds.blocks)
     gates = {
-        "dsr": _gate(deflated["dsr"], thresholds.dsr, "at least"),
-        "pbo": _overfitting_gate(overfitting, thresholds.pbo, missing),
-        "sharpe_net": _gate(sharpe_net, thresholds.sharpe, "above"),
-        "dsr_2x": _gate(deflated_2x["dsr"], thresholds.dsr, "at least"),
+        "dsr": _sharpe_gate(deflated["dsr"], thresholds.dsr, "at least", basis, cause),
+        "pbo": {**_overfitting_gate(overfitting, thresholds.pbo, missing), "basis": TOTAL},
+        "sharpe_net": _sharpe_gate(sharpe_net, thresholds.sharpe, "above", basis, cause),
+        "dsr_2x": _sharpe_gate(deflated_2x["dsr"], thresholds.dsr, "at least", basis, cause),
     }
     maxima = [p for p, _ in participation if p is not None]
     means = [m for _, m in participation if m is not None]
-    starts = start_date_sensitivity(net_rows, months)
+    sharpes = [sharpe_gross, sharpe_total] + ([sharpe_net] if cause is None else [])
     return {
         "certifies": CERTIFIES,
         "passed": all(gate["passed"] for gate in gates.values()),
         "gates": gates,
         "thresholds": asdict(thresholds),
+        "sharpe_basis": basis,
+        "excess": {
+            "benchmark": BENCHMARK if basis == EXCESS else None,
+            "definition": EXCESS_DEFINITION if basis == EXCESS else None,
+            "defined": cause is None,
+            "cause": cause,
+        },
         "dsr": deflated["dsr"],
         "pbo": overfitting["pbo"],
         "sharpe_net": sharpe_net,
         "dsr_2x": deflated_2x["dsr"],
+        "sharpe_total": sharpe_total,
         "sharpe_gross": sharpe_gross,
-        "gross_sharpe_flag": max(sharpe_gross, sharpe_net) > thresholds.suspicious_sharpe,
+        "gross_sharpe_flag": max(sharpes) > thresholds.suspicious_sharpe,
         "break_even_multiple": break_even_multiple(net_rows, gross_rows),
         "participation_max": max(maxima) if maxima else 0.0,
         "participation_mean": float(np.mean(means)) if means else 0.0,
         "start_dates": starts,
-        "start_date_stable": all(start["sharpe_net"] > thresholds.sharpe for start in starts),
+        "start_date_stable": stable,
         "path_quantiles": path_quantiles(net_rows),
         "deflated_sharpe": deflated,
         "deflated_sharpe_2x": deflated_2x,
@@ -340,6 +430,18 @@ def _gate(value: float, threshold: float, rule: str) -> dict[str, Any]:
         "above": value > threshold,
     }[rule]
     return {"value": value, "threshold": threshold, "rule": rule, "passed": bool(passed)}
+
+
+def _sharpe_gate(
+    value: float, threshold: float, rule: str, basis: str, cause: str | None
+) -> dict[str, Any]:
+    """A gate on the Sharpe of the paths, which names the basis it was measured on and, when
+    the excess Sharpe is undefined, fails with the cause named whatever value it records."""
+    gate = {**_gate(value, threshold, rule), "basis": basis, "defined": cause is None}
+    if cause is not None:
+        gate["passed"] = False
+    gate["cause"] = cause
+    return gate
 
 
 def _overfitting_gate(

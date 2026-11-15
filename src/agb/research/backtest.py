@@ -99,12 +99,14 @@ from agb.research.trials import Ledger, Run
 
 KIND = "backtest"
 VENUE = Venue("SIM")
+# The gates' excess returns are measured over it (issue #167), and the after-tax diagnostic's
+# buy-and-hold comparison buys it.
+BENCHMARK = "SPY"
 MONTHS_PER_YEAR = 12
 LIQUIDITY_BARS = scan.LIQUIDITY_BARS
 # Decimal places of the adjusted prices the engine trades; split-adjusted closes run small.
 PRECISION = 6
 # The session's bars are stamped at this UTC hour, after the New York close all year round.
-BENCHMARK = "SPY"  # the after-tax diagnostic's buy-and-hold comparison
 CLOSE_HOUR_UTC = 21
 # Calendar days of bars loaded before the first signal session, so the cost model has its
 # sixty-one bars from the first rebalance on.
@@ -497,7 +499,7 @@ class Feed:
         benchmark: Series | None = None,
     ) -> None:
         self.series = series
-        self.benchmark = benchmark  # the buy-and-hold comparison's bars, or None if unlisted
+        self.benchmark = benchmark  # the excess returns' and buy-and-hold's bars, or None
         self.end = end  # the last session in the lake for these names
         self.last = {ticker: s.dates[-1] for ticker, s in series.items()}
         self._bars = bars
@@ -581,8 +583,8 @@ def load(
     start = months[0].snapshot_date
     until = months[-1].exit
     windows = _windows(conn, wanted)
-    # The benchmark is marked at the first entry and the last exit and never ranked, so one
-    # window serves it: the one every name used to share.
+    # The benchmark is marked at every entry and the last exit and never ranked, so one window
+    # serves it: the one every name used to share.
     opening = start - timedelta(days=HISTORY_DAYS)
     if benchmark:
         windows[benchmark] = min(windows.get(benchmark, opening), opening)
@@ -1110,10 +1112,36 @@ def _report(
         "final_value": marks[-1],
         "after_tax": _after_tax(outcome, feed, months, options, marks[-1]),
         "monthly": [
-            {"as_of": month.as_of.isoformat(), "net": n, "gross": g}
-            for month, n, g in zip(months, net, gross, strict=True)
+            {"as_of": month.as_of.isoformat(), "net": n, "gross": g, "benchmark": b}
+            for month, n, g, b in zip(
+                months, net, gross, _benchmark_returns(feed, months), strict=True
+            )
         ],
     }
+
+
+def _benchmark_returns(feed: Feed, months: Sequence[Month]) -> list[float | None]:
+    """The benchmark's total return over each month, between the same two sessions the run's
+    own monthly return is marked on: the month's entry and the next month's, or the final exit
+    for the last. Certification subtracts it from the path's net return for the excess-return
+    gates (issue #167).
+
+    A month is None unless the lake holds a benchmark bar on both of its sessions. Nothing is
+    carried forward or filled in, because an excess return measured against a price from
+    another day is not an excess return, and certification treats any None as a missing
+    benchmark rather than dropping or zeroing the month. A plain backtest only reports them."""
+    series = feed.benchmark
+    if series is None:
+        return [None] * len(months)
+    days = [month.entry for month in months] + [months[-1].exit]
+    prices = []
+    for day in days:
+        i = series.index(day)
+        prices.append(None if i is None else float(series.adjusted[i]))
+    return [
+        None if start is None or end is None or start <= 0 else end / start - 1.0
+        for start, end in zip(prices[:-1], prices[1:], strict=True)
+    ]
 
 
 def _after_tax(
