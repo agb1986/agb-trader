@@ -202,5 +202,7 @@ class FakeEdgar:
 
 
 def client(fake=None):
-    """An Edgar client on the fake, unthrottled."""
-    return Edgar(USER_AGENT, opener=fake or FakeEdgar(), throttle=Throttle(1e9))
+    """An Edgar client on the fake, unthrottled and not pausing between retries."""
+    return Edgar(
+        USER_AGENT, opener=fake or FakeEdgar(), throttle=Throttle(1e9), sleep=lambda seconds: None
+    )

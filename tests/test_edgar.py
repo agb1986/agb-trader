@@ -1,10 +1,19 @@
 import json
 import threading
 import time
+import urllib.error
 from datetime import date
 
 import pytest
-from edgar_fake import AS_OF, COMPANIES, USER_AGENT, FakeEdgar, client, submissions
+from edgar_fake import (
+    AS_OF,
+    COMPANIES,
+    TEN_K,
+    USER_AGENT,
+    FakeEdgar,
+    client,
+    submissions,
+)
 
 from agb import edgar
 
@@ -194,15 +203,266 @@ def test_an_unlisted_ticker_and_a_failing_document_are_edgar_failures():
     assert "k.htm" in result.detail
 
 
-def test_a_10k_without_its_items_is_an_edgar_failure():
+def test_a_10k_without_its_items_is_read_whole_and_marked():
     fake = FakeEdgar()
     for url in fake.pages:
         if url.endswith("/k.htm"):
-            fake.pages[url] = b"<html><body><p>Nothing here.</p></body></html>"
+            fake.pages[url] = (
+                b"<html><body><p>Part I.</p><h2>Principal Risks</h2>"
+                b"<p>Our largest customer is 62% of revenue.</p></body></html>"
+            )
+    result = edgar.retrieve(client(fake), "ACME", AS_OF)
+
+    assert result.outcome == "retrieved"
+    annual = [s for s in result.sections if s.filing.form == "10-K"]
+    assert [s.section for s in annual] == ["Whole document (Item 1A, Item 7 not found)"]
+    assert "62% of revenue" in annual[0].text
+
+
+def test_a_10k_with_one_missing_heading_is_read_whole_and_names_it():
+    page = TEN_K.replace("Management&#8217;s Discussion", "Operating review")
+    page = page.replace("Management's Discussion", "Operating review")
+    fake = FakeEdgar()
+    for url in fake.pages:
+        if url.endswith("/k.htm"):
+            fake.pages[url] = page.encode()
+    result = edgar.retrieve(client(fake), "ACME", AS_OF)
+
+    annual = [s for s in result.sections if s.filing.form == "10-K"]
+    assert [s.section for s in annual] == ["Whole document (Item 7 not found)"]
+    assert "leverage covenant" in annual[0].text
+
+
+def test_a_prospectus_without_a_risk_factors_heading_is_read_whole_and_marked():
+    fake = FakeEdgar()
+    for url in fake.pages:
+        if url.endswith("/p.htm"):
+            fake.pages[url] = b"<html><body><p>We have a history of losses.</p></body></html>"
+    result = edgar.retrieve(client(fake), "NEWCO", AS_OF)
+
+    assert result.outcome == "retrieved"
+    assert [s.section for s in result.sections] == ["Whole document (Risk Factors not found)"]
+
+
+def test_an_empty_10k_is_still_an_edgar_failure():
+    fake = FakeEdgar()
+    for url in fake.pages:
+        if url.endswith("/k.htm"):
+            fake.pages[url] = b"<html><body></body></html>"
     result = edgar.retrieve(client(fake), "ACME", AS_OF)
 
     assert result.outcome == "edgar_failure"
-    assert "Item 1A not found" in result.detail
+    assert "empty document" in result.detail
+
+
+class Flaky(FakeEdgar):
+    """Answers the first `times` requests for any URL containing `fragment` with `error`."""
+
+    def __init__(self, fragment, error, times=1):
+        super().__init__()
+        self.fragment, self.error, self.left = fragment, error, times
+
+    def __call__(self, request):
+        if self.fragment in request.full_url and self.left > 0:
+            self.left -= 1
+            self.requests.append((request.full_url, request.get_header("User-agent")))
+            raise self.error(request.full_url)
+        return super().__call__(request)
+
+
+def http_error(code, headers=None):
+    return lambda url: urllib.error.HTTPError(url, code, "error", headers, None)
+
+
+def test_one_503_then_success_scores_the_name_normally():
+    fake = Flaky("CIK0000000123", http_error(503))
+    pauses = []
+    throttled = []
+
+    class CountingThrottle(edgar.Throttle):
+        def wait(self):
+            throttled.append(1)
+
+    result = edgar.retrieve(
+        edgar.Edgar(USER_AGENT, opener=fake, throttle=CountingThrottle(1e9), sleep=pauses.append),
+        "ACME",
+        AS_OF,
+    )
+
+    assert result.outcome == "retrieved"
+    assert result.detail is None
+    assert len(result.sections) == 5
+    assert pauses == [edgar.BACKOFF]
+    # The retry took its own slot in the rate limit.
+    assert len(throttled) == len(fake.requests)
+
+
+def test_a_dropped_connection_and_a_429_are_retried_with_a_growing_pause():
+    for error, times in ((lambda url: urllib.error.URLError("reset"), 2), (http_error(429), 2)):
+        pauses = []
+        fake = Flaky("CIK0000000123", error, times=times)
+        client_ = edgar.Edgar(
+            USER_AGENT, opener=fake, throttle=edgar.Throttle(1e9), sleep=pauses.append
+        )
+
+        assert client_.submissions("0000000123")["name"] == "ACME WIDGETS CORP /DE/"
+        assert pauses == [edgar.BACKOFF, edgar.BACKOFF * 2]
+
+
+def test_retry_after_sets_the_pause_up_to_a_ceiling():
+    for header, expected in (("7", 7.0), ("9999", edgar.MAX_PAUSE), ("soon", edgar.BACKOFF)):
+        pauses = []
+        fake = Flaky("CIK0000000123", http_error(429, {"Retry-After": header}))
+        client_ = edgar.Edgar(
+            USER_AGENT, opener=fake, throttle=edgar.Throttle(1e9), sleep=pauses.append
+        )
+
+        client_.submissions("0000000123")
+        assert pauses == [expected]
+
+
+def test_a_persistent_error_gives_up_after_the_retries_and_is_an_edgar_failure():
+    pauses = []
+    fake = Flaky("CIK0000000123", http_error(503), times=100)
+    result = edgar.retrieve(
+        edgar.Edgar(USER_AGENT, opener=fake, throttle=edgar.Throttle(1e9), sleep=pauses.append),
+        "ACME",
+        AS_OF,
+    )
+
+    assert result.outcome == "edgar_failure"
+    assert "HTTP 503" in result.detail
+    assert len(pauses) == edgar.RETRIES
+    assert sum("CIK0000000123" in url for url, _ in fake.requests) == edgar.RETRIES + 1
+
+
+def test_a_client_error_is_not_retried():
+    pauses = []
+    fake = FakeEdgar()
+    fake.pages.pop("https://data.sec.gov/submissions/CIK0000000123.json")
+    client_ = edgar.Edgar(
+        USER_AGENT, opener=fake, throttle=edgar.Throttle(1e9), sleep=pauses.append
+    )
+
+    with pytest.raises(edgar.EdgarError, match="HTTP 404"):
+        client_.submissions("0000000123")
+    assert pauses == []
+    assert len(fake.requests) == 1
+
+
+def test_threads_share_one_fetch_of_the_ticker_list():
+    fake = FakeEdgar()
+    shared = client(fake)
+    found = []
+    barrier = threading.Barrier(8)
+
+    def look():
+        barrier.wait()
+        found.append(shared.cik("ACME"))
+
+    threads = [threading.Thread(target=look) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert found == ["0000000123"] * 8
+    assert sum(url == edgar.TICKERS_URL for url, _ in fake.requests) == 1
+
+
+def busy_company(fake, as_of_filings=None):
+    """ACME with only 8-Ks in `recent`: its 10-K and 10-Q sit on an older page."""
+    company = COMPANIES["ACME"]
+    recent = [row for row in company["filings"] if row[0] == "8-K"]
+    older = [row for row in company["filings"] if row[0] != "8-K"]
+    body = submissions({**company, "filings": recent})
+    body["filings"]["files"] = [
+        {
+            "name": "CIK0000000123-submissions-001.json",
+            "filingFrom": "2025-02-21",
+            "filingTo": "2026-10-30",
+        },
+        {
+            "name": "CIK0000000123-submissions-002.json",
+            "filingFrom": "2010-01-01",
+            "filingTo": "2025-02-20",
+        },
+    ]
+    fake.pages["https://data.sec.gov/submissions/CIK0000000123.json"] = json.dumps(body).encode()
+    page = submissions({**company, "filings": older})["filings"]["recent"]
+    fake.pages["https://data.sec.gov/submissions/CIK0000000123-submissions-001.json"] = json.dumps(
+        page
+    ).encode()
+    fake.pages["https://data.sec.gov/submissions/CIK0000000123-submissions-002.json"] = b"{}"
+
+
+def test_the_older_pages_are_read_when_recent_does_not_reach_a_10k():
+    fake = FakeEdgar()
+    busy_company(fake)
+    result = edgar.retrieve(client(fake), "ACME", AS_OF)
+
+    assert result.outcome == "retrieved"
+    read = [(s.filing.form, s.filing.filed, s.section) for s in result.sections]
+    assert read == [
+        ("10-K", date(2026, 2, 20), "Item 1A"),
+        ("10-K", date(2026, 2, 20), "Item 7"),
+        ("10-Q", date(2026, 5, 1), "Full text"),
+        ("8-K", date(2026, 6, 10), "Full text"),
+        ("8-K", date(2026, 8, 15), "Full text"),
+    ]
+    urls = [url for url, _ in fake.requests]
+    assert "https://data.sec.gov/submissions/CIK0000000123-submissions-001.json" in urls
+    # The 10-K was on the first older page, so the second is never fetched.
+    assert not any("submissions-002" in url for url in urls)
+
+
+def test_the_older_pages_are_not_read_when_recent_has_a_10k():
+    fake = FakeEdgar()
+    body = submissions(COMPANIES["ACME"])
+    body["filings"]["files"] = [
+        {
+            "name": "CIK0000000123-submissions-001.json",
+            "filingFrom": "2000-01-01",
+            "filingTo": "2025-01-01",
+        }
+    ]
+    fake.pages["https://data.sec.gov/submissions/CIK0000000123.json"] = json.dumps(body).encode()
+
+    result = edgar.retrieve(client(fake), "ACME", AS_OF)
+
+    assert result.outcome == "retrieved"
+    assert not any("submissions-001" in url for url, _ in fake.requests)
+
+
+def test_an_older_page_that_fails_is_an_edgar_failure():
+    fake = FakeEdgar()
+    busy_company(fake)
+    fake.failing.add("submissions-001")
+
+    result = edgar.retrieve(client(fake), "ACME", AS_OF)
+
+    assert result.outcome == "edgar_failure"
+    assert "submissions-001" in result.detail
+
+
+def test_a_page_filed_after_the_as_of_date_is_skipped():
+    fake = FakeEdgar()
+    busy_company(fake)
+    body = json.loads(fake.pages["https://data.sec.gov/submissions/CIK0000000123.json"])
+    body["filings"]["files"].insert(
+        0,
+        {
+            "name": "CIK0000000123-submissions-009.json",
+            "filingFrom": "2026-11-01",
+            "filingTo": "2026-12-31",
+        },
+    )
+    fake.pages["https://data.sec.gov/submissions/CIK0000000123.json"] = json.dumps(body).encode()
+
+    result = edgar.retrieve(client(fake), "ACME", AS_OF)
+
+    assert result.outcome == "retrieved"
+    assert not any("submissions-009" in url for url, _ in fake.requests)
 
 
 def test_class_share_tickers_match_edgar_dashes():

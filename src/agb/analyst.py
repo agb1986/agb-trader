@@ -193,16 +193,28 @@ class AnthropicModel:
         )
 
 
+# Forms cut first when the documents do not fit, the oldest of them first.
+_CUT_FIRST = ("8-K",)
+
+
 def documents(sections: list[tuple[str, str, str, str]]) -> tuple[list[Document], list[int]]:
     """Number the (form, filed, section, text) pieces D1, D2, ... in reading order, cutting
-    the text to MAX_CHARS in total. Returns the documents and the characters each one sent."""
-    out, sent, left = [], [], MAX_CHARS
-    for n, (form, filed, section, text) in enumerate(sections, start=1):
-        taken = text[: max(0, left)]
-        left -= len(taken)
-        sent.append(len(taken))
-        if taken:
-            out.append(Document(f"D{n}", form, filed, section, taken))
+    the text to MAX_CHARS in total. Returns the documents and the characters each one sent.
+
+    The periodic filings take the budget first, in reading order. The 8-Ks share what is left,
+    newest first, so that it is the oldest 8-Ks that are cut."""
+    periodic = [n for n, piece in enumerate(sections) if piece[0] not in _CUT_FIRST]
+    current = [n for n, piece in enumerate(sections) if piece[0] in _CUT_FIRST]
+    current.sort(key=lambda n: (sections[n][1], n), reverse=True)
+    left, take = MAX_CHARS, {}
+    for n in periodic + current:
+        take[n] = min(len(sections[n][3]), max(0, left))
+        left -= take[n]
+    out, sent = [], []
+    for n, (form, filed, section, text) in enumerate(sections):
+        sent.append(take[n])
+        if take[n]:
+            out.append(Document(f"D{n + 1}", form, filed, section, text[: take[n]]))
     return out, sent
 
 
