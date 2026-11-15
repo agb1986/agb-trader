@@ -14,7 +14,9 @@ minutes, so the bot can compare the broker's
 Without keys it beats and does nothing else, so the stack starts whole before the operator
 has an Alpaca account. Errors reaching the broker end the cycle, not the service: the next
 cycle starts from what the database says, which is why every row is written before the
-call it records.
+call it records. Each basket's submission, each reconcile and the snapshot are their own
+step: one that fails is logged and alerted on at once, and the steps after it still run. An
+error from the database is the exception, and ends the process as it does in every service.
 """
 
 import logging
@@ -46,6 +48,14 @@ OBSERVE_BACKOFF_CAP = timedelta(minutes=10)
 # the staleness window the health checks use. Below that it is noise: a single failed cycle is
 # an ordinary event, and the next one carries on from what the database says.
 FAILURES_BEFORE_ALERT = 10
+# A step of the cycle that failed on its own, alerted on the cycle it fails: one basket's
+# submission, one basket's reconcile, or the snapshot of one session. The alert's subject and
+# period name the basket or the session, so a step that fails every cycle is raised once.
+SUBMISSION_FAILED = "submission_failed"
+RECONCILE_FAILED = "reconcile_failed"
+SNAPSHOT_FAILED = "snapshot_failed"
+# An approved basket whose submission window closed before it went in.
+WINDOW_MISSED = "submission_window_missed"
 
 
 def _stamp(at: datetime) -> str:
@@ -90,6 +100,9 @@ class Execution:
         self._failures = 0
         self._failing_since: datetime | None = None
         self._alerted = False
+        # The baskets already told about as having missed their window, so the warning is
+        # logged once per basket rather than once per cycle for as long as it stays approved.
+        self._missed: set[int] = set()
 
     @classmethod
     def from_env(cls) -> "Execution":
@@ -183,10 +196,38 @@ class Execution:
         for basket in execution.waiting(conn, "submitted"):
             if now < calendar.close_at(basket.session_date) + self.settle:
                 continue
-            execution.reconcile(conn, self.broker, basket, now)
+            try:
+                execution.reconcile(conn, self.broker, basket, now)
+            except psycopg.Error:
+                raise
+            except Exception as exc:
+                self.step_failed(conn, RECONCILE_FAILED, basket.reference, basket.period, exc)
         session = self.closed_session(calendar, now)
         if session is not None:
-            execution.snapshot(conn, self.broker, session, calendar)
+            try:
+                execution.snapshot(conn, self.broker, session, calendar)
+            except psycopg.Error:
+                raise
+            except Exception as exc:
+                self.step_failed(conn, SNAPSHOT_FAILED, ROLE, session.isoformat(), exc)
+
+    def step_failed(
+        self, conn: psycopg.Connection, kind: str, subject: str, period: str, exc: Exception
+    ) -> None:
+        """One step of the cycle failed and the rest carry on. Log it and alert at once: a
+        failed basket is something the operator acts on before the close, not after a run
+        of failed cycles. The alert is unique by (kind, subject, period), so a step that
+        fails every cycle is raised once."""
+        error = f"{type(exc).__name__}: {exc}"
+        log.error("%s %s: %s", subject, kind, error)
+        execution.raise_alert(
+            conn,
+            kind,
+            subject,
+            period,
+            f"{subject}: {kind.replace('_', ' ')} at {_stamp(self.clock())}. The cycle carried "
+            f"on with the other steps; this one is tried again next cycle.\nthe error: {error}",
+        )
 
     def observe_due(self, now: datetime) -> bool:
         """Whether to read the account's flags this cycle.
@@ -216,21 +257,22 @@ class Execution:
     def submit_due(self, conn: psycopg.Connection, calendar: NyseCalendar, now: datetime) -> None:
         """Send the orders of every approved basket whose submission window is open.
 
-        The period's submission job is held while its basket goes in, and completed when the
-        submission is over however it ended. A worker that finds the job held by someone
-        else, or held on a lease that has run out, leaves the basket alone: an expired lease
-        is for a human, not for another attempt.
+        The period's submission job is held while its basket goes in. It is completed when the
+        submission returns, and released with the error on the record when it raises, so the
+        next cycle may hold it again: submission is idempotent by client_order_id, so going
+        again sends only what the broker has not seen. A worker that finds the job held by
+        someone else, or held on a lease that has run out, leaves the basket alone: an
+        expired lease is for a human, not for another attempt.
+
+        A basket whose submission fails is alerted on and the next basket still goes in. A
+        basket still approved when its window closes is warned about and alerted on once.
         """
         for basket in execution.waiting(conn, "approved"):
             start, end = execution.submit_window(calendar, basket.session_date)
             if now < start:
                 continue
             if now >= end:
-                log.warning(
-                    "basket %s: its submission window closed at %s; leaving it approved",
-                    basket.reference,
-                    end.astimezone(nyse.NEW_YORK).strftime("%Y-%m-%d %H:%M ET"),
-                )
+                self.window_missed(conn, basket, end)
                 continue
             claim = jobs.hold(conn, schedule.SUBMISSION, basket.period, execution.ROLE, self.lease)
             if claim is None:
@@ -240,8 +282,51 @@ class Execution:
                     basket.period,
                 )
                 continue
-            execution.submit(conn, self.broker, basket, now)
+            outcome = "interrupted before the submission returned"
+            try:
+                execution.submit(conn, self.broker, basket, now)
+                outcome = None
+            except psycopg.Error:
+                raise
+            except Exception as exc:
+                outcome = f"{type(exc).__name__}: {exc}"
+                self.step_failed(conn, SUBMISSION_FAILED, basket.reference, basket.period, exc)
+            finally:
+                self.end_submission(conn, claim, outcome)
+
+    def end_submission(self, conn: psycopg.Connection, claim: jobs.Claim, error: str | None):
+        """Complete the submission job if the submission returned, or release it with the
+        error that stopped it. A lease lost while releasing is logged and left alone: the
+        error that brought us here is the one to report, and an expired submission lease is
+        halted on by the next cycle."""
+        if error is None:
             jobs.complete(conn, claim)
+            return
+        try:
+            jobs.release(conn, claim, error)
+        except jobs.LeaseLost as exc:
+            log.error("submission job for %s not released: %s", claim.period, exc)
+
+    def window_missed(self, conn: psycopg.Connection, basket: execution.Basket, end: datetime):
+        """A basket still approved after its window closed: warn and alert once for it."""
+        if basket.id in self._missed:
+            return
+        closed = end.astimezone(nyse.NEW_YORK).strftime("%Y-%m-%d %H:%M ET")
+        log.warning(
+            "basket %s: its submission window closed at %s; leaving it approved",
+            basket.reference,
+            closed,
+        )
+        execution.raise_alert(
+            conn,
+            WINDOW_MISSED,
+            basket.reference,
+            basket.period,
+            f"basket {basket.reference} was still approved when its submission window closed "
+            f"at {closed}, so none of its orders went in for {basket.session_date}. It is "
+            f"left approved and is not tried again.",
+        )
+        self._missed.add(basket.id)
 
     def closed_session(self, calendar: NyseCalendar, now: datetime) -> date | None:
         """The latest session whose close is at least `settle` behind `now`."""

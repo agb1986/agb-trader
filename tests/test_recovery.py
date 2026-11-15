@@ -140,7 +140,12 @@ def test_a_crash_before_the_order_row_halts_with_every_order_unwritten(db, caplo
 
     with caplog.at_level(logging.ERROR):
         crash(db, fake)
-    assert "cycle stopped: GET /v2/stocks/quotes/latest: connection reset" in caplog.text
+    assert (
+        f"{PERIOD} submission_failed: AlpacaError: GET /v2/stocks/quotes/latest: connection reset"
+        in caplog.text
+    )
+    # The lease had run out, so it is not released: it stays expired for the halt below.
+    assert f"submission job for {PERIOD} not released" in caplog.text
     assert rows(db, "SELECT count(*) FROM agb.broker_order") == [(0,)]
 
     # The next cycle, with a broker that answers, opens the cause rather than trying again.
@@ -170,7 +175,7 @@ def test_a_crash_between_the_write_and_the_call_reports_the_order_as_unsent(db, 
     with caplog.at_level(logging.ERROR):
         crash(db, fake)
     [(cid,)] = rows(db, "SELECT client_order_id FROM agb.broker_order")
-    assert f"cycle stopped: {cid}: {LOST}" in caplog.text
+    assert f"{PERIOD} submission_failed: ExecutionError: {cid}: {LOST}" in caplog.text
     assert fake.by_client == {}
     assert events(db, order_id(db, cid)) == []
 

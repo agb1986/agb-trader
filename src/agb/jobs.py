@@ -3,7 +3,8 @@
 A claim is a lease: `SELECT ... FOR UPDATE SKIP LOCKED` picks a job no one holds, and a
 conditional update sets `claimed_by` and `lease_until`. Two workers can never hold the same
 job, and a worker that finds a job locked skips it rather than waiting. The worker renews the
-lease while it works and releases it by completing or failing the job.
+lease while it works and releases it by completing or failing the job, or by releasing it
+(`release`) to be held again.
 
 What happens when a lease expires depends on the kind. A pipeline stage is deterministic and
 writes only to the database, so its expired lease is simply reclaimed (`reclaim_expired`).
@@ -221,6 +222,24 @@ def fail(conn: psycopg.Connection, claim: Claim, detail: str) -> int:
     with conn.transaction():
         _release(conn, claim)
         return _event(conn, claim.job_id, "failed", claim.worker, detail=detail)
+
+
+def release(conn: psycopg.Connection, claim: Claim, detail: str) -> int:
+    """Give up a claimed job without ending it, so it can be held again.
+
+    For work that stopped on an error and may be tried again, such as a submission that is
+    idempotent at the broker. The `released` event records why. Only a live lease can be
+    released this way: one that has run out stays expired for a human (`release_expired`).
+    """
+    with conn.transaction():
+        released = conn.execute(
+            "UPDATE agb.job SET claimed_by = NULL, lease_until = NULL "
+            "WHERE id = %s AND claimed_by = %s AND lease_until >= now()",
+            (claim.job_id, claim.worker),
+        )
+        if released.rowcount != 1:
+            raise LeaseLost(f"job {claim.job_id}: {claim.worker} no longer holds a live lease")
+        return _event(conn, claim.job_id, "released", claim.worker, detail=detail)
 
 
 def fulfil(
