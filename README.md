@@ -43,12 +43,33 @@ rule between a peak and a limit, and the nightly panel-store hash check.
 
 ```sh
 uv sync         # install every dependency group
-make test       # the whole suite, including a full stack bring-up
-make test-fast  # everything except the stack bring-up
+make test       # the whole suite, including a full stack bring-up, without the live tests
+make test-fast  # everything except the stack bring-up and the live tests
+make test-live  # only the live tests, each skipped unless its own variable is set
 make lint
 ```
 
 The tests start their own throwaway Postgres container on a random local port and never
 touch the stack's database, so several worktrees can run them at once.
+
+Tests marked `live` talk to real services, so no default run collects them: `make test`,
+`make test-fast` and a plain `uv run pytest` all deselect them, whatever is exported in the
+shell. `make test-live` (or `uv run pytest -m live`) collects them, and each module still runs
+only when its own variable is set to `1`, with the credentials it names in its docstring read
+from the shell environment:
+
+| Variable | What it touches |
+| --- | --- |
+| `AGB_LIVE_LIQUIDATE` | Alpaca paper: **closes every position in the paper account** |
+| `AGB_LIVE_ALPACA` | Alpaca paper: reads the account, sets and unsets `suspend_trade`, submits nothing |
+| `AGB_LIVE_TELEGRAM` | Telegram: sends a few messages to the real chat through the real proxy |
+| `AGB_LIVE_SHARADAR` | Sharadar: pulls the latest session into a temporary directory |
+| `AGB_LIVE_EDGAR` | SEC EDGAR: a few dozen requests for real filings |
+| `AGB_LIVE_ANTHROPIC` | Claude API: paid calls for the Analyst and the debate |
+| `AGB_LIVE_LAKE` | The real lake under `AGB_LAKE_DIR`, read only |
+| `AGB_LIVE_RSYNC` | The server, over the operator's SSH: a dry-run sync of its lake, copies nothing |
+
+Name one module to run only it, e.g. `AGB_LIVE_TELEGRAM=1 uv run pytest -m live
+tests/test_telegram_live.py`.
 
 Schema changes go in [migrations/](migrations/); read its README first.

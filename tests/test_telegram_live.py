@@ -19,10 +19,13 @@ from agb.telegram import Telegram
 
 REQUIRED = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "HTTPS_PROXY")
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("AGB_LIVE_TELEGRAM") != "1" or not all(os.environ.get(k) for k in REQUIRED),
-    reason="live Telegram check: set AGB_LIVE_TELEGRAM=1 and " + ", ".join(REQUIRED),
-)
+pytestmark = [
+    pytest.mark.live,
+    pytest.mark.skipif(
+        os.environ.get("AGB_LIVE_TELEGRAM") != "1" or not all(os.environ.get(k) for k in REQUIRED),
+        reason="live Telegram check: set AGB_LIVE_TELEGRAM=1 and " + ", ".join(REQUIRED),
+    ),
+]
 
 
 def test_a_real_alert_is_delivered_and_recorded(db):
