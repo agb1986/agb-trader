@@ -27,7 +27,7 @@ COMPOSE := docker compose --env-file $(ENV_DIR)/db.env
 
 .DEFAULT_GOAL := help
 .PHONY: help env up down status logs agb reconcile backfill lake sync-lake research measure \
-	promote sizing panel-check deploy rollback test test-fast lint
+	promote sizing panel-check deploy rollback test test-fast test-live lint
 
 help: ## List the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-9s %s\n", $$1, $$2}'
@@ -91,11 +91,14 @@ deploy: ## Build this commit's image, ship it to the server and restart the stac
 rollback: ## Restart the server's stack on the previously deployed image
 	scripts/deploy/rollback.sh
 
-test: ## Run the test suite against throwaway Postgres containers
-	uv run pytest
+test: ## Run the test suite against throwaway Postgres containers, without the live tests
+	uv run pytest -m "not live"
 
-test-fast: ## Run the test suite without building and starting the whole stack
-	uv run pytest -m "not stack"
+test-fast: ## Run the test suite without building and starting the whole stack or the live tests
+	uv run pytest -m "not stack and not live"
+
+test-live: ## Run the live tests that their AGB_LIVE_* variables enable; they touch real services, see README
+	uv run pytest -m live
 
 lint: ## Lint and check formatting
 	uv run ruff check .
