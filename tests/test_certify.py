@@ -13,7 +13,7 @@ model against."""
 
 import json
 import shutil
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -22,7 +22,7 @@ from psycopg import errors
 from psycopg.rows import dict_row
 
 from agb.research import __main__ as cli
-from agb.research import artifact, backtest, certify, cpcv, train, trials
+from agb.research import artifact, backtest, certify, cpcv, gates, train, trials
 from agb.research.panel import Panel
 from agb.research.trials import Ledger
 from agb.roles import RESEARCH
@@ -80,6 +80,38 @@ def failed(panel, research_lake, tmp_path_factory) -> certify.Certification:
         panel, MODEL, VALIDATION, OPTIONS, ledger,
         research_dir=research_dir, lake_dir=research_lake,
     )  # fmt: skip
+
+
+def without_spy(panel, lake_dir, tmp_path_factory, name) -> certify.Certification:
+    """The same configuration certified from a fresh ledger against `lake_dir`, a lake whose
+    benchmark bars are missing or cut short."""
+    research_dir = tmp_path_factory.mktemp(name)
+    ledger = Ledger(research_dir / trials.FILE)
+    return certify.run(
+        panel, MODEL, VALIDATION, OPTIONS, ledger,
+        research_dir=research_dir, lake_dir=lake_dir,
+    )  # fmt: skip
+
+
+@pytest.fixture(scope="module")
+def unbenchmarked(panel, tmp_path_factory) -> certify.Certification:
+    """Certified against a lake of the same names and no index fund, which is the real lake's
+    shape today. The names come out of the seeded market exactly as in the research lake,
+    because the benchmark is drawn after them."""
+    from research_fake import Market
+
+    lake_dir = Market(tmp_path_factory.mktemp("lake-without-spy")).names().land()
+    return without_spy(panel, lake_dir, tmp_path_factory, "research-without-spy")
+
+
+@pytest.fixture(scope="module")
+def partly_benchmarked(panel, tmp_path_factory) -> certify.Certification:
+    """Certified against a lake whose benchmark stops printing halfway through the panel."""
+    from research_fake import BENCHMARK, Market
+
+    market = Market(tmp_path_factory.mktemp("lake-partial-spy")).names()
+    lake_dir = market.name(BENCHMARK, noise=0.002, category="ETF", until=date(2025, 6, 30)).land()
+    return without_spy(panel, lake_dir, tmp_path_factory, "research-partial-spy")
 
 
 def stuff(ledger: Ledger, panel: Panel, count: int) -> None:
@@ -453,6 +485,26 @@ def test_the_report_says_what_the_gates_certify(certified):
     assert f"counted as {trials.RULE}" in report
 
 
+def test_the_report_names_the_excess_return_definition(certified):
+    """Issue #167: the report says the Sharpe gates read returns in excess of SPY, defines the
+    excess return, and gives the total-return Sharpe beside them."""
+    manifest = certified.manifest
+    report = (certified.directory / certify.REPORT).read_text()
+    assert manifest["sharpe_basis"] == gates.EXCESS == "excess_spy"
+    assert manifest["excess"] == {
+        "benchmark": "SPY", "definition": gates.EXCESS_DEFINITION, "defined": True, "cause": None,
+    }  # fmt: skip
+    assert "read returns in excess of SPY" in report
+    assert gates.EXCESS_DEFINITION in report
+    assert "ranks the candidates on total returns" in report
+    assert f"total-return Sharpe {manifest['sharpe_total']:.4f}" in report
+    assert manifest["sharpe_net"] < manifest["sharpe_total"], "the benchmark rose"
+    for key in ("dsr", "sharpe_net", "dsr_2x"):
+        assert manifest["gates"][key]["basis"] == gates.EXCESS
+    assert manifest["gates"]["pbo"]["basis"] == gates.TOTAL
+    assert "sharpe_basis" not in artifact.FIELDS, "the basis is the manifest's, not a column"
+
+
 def test_a_certification_is_never_overwritten(certified, prior, panel, research_lake):
     ledger, _ = prior
     before = ledger.count()
@@ -593,6 +645,94 @@ def test_declaring_more_trials_lowers_the_deflated_sharpe(failed, certified):
     assert failed.manifest["sharpe_net"] == pytest.approx(certified.manifest["sharpe_net"])
     assert failed.manifest["dsr"] < certified.manifest["dsr"]
     assert failed.manifest["dsr_2x"] < certified.manifest["dsr_2x"]
+
+
+# The benchmark missing (issue #167) -------------------------------------------------------------
+
+SHARPE_GATES = ("dsr", "sharpe_net", "dsr_2x")
+
+
+def missing_benchmark(certification: certify.Certification, cause: str) -> None:
+    """The three Sharpe gates failed with the cause named in the gate, the manifest and the
+    report, finite fail values recorded, and the artifact written and importable."""
+    manifest = certification.manifest
+    assert not certification.passed and not manifest["passed"]
+    assert manifest["sharpe_basis"] == gates.EXCESS
+    assert manifest["excess"]["defined"] is False and manifest["excess"]["cause"] == cause
+    for key in SHARPE_GATES:
+        gate = manifest["gates"][key]
+        assert not gate["passed"] and gate["defined"] is False and gate["cause"] == cause
+    assert (manifest["dsr"], manifest["sharpe_net"], manifest["dsr_2x"]) == (
+        gates.UNDEFINED_DSR, gates.UNDEFINED_SHARPE, gates.UNDEFINED_DSR,
+    )  # fmt: skip
+    assert manifest["sharpe_total"] > 0, "the total-return Sharpe is still measured"
+    report = (certification.directory / certify.REPORT).read_text()
+    assert report.startswith(f"# Certification of {OPTIONS.model_id}: FAILED")
+    assert f"Those three gates fail ({cause})." in report
+    assert "- sharpe_net: undefined, above 0.0000: FAIL" in report
+    assert artifact.load(certification.directory) == manifest, "written, and it verifies"
+
+
+def test_a_lake_without_the_benchmark_fails_the_sharpe_gates_and_writes_the_artifact(
+    unbenchmarked, db
+):
+    """The coordinator's rule: a missing benchmark is a failed gate rather than an error, so
+    the artifact exists for the operator's paper-only waiver to waive."""
+    paths = json.loads((unbenchmarked.directory / certify.PATHS).read_text())
+    total = sum(len(path["monthly"]) for path in paths)
+    assert total and all(month["benchmark"] is None for path in paths for month in path["monthly"])
+    cause = f"excess Sharpe undefined: the lake holds no SPY return for {total} of {total}"
+    missing_benchmark(unbenchmarked, cause + " traded path-months")
+    row = imported(db, unbenchmarked.directory)
+    assert not row["passed"] and row["sharpe_net"] == gates.UNDEFINED_SHARPE
+
+
+def test_a_benchmark_that_covers_part_of_the_run_fails_closed(partly_benchmarked, unbenchmarked):
+    """Partial coverage is not partly measured: no month is dropped or zero-filled, and the
+    certification fails exactly as with no benchmark, naming how many months it lacked."""
+    cause = partly_benchmarked.manifest["excess"]["cause"]
+    absent, total = (int(word) for word in cause.split("return for ")[1].split()[0:3:2])
+    assert 0 < absent < total, "some months carry the benchmark and some do not"
+    missing_benchmark(partly_benchmarked, cause)
+    assert partly_benchmarked.manifest["sharpe_total"] == pytest.approx(
+        unbenchmarked.manifest["sharpe_total"]
+    ), "the same book either way"
+
+
+def test_an_artifact_without_a_basis_loads_and_verifies_as_total(db, certified, tmp_path):
+    """Certifications up to lgbm-2026-10 recorded no basis: they verify unchanged, are read as
+    having gated total returns, and import."""
+    copy = copied(certified, tmp_path)
+    manifest = {
+        key: value
+        for key, value in copy.manifest.items()
+        if key not in ("sharpe_basis", "excess", "sharpe_total")
+    }
+    manifest["gates"] = {
+        key: (
+            {k: v for k, v in gate.items() if k not in ("basis", "defined", "cause")}
+            if key in SHARPE_GATES
+            else gate
+        )
+        for key, gate in manifest["gates"].items()
+    }
+    (copy.directory / artifact.MANIFEST).write_text(json.dumps(manifest))
+    copy.rewrite()
+
+    loaded = artifact.load(copy.directory)
+    assert "sharpe_basis" not in loaded
+    assert loaded.get("sharpe_basis", gates.TOTAL) == gates.TOTAL
+    report = certify.report(loaded)
+    assert "The deflated Sharpe and Sharpe gates read total returns." in report
+    assert f"total-return Sharpe {loaded['sharpe_net']:.4f}" in report
+    assert imported(db, copy.directory)["sharpe_net"] == loaded["sharpe_net"]
+
+
+def test_an_unknown_basis_is_refused(certified, tmp_path):
+    copy = copied(certified, tmp_path)
+    copy.rewrite(sharpe_basis="excess_cash")
+    with pytest.raises(artifact.CertificationError, match="unknown Sharpe basis"):
+        artifact.load(copy.directory)
 
 
 def test_a_run_that_raises_leaves_a_failed_trial_and_no_artifact(
