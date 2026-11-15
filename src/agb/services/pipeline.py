@@ -33,7 +33,12 @@ bytes is left untouched and recorded nothing new, a reference already proposed i
 basket already gated keeps its verdict. The same holds for a rerun interrupted between
 building and gating.
 Data the vendor has not yet published is not a failure: the service keeps the job and shortens
-its lease to RETRY, so the work is tried again once the lease runs out, until it lands.
+its lease to RETRY, so the work is tried again once the lease runs out, until it lands. That
+holds for a session the vendor is still publishing, one short of the row floor (agb.lake): it
+is deferred quietly, with no alert of its own, and if it never lands the pull's expected event
+goes overdue. The earlier sessions a deferred pull did land are recorded all the same. A
+request the vendor fails is made again by the lake client, with backoff; one that fails on
+every attempt fails the job, which raises the alert below.
 
 A job that fails on its own data -- a corrupt panel body, a database error, an unreadable
 Parquet file, or any of the errors each job names -- fails with the cause named in its
@@ -56,6 +61,7 @@ import argparse
 import logging
 import os
 import shutil
+import time
 from collections.abc import Callable, Iterable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -205,12 +211,12 @@ def capital_from_env() -> Decimal | None:
 
 
 class Pipeline:
-    """One pipeline cycle, run by `serve`. The URL opener, the capital, the panel audit's
-    sample size, the gate's limits and the clock the gate reads are injectable for tests. A
-    ranker given here is used instead of the promoted model, for tests only; otherwise each
-    rebalance loads the promoted model from `models_dir`. Capital left as None, which is how
-    `from_env` leaves it unless AGB_CAPITAL_USD is set, sizes each basket on the account's
-    equity as execution last read it."""
+    """One pipeline cycle, run by `serve`. The URL opener, the wait between vendor retries,
+    the capital, the panel audit's sample size, the gate's limits and the clock the gate reads
+    are injectable for tests. A ranker given here is used instead of the promoted model, for
+    tests only; otherwise each rebalance loads the promoted model from `models_dir`. Capital
+    left as None, which is how `from_env` leaves it unless AGB_CAPITAL_USD is set, sizes each
+    basket on the account's equity as execution last read it."""
 
     def __init__(
         self,
@@ -218,6 +224,7 @@ class Pipeline:
         api_key: str = "",
         *,
         opener: lake.Opener = lake.urlopen,
+        sleep: Callable[[float], None] = time.sleep,
         ranker: Ranker | None = None,
         models_dir: Path = registry.DEFAULT_MODELS_DIR,
         panel_dir: Path = panel_store.DEFAULT_DIR,
@@ -232,6 +239,7 @@ class Pipeline:
         self.lake_dir = lake_dir
         self.api_key = api_key
         self.opener = opener
+        self.sleep = sleep
         self.ranker = ranker
         self.models_dir = models_dir
         self.panel_dir = panel_dir
@@ -255,7 +263,7 @@ class Pipeline:
         )
 
     def client(self) -> Sharadar:
-        return Sharadar(self.api_key, self.opener)
+        return Sharadar(self.api_key, self.opener, sleep=self.sleep)
 
     def stage2(self, conn: psycopg.Connection) -> basket.Stage2 | None:
         """The panel the month's basket is blended with: the newest `panel_config`, driven by
@@ -478,8 +486,19 @@ class Pipeline:
         try:
             partitions = lake.pull(self.lake_dir, self.client(), session)
         except NotYet as exc:
+            # The sessions before this one that the pull did land are the lake's now; record
+            # them, so the lake and its ledger agree while this session waits.
+            added = record(conn, session, exc.landed, claim.job_id)
             jobs.renew(conn, claim, self.retry)
-            log.info("data pull %s: %s; trying again in %s", claim.period, exc, self.retry)
+            log.info(
+                "data pull %s: %s; landed %d earlier partitions, %d of them new or changed;"
+                " trying again in %s",
+                claim.period,
+                exc,
+                len(exc.landed),
+                added,
+                self.retry,
+            )
             return
         except (LakeError, OSError, pa.ArrowException, psycopg.Error) as exc:
             fail(conn, claim, "data pull", exc)
