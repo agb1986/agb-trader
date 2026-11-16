@@ -139,8 +139,13 @@ def _json_default(value: object) -> object:
     raise TypeError(f"{type(value).__name__} is not JSON serialisable")
 
 
+# What `code_version` reads when the build set no version: a checkout run by hand, or an image
+# built without `AGB_VERSION`. It names no commit, so `certify` refuses to run under it.
+UNVERSIONED = "dev"
+
+
 def code_version() -> str:
-    return os.environ.get("AGB_VERSION", "dev")
+    return os.environ.get("AGB_VERSION") or UNVERSIONED
 
 
 def configuration(row: dict[str, object]) -> tuple[object, ...]:

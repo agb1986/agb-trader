@@ -219,3 +219,12 @@ def research_panel(research_lake: Path):
     from agb.research import panel
 
     return panel.build(research_lake, PANEL_START, END)
+
+
+@pytest.fixture(scope="module")
+def certifiable() -> Iterator[None]:
+    """A build version for a module that certifies, since `certify` refuses to run under `dev`.
+    Module-scoped, because the certifications those modules share are."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("AGB_VERSION", "test-build")
+        yield

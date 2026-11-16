@@ -418,19 +418,21 @@ echo "$cmd" >> "$AGB_SSH_LOG"
 """
 
 
-def write_artifact(root, model_id: str = "ranker-2026.1", payload: bytes = b"booster") -> Path:
+def write_artifact(
+    root, model_id: str = "ranker-2026.1", payload: bytes = b"booster", passed: bool = True
+) -> Path:
     """A certification artifact as far as promote.sh reads one: a manifest whose `files` map
-    gives every other file's digest."""
+    gives every other file's digest, and which says whether the certification `passed`."""
     artifact = root / "certifications" / model_id
     artifact.mkdir(parents=True, exist_ok=True)
     (artifact / "model.txt").write_bytes(payload)
     (artifact / "manifest.json").write_text(
-        json.dumps({"files": {"model.txt": hashlib.sha256(payload).hexdigest()}})
+        json.dumps({"passed": passed, "files": {"model.txt": hashlib.sha256(payload).hexdigest()}})
     )
     return artifact
 
 
-def promote(tmp_path, *args, reason: str = "") -> subprocess.CompletedProcess:
+def promote(tmp_path, *args, reason: str = "", passed: bool = True) -> subprocess.CompletedProcess:
     """promote.sh over a stub ssh and a stub artifact, with the remote commands it issued in
     `stdout` one per line."""
     bin_dir = tmp_path / "bin"
@@ -438,7 +440,7 @@ def promote(tmp_path, *args, reason: str = "") -> subprocess.CompletedProcess:
     ssh = bin_dir / "ssh"
     ssh.write_text(FAKE_SSH)
     ssh.chmod(0o755)
-    write_artifact(tmp_path)
+    write_artifact(tmp_path, passed=passed)
     log = tmp_path / "ssh.log"
     log.write_text("")
     done = subprocess.run(
@@ -465,7 +467,7 @@ def test_promote_carries_the_paper_waiver_to_the_server(tmp_path):
     """The waiver is a flag on the server's `agb promote`, so the handoff has to pass it and the
     reason through; `make promote MODEL=... CMD=waive REASON=...` is the whole measurement
     handoff, not three steps by hand."""
-    done = promote(tmp_path, "waive", reason="measuring the live limits, issue #45")
+    done = promote(tmp_path, "waive", reason="measuring the live limits, issue #45", passed=False)
     assert done.returncode == 0, done.stderr
     [promotion] = [line for line in done.stdout.splitlines() if " agb promote " in line]
     # The reason is one word of prose, so the remote shell has to parse it back as one argument.
@@ -684,6 +686,16 @@ def test_a_verified_copy_is_shipped_once(tmp_path):
     assert again.returncode == 0, again.stderr
     assert "already shipped" in again.stdout
     assert "every file verified" in server.run("check").stdout
+
+
+def test_promote_stops_at_a_failed_certification_before_anything_is_shipped(tmp_path):
+    """The waiver is the only way a failed certification goes live. The server's `agb promote`
+    refuses it as well, but by then the artifact is shipped and its row imported. Issue #169."""
+    done = promote(tmp_path, passed=False)
+    assert done.returncode == 1
+    assert "ranker-2026.1 failed its certification" in done.stderr
+    assert "CMD=waive" in done.stderr
+    assert done.stdout == "", "it refuses before it reaches the server"
 
 
 # ssh for sizing.sh: the `pgrep` call is run for real, through a shell that carries the pattern

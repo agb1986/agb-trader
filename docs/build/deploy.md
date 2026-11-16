@@ -253,10 +253,12 @@ A model is certified on the workstation by the research profile, which writes it
 directory under `research/certifications/<model id>/`. Getting it live takes three steps, which
 `make promote MODEL=<model id>` runs in order over SSH, skipping each one that is already done;
 `make promote MODEL=<model id> CMD=check` reports where a model stands without changing
-anything, including the waiver it is live under, if any. Neither `make agb` nor
-`make research` can do these writes: the `cli` service is pointed at the workstation's own
-database, where no certification was ever imported, and the `research` service has no database
-at all. The steps by hand are:
+anything, including the waiver it is live under, if any. `make promote` stops before it ships
+anything when the artifact's manifest says the certification failed its gates, as `certify`
+itself exits 1 after writing a failed one; the paper waiver below is the only way past that.
+Neither `make agb` nor `make research` can do these writes: the `cli` service is pointed at the
+workstation's own database, where no certification was ever imported, and the `research`
+service has no database at all. The steps by hand are:
 
 1. Copy the artifact directory, unchanged, to `models/<model id>/` in the deploy directory.
    `make promote` extracts it into a temporary directory beside the destination and renames
