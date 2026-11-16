@@ -16,7 +16,7 @@ from account_fake import read_book
 from market_fake import PERIOD, SIGNAL, TRADE, Market
 from psycopg import errors
 from registry_fake import ARTIFACT, MODEL_ID
-from test_gate import go_live
+from test_gate import actor_for, go_live
 
 from agb import approval, basket, corporate, gate, jobs, lake, schedule
 from agb.corporate import Event, Kind
@@ -525,10 +525,11 @@ def proposed_basket(db, reference="2026-10"):
 
 
 def move(db, basket_id, seq, from_state, to_state, role, surface=None):
+    actor = actor_for(role, to_state)
     db.connect(role).execute(
         "INSERT INTO agb.basket_event (basket_id, seq, from_state, to_state, actor, surface)"
         " VALUES (%s, %s, %s, %s, %s, %s)",
-        (basket_id, seq, from_state, to_state, role, surface or role),
+        (basket_id, seq, from_state, to_state, actor, surface or role),
     )
 
 
@@ -583,7 +584,7 @@ def test_a_basket_walks_from_proposed_to_filled_by_the_roles_allowed_each_step(d
     assert rows(db, "SELECT seq, to_state, actor, surface FROM agb.basket_event ORDER BY seq") == [
         (1, "proposed", "pipeline", "pipeline"),
         (2, "pending", "bot", "telegram"),
-        (3, "approved", "bot", "telegram"),
+        (3, "approved", "telegram:7", "telegram"),
         (4, "submitted", "execution", "execution"),
         (5, "filled", "execution", "execution"),
     ]
