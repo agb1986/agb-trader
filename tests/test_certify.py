@@ -27,6 +27,9 @@ from agb.research.panel import Panel
 from agb.research.trials import Ledger
 from agb.roles import RESEARCH
 
+# `certify` refuses to run without a build version.
+pytestmark = pytest.mark.usefixtures("certifiable")
+
 MODEL = train.Config(num_boost_round=20, min_data_in_leaf=5)
 VALIDATION = cpcv.Options(groups=6, test_groups=2, embargo_months=1)
 OPTIONS = certify.Options(model_id="ranker-2024.1", size=6, hold_through=10)
@@ -757,6 +760,22 @@ def test_a_run_that_raises_leaves_a_failed_trial_and_no_artifact(
     assert not (research_dir / "certifications").exists()
 
 
+def test_a_run_under_no_build_version_is_refused_before_it_starts(
+    panel, research_lake, tmp_path, monkeypatch
+):
+    """`dev` names no commit, so the artifact and the cache it keys could not say what ran."""
+    monkeypatch.delenv("AGB_VERSION")
+    research_dir = tmp_path / "research"
+    ledger = Ledger(research_dir / trials.FILE)
+    with pytest.raises(certify.CertificationError, match="names no build"):
+        certify.run(
+            panel, MODEL, VALIDATION, OPTIONS, ledger,
+            research_dir=research_dir, lake_dir=research_lake,
+        )  # fmt: skip
+    assert ledger.count() == 0
+    assert not (research_dir / "certifications").exists()
+
+
 def test_a_run_refuses_a_ledger_a_row_was_taken_out_of(panel, research_lake, tmp_path):
     """A ledger whose chain is broken declares a count nobody can vouch for, so the run refuses
     it before adding a row of its own or writing anything."""
@@ -932,3 +951,28 @@ def test_the_cli_certifies_and_imports(
         cli.main(["import", str(directory)])
     with pytest.raises(SystemExit, match="never overwritten"):
         cli.main(["certify", "--model-id", "cli-ranker", "--rounds", "20", "--groups", "6"])
+
+
+def test_the_cli_exits_1_on_a_failed_certification_after_writing_it(
+    panel, research_lake, tmp_path, monkeypatch, capsys
+):
+    """A failed certification is a record, so it is written, but the command failed: a script
+    reading the exit status must not take the artifact for a promotable one. An empty ledger
+    leaves the overfitting gate one candidate, which fails it."""
+    research_dir = tmp_path / "research"
+    research_dir.mkdir()
+    panel.save(research_dir / "panel.parquet")
+    monkeypatch.setenv("AGB_RESEARCH_DIR", str(research_dir))
+    monkeypatch.setenv("AGB_LAKE_DIR", str(research_lake))
+    with pytest.raises(SystemExit) as exited:
+        cli.main([
+            "certify", "--model-id", "cli-failed", "--rounds", "20", "--min-leaf", "5",
+            "--groups", "6", "--size", "6", "--hold-through", "10",
+        ])  # fmt: skip
+    assert exited.value.code == 1
+    out = capsys.readouterr().out
+    assert f"certification FAILED: {STAGE_1}; artifact " in out
+    manifest = json.loads(
+        (research_dir / "certifications" / "cli-failed" / artifact.MANIFEST).read_text()
+    )
+    assert manifest["passed"] is False

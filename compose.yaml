@@ -367,6 +367,8 @@ services:
     build:
       context: .
       target: research
+      # `make research` sets it to the checkout's commit. Built without it the image reports
+      # `dev`, under which `certify` refuses to run.
       args:
         AGB_VERSION: ${AGB_VERSION:-dev}
     profiles: [research]

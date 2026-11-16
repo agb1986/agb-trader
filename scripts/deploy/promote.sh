@@ -214,8 +214,18 @@ check() {
     fi
 }
 
+# A certification that failed its gates is promoted only under the waiver; the server's
+# `agb promote` refuses it too, but stopping here ships and imports nothing.
+passed() {
+    [ "$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1])).get("passed") is True)' \
+        "$artifact/manifest.json")" = True ] ||
+        die "$model failed its certification; promote it under the paper-only waiver with" \
+            "\`make promote MODEL=$model CMD=waive REASON=\"why\"\`, or certify another model"
+}
+
 all() {
     written
+    [ -n "$waive" ] || passed
     deployed
     ship
     record

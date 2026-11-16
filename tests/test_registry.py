@@ -38,6 +38,9 @@ from agb.roles import RESEARCH
 from agb.schedule import Expected, Planned
 from agb.services.pipeline import Pipeline
 
+# `certify` refuses to run without a build version.
+pytestmark = pytest.mark.usefixtures("certifiable")
+
 MODEL_ID = "ranker-2026.1"
 MODEL = train.Config(num_boost_round=20, min_data_in_leaf=5)
 VALIDATION = cpcv.Options(groups=6, test_groups=2, embargo_months=1)
