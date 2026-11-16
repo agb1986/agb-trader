@@ -583,8 +583,9 @@ def test_a_pull_after_a_gap_lands_each_session_it_missed(tmp_path):
     ]
     for day in ("2026-09-10", "2026-09-11", "2026-09-14"):
         assert read(tmp_path, f"sep/date={day}").column("ticker").to_pylist() == ["AAPL", "MSFT"]
+    # The fetch starts on the overlap day, the 9th, which nothing restated, so it is all.
     [sep] = [u for u in vendor.urls if "/stocks?" in u]
-    assert "date.gte=2026-09-10" in sep and "date.lte=2026-09-14" in sep
+    assert "date.gte=2026-09-09" in sep and "date.lte=2026-09-14" in sep
 
 
 def test_a_pull_again_after_a_gap_changes_nothing(tmp_path):
@@ -678,3 +679,166 @@ def test_sf1_is_fetched_from_a_week_before_the_last_pull(tmp_path):
         ("AAPL", "ARQ", date(2026, 6, 27), date(2026, 9, 3), 1.56),
         ("MSFT", "ARY", date(2026, 6, 30), date(2026, 8, 28), 12.1),
     ]
+
+
+def back_adjust(vendor, ticker, ex_date, *, split=1.0, dividend=0.0):
+    """Price `ticker` as the vendor does once it goes ex an action on `ex_date`. A `split` divides
+    `close` and `closeadj` before the ex-date, leaving the unadjusted close as it traded, and every
+    price from the ex-date on, which trade on the new share count. A `dividend` of that much a
+    share divides `closeadj` before the ex-date by one less its share of the close before it."""
+    rows = sorted(
+        (r for r in vendor.rows["stocks"] if r["ticker"] == ticker), key=lambda r: r["date"]
+    )
+    before = [r for r in rows if r["date"] < ex_date]
+    factor = 1 - dividend / (float(before[-1]["close"]) / split)
+    for row in before:
+        for column in ("open", "high", "low", "close"):
+            row[column] = str(float(row[column]) / split)
+        row["closeadj"] = str(float(row["closeadj"]) / split * factor)
+    for row in rows[len(before) :]:
+        for column in ("open", "high", "low", "close", "closeadj", "closeunadj"):
+            row[column] = str(float(row[column]) / split)
+
+
+def series(root, ticker):
+    """`ticker`'s stored (date, close, closeadj, closeunadj) rows, in date order."""
+    return (
+        lake.connect(root)
+        .execute(
+            "SELECT date, close, closeadj, closeunadj FROM sep WHERE ticker = ? ORDER BY date",
+            [ticker],
+        )
+        .fetchall()
+    )
+
+
+def history_requests(vendor):
+    return sorted(u.split("ticker=")[1].split("&")[0] for u in vendor.urls if "ticker=" in u)
+
+
+def test_a_split_since_the_last_session_restates_the_tickers_history(tmp_path):
+    # The lake has the 10th and 11th at AAPL's pre-split prices. AAPL splits 2:1 on the 14th,
+    # and the vendor halves its earlier closes. The pull of the 14th restates them.
+    vendor = trading(sample(), "2026-09-10")
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 10))
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 11))
+    msft = {d: read(tmp_path, f"sep/date={d}") for d in ("2026-09-10", "2026-09-11")}
+    back_adjust(vendor, "AAPL", "2026-09-14", split=2)
+    vendor.urls.clear()
+
+    partitions = lake.pull(tmp_path, client(vendor), SESSION)
+
+    assert history_requests(vendor) == ["AAPL"]
+    assert sep_partitions(partitions) == [
+        "sep/date=2026-09-14",
+        "sep/date=2026-09-10",
+        "sep/date=2026-09-11",
+    ]
+    assert series(tmp_path, "AAPL") == [
+        (date(2026, 9, 10), 150.0, 150.0, 300.0),
+        (date(2026, 9, 11), 163.75, 163.75, 327.5),
+        (date(2026, 9, 14), 164.105, 164.105, 164.105),
+    ]
+    # One basis: the split-adjusted close moves 0.2% across the split, not -50%.
+    (_, before, _, _), (_, after, _, _) = series(tmp_path, "AAPL")[1:]
+    assert after / before - 1 == pytest.approx(0.0021, abs=1e-4)
+    for day, table in msft.items():
+        stored = read(tmp_path, f"sep/date={day}")
+        assert stored.filter(pa.compute.equal(stored["ticker"], "MSFT")) == table.filter(
+            pa.compute.equal(table["ticker"], "MSFT")
+        )
+    assert lake.inconsistent(tmp_path) == []
+
+
+def test_a_dividend_since_the_last_session_restates_the_adjusted_close(tmp_path):
+    # MSFT goes ex a $5.099 dividend on the 14th, 1% of the 11th's close: the vendor scales its
+    # earlier adjusted closes by 0.99, and the pull carries that into the lake.
+    vendor = trading(sample(), "2026-09-10")
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 11))
+    back_adjust(vendor, "MSFT", "2026-09-14", dividend=5.099)
+    vendor.urls.clear()
+
+    lake.pull(tmp_path, client(vendor), SESSION)
+
+    assert history_requests(vendor) == ["MSFT"]
+    assert [(d, adj) for d, _, adj, _ in series(tmp_path, "MSFT")] == [
+        (date(2026, 9, 11), pytest.approx(509.9 * 0.99)),
+        (date(2026, 9, 14), 512.3),
+    ]
+    assert lake.inconsistent(tmp_path) == []
+
+
+def test_a_pull_with_no_action_fetches_no_history(tmp_path):
+    vendor = trading(sample(), "2026-09-10")
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 10))
+    vendor.urls.clear()
+    partitions = lake.pull(tmp_path, client(vendor), SESSION)
+    assert history_requests(vendor) == []
+    assert "sep/date=2026-09-10" not in sep_partitions(partitions)
+
+
+def test_a_restatement_waits_for_a_session_to_land_with(tmp_path):
+    # AAPL splits on the 11th, but the vendor has none of the 11th yet: nothing lands, and the
+    # next pull still sees the split on the overlap day and restates the 10th then.
+    vendor = trading(sample(), "2026-09-10")
+    vendor.rows["stocks"] = [r for r in vendor.rows["stocks"] if r["date"] <= "2026-09-10"]
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 10))
+    back_adjust(vendor, "AAPL", "2026-09-11", split=2)
+    before = mtimes(tmp_path)
+
+    with pytest.raises(NotYet) as caught:
+        lake.pull(tmp_path, client(vendor), SESSION)
+
+    assert caught.value.landed == []
+    assert mtimes(tmp_path) == before
+    trading(vendor, "2026-09-11", "2026-09-14")
+    lake.pull(tmp_path, client(vendor), SESSION)
+    assert series(tmp_path, "AAPL")[0] == (date(2026, 9, 10), 150.0, 150.0, 300.0)
+
+
+def test_a_session_landed_short_of_the_pull_still_carries_the_restatement(tmp_path):
+    # The 11th lands, the 14th is still being published: the 10th is restated with the 11th,
+    # since the next pull's overlap day is the 11th, already on the new basis.
+    vendor = trading(sample(), "2026-09-10")
+    vendor.rows["stocks"] = [r for r in vendor.rows["stocks"] if r["date"] != "2026-09-14"]
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 10))
+    vendor.rows["stocks"] = [r for r in vendor.rows["stocks"] if r["date"] != "2026-09-11"]
+    trading(vendor, "2026-09-11")
+    trading(vendor, "2026-09-14", tickers=("AAPL",))
+    back_adjust(vendor, "AAPL", "2026-09-11", split=2)
+
+    with pytest.raises(NotYet) as caught:
+        lake.pull(tmp_path, client(vendor), SESSION)
+
+    assert [p.path for p in caught.value.landed] == ["sep/date=2026-09-11", "sep/date=2026-09-10"]
+    assert series(tmp_path, "AAPL")[0] == (date(2026, 9, 10), 150.0, 150.0, 300.0)
+    assert lake.inconsistent(tmp_path) == []
+
+
+def test_the_consistency_check_passes_a_clean_lake(tmp_path):
+    # A backfill of a vendor that has adjusted for a split and a dividend, then daily pulls.
+    vendor = trading(sample(), "2026-09-10")
+    back_adjust(vendor, "AAPL", "2026-09-11", split=4)
+    back_adjust(vendor, "MSFT", "2026-09-14", dividend=2.5)
+    bulk(tmp_path, vendor, SEP, tmp_path)
+    assert lake.inconsistent(tmp_path) == []
+    trading(vendor, "2026-09-15", "2026-09-16")
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 16))
+    assert lake.inconsistent(tmp_path) == []
+    assert lake.inconsistent(tmp_path / "empty") == []
+
+
+def test_the_consistency_check_flags_a_series_on_two_bases(tmp_path, capsys):
+    # The 14th lands as a pull that did not look at the overlap day would land it: on the basis
+    # of a split of AAPL and a dividend of MSFT on the 15th, over a 10th and 11th that are not.
+    vendor = trading(sample(), "2026-09-10")
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 11))
+    back_adjust(vendor, "AAPL", "2026-09-15", split=2)
+    back_adjust(vendor, "MSFT", "2026-09-15", dividend=5.123)
+    lake.land(tmp_path, SEP, client(vendor).query(SEP, {"date": SESSION}), SESSION)
+
+    assert lake.inconsistent(tmp_path) == ["AAPL", "MSFT"]
+    with pytest.raises(SystemExit) as exit_:
+        lake.main(["--lake", str(tmp_path), "--check"])
+    assert exit_.value.code == 1
+    assert capsys.readouterr().out == "AAPL\nMSFT\n"
