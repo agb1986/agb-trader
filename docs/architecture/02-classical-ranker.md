@@ -135,7 +135,7 @@ Forced-event handling is built, and the same rules serve the backtest and live:
 
 - **Cash acquisition** — the position terminates at the deal price; hold cash until the next rebalance rather than redeploying mid-month, since redeployment is an off-cadence decision with no signal behind it.
 - **Stock-for-stock merger** — acquirer shares are received and sold at the next rebalance regardless of the acquirer's rank, because that position was never chosen.
-- **Delisting to OTC** — exit at the last listed print. Sharadar SEP carries delisted tickers, which is precisely why it was selected; the backtest models this honestly instead of silently dropping the name.
+- **Delisting to OTC** — exit at the last listed print. Sharadar SEP carries delisted tickers, which is precisely why it was selected; the backtest models this honestly instead of silently dropping the name. Where a name's bars simply stop, the backtest sells it at its last print less a conservative delisting return, since what the OTC sale realised is not in the data ([01 — Data, broker, backtesting](01-data-broker-backtesting.md)).
 - **Trading halt spanning a rebalance date** — carry the position, skip its replacement, and run 19 names that month.
 
 The last case implies a requirement that is easy to miss: **position-count logic must tolerate holding fewer than 20 names**, or the strategy fails at the worst possible moment.

@@ -41,7 +41,7 @@ NautilusTrader provides no cross-sectional ranking or rebalancing abstraction. U
 
 **The scan and the validation run are not expected to agree on real data, and the scan is the one that is wrong on purpose.** The scan exists to be fast, so it models three frictions fewer than the engine, each of which the engine models because the live basket has it:
 
-- **Delisting exits.** The engine sells a held name at its last listed print, the forced exit [02 — Classical ranker](02-classical-ranker.md) requires. The scan carries the last price forward and sells the name at the next rebalance that drops it out of the ranking.
+- **Delisting exits.** The engine sells a held name at its last listed print less a delisting return, the forced exit [02 — Classical ranker](02-classical-ranker.md) requires. The lake has no price for what an OTC sale realises, so the return is an assumption: `backtest.DELISTING_RETURN`, −30%, after Shumway (1997), who put performance-related delistings from the NYSE and AMEX at about −30%; Shumway and Warther (1999) found Nasdaq's worse still. It is a backtest option, recorded with the trial, and every run reports the exits and the dollars the return took. Tradeability is read from the signal session alone, as live reads it, so a name whose bars stop before the trade session is still planned and its buy goes unfilled. The scan carries the last price forward and sells the name at the next rebalance that drops it out of the ranking.
 - **Trims.** The engine trims a buy the account cannot fund whole, and drops one that rounds to no shares at all. vectorbt's shared cash group does neither.
 - **Whole shares.** The engine sizes whole shares at the signal session's close, as the live basket sizes them; vectorbt sizes fractional shares at the fill.
 
@@ -109,6 +109,8 @@ Applied to sells only, at the current schedule across all of history:
 - **FINRA TAF:** $0.000195 per share, capped at $9.79 per trade, rounded to the cent.
 - **CAT fee:** $0.000001 per executed share.
 - **Commission:** $0.
+
+The per-share fees, TAF and CAT, count the shares as they traded. The validation run holds split-adjusted shares at adjusted prices, so its equity curve is the adjusted one, and converts each fill's shares at that session's as-traded close (`closeunadj`) before pricing the fees: a name that has split 4:1 since printed a quarter of the shares at four times the price. The liquidity inputs are unaffected, because the spread, σ_daily and ADV_$ read the vendor's split-adjusted close, high, low and volume, whose ratios and products do not depend on the share basis.
 
 Historical Section 31 rates varied year to year; the difference is under 0.3 bps a side and does not justify a dated rate table. The whole fee stack is roughly 0.2 bps per sell at typical position sizes, material only as a correctness check against broker statements.
 
