@@ -16,7 +16,7 @@ The bot is the only service holding the Telegram token, and the only one whose t
 
 ## The command set
 
-Fourteen commands.
+Fifteen commands.
 
 ```
 /status        — what the system is doing right now
@@ -33,9 +33,10 @@ Fourteen commands.
 /resume        — clear the halt and the pause
 /liquidate     — close every position at market (two steps)
 /log [n]       — recent audit lines
+/help          — this list
 ```
 
-The set divides in three. `/status`, `/positions`, `/pnl` and `/log` are read-only monitoring. `/pending`, `/approve`, `/reject`, `/basket`, `/why` and `/gate` are the approval loop and its drill-downs. `/pause`, `/resume` and `/liquidate` are the kill-switch. `/level` sits across the first two, because the autonomy ladder is both a fact about current state and the thing the approval loop is working toward.
+The set divides in three. `/status`, `/positions`, `/pnl` and `/log` are read-only monitoring. `/pending`, `/approve`, `/reject`, `/basket`, `/why` and `/gate` are the approval loop and its drill-downs. `/pause`, `/resume` and `/liquidate` are the kill-switch. `/level` sits across the first two, because the autonomy ladder is both a fact about current state and the thing the approval loop is working toward. `/help` lists the commands and touches nothing.
 
 **There is no command that changes a position outside the approval loop and `/liquidate`.** That is the standing constraint expressed as an interface: the bot offers no way to trim a name, add one, or override a weight. If the human wants a different book, the mechanism is to reject the rebalance or to liquidate, both recorded as deliberate divergences. There is no `/promote` and no way to move the ladder up: those are server CLI acts ([04 — Risk limits and approval workflow](04-risk-and-approval.md)), and `/level` is read-only.
 

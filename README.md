@@ -5,7 +5,7 @@ A semi-autonomous, AI-integrated US equities trader. The design lives in
 
 ## Quickstart
 
-Needs Docker with Compose v2, GNU Make and [uv](https://docs.astral.sh/uv/).
+Needs Docker with Compose v2.20 or newer, GNU Make and [uv](https://docs.astral.sh/uv/).
 
 ```sh
 make env      # copy each env/*.env.example to env/*.env; set real passwords in env/db.env
@@ -85,3 +85,9 @@ Name one module to run only it, e.g. `AGB_LIVE_TELEGRAM=1 uv run pytest -m live
 tests/test_telegram_live.py`.
 
 Schema changes go in [migrations/](migrations/); read its README first.
+
+## Licence
+
+The repository carries no `LICENSE` file, so all rights are reserved by default and nothing here
+is offered for reuse. That is deliberate and not an oversight: the choice of licence, if any,
+belongs to the owner.

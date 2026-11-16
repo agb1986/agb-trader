@@ -11,6 +11,8 @@
 #     heartbeat's age (`python -m agb.heartbeat`), so `up --wait` only passes once every service
 #     is beating; db and vpn check themselves; the one-shots disable it and are judged by their
 #     exit status. Only fields Docker Engine 20.10 knows are used: no `start_interval`.
+#   - The Compose plugin must be v2.20 or newer (docs/build/deploy.md): the file uses the
+#     top-level `name`, `depends_on` conditions and, through agb-stack, `up --wait-timeout`.
 #   - No service mounts the Docker socket, and `db` publishes no host port.
 #   - `core` is internal. Only `pipeline`, `execution` and `reconcile` join `outbound`, the
 #     network with a route to the internet; `ui` joins `ui-port` for its published port alone.
@@ -368,7 +370,8 @@ services:
       context: .
       target: research
       # `make research` sets it to the checkout's commit. Built without it the image reports
-      # `dev`, under which `certify` refuses to run.
+      # `dev`, under which `certify` refuses to run. The app image takes its version from
+      # AGB_IMAGE_TAG instead (the release tag); both default to `dev`, as the Dockerfile does.
       args:
         AGB_VERSION: ${AGB_VERSION:-dev}
     profiles: [research]
