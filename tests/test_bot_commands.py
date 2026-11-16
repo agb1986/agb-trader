@@ -18,6 +18,7 @@ from test_execution import (
     AFTER,
     CALENDAR,
     CLOSE_AT,
+    CUTOFF,
     NEXT,
     NOW,
     approved,
@@ -100,7 +101,7 @@ def paper(db):
     conn = db.connect("execution")
     target = approved(db)
     fake = broker()
-    assert execution.submit(conn, fake, target, NOW).state == "submitted"
+    assert execution.submit(conn, fake, target, lambda: NOW, CUTOFF).state == "submitted"
     fake.close(CLOSE_AT)
     assert execution.reconcile(conn, fake, target, AFTER).state == "filled"
     assert execution.snapshot(conn, fake, TRADE, CALENDAR)
@@ -428,7 +429,10 @@ def test_after_a_gate_halt_gate_leads_with_the_failing_check_and_its_measurement
 def test_a_failed_broker_check_raises_the_gate_halt_alert_too(db):
     conn = db.connect("execution")
     target = approved(db)
-    assert execution.submit(conn, broker(suspend_trade=True), target, NOW).state == "halted"
+    assert (
+        execution.submit(conn, broker(suspend_trade=True), target, lambda: NOW, CUTOFF).state
+        == "halted"
+    )
 
     cycle(db, FakeTelegram())
 
@@ -500,7 +504,7 @@ def test_the_fill_confirmation_arrives_after_the_close_and_only_once(db):
     conn = db.connect("execution")
     target = approved(db)
     fake = broker()
-    execution.submit(conn, fake, target, NOW)
+    execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
     telegram = FakeTelegram()
 
     cycle(db, telegram, NOW)

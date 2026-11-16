@@ -40,7 +40,7 @@ from market_fake import PERIOD, SIGNAL, TRADE
 from psycopg.types.json import Jsonb
 from test_bot import CHAT, FakeTelegram, beat_at, expect
 from test_bot_commands import ET
-from test_execution import AFTER, CALENDAR, CLOSE_AT, NOW, basket, broker
+from test_execution import AFTER, CALENDAR, CLOSE_AT, CUTOFF, NOW, basket, broker
 from test_gate import EVENING, HELD, NAMES, SOUND, TURNOVER, hold, insert, rows, run, state
 from test_health import dividend, mode, months
 from test_ladder import at_level
@@ -171,7 +171,7 @@ def traded(db):
     assert state(db, basket_id)[:2] == ("approved", 2)
     target = basket(db, basket_id)
     fake = broker()
-    assert execution.submit(conn, fake, target, NOW).state == "submitted"
+    assert execution.submit(conn, fake, target, lambda: NOW, CUTOFF).state == "submitted"
     fake.close(CLOSE_AT)
     assert execution.reconcile(conn, fake, target, AFTER).state == "filled"
     assert execution.snapshot(conn, fake, TRADE, CALENDAR)

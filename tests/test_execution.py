@@ -44,6 +44,7 @@ from agb.services.execution import Execution
 
 # 15:35 ET on the trade session: inside the submission window, which runs 15:30 to 15:45.
 NOW = datetime(2026, 10, 1, 19, 35, tzinfo=UTC)
+CUTOFF = datetime(2026, 10, 1, 19, 45, tzinfo=UTC)
 CLOSE_AT = datetime(2026, 10, 1, 20, 0, tzinfo=UTC)
 AFTER = datetime(2026, 10, 1, 20, 5, tzinfo=UTC)
 NEXT = date(2026, 10, 2)
@@ -149,7 +150,7 @@ def test_the_approved_basket_passes_the_broker_checks_and_is_submitted_as_moc(db
         seen.append(client_order_id)
 
     fake = broker(on_submit=at_the_broker)
-    outcome = execution.submit(conn, fake, target, NOW)
+    outcome = execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     assert outcome == execution.Outcome(
         target.id, "submitted", 20, "20 orders answered by the broker at 19:35:00Z"
@@ -212,14 +213,14 @@ def test_a_lost_answer_is_looked_up_under_the_client_order_id_and_never_resent(d
 
     fake = broker(on_submit=lose_the_answer)
     with pytest.raises(ExecutionError, match=f"{PERIOD}-N03: POST /v2/orders: timed out"):
-        execution.submit(conn, fake, target, NOW)
+        execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     assert state(db, target.id)[:2] == ("approved", 2)
     assert rows(db, "SELECT count(*) FROM agb.broker_order") == [(3,)]
     assert events(db, order_id(db, f"{PERIOD}-N03")) == []
 
     fake.on_submit = None
-    outcome = execution.submit(conn, fake, target, NOW)
+    outcome = execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     assert outcome.state == "submitted"
     assert events(db, order_id(db, f"{PERIOD}-N03")) == [("lookup", "accepted", "ord-0003")]
@@ -241,9 +242,9 @@ def test_a_row_the_broker_never_saw_is_sent_under_the_same_client_order_id(db):
 
     fake = broker(on_submit=crash_before_the_call)
     with pytest.raises(ExecutionError):
-        execution.submit(conn, fake, target, NOW)
+        execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
     fake.on_submit = None
-    execution.submit(conn, fake, target, NOW)
+    execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     assert state(db, target.id)[0] == "submitted"
     assert events(db, order_id(db, f"{PERIOD}-N03")) == [("ack", "accepted", "ord-0003")]
@@ -259,7 +260,7 @@ def test_a_duplicate_client_order_id_resolves_through_lookup_and_never_a_second_
     fake = broker()
     held = fake.accept("N05", Decimal(240), "buy", f"{PERIOD}-N05")
 
-    outcome = execution.submit(conn, fake, target, NOW)
+    outcome = execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     assert outcome.state == "submitted"
     assert events(db, order_id(db, f"{PERIOD}-N05")) == [("lookup", "accepted", held.id)]
@@ -282,7 +283,7 @@ def test_a_halt_cause_opened_mid_submission_stops_the_remaining_orders(db):
             db.connect("bot").execute(PAUSE)
 
     fake = broker(on_submit=pause_after_five)
-    outcome = execution.submit(conn, fake, target, NOW)
+    outcome = execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     reason = "halt open mid-submission (pause): 5 of 20 orders sent, 0 still live or filled"
     assert outcome == execution.Outcome(target.id, "halted", 5, reason)
@@ -314,7 +315,7 @@ def test_an_order_that_will_not_cancel_is_named_in_a_partial_rebalance_alert(db)
 
     fake = broker(on_submit=pause_after_two)
     fake.cancel_fails.add("ord-0002")
-    outcome = execution.submit(conn, fake, target, NOW)
+    outcome = execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     assert outcome.state == "halted"
     assert outcome.reason == (
@@ -338,6 +339,55 @@ def test_an_order_that_will_not_cancel_is_named_in_a_partial_rebalance_alert(db)
     ]
 
 
+def test_a_clock_past_the_cutoff_after_the_fifth_order_sends_five_and_raises_one_alert(db):
+    """Issue #174: the clock is read before each order, not once for the cycle. A submission
+    that starts at 15:44 and is slow sends nothing after 15:45: the rest are named in one
+    partial-rebalance alert and the basket is halted, its five orders left to the close."""
+    conn = db.connect("execution")
+    target = approved(db)
+    reads = []
+
+    def clock():
+        sent = len(fake.submits())
+        reads.append(sent)
+        return CUTOFF - timedelta(seconds=1) if sent < 5 else CUTOFF
+
+    fake = broker()
+    outcome = execution.submit(conn, fake, target, clock, CUTOFF)
+
+    assert outcome.state == "halted"
+    assert outcome.sent == 5
+    assert outcome.reason == (
+        "the 15:45 ET cutoff passed mid-submission, at 19:45:00Z: 5 of 20 orders sent, 15 not sent"
+    )
+    assert fake.submits() == [f"{PERIOD}-{s}" for s in NAMES[:5]]
+    assert rows(db, "SELECT count(*) FROM agb.broker_order") == [(5,)]
+    assert state(db, target.id) == ("halted", 3, "execution", "execution")
+    assert halts(db) == []
+    unsent = ", ".join(f"buy 240 {s}" for s in NAMES[5:])
+    [(kind, subject, period, body)] = alerts(db)
+    assert (kind, subject, period) == ("partial_rebalance_halted", PERIOD, PERIOD)
+    assert body.startswith(f"basket {PERIOD} halted mid-submission; ")
+    assert "5 of 20 orders sent" in body
+    assert body.endswith("Not sent: " + unsent)
+    # Nothing was cancelled: the five orders stay live for the close.
+    assert all(o.status == "accepted" for o in fake.orders.values())
+    assert reads[:6] == [0, 1, 2, 3, 4, 5]
+
+
+def test_a_clock_at_the_cutoff_before_the_first_order_sends_nothing_and_fails_the_submission(db):
+    conn = db.connect("execution")
+    target = approved(db)
+    fake = broker()
+
+    with pytest.raises(ExecutionError, match="cutoff passed before the first order"):
+        execution.submit(conn, fake, target, lambda: CUTOFF, CUTOFF)
+
+    assert fake.submits() == []
+    assert state(db, target.id)[0] == "approved"
+    assert alerts(db) == []
+
+
 def test_an_order_still_being_cancelled_stays_open_and_its_later_fill_is_recorded(db):
     """Issue #149: the broker has taken the cancel but not carried it out, and fills the order
     at the close. The halt does not record it as final: it stays open, is named in the alert,
@@ -351,7 +401,7 @@ def test_an_order_still_being_cancelled_stays_open_and_its_later_fill_is_recorde
 
     fake = broker(on_submit=pause_after_two)
     fake.cancel_pending.add("ord-0002")
-    outcome = execution.submit(conn, fake, target, NOW)
+    outcome = execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     assert outcome.reason == (
         "halt open mid-submission (pause): 2 of 20 orders sent, 1 still live or filled"
@@ -399,7 +449,7 @@ def test_an_order_cancelled_after_a_partial_fill_is_named_as_having_moved_the_bo
             db.connect("bot").execute(PAUSE)
 
     fake = broker(on_submit=fill_then_pause)
-    outcome = execution.submit(conn, fake, target, NOW)
+    outcome = execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     assert outcome.reason == (
         "halt open mid-submission (pause): 2 of 20 orders sent, 1 still live or filled"
@@ -429,7 +479,7 @@ def test_a_failed_broker_check_halts_the_basket_like_a_gate_failure(db):
     fake = broker(suspend_trade=True)
     fake.assets["N07"] = Asset("N07", "inactive", False, True)
 
-    outcome = execution.submit(conn, fake, target, NOW)
+    outcome = execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     reason = (
         "broker checks failed: suspend_trade measured true, needs false;"
@@ -471,7 +521,7 @@ def test_every_quote_is_read_in_one_request_before_the_first_order(db):
     target = approved(db)
     fake = broker()
 
-    execution.submit(conn, fake, target, NOW)
+    execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     quotes = [i for i, c in enumerate(fake.calls) if c[0] == "latest_quotes"]
     assert [fake.calls[i] for i in quotes] == [("latest_quotes", tuple(NAMES))]
@@ -488,7 +538,7 @@ def test_a_missing_quote_sends_no_order_at_all(db):
     del fake.quotes["N14"], fake.quotes["N03"]
 
     with pytest.raises(ExecutionError, match=r"^no quote for N03, N14; no order sent$"):
-        execution.submit(conn, fake, target, NOW)
+        execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     assert fake.submits() == []
     assert rows(db, "SELECT count(*) FROM agb.broker_order") == [(0,)]
@@ -504,7 +554,7 @@ def test_a_pause_set_before_submission_halts_as_a_pause_not_a_gate_breach(db):
     db.connect("bot").execute(PAUSE)
     fake = broker(suspend_trade=True)
 
-    outcome = execution.submit(conn, fake, target, NOW)
+    outcome = execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     reason = "halt open before submission (pause): 0 of 20 orders sent, 0 still live or filled"
     assert outcome == execution.Outcome(target.id, "halted", 0, reason)
@@ -554,7 +604,7 @@ def test_a_refused_order_is_recorded_as_rejected_and_the_rest_go_in(db):
     fake = broker()
     fake.refuse.add("N03")
 
-    outcome = execution.submit(conn, fake, target, NOW)
+    outcome = execution.submit(conn, fake, target, lambda: NOW, CUTOFF)
 
     assert outcome.state == "submitted"
     assert events(db, order_id(db, f"{PERIOD}-N03")) == [("rejected", "rejected", None)]
@@ -609,7 +659,7 @@ SYMBOLS = ("H01", *NAMES[:11])
 
 def submitted(db, conn, fake, case=WITH_A_SALE):
     basket = approved(db, case)
-    assert execution.submit(conn, fake, basket, NOW).state == "submitted"
+    assert execution.submit(conn, fake, basket, lambda: NOW, CUTOFF).state == "submitted"
     return basket
 
 
@@ -737,7 +787,7 @@ def test_a_basket_that_alerted_at_submission_and_then_filled_short_raises_both_a
     target = approved(db)
     fake = broker()
     fake.refuse.add("N03")
-    assert execution.submit(conn, fake, target, NOW).state == "submitted"
+    assert execution.submit(conn, fake, target, lambda: NOW, CUTOFF).state == "submitted"
 
     fake.close(CLOSE_AT, short={"N05": Decimal(200)})
     outcome = execution.reconcile(conn, fake, target, AFTER)
