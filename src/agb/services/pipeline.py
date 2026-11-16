@@ -12,8 +12,10 @@
     from ANTHROPIC_API_KEY and the store under AGB_PANEL_DIR), runs the
     pre-trade gate on it (agb.gate), and completes the job, which fulfils the proposal's
     expected event. The basket is sized on the account's equity as execution last read it
-    (`agb.broker_state_now`); with no reading fresh enough the job is kept and tried again,
-    and AGB_CAPITAL_USD overrides the account for a run that must be sized by hand. The gate
+    (`agb.broker_state_now`) in the trading mode in force, and starts from the positions it
+    read at the signal session's close; with no reading fresh enough, none in this mode, or
+    no position snapshot that recent, the job is kept and tried again. AGB_CAPITAL_USD
+    overrides the account for a run that must be sized by hand. The gate
     halts a basket that fails any check and opens the halt latch; in paper mode it approves one
     that passes, and in live mode (or in paper mode set to ask) leaves it for the human. With
     no model promoted, or the promoted one voided or altered, the job fails and no basket is
@@ -50,7 +52,9 @@ another worker reclaimed it -- is left to that worker: the cycle logs it and end
 failing the job. A rerun that fails is logged and raises a `pipeline_rerun_failed` alert, once
 per rerun; it has no job to fail, so it is tried again each cycle. That includes a gate that
 refuses to approve a basket past its cutoff (the `transition_timely` trigger's
-`CheckViolation`). A rerun whose basket was built but never gated, and has since been retired
+`CheckViolation`). A rerun that is `NotReady`, because execution has not yet read the account
+at its signal session's close, is not a failure: it is logged and tried again next cycle,
+with no alert. A rerun whose basket was built but never gated, and has since been retired
 as missed by the approval sweep, is skipped: the sweep has already alerted on it.
 
     python -m agb.services.pipeline             run the service
@@ -414,6 +418,11 @@ class Pipeline:
                 now=self.clock(),
                 limits=self.limits,
             )
+        except NotReady as exc:
+            # Execution has not read the account since the signal session: the rerun waits for
+            # the read, as a rebalance does, and its cutoff bounds the wait.
+            log.info("rerun %s: %s; trying again next cycle", reference, exc)
+            return
         except (
             BasketError,
             GateError,

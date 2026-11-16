@@ -8,8 +8,9 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 import registry_fake
+from account_fake import read_book
 from conftest import SUPERUSER
-from market_fake import PERIOD, Market
+from market_fake import PERIOD, SIGNAL, TRADE, Market
 from psycopg import errors
 from test_basket import plan_rebalance
 from test_basket import run as build
@@ -472,6 +473,7 @@ def test_the_database_refuses_the_systems_approval_after_the_cutoff_too(db):
     # Paper runs unattended, so a gate passed late would approve the basket alone.
     basket_id = insert(db)
     registry_fake.promote(db)
+    read_book(db, SIGNAL)
     conn = db.connect("pipeline")
     conn.execute("SELECT set_config('agb.test_clock', %s, false)", (LATE.isoformat(),))
     with pytest.raises(errors.CheckViolation, match="basket_cutoff: pipeline may not approve"):
@@ -628,7 +630,7 @@ def test_a_missed_rebalance_is_rerun_through_the_gate_and_the_approval(
         ("2026-10r1", date(2026, 10, 2))
     ]
 
-    build(db, root, clock=lambda: NEXT_MORNING)
+    build(db, root, read=TRADE, clock=lambda: NEXT_MORNING)
 
     [(rerun, deviation_of, session, period)] = rows(
         db,

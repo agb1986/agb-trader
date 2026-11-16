@@ -73,9 +73,15 @@ sync-lake: ## Pull the server's lake into $(LAKE_DIR), read-only against the ser
 	@mkdir -p $(AGB_LAKE_DIR)
 	uv run python -m agb.research sync --env-file $(ENV_DIR)/research.env --lake $(AGB_LAKE_DIR)
 
+# The research image is built with this checkout's commit as its AGB_VERSION, which keys the
+# certification cache and is recorded in every trial and artifact; `certify` refuses to run
+# without one. A checkout with uncommitted changes is marked -dirty, since the commit alone
+# does not name the code that ran.
+RESEARCH_VERSION = $(shell git rev-parse --short=12 HEAD)$(shell git diff --quiet HEAD -- || echo -dirty)
+
 research: sync-lake ## Sync the lake, then run a research command, e.g. make research CMD="cpcv"
 	@mkdir -p $(AGB_RESEARCH_DIR)
-	$(COMPOSE) --profile research run --build --rm research $(CMD)
+	AGB_VERSION=$(RESEARCH_VERSION) $(COMPOSE) --profile research run --build --rm research $(CMD)
 
 measure: ## Sample each container's memory until interrupted, e.g. make measure OUT=peaks.md
 	uv run python -m agb.measure $(if $(OUT),--out $(OUT),)

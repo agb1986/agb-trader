@@ -25,7 +25,10 @@ audit record. Every key is a digest of a record of what it keys, that record is 
 entry, and it is compared with the asking run's before the payload is used, so a digest
 collision misses rather than lies. `trials.code_version` is part of every record, so an entry
 written by another build of the code is never reused, and `FORMAT` is too, so a change to what
-an entry holds retires every entry written before it.
+an entry holds retires every entry written before it. The panel is keyed by its values as well
+as its rows, features and labels included, because the panel is built by its own command and
+may have been built by another build than the one reading it: a panel rebuilt after a feature
+formula changed misses even where every other part of the record agrees.
 
 A path is keyed by the scores it trades rather than by the model that produced them, which is
 why changing the model configuration misses every path without a path key having to know what
@@ -65,7 +68,7 @@ ENTRY = "entry.json"  # written last: its presence is what marks an entry comple
 SCORES = "scores.parquet"
 # What an entry holds and how its key is built. Bump it for any change to either, and every
 # entry written before the change misses rather than being read under the new rules.
-FORMAT = 2  # 2: a backtest's monthly rows carry the benchmark's return (issue #167)
+FORMAT = 3  # 3: the first month carries the first basket's fees (issue #168)
 KINDS = ("cpcv", "backtest", "path")
 _DIGITS = 32  # of the key's digest, which names the entry's directory
 _SCORES_SCHEMA = pa.schema([
@@ -234,11 +237,14 @@ def _traded(
 
 def fingerprint(panel: Panel) -> dict[str, Any]:
     """What identifies the panel a run reads: the lake bytes it was built from, the cost model
-    it was costed with, and a digest over its rows in order.
+    it was costed with, a digest over its rows in order, and a digest over its values.
 
     The row digest is what lets a cached score series be read back by position, and it is what
     makes a panel rebuilt over a wider window a different panel even when its partition digest
-    happens to match."""
+    happens to match. The value digest is what makes a panel rebuilt after a feature formula
+    or the labelling changed a different panel: the lake bytes and the rows are the same, but
+    what the model learns from is not, and a code version alone does not say so when the
+    panel was built by another build than the one certifying it."""
     frame = panel.frame
     keys = frame["as_of"].astype(str).str.cat(frame["ticker"].astype(str), sep="|")
     hasher = hashlib.sha256()
@@ -248,7 +254,24 @@ def fingerprint(panel: Panel) -> dict[str, Any]:
         "partition_hash": panel.partition_hash,
         "cost_model_version": panel.cost_model_version,
         "rows": hasher.hexdigest(),
+        "values": values_digest(frame),
     }
+
+
+def values_digest(frame: pd.DataFrame) -> str:
+    """A digest over every column's name and values in row order, the features and the labels
+    among them. Numbers are hashed by their bytes, missing values included, as `scores_digest`
+    hashes a score series; anything else, the sector and the dates, by its text."""
+    hasher = hashlib.sha256()
+    hasher.update(f"rows={len(frame)}\n".encode())
+    for name in frame.columns:
+        column = frame[name]
+        hasher.update(f"column={name}\n".encode())
+        if pd.api.types.is_numeric_dtype(column.dtype):
+            hasher.update(column.to_numpy(dtype="<f8", na_value=np.nan).tobytes())
+        else:
+            hasher.update("\n".join(column.astype(str)).encode())
+    return hasher.hexdigest()
 
 
 def scores_digest(values: Any) -> str:

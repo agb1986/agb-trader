@@ -6,7 +6,8 @@
     walkforward  the annual expanding-window test of a configuration
     scan         a vectorbt scan of one signal, costed with the live cost model
     backtest     the NautilusTrader validation backtest of one signal, checking the scan
-    certify      run the validation gates over a configuration and write the artifact
+    certify      run the validation gates over a configuration and write the artifact;
+                 exits 1 when the gates fail, after writing it
     import       verify a certification artifact and insert its model_certification row
     trials       list the trial ledger
     reproduce    rerun a trial from its row and compare the results
@@ -122,6 +123,10 @@ def main(argv: list[str] | None = None) -> None:
     run = _run(args)
     print(f"trial {run.trial_id}")
     print(json.dumps(run.results, indent=2, sort_keys=True))
+    # A failed certification is still written, because it is a record, but the command failed:
+    # a script or an operator reading the status must not take the artifact for a promotable one.
+    if args.command == "certify" and not run.results["passed"]:
+        sys.exit(1)
 
 
 def _run(args):

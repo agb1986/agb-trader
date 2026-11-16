@@ -45,8 +45,11 @@ targets and no orders. It is a record of the counterfactual, never a position, s
 reference, nothing to type at it, and the `basket_event` trigger refuses to move it on.
 
 The book is what the broker reported at its last position read, which is also the book
-`agb.position_mismatch` reconciles against. Until the first basket fills there is no snapshot
-and the book is empty, so the first proposal buys twenty names. It is deliberately not the
+`agb.position_mismatch` reconciles against. That read must be of the signal session or later:
+execution snapshots the account at every close, so a latest snapshot older than the signal
+session, or none at all, means execution has not read the account since, and the book is
+`NotReady` rather than last week's. An account that holds nothing has a snapshot with no
+positions, so the first proposal still buys twenty names. It is deliberately not the
 targets of the last filled basket: a basket reaches `filled` when its session is over, so the
 targets of orders that expired unfilled would stand in the book as positions nobody holds.
 
@@ -79,12 +82,21 @@ CAPITAL_ENV = "AGB_CAPITAL_USD"
 # last wrote is not what the account holds now. A basket sized on a stale number asks for capital
 # the account may not have, so the rebalance waits for a fresh reading rather than guessing.
 EQUITY_FRESH = timedelta(hours=24)
+# How far past `now` an account reading may be stamped and still be taken as the clock skew
+# between the database and the caller. A reading further ahead than this is not from the
+# present: a wrong clock or a planted row, and the basket is not sized on it.
+EQUITY_SKEW = timedelta(seconds=30)
 SURFACE = "pipeline"
 # The weight the shadow basket is blended at when the live basket trades the pure stage-1
 # ranking. When the live basket trades a blend, the shadow is the stage-1 ranking instead.
 SHADOW_W = 0.2
 
-_EQUITY = "SELECT equity_usd, observed_at FROM agb.broker_state_now"
+# The newest account reading, with the trading mode it was taken in and the mode in force. A
+# reading from the other mode is another account's equity.
+_EQUITY = """
+    SELECT s.equity_usd, s.observed_at, s.mode, (SELECT m.mode FROM agb.current_mode m)
+    FROM agb.broker_state_now s
+"""
 
 _PERIOD = re.compile(r"^\d{4}-\d{2}$")
 # The daily bars the cost model reads, plus the one day the two-day spread needs.
@@ -175,10 +187,12 @@ _INSERT_EVENT = """
 # basket: a basket reaches `filled` when its state machine says the session is over, and the
 # orders that expired unfilled leave their targets standing. The holdings are what the broker
 # says they are, which is also the book `agb.position_mismatch` reconciles against.
+# One row per position of the latest snapshot, or a single row with no symbol when the
+# account held nothing; no rows at all when no snapshot has been read.
 _BOOK = """
-    SELECT p.symbol, p.qty
-    FROM agb.position p
-    WHERE p.snapshot_id = (SELECT max(id) FROM agb.position_snapshot)
+    WITH latest AS (SELECT id, snapshot_date FROM agb.position_snapshot ORDER BY id DESC LIMIT 1)
+    SELECT l.snapshot_date, p.symbol, p.qty
+    FROM latest l LEFT JOIN agb.position p ON p.snapshot_id = l.id
 """
 # The shadow's own book: what the last shadow basket holds. It is never filled, because it is
 # never traded, so what it was proposed to hold is what it holds.
@@ -251,7 +265,8 @@ class BasketError(Exception):
 
 
 class NotReady(BasketError):
-    """The lake does not yet hold the signal session; try again later."""
+    """What the basket is built from is not there yet: the lake does not hold the signal
+    session, or execution has not read the account since it. Try again later."""
 
 
 def account_capital(
@@ -259,16 +274,28 @@ def account_capital(
 ) -> Decimal:
     """The capital a basket is sized against: the account's equity, as execution last read it.
     Equity rather than cash, because the basket's weights describe the whole portfolio and the
-    plan only trades the difference from what is held. Raises `NotReady` when no reading exists
-    or the newest one is older than `fresh`, so the rebalance retries instead of sizing on a
-    number that is not the account's."""
+    plan only trades the difference from what is held. Raises `NotReady` when no reading exists,
+    the newest one was taken in another trading mode than the one in force (or before readings
+    recorded their mode), is stamped more than `EQUITY_SKEW` after `now`, or is older than
+    `fresh`, so the rebalance retries instead of sizing on a number that is not the account's.
+    """
     row = conn.execute(_EQUITY).fetchone()
     if row is None:
         raise NotReady("no account reading to size the basket against")
-    equity, observed_at = row
+    equity, observed_at, mode, current = row
+    if mode is None or mode != current:
+        raise NotReady(
+            f"the account reading of {observed_at:%Y-%m-%d %H:%M:%S%z} was taken in"
+            f" {mode or 'an unrecorded'} mode, not the {current} mode in force"
+        )
     if equity is None:
         raise NotReady(
             f"the account reading of {observed_at:%Y-%m-%d %H:%M:%S%z} carries no equity"
+        )
+    if observed_at - now > EQUITY_SKEW:
+        raise NotReady(
+            f"the newest account reading is stamped {observed_at:%Y-%m-%d %H:%M:%S%z}, after"
+            f" {now:%Y-%m-%d %H:%M:%S%z}; a basket is not sized on a reading from the future"
         )
     age = now - observed_at
     if age > fresh:
@@ -332,11 +359,22 @@ class _Shadow:
     held: dict[str, Decimal]
 
 
-def book(conn: psycopg.Connection) -> dict[str, Decimal]:
+def book(conn: psycopg.Connection, as_of: date) -> dict[str, Decimal]:
     """The positions the rebalance starts from: what the broker held at the latest position
-    snapshot, in shares. Empty until a snapshot has been read, and empty for an account that
-    holds nothing — the snapshot row exists to say the read happened."""
-    return {symbol: Decimal(qty) for symbol, qty in conn.execute(_BOOK).fetchall()}
+    snapshot, in shares. Empty for an account that holds nothing — the snapshot row exists to
+    say the read happened. Raises `NotReady` when no snapshot has been read, or the latest is
+    of a session before `as_of`, the signal session the basket is built on: execution reads the
+    account at every close, so an older book is one it has not read since."""
+    rows = conn.execute(_BOOK).fetchall()
+    if not rows:
+        raise NotReady(f"no position snapshot to build the basket for {as_of} on")
+    snapshot_date = rows[0][0]
+    if snapshot_date < as_of:
+        raise NotReady(
+            f"the latest position snapshot is of {snapshot_date}, before the signal session"
+            f" {as_of} the basket is built on; execution has not read the account since"
+        )
+    return {symbol: Decimal(qty) for _, symbol, qty in rows if symbol is not None}
 
 
 def shadow_book(conn: psycopg.Connection) -> dict[str, Decimal]:
@@ -379,7 +417,7 @@ def propose(
     session_date = row[0]
     signal = signal_session(session_date, calendar)
 
-    held = book(conn)
+    held = book(conn, signal)
     shadow_held = shadow_book(conn)
     # What the market did to the book without being asked (agb.corporate), as the operator
     # recorded it. The events are folded into the book before anything is selected, so the
@@ -708,7 +746,9 @@ def rerun(
     if row is None:
         raise BasketError(f"basket {original} does not exist")
     signal = row[0]
-    held = book(conn)
+    # Marks only: the orders are the original's. The book must still be read since the new
+    # session's signal session, which is the one the gate measures the rerun against.
+    held = book(conn, signal_session(session_date))
     lake_db = lake.connect(lake_dir)
     try:
         members = frozenset(universe.snapshot(signal, lake_dir, db=lake_db).tickers)

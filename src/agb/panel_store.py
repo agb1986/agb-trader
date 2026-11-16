@@ -45,6 +45,18 @@ def _sync_dir(directory: Path) -> None:
         os.close(fd)
 
 
+def decompress(compressed: bytes, digest: str, where: Path) -> bytes:
+    """A body's bytes from its file's, checked against `digest`. `where` names the store in the
+    error raised when they do not decompress or do not match."""
+    try:
+        data = zstandard.ZstdDecompressor().decompress(compressed)
+    except zstandard.ZstdError as exc:
+        raise StoreError(f"body {digest} in {where} does not decompress: {exc}") from exc
+    if sha256(data) != digest:
+        raise StoreError(f"body {digest} in {where} does not match its hash")
+    return data
+
+
 class PanelStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
@@ -88,13 +100,7 @@ class PanelStore:
             compressed = self.path(digest).read_bytes()
         except FileNotFoundError:
             raise StoreError(f"no body {digest} in {self.root}") from None
-        try:
-            data = zstandard.ZstdDecompressor().decompress(compressed)
-        except zstandard.ZstdError as exc:
-            raise StoreError(f"body {digest} in {self.root} does not decompress: {exc}") from exc
-        if sha256(data) != digest:
-            raise StoreError(f"body {digest} in {self.root} does not match its hash")
-        return data
+        return decompress(compressed, digest, self.root)
 
     def get_text(self, digest: str) -> str:
         return self.get(digest).decode()

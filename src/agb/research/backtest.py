@@ -21,16 +21,27 @@ Fills are at the close with no slippage of their own; every fill is charged `cos
 over `cost.liquidity` on the sixty-one bars through the signal session, the live cost model on
 both sides plus the sell-side fees, through NautilusTrader's own fee model, so the engine's cash
 account is net of the same cost the pre-trade gate applies. `cost_multiple` scales that charge
-for the two-times-cost checks. A buy that the account cannot fund whole after the sells is
-trimmed to the free cash, never refused, and the report counts the trims.
+for the two-times-cost checks. The engine trades adjusted shares at adjusted prices, which
+keeps its equity curve on the panel's basis, but the per-share fees are charged on the shares
+the live basket would trade at the unadjusted close (`Feed.as_traded`); the dollar inputs, the
+notional and the liquidity, are the same on either basis. A buy that the account cannot fund
+whole after the sells is trimmed to the free cash, never refused, and the report counts the
+trims.
 
 The bars are every name's daily bars from the lake, with prices adjusted like the panel's
-labels and the scan's prices, including names that have since been delisted: a held name whose
-bars stop before the lake's end is sold at its last listed print, as the specification's
-forced-exit rule requires, and the report counts those exits. A name without a print at the
-signal session, or without the bars the cost model needs, or whose bars stop by the trade
-session, is untradeable at that rebalance: carried if held and never bought, exactly as
-`basket.propose` treats it.
+labels and the scan's prices, including names that have since been delisted. A held name whose
+bars stop before the lake's end is sold at the close of its last listed print, as the
+specification's forced-exit rule requires, and the sale realises that print times one plus
+`Options.delisting_return` (`DELISTING_RETURN` unless the run says otherwise, because the lake
+records no delisting return of its own). The timing is an assumption too: the exit is booked at
+that last close, and its proceeds wait in cash until the next rebalance, where in practice a
+delisted stub settles later, if at all. The report counts those exits and the dollars the
+delisting return took. Whether a name is tradeable at a rebalance is read from the signal
+session alone, never from bars the strategy could not yet have seen: a name without a print at
+the signal session, or without the bars the cost model needs, is untradeable, carried if held
+and never bought, exactly as `basket.propose` treats it. A name whose bars stop before the
+trade session is planned like any other, and its buy goes unfilled and its sell is the
+delisting exit that has already happened.
 
 `forced` passes the recorded corporate events (`agb.corporate`) a period's rebalance must
 account for, and they are applied by the same rules the live basket applies, from the same
@@ -43,9 +54,12 @@ delisted or converted name is divested at the next rebalance whatever its rank. 
 passed in rather than put in `Options` because the options are serialised into the trial row,
 and because they are a fact about a month rather than a knob of the configuration.
 
-Every run reports gross and net returns, monthly and in total, the two-sided turnover of each
-rebalance, the maximum and mean participation (order dollars over the name's median daily
-dollar volume), and the same configuration run from several later start dates. Given one
+Every run reports gross and net returns, monthly and in total, the fees paid each month, the
+two-sided turnover of each rebalance, the maximum and mean participation (order dollars over the
+name's median daily dollar volume), and the same configuration run from several later start
+dates. The first month is marked from the starting cash rather than from the first trade
+session's close, so the first basket's fees fall in it: the monthly net returns compound to the
+total return, and the monthly fees add up to the fees paid. Given one
 score series per combinatorial path, it reports each path's series separately, in the form
 the deflated Sharpe and overfitting gates consume. It also reports the approximate UK
 after-tax view of the run (`agb.research.tax`) beside the same treatment of buying `BENCHMARK`
@@ -54,8 +68,9 @@ gains every year where holding an index defers them; that view is labelled appro
 its simplifications and is read by no gate.
 
 Four things separate this backtest from the scan by design, and bound how closely the two can
-agree: a name that stops printing is sold here at its last listed print, where the scan carries
-the last price forward and sells at the next rebalance that drops it from the ranking; a buy
+agree: a name that stops printing is sold here at its last listed print less the delisting
+return, where the scan carries the last price forward and sells at the next rebalance that
+drops it from the ranking; a buy
 the account cannot fund whole is trimmed here, and dropped if it rounds to no shares, where
 vectorbt's shared cash group does neither; orders are sized in whole shares at the signal
 session's close, as the live basket sizes them, where vectorbt sizes fractional shares at the
@@ -102,6 +117,15 @@ VENUE = Venue("SIM")
 # The gates' excess returns are measured over it (issue #167), and the after-tax diagnostic's
 # buy-and-hold comparison buys it.
 BENCHMARK = "SPY"
+# The return a delisted name's shares earn from their last listed print, where the lake records
+# none of its own: an assumption, not a measurement. The lake's prices end at the last print and
+# its tables (SEP, SF1, TICKERS) carry no delisting return, yet a stub that settles later, if at
+# all, is worth less than that print on average. Shumway (1997), "The Delisting Bias in CRSP
+# Data", Journal of Finance 52(1), puts performance-related NYSE and AMEX delistings near -30%;
+# Shumway and Warther (1999) put Nasdaq's near -55%. It is charged on every delisting the bars
+# show, so an acquisition the corporate record does not hold is charged as a failure: a
+# conservative choice, made on purpose (issue #168).
+DELISTING_RETURN = -0.30
 MONTHS_PER_YEAR = 12
 LIQUIDITY_BARS = scan.LIQUIDITY_BARS
 # Decimal places of the adjusted prices the engine trades; split-adjusted closes run small.
@@ -111,7 +135,7 @@ CLOSE_HOUR_UTC = 21
 # Calendar days of bars loaded before the first signal session, so the cost model has its
 # sixty-one bars from the first rebalance on.
 HISTORY_DAYS = 120
-_NEEDED = ("ticker", "date", "open", "high", "low", "close", "closeadj", "volume")
+_NEEDED = ("ticker", "date", "open", "high", "low", "close", "closeadj", "closeunadj", "volume")
 # Each name gets its own window rather than one window for all of them. A name first ranked in
 # 2015 is never looked at before 2015, and loading its 1998 bars costs a `Bar` object apiece to
 # no end: over a validation's fifteen paths most of the bars loaded were leading history for a
@@ -136,7 +160,7 @@ WHERE back <= $bars
 GROUP BY ticker
 """
 _BARS = """
-SELECT s.ticker, s.date, s.open, s.high, s.low, s.close, s.closeadj, s.volume
+SELECT s.ticker, s.date, s.open, s.high, s.low, s.close, s.closeadj, s.closeunadj, s.volume
 FROM sep s JOIN _backtest_window w ON s.ticker = w.ticker
 WHERE s.date BETWEEN w.since AND $until AND s.close > 0 AND s.closeadj > 0
 ORDER BY s.ticker, s.date
@@ -163,6 +187,9 @@ class Options:
     hold_through: int = rebalance.HOLD_THROUGH
     init_cash: float = 1_000_000.0
     cost_multiple: float = 1.0
+    # The return a delisting exit realises on the last listed print, from -1 (the shares are
+    # worthless) to 0 (they settle at the print).
+    delisting_return: float = DELISTING_RETURN
     # ISO dates: the same configuration is also run from the first month at or after each.
     # Empty means the months a quarter, a half and three quarters of the way through the panel.
     starts: tuple[str, ...] = ()
@@ -176,6 +203,8 @@ class Options:
             raise ValueError("init_cash must be positive")
         if self.cost_multiple <= 0:
             raise ValueError("cost_multiple must be positive")
+        if not -1.0 <= self.delisting_return <= 0.0:
+            raise ValueError("delisting_return must lie between -1 and 0")
         starts = tuple(date.fromisoformat(str(start)).isoformat() for start in self.starts)
         object.__setattr__(self, "starts", starts)
 
@@ -463,8 +492,9 @@ def _starts(months: Sequence[Month], options: Options) -> list[int]:
 
 @dataclass(frozen=True)
 class Series:
-    """One name's bars, oldest first: the raw columns the cost model reads and the adjusted
-    close the engine trades, rounded to the engine's precision."""
+    """One name's bars, oldest first: the raw columns the cost model reads, the adjusted
+    close the engine trades, rounded to the engine's precision, and the as-traded close the
+    per-share fees are counted at."""
 
     dates: list[date]
     high: np.ndarray
@@ -472,6 +502,7 @@ class Series:
     close: np.ndarray
     volume: np.ndarray
     adjusted: np.ndarray
+    traded: np.ndarray
 
     def index(self, day: date) -> int | None:
         """The position of the bar on `day`, if there is one."""
@@ -523,6 +554,21 @@ class Feed:
         if n == 0:
             raise BacktestError(f"{ticker} has no bar on or before {day}")
         return float(s.adjusted[n - 1])
+
+    def as_traded(self, ticker: str, day: date) -> float:
+        """The as-traded shares in one share the engine trades on `day`: the adjusted close
+        over the as-traded close, so the per-share fees count the shares live would send.
+
+        The engine's shares are priced at the adjusted close, so a name that has since split
+        2:1 trades twice the shares at half the price it printed; live, whose basket prices
+        from the as-traded close, would send half of them. A day without a bar, or without an
+        as-traded close, counts the engine's own shares."""
+        s = self.series[ticker]
+        i = s.index(day)
+        if i is None:
+            return 1.0
+        traded = float(s.traded[i])
+        return float(s.adjusted[i]) / traded if traded > 0 else 1.0
 
     def liquidity(self, ticker: str, day: date) -> cost.Liquidity:
         """The cost model's inputs over its window of bars through `day`."""
@@ -618,6 +664,7 @@ def load(
             close=group["close"].to_numpy(dtype="float64"),
             volume=group["volume"].to_numpy(dtype="float64"),
             adjusted=group["adjusted"].to_numpy(dtype="float64"),
+            traded=group["closeunadj"].to_numpy(dtype="float64"),
         )
         for ticker, group in frame.groupby("ticker", sort=True)
     }
@@ -714,9 +761,12 @@ def _require(conn: duckdb.DuckDBPyConnection) -> None:
 
 @dataclass(frozen=True)
 class Fill:
-    """One fill as the engine reported it: the session, the whole shares, the close they
-    filled at, the fee charged and the order's participation in the name's daily dollar
-    volume."""
+    """One fill as the engine reported it: the session, the whole shares, the price they
+    realised, the fee charged and the order's participation in the name's daily dollar volume.
+
+    The price is the close the engine filled at, except on a delisting exit, where it is that
+    close less the delisting return; `delisting` holds the dollars the return took, which the
+    price already reflects and the fee does not include."""
 
     day: date
     ticker: str
@@ -725,23 +775,33 @@ class Fill:
     price: float
     fee: float
     participation: float
+    delisting: float = 0.0
 
 
 @dataclass
 class _Book:
     """What the strategy and the fee model share: the liquidity priced for each name at its
-    last decision, every charge the fee model has made, and the orders that are legs of a
-    corporate action rather than trades of ours, which are charged nothing."""
+    last decision, every charge the fee model has made, the orders that are legs of a
+    corporate action rather than trades of ours, which are charged nothing, the delisting
+    exits and the return each realises, and the as-traded shares in each order's share."""
 
     multiple: float
     liquidity: dict[str, cost.Liquidity] = field(default_factory=dict)
-    charges: list[tuple[str, float, float]] = field(default_factory=list)  # ticker, fee, take
+    # ticker, fee, participation, and the dollars a delisting return took
+    charges: list[tuple[str, float, float, float]] = field(default_factory=list)
     free: set = field(default_factory=set)  # the client order ids a corporate action forced
+    delisting: dict = field(default_factory=dict)  # client order id: the delisting return
+    as_traded: dict = field(default_factory=dict)  # client order id: `Feed.as_traded`
 
 
 class _Fees(FeeModel):
     """NautilusTrader's fee model, charging each fill the live cost model's total: the spread
-    floor and impact on both sides, and the regulatory fees on sells."""
+    floor and impact on both sides, and the regulatory fees on sells, with the per-share fees
+    counted on the shares live would trade.
+
+    A delisting exit is also charged the delisting return on its notional. The engine can only
+    fill at the bar's close, so the commission is where the loss reaches the account; the
+    strategy splits it back out of the fee it reports."""
 
     def __init__(self, book: _Book) -> None:
         super().__init__()
@@ -752,7 +812,7 @@ class _Fees(FeeModel):
         if order.client_order_id in self.book.free:
             # A cash acquisition or a merger conversion: the position changes without a trade
             # of ours behind it, so there is no commission and no participation to report.
-            self.book.charges.append((ticker, 0.0, 0.0))
+            self.book.charges.append((ticker, 0.0, 0.0, 0.0))
             return Money(0, USD)
         liq = self.book.liquidity.get(ticker)
         if liq is None:
@@ -760,10 +820,12 @@ class _Fees(FeeModel):
         shares = int(fill_qty)
         notional = shares * float(fill_px)
         side = cost.Side.BUY if order.side == OrderSide.BUY else cost.Side.SELL
-        priced = cost.trade_cost(side, notional, shares, liq)
-        commission = Money(priced.total_usd * self.book.multiple, USD)
-        self.book.charges.append((ticker, commission.as_double(), notional / liq.adv_usd))
-        return commission
+        coid = order.client_order_id
+        priced = cost.trade_cost(side, notional, shares * self.book.as_traded.get(coid, 1.0), liq)
+        fee = Money(priced.total_usd * self.book.multiple, USD).as_double()
+        loss = Money(notional * -self.book.delisting.get(coid, 0.0), USD).as_double()
+        self.book.charges.append((ticker, fee, notional / liq.adv_usd, loss))
+        return Money(fee + loss, USD)
 
 
 class _Rebalancer(Strategy):
@@ -794,6 +856,7 @@ class _Rebalancer(Strategy):
         self.fills: list[Fill] = []
         self.counts: Counter[str] = Counter()
         self.pending: set = set()  # the client order ids of the rebalance's unfilled sells
+        self.exiting: set[str] = set()  # the names a delisting exit has been sent for
         # The buys waiting on those sells: session, name, shares, and whether a corporate
         # action forced the leg, which is charged no commission.
         self.queued: list[tuple[date, str, int, bool]] = []
@@ -827,10 +890,16 @@ class _Rebalancer(Strategy):
         if event is not None and day >= event.effective_date:
             self.terminate(ticker, day, event)
             return
-        if self.feed.last[ticker] == day and day < self.feed.end:
-            # The name's last listed print: the forced exit, at this close.
-            self.book.liquidity[ticker] = self.feed.liquidity(ticker, day)
-            self.submit(ticker, OrderSide.SELL, self.positions[ticker])
+        if self.feed.last[ticker] == day and day < self.feed.end and ticker not in self.exiting:
+            self.delist(ticker, day, self.positions[ticker])
+
+    def delist(self, ticker: str, day: date, qty: int) -> None:
+        """The forced exit at a name's last listed print: `qty` shares sold at this close less
+        the delisting return, which `Options.delisting_return` sets."""
+        self.book.liquidity[ticker] = self.feed.liquidity(ticker, day)
+        self.submit(ticker, OrderSide.SELL, qty, day, delisting=self.options.delisting_return)
+        if ticker not in self.exiting:
+            self.exiting.add(ticker)
             self.counts["delisting_exits"] += 1
 
     def terminate(self, ticker: str, day: date, event: corporate.Event) -> None:
@@ -849,7 +918,7 @@ class _Rebalancer(Strategy):
                     f" {shares} {event.into_symbol}"
                 )
             self.queued.append((day, str(event.into_symbol), shares, True))
-        self.pending.add(self.submit(ticker, OrderSide.SELL, qty, free=True))
+        self.pending.add(self.submit(ticker, OrderSide.SELL, qty, day, free=True))
         self.counts[f"{event.kind}_exits"] += 1
 
     def decide(self, month: Month) -> None:
@@ -861,15 +930,16 @@ class _Rebalancer(Strategy):
         divest = corporate.divest(events)
         prints: dict[str, Decimal] = {}
         # A halted incumbent and a terminated position come from the record; the rest is read
-        # from the bars, exactly as `basket.propose` reads them from the lake.
+        # from the bars of the signal session alone, exactly as `basket.propose` reads them
+        # from the lake: a name whose bars stop before the trade session is planned like any
+        # other, and its buy goes unfilled.
         untradeable: set[str] = set(corporate.untradeable(events))
         for ticker in {*held, *ranking}:
             if ticker not in feed.series:
                 continue  # never reached by the ranking; checked below if it is
             print_ = feed.print_at(ticker, day)
             counted = feed.series[ticker].through(day) >= LIQUIDITY_BARS
-            delisting = feed.last[ticker] <= month.entry and feed.last[ticker] < feed.end
-            if print_ is None or not counted or delisting:
+            if print_ is None or not counted:
                 untradeable.add(ticker)
             else:
                 prints[ticker] = Decimal(str(print_))
@@ -928,10 +998,12 @@ class _Rebalancer(Strategy):
         for order in plan:
             if order.side is not rebalance.Side.SELL:
                 continue
+            if order.symbol in self.exiting:
+                continue  # its delisting exit has sold it already
             if self.feed.close_at(order.symbol, day) is None:
                 self.counts["unfilled"] += 1  # no print this session; the name stays held
                 continue
-            self.pending.add(self.submit(order.symbol, OrderSide.SELL, order.qty))
+            self.pending.add(self.submit(order.symbol, OrderSide.SELL, order.qty, day))
         if not self.pending:
             self.buy()
 
@@ -947,51 +1019,75 @@ class _Rebalancer(Strategy):
                 self.counts["unfilled"] += 1
                 continue
             liq = None if no_fee else self.book.liquidity[ticker]
+            factor = self.feed.as_traded(ticker, day)
             qty = wanted
-            fee = 0.0 if liq is None else self.fee(cost.Side.BUY, qty, price, liq)
+            fee = 0.0 if liq is None else self.fee(cost.Side.BUY, qty, price, liq, factor)
             while qty > 0 and qty * price + fee > free:
                 qty = min(qty - 1, int((free - fee) // price))
-                fee = self.fee(cost.Side.BUY, qty, price, liq) if qty > 0 and liq else 0.0
+                fee = self.fee(cost.Side.BUY, qty, price, liq, factor) if qty > 0 and liq else 0.0
             if qty <= 0:
                 self.counts["unfilled"] += 1
                 continue
             if qty < wanted:
                 self.counts["trimmed"] += 1
-            self.submit(ticker, OrderSide.BUY, qty, free=no_fee)
+            self.submit(ticker, OrderSide.BUY, qty, day, free=no_fee)
             free -= qty * price + fee
 
-    def fee(self, side: cost.Side, qty: int, price: float, liq: cost.Liquidity) -> float:
+    def fee(
+        self, side: cost.Side, qty: int, price: float, liq: cost.Liquidity, factor: float
+    ) -> float:
         """What the fee model will charge the fill, plus a cent of rounding headroom."""
-        priced = cost.trade_cost(side, qty * price, qty, liq)
+        priced = cost.trade_cost(side, qty * price, qty * factor, liq)
         return Money(priced.total_usd * self.options.cost_multiple, USD).as_double() + 0.01
 
-    def submit(self, ticker: str, side: OrderSide, qty: int, *, free: bool = False):
+    def submit(
+        self,
+        ticker: str,
+        side: OrderSide,
+        qty: int,
+        day: date,
+        *,
+        free: bool = False,
+        delisting: float | None = None,
+    ):
+        """Send a market order for `qty` shares at `day`'s close. A forced corporate-action leg
+        is `free` of fees; a delisting exit names the `delisting` return it realises."""
         order = self.order_factory.market(
             InstrumentId(Symbol(ticker), VENUE),
             side,
             Quantity.from_int(qty),
             time_in_force=TimeInForce.DAY,
         )
+        coid = order.client_order_id
         if free:
-            self.book.free.add(order.client_order_id)
+            self.book.free.add(coid)
+        self.book.as_traded[coid] = self.feed.as_traded(ticker, day)
+        if delisting is not None:
+            self.book.delisting[coid] = delisting
         self.submit_order(order)
         return order.client_order_id
 
     def on_order_filled(self, event) -> None:
         ticker = event.instrument_id.symbol.value
         day = _day(event.ts_event)
-        qty, price = int(event.last_qty), float(event.last_px)
-        fee = event.commission.as_double()
+        qty, close = int(event.last_qty), float(event.last_px)
+        commission = event.commission.as_double()
         expected = self.feed.close_at(ticker, day)
-        if _off_close(price, expected):
-            raise BacktestError(f"{ticker} filled at {price} on {day}, whose close is {expected}")
-        charged, take = self.book.charges[len(self.fills)][1:]
-        if abs(charged - fee) > 0.005:
-            raise BacktestError(f"{ticker}: charged {fee}, the cost model priced {charged}")
+        if _off_close(close, expected):
+            raise BacktestError(f"{ticker} filled at {close} on {day}, whose close is {expected}")
+        charged, take, loss = self.book.charges[len(self.fills)][1:]
+        if abs(charged + loss - commission) > 0.005:
+            raise BacktestError(
+                f"{ticker}: charged {commission}, the cost model priced {charged + loss}"
+            )
+        # The commission carries a delisting exit's loss as well as the fee; the account moves
+        # by both, and the fill reports them apart.
+        fee = commission - loss
+        price = close - loss / qty if loss else close
         if event.order_side == OrderSide.BUY:
             side = cost.Side.BUY
             self.positions[ticker] = self.positions.get(ticker, 0) + qty
-            self.cash -= qty * price + fee
+            self.cash -= qty * close + commission
         else:
             side = cost.Side.SELL
             left = self.positions.get(ticker, 0) - qty
@@ -1001,8 +1097,11 @@ class _Rebalancer(Strategy):
                 self.positions[ticker] = left
             else:
                 self.positions.pop(ticker, None)
-            self.cash += qty * price - fee
-        self.fills.append(Fill(day, ticker, side, qty, price, fee, take))
+            self.cash += qty * close - commission
+        self.fills.append(Fill(day, ticker, side, qty, price, fee, take, loss))
+        if side is cost.Side.BUY and self.feed.last[ticker] == day < self.feed.end:
+            # Bought at the name's last listed print: the shares go straight out again.
+            self.delist(ticker, day, qty)
         self.pending.discard(event.client_order_id)
         if not self.pending and self.queued:
             self.buy()
@@ -1091,6 +1190,7 @@ def _report(
     net = [marks[i + 1] / marks[i] - 1.0 for i in range(len(months))]
     gross = [(marks[i + 1] + fees_between[i]) / marks[i] - 1.0 for i in range(len(months))]
     fees_paid = sum(fill.fee for fill in outcome.fills)
+    delisting_loss = sum(fill.delisting for fill in outcome.fills)
     takes = [fill.participation for fill in outcome.fills]
     return {
         **_metrics(net, marks, options),
@@ -1104,6 +1204,9 @@ def _report(
         "unfilled": outcome.counts["unfilled"],
         "trimmed": outcome.counts["trimmed"],
         "delisting_exits": outcome.counts["delisting_exits"],
+        # The dollars the delisting return took from those exits, and the return assumed.
+        "delisting_loss": delisting_loss,
+        "delisting_return": options.delisting_return,
         **corporate.counts(forced),
         **{
             f"{kind}_exits": outcome.counts[f"{kind}_exits"]
@@ -1112,9 +1215,9 @@ def _report(
         "final_value": marks[-1],
         "after_tax": _after_tax(outcome, feed, months, options, marks[-1]),
         "monthly": [
-            {"as_of": month.as_of.isoformat(), "net": n, "gross": g, "benchmark": b}
-            for month, n, g, b in zip(
-                months, net, gross, _benchmark_returns(feed, months), strict=True
+            {"as_of": month.as_of.isoformat(), "net": n, "gross": g, "fees": f, "benchmark": b}
+            for month, n, g, f, b in zip(
+                months, net, gross, fees_between, _benchmark_returns(feed, months), strict=True
             )
         ],
     }
@@ -1125,6 +1228,10 @@ def _benchmark_returns(feed: Feed, months: Sequence[Month]) -> list[float | None
     own monthly return is marked on: the month's entry and the next month's, or the final exit
     for the last. Certification subtracts it from the path's net return for the excess-return
     gates (issue #167).
+
+    The run's first month is marked from the starting cash rather than from its entry's close,
+    so that the first basket's fees fall in it, but the account is all cash until that entry,
+    so its return still runs over the same entry-to-entry window as the benchmark's.
 
     A month is None unless the lake holds a benchmark bar on both of its sessions. Nothing is
     carried forward or filled in, because an excess return measured against a price from
@@ -1271,8 +1378,12 @@ def _marks(
     fills: Sequence[Fill], feed: Feed, months: Sequence[Month], options: Options
 ) -> tuple[list[float], list[float], list[float]]:
     """The fills replayed: the account marked at the close of the first signal session, of
-    every trade session after that session's fills, and of the final exit; the fees paid
-    between each pair of marks; and the two-sided notional traded at each trade session."""
+    every later trade session after that session's fills, and of the final exit; the fees
+    paid between each pair of marks; and the two-sided notional traded at each trade session.
+
+    The first month runs from the starting cash, not from the close of the first trade
+    session, so the first basket's fees fall in it (issue #168): the monthly net returns
+    compound to the total return, and the monthly fees add up to the fees paid."""
     days = [months[0].snapshot_date] + [month.entry for month in months] + [months[-1].exit]
     marks: list[float] = []
     fees_between: list[float] = []
@@ -1298,8 +1409,9 @@ def _marks(
         marks.append(value)
         fees_between.append(fees)
         traded.append(notional)
-    # The first mark is the starting cash; the returns run from trade session to trade session.
-    return marks[1:], fees_between[2:], traded[1:-1]
+    # The first mark is the starting cash, held until the first trade session; the returns
+    # after it run from trade session to trade session.
+    return [marks[0], *marks[2:]], [sum(fees_between[:3]), *fees_between[3:]], traded[1:-1]
 
 
 def _sensitivity(

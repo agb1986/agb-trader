@@ -23,6 +23,9 @@ from agb.research import backtest, cache, certify, cpcv, train, trials
 from agb.research.panel import Panel
 from agb.research.trials import Ledger
 
+# `certify` refuses to run without a build version.
+pytestmark = pytest.mark.usefixtures("certifiable")
+
 MODEL_ID = "ranker-cache.1"
 MODEL = train.Config(num_boost_round=20, min_data_in_leaf=5)
 OTHER = train.Config(num_boost_round=21, min_data_in_leaf=5)
@@ -240,6 +243,27 @@ def test_a_changed_panel_misses_even_at_the_same_partition_digest(
     before = ledger.count()
     backtest.run(shorter, trading(), ledger, lake_dir=research_lake, scores=cut, cache=kept)
     assert ledger.count() == before + 1
+
+
+@pytest.mark.parametrize("column", ["mom_12_1", "forward_return"])
+def test_one_changed_value_misses_at_the_same_rows_and_partition_digest(panel, column, tmp_path):
+    """A panel rebuilt after a feature or label formula changed has the rows and the partition
+    digest of the one before, so only its values tell the two apart. Issue #169."""
+    ledger = Ledger(tmp_path / trials.FILE)
+    kept = cache.Cache.under(tmp_path)
+    cpcv.run(panel, MODEL, VALIDATION, ledger, cache=kept)
+    frame = panel.frame.copy()
+    row = frame[column].first_valid_index()
+    frame.loc[row, column] += 1.0
+    changed = Panel(
+        frame=frame,
+        partition_hash=panel.partition_hash,
+        cost_model_version=panel.cost_model_version,
+    )
+    assert cache.fingerprint(changed) != cache.fingerprint(panel)
+    before = ledger.count()
+    cpcv.run(changed, MODEL, VALIDATION, ledger, cache=kept)
+    assert ledger.count() == before + 1, f"a panel with another {column} value was reused"
 
 
 # (c): resuming ------------------------------------------------------------------------------

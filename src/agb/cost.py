@@ -117,6 +117,15 @@ CURRENT = CostModel(
     commission=Decimal("0"),
 )
 
+# Every released cost model, by version: the constants behind each fingerprint in `VERSIONS`,
+# which holds fingerprints only. A fill records the version that priced it, and checking its
+# fees means recomputing them under that version's own constants, which only this registry
+# can supply. Add each new version here beside its line in `VERSIONS`, and never edit or
+# remove one. `CURRENT` is the newest.
+MODELS: dict[str, CostModel] = {
+    "1": CURRENT,
+}
+
 
 # Liquidity: a name's trailing-window inputs to the cost, from its daily bars.
 #

@@ -38,7 +38,7 @@ Rejected: a mutable `state` column plus an audit copy, which gives two records o
 
 Every inbound command from Telegram, the UI or the CLI is a `command` row: actor, surface, the raw text as typed, the parsed verb and arguments, and the outcome, accepted or refused with a reason. **Refused commands are logged too**: a bare `/approve`, a basket reference that does not match the pending basket, a wrong liquidation token. A refusal is evidence of what the operator attempted. An approval's `basket_event` references the command that caused it, so the record holds both the basket id as typed and the basket it resolved to.
 
-`/liquidate` writes `liquidation` rows: the token issued, the confirmation, and the broker's per-symbol HTTP 207 result.
+`/liquidate` writes `liquidation` rows: the token issued, the confirmation, and the broker's per-symbol HTTP 207 result. Execution records that answer as `liquidation_order` rows, one per symbol, the moment close-all returns and before anything else that could fail, so a retry works from the record and never sends a second close-all. The closing orders belong to no basket, so their fills are `liquidation_fill` rows rather than `fill` rows, and the daily position check counts them with the basket fills.
 
 ## The audit log and immutability
 
@@ -74,7 +74,9 @@ Rejected: a single boolean latch with a free-text reason, where a second cause a
 
 **Shortfall is a view**, never a stored column: the fill price against the reference mid, signed by side, set beside the modelled cost. It cannot disagree with its inputs. The live cost alert reads this view.
 
-**Positions are daily broker snapshots**, not a sum of fills. Splits, mergers and spin-offs change holdings without any fill, and a fill-derived book drifts silently from the first corporate action. A daily check compares each snapshot against the previous snapshot plus the day's fills and alerts on any mismatch. A split will trigger it, which is correct: it is a real change the operator should see. Like every alert, it notifies and never acts.
+**Positions are daily broker snapshots**, not a sum of fills. Splits, mergers and spin-offs change holdings without any fill, and a fill-derived book drifts silently from the first corporate action. A daily check compares each snapshot against the previous snapshot plus the day's fills, a liquidation's included, and alerts on any mismatch. A split will trigger it, which is correct: it is a real change the operator should see. Like every alert, it notifies and never acts.
+
+As built, a basket is only built on a book read recently enough. The latest snapshot must be of the basket's signal session or later; an older one, or none, means execution has not read the account since, and the rebalance or rerun waits and tries again rather than sizing trades against last month's holdings. The equity the basket is sized on is the latest `broker_state` reading, which must be no older than 24 hours, no more than 30 seconds ahead of the clock, and stamped with the trading mode in force: each reading records the mode current when it was taken, so a paper account's equity never sizes a live basket. Readings from before the column existed carry no mode and size nothing. The status readout, the liquidation summary and the certified-capital alert still read the latest reading whatever its mode, because they report what the broker last said rather than act on it.
 
 `forced_event` is the record of the four forced corporate actions the ranker defines, one append-only row per period, symbol and kind, written by a human with the `command` row that carried it. It holds the holding before the event and the holding it leaves, the deal price or last listed print where there is one, and the acquirer and the shares a merger paid. The mismatch check folds those share deltas into what it expects, so a filed event keeps the alert quiet while an unrecorded corporate action still raises it; the same rows are what let the pre-trade gate accept a basket of fewer than 20 names.
 
@@ -142,6 +144,7 @@ Rejected: everything in Postgres, which grows the dump by hundreds of megabytes 
 | basket content tables, `basket_event`, `basket_transition` | pipeline (content), bot / ui / scheduler / execution (events per transition table) | no |
 | `command` | bot, ui, cli | no |
 | `liquidation` | bot, ui (token, confirm), execution (result) | no |
+| `liquidation_order`, `liquidation_fill` | execution | no |
 | `halt_event`, `broker_state` | pipeline (gate_breach), execution (lease, broker_state), bot / ui (pause, resume, liquidation) | no |
 | `order`, `order_event`, `fill`, position snapshots | execution | no |
 | `reconcile_run` | execution (the operator's `agb reconcile`) | no |
@@ -168,7 +171,6 @@ Views: current basket state, open halt causes, audit log, shortfall, eligibility
 
 - Concrete DDL, the migration tool, indexes, poll intervals and lease durations, tuned against measured runs.
 - The CLI's full surface beyond the verbs named here (promote, level, mode, panel configuration).
-- Backup of the content-addressed panel store on `/mnt/data`, which follows whatever protects the lake.
 - The workstation-side tooling that produces the trial ledger. The contract is fixed; the tool is the open experiment-tracking item.
 
 ## Sources

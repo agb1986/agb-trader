@@ -210,8 +210,11 @@ def _closes(
 
 
 def fee_arithmetic(conn: psycopg.Connection) -> Result:
-    """Each paper fill's recorded fees against the schedule that priced them. The regulatory
-    fees fall on sells, so a record with no sell fill has nothing to check."""
+    """Each paper fill's recorded fees against the schedule that priced them: the released
+    cost model its own `fee_model_version` names, not the one in force now, so a fee change
+    does not fail the fills made before it. A version no released model carries fails, because
+    its fees cannot be recomputed. The regulatory fees fall on sells, so a record with no sell
+    fill has nothing to check."""
     fills = conn.execute(_FILLS).fetchall()
     sells = [row for row in fills if row[5] == cost.Side.SELL]
     if not sells:
@@ -220,7 +223,8 @@ def fee_arithmetic(conn: psycopg.Connection) -> Result:
         )
     wrong = []
     for _, _, reference, _, symbol, side, qty, price, sec, taf, cat, commission, version in fills:
-        if version != cost.CURRENT.version:
+        model = cost.MODELS.get(version)
+        if model is None:
             wrong.append(
                 {
                     "reference": reference,
@@ -228,11 +232,11 @@ def fee_arithmetic(conn: psycopg.Connection) -> Result:
                     "side": side,
                     "fee": "fee_model_version",
                     "recorded": version,
-                    "expected": f"one of {', '.join(sorted(cost.VERSIONS))}",
+                    "expected": f"one of {', '.join(sorted(cost.MODELS))}",
                 }
             )
             continue
-        expected = cost.fees(side, qty * price, qty)
+        expected = cost.fees(side, qty * price, qty, model)
         for name, was, should in (
             ("sec_fee_usd", sec, expected.sec),
             ("taf_fee_usd", taf, expected.taf),
@@ -260,6 +264,7 @@ def fee_arithmetic(conn: psycopg.Connection) -> Result:
             "fills": len(fills),
             "sells": len(sells),
             "model_version": cost.CURRENT.version,
+            "versions": sorted({row[-1] for row in fills}),
             "wrong": wrong[:DETAIL_ROWS],
         },
     )

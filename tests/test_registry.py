@@ -28,6 +28,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import registry_fake
+from account_fake import read_book
 
 from agb import cli, cost, gate, lake, registry, schedule, universe
 from agb.approval import Source
@@ -37,6 +38,9 @@ from agb.research.trials import Ledger
 from agb.roles import RESEARCH
 from agb.schedule import Expected, Planned
 from agb.services.pipeline import Pipeline
+
+# `certify` refuses to run without a build version.
+pytestmark = pytest.mark.usefixtures("certifiable")
 
 MODEL_ID = "ranker-2026.1"
 MODEL = train.Config(num_boost_round=20, min_data_in_leaf=5)
@@ -191,8 +195,9 @@ def plan_rebalance(db) -> None:
 
 def rebalance(db, lake_dir: Path, models: Path, **kwargs) -> None:
     """One pipeline cycle: the planned rebalance, ranked by the promoted model unless a ranker
-    is given."""
+    is given, with the account read at the signal session's close."""
     kwargs = {"limits": LIMITS, "clock": lambda: EVENING, "capital": CAPITAL, **kwargs}
+    read_book(db, SIGNAL)
     Pipeline(lake_dir, "", models_dir=models, **kwargs)(db.connect("pipeline"))
 
 

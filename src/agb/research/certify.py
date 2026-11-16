@@ -111,14 +111,25 @@ from agb.research.cache import Cache
 from agb.research.panel import Panel
 from agb.research.trials import FILE as LEDGER_FILE
 from agb.research.trials import RULE as TRIAL_RULE
-from agb.research.trials import Ledger, LedgerError, Run, code_version, configuration, roots
+from agb.research.trials import (
+    UNVERSIONED,
+    Ledger,
+    LedgerError,
+    Run,
+    code_version,
+    configuration,
+    roots,
+)
 
 CERTIFIES = gates.CERTIFIES
 CAPITAL = 100_000.0
 DIRECTORY = "certifications"
 PATHS = "paths.json"
 REPORT = "report.md"
-MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# The one pattern for a model id; scripts/deploy/promote.sh holds the same one for the same reason,
+# and tests/test_compose.py checks that the two agree. It is matched against the whole string:
+# `$` alone would let a trailing newline through.
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # The trial kinds whose results carry monthly net returns the overfitting gate can read.
 CANDIDATE_KINDS = ("backtest",)
 
@@ -134,7 +145,7 @@ class Options:
     thresholds: gates.Thresholds = field(default_factory=gates.Thresholds)
 
     def __post_init__(self) -> None:
-        if not MODEL_ID.match(self.model_id):
+        if not MODEL_ID.fullmatch(self.model_id):
             raise ValueError(f"model id {self.model_id!r}: letters, digits, dot, dash, underscore")
 
 
@@ -188,6 +199,14 @@ def run(
     it rather than appending a row, which is what keeps the verdict identical; see
     `agb.research.cache`. Turning it off makes the run recompute everything.
     """
+    # The code version keys the cache and is recorded in the manifest, and `dev` names no
+    # build: an entry written by one checkout would be served to another, and the artifact
+    # could not say what code certified it.
+    if code_version() == UNVERSIONED:
+        raise CertificationError(
+            f"the code version is {UNVERSIONED!r}, which names no build; set AGB_VERSION to the"
+            " commit, as `make research` does"
+        )
     directory = research_dir / DIRECTORY / options.model_id
     if directory.exists():
         raise CertificationError(f"{directory} exists; a certification is never overwritten")
