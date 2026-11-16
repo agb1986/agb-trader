@@ -39,6 +39,7 @@ from psycopg.types.json import Jsonb
 from agb import blend, jobs, readout, schedule
 from agb.health import et
 from agb.nyse import MOC_SUBMISSION_LEAD, NEW_YORK, NyseCalendar, trading_date
+from agb.rows import one
 
 APPROVAL_REQUEST = schedule.APPROVAL_REQUEST
 APPROVAL_REMINDER = "approval_reminder"
@@ -173,21 +174,23 @@ def record(
     refusal: str | None = None,
 ) -> int:
     """Record a command, accepted or refused, and return its id."""
-    (command_id,) = conn.execute(
-        _COMMAND,
-        {
-            "actor": source.actor,
-            "surface": source.surface,
-            "text": source.text,
-            "verb": verb,
-            "args": Jsonb(args),
-            "outcome": "accepted" if refusal is None else "refused",
-            "reason": refusal,
-            "chat_id": source.chat_id,
-            "message_id": source.message_id,
-        },
-    ).fetchone()
-    return command_id
+    (command_id,) = one(
+        conn.execute(
+            _COMMAND,
+            {
+                "actor": source.actor,
+                "surface": source.surface,
+                "text": source.text,
+                "verb": verb,
+                "args": Jsonb(args),
+                "outcome": "accepted" if refusal is None else "refused",
+                "reason": refusal,
+                "chat_id": source.chat_id,
+                "message_id": source.message_id,
+            },
+        )
+    )
+    return int(command_id)
 
 
 # Times.
@@ -242,9 +245,7 @@ def request_text(
     and the prompt, which states what no answer means. A name the panel scored is bought with
     its safety score beside it, and whatever the panel flagged about the basket's names is
     listed under FLAGS."""
-    reference, session, capital, mode, checks, passed = conn.execute(
-        _REQUEST, (basket_id,)
-    ).fetchone()
+    reference, session, capital, mode, checks, passed = one(conn.execute(_REQUEST, (basket_id,)))
     cutoff = cutoff_of(calendar, session)
     diff = readout.diff(conn, basket_id)
     width = diff.width
@@ -645,19 +646,21 @@ def _retire(
     kind, body = alert
     try:
         with conn.transaction():
-            (event_id,) = conn.execute(
-                _MOVE,
-                {
-                    "basket": basket.id,
-                    "seq": basket.seq + 1,
-                    "from": basket.state,
-                    "to": "missed",
-                    "actor": SYSTEM,
-                    "surface": SCHEDULER,
-                    "reason": reason,
-                    "command": None,
-                },
-            ).fetchone()
+            (event_id,) = one(
+                conn.execute(
+                    _MOVE,
+                    {
+                        "basket": basket.id,
+                        "seq": basket.seq + 1,
+                        "from": basket.state,
+                        "to": "missed",
+                        "actor": SYSTEM,
+                        "surface": SCHEDULER,
+                        "reason": reason,
+                        "command": None,
+                    },
+                )
+            )
             conn.execute(_RAISE, (kind, basket.reference, basket.period, body, SCHEDULER))
             if fulfil:
                 jobs.fulfil(
@@ -787,7 +790,7 @@ _SET_PAPER_APPROVAL = """
 
 
 def paper_approval_text(conn: psycopg.Connection) -> str:
-    required, since, actor, reason = conn.execute(_PAPER_APPROVAL).fetchone()
+    required, since, actor, reason = one(conn.execute(_PAPER_APPROVAL))
     asks = "asks the human first" if required else "runs unattended"
     why = f": {reason}" if reason else ""
     return f"paper mode {asks}, since {et(since)}, set by {actor}{why}"
