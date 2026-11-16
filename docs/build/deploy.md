@@ -279,8 +279,12 @@ lake/tickers/snapshot=YYYY-MM-DD/part.parquet  the tickers table as it stood tha
 The scheduler plans a `data_pull` job for every session. It becomes claimable two hours after
 the close, and its expected event is due at the next open. The service pulls the prices for
 every session since the last one that landed, so a session missed to a vendor error is picked
-up by the next pull. It also pulls the fundamentals the vendor changed since a week before the
-last pull, and the tickers table, delisted tickers included. It records each partition's date
+up by the next pull. The vendor adjusts prices backwards, so a split or dividend rescales a
+ticker's earlier sessions. Each pull also fetches the last session that landed, and a ticker
+the vendor now prices differently on it has its whole history fetched again and rewritten
+across the sessions the lake holds, which changes those partitions' hashes. It also pulls
+the fundamentals the vendor changed since a week before the last pull, and the tickers table,
+delisted tickers included. It records each partition's date
 and SHA-256 in `agb.lake_snapshot`. If the vendor has not published a session yet, or has
 published fewer than 90% of the rows the session before it had, the service lands the
 complete sessions before it and tries again every 15 minutes, without an alert of its own.
@@ -302,11 +306,16 @@ To query the lake with DuckDB, and to see the latest snapshots:
 
 ```sh
 ./agb-stack exec pipeline python -m agb.lake "SELECT max(date), count(*) FROM sep"
+./agb-stack exec pipeline python -m agb.lake --check
 ./agb-stack exec -T db psql -U postgres -d agb -c \
   "SELECT snapshot_date, partition, sha256 FROM agb.lake_snapshot ORDER BY id DESC LIMIT 5"
 ./agb-stack exec -T db psql -U postgres -d agb -c \
   "SELECT period, state FROM agb.job_state WHERE kind = 'data_pull' ORDER BY period DESC LIMIT 5"
 ```
+
+`--check` lists each ticker whose stored adjusted prices sit on two bases, an action the lake
+missed, and exits 1 if there is one. Running the backfill again rewrites the history on the
+vendor's current basis.
 
 The views are `sep`, `sf1`, which shows the latest version of each fundamentals row, and
 `tickers`, which shows the newest snapshot. `sf1_as_of('2020-06-30')` shows the fundamentals

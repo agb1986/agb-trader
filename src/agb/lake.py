@@ -30,7 +30,16 @@ can use only what had been filed by a given day, and its `lastupdated` column, s
 use each filing as the vendor showed it on that day rather than as since restated. Delisted
 tickers are never filtered out.
 
-`connect` opens DuckDB over the lake, and `python -m agb.lake "SQL"` runs one query.
+The vendor adjusts SEP prices backwards: a split or dividend rescales `close` and `closeadj` on
+every session before its ex-date, as the vendor serves them from then on. So each pull fetches
+from the lake's last session, the overlap day, as well as the sessions after it. A ticker the
+vendor now prices differently on that day has had an action since it landed, and its whole
+history is fetched again and written over the partitions the lake holds, so its adjusted series
+stays on one basis. `inconsistent` flags a ticker whose stored series still has two bases
+meeting.
+
+`connect` opens DuckDB over the lake, and `python -m agb.lake "SQL"` runs one query;
+`python -m agb.lake --check` lists the tickers `inconsistent` flags.
 """
 
 import argparse
@@ -41,6 +50,7 @@ import io
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 import urllib.error
@@ -77,6 +87,13 @@ MAX_GAP = timedelta(days=45)
 # The count of listed stocks moves by a few a day; a session the vendor is still publishing is
 # short by far more.
 FLOOR = 0.9
+# The SEP prices the vendor adjusts backwards: a pull compares them on the overlap day to tell
+# that a split or dividend has rescaled a ticker's history since it landed.
+ADJUSTED = ("close", "closeadj")
+# The consistency check's allowance for the vendor's rounding of each row's prices: this share
+# of the close, and this much of a dollar.
+RELATIVE_SLACK = 1e-4
+ROUNDING = 0.01
 # How many times a request is made before its failure stands, the wait before the second
 # attempt, doubling for each one after it, and the longest `Retry-After` waited out. Asked to
 # wait longer, the pull fails and the next day's pull lands the session.
@@ -537,6 +554,52 @@ def _last(lake: Path, dataset: Dataset, before: date) -> tuple[date, Path] | Non
     return None
 
 
+def _restated(stored: pa.Table, fetched: pa.Table) -> list[str]:
+    """The tickers whose prices on a session the lake holds the vendor now gives on another
+    basis: a `close` or `closeadj` in `fetched` that differs from the one in `stored`. The vendor
+    adjusts backwards, so a split or dividend since that session rescales its prices. A price
+    column one of them lacks is left out of the comparison."""
+    compared = [c for c in ADJUSTED if c in stored.schema.names and c in fetched.schema.names]
+    old = stored.select(["ticker", *compared])
+    new = fetched.select(["ticker", *compared])
+    new = new.rename_columns(["ticker", *(f"new_{c}" for c in compared)])
+    both = old.join(new, "ticker", join_type="inner")
+    moved = pa.array([False] * both.num_rows, pa.bool_())
+    for column in compared:
+        before, after = both.column(column), both.column(f"new_{column}")
+        differs = pc.fill_null(
+            pc.not_equal(before, after), pc.xor(pc.is_null(before), pc.is_null(after))
+        )
+        moved = pc.or_(moved, differs)
+    return sorted(both.filter(moved).column("ticker").to_pylist())
+
+
+def _history(client: Sharadar, tickers: list[str], through: date) -> pa.Table | None:
+    """The SEP prices of each of `tickers` from SINCE to `through`, all on today's basis."""
+    if not tickers:
+        return None
+    return pa.concat_tables(
+        [client.query(SEP, {"ticker": t, "date.gte": SINCE, "date.lte": through}) for t in tickers],
+        promote_options="default",
+    )
+
+
+def restate(lake: Path, history: pa.Table) -> list[Partition]:
+    """Replace, in each SEP partition the lake holds, the rows of the tickers in `history` with
+    `history`'s rows for that session. A session the lake does not hold is not created."""
+    tickers = pc.unique(history.column("ticker"))
+    partitions = []
+    for value, rows in split(history, SEP.key):
+        path = lake / SEP.name / f"{SEP.partition}={value}" / FILE
+        if not path.exists():
+            continue
+        old = pq.read_table(path)
+        kept = old.filter(pc.invert(pc.is_in(old.column("ticker"), value_set=tickers)))
+        table = pa.concat_tables([kept, rows], promote_options="default")
+        partitions.append(write_partition(lake, SEP, value, table.select(old.schema.names)))
+    return partitions
+
+
 def pull(lake: Path, client: Sharadar, session: date) -> list[Partition]:
     """Land `session` and every session since the last one the lake holds: their SEP prices,
     the SF1 rows the vendor changed from a week before the last pull to `session`, and the
@@ -546,7 +609,13 @@ def pull(lake: Path, client: Sharadar, session: date) -> list[Partition]:
     it. The first that is missing or short stops the pull, which raises NotYet carrying the
     partitions of the sessions before it that did land; SF1 and the tickers land only with
     `session` itself. Raises LakeError if the lake's last session is more than MAX_GAP before
-    `session`."""
+    `session`.
+
+    The fetch starts on the lake's last session, the overlap day, which is not landed again. A
+    ticker the vendor now prices differently on that day has had a split or dividend since:
+    the vendor adjusts backwards, so its whole history moved. That ticker's history is fetched
+    again and restated in every partition the lake holds, so its adjusted series stays on one
+    basis. The restated partitions are among those returned, or those NotYet carries."""
     previous = _last(lake, SEP, session)
     if previous is not None and session - previous[0] > MAX_GAP:
         raise LakeError(
@@ -557,40 +626,54 @@ def pull(lake: Path, client: Sharadar, session: date) -> list[Partition]:
         expected = [session]
         sep = client.query(SEP, {"date": session})
         floor = 0
+        restated: list[str] = []
     else:
         start = previous[0] + timedelta(days=1)
         calendar = nyse.NyseCalendar(previous[0] - timedelta(days=7), session + timedelta(days=7))
         expected = [*calendar.sessions(start, session), session]
-        sep = client.query(SEP, {"date.gte": start, "date.lte": session})
-        floor = pq.ParquetFile(previous[1]).metadata.num_rows
+        sep = client.query(SEP, {"date.gte": previous[0], "date.lte": session})
+        stored = pq.read_table(previous[1])
+        floor = stored.num_rows
+        overlap = sep.filter(pc.equal(sep.column(SEP.key), pa.scalar(previous[0])))
+        restated = _restated(stored, overlap)
+        sep = sep.filter(pc.greater(sep.column(SEP.key), pa.scalar(previous[0])))
     by_session = {date.fromisoformat(value): rows for value, rows in split(sep, SEP.key)}
     complete: list[tuple[date, pa.Table]] = []
+    short: str | None = None
     for day in sorted({*expected, *by_session}):
         rows = by_session.get(day)
         count = 0 if rows is None else rows.num_rows
-        if count == 0 or count < FLOOR * floor:
-            landed = [p for d, r in complete for p in land(lake, SEP, r, d)]
-            if count == 0:
-                raise NotYet(f"the vendor has no SEP prices for {day} yet", landed)
-            raise NotYet(
+        if count == 0:
+            short = f"the vendor has no SEP prices for {day} yet"
+        elif count < FLOOR * floor:
+            short = (
                 f"the vendor has {count} SEP prices for {day}, short of {FLOOR:.0%} of the"
-                f" {floor} the session before it had; it is still publishing",
-                landed,
+                f" {floor} the session before it had; it is still publishing"
             )
+        if short:
+            break
         complete.append((day, rows))
         floor = count
-    last_pull = _last(lake, TICKERS, session)
-    since = min(session, last_pull[0]) if last_pull else session
-    sf1 = client.query(SF1, {"lastupdated.gte": since - SF1_LOOKBACK, "lastupdated.lte": session})
-    sf1 = sf1.filter(pc.greater_equal(sf1.column("datekey"), pa.scalar(SINCE)))
-    tickers = client.tickers()
-    if tickers.num_rows == 0:
-        raise LakeError("the vendor returned no tickers")
-    return [
-        *(p for day, rows in complete for p in land(lake, SEP, rows, day)),
-        *land(lake, SF1, sf1, session),
-        *land(lake, TICKERS, tickers, session),
-    ]
+    # A restatement lands with the first session after the overlap day, never without one: the
+    # next pull's overlap day is then the newest landed session, on the vendor's new basis, and
+    # would show no change.
+    history = _history(client, restated, previous[0]) if complete and previous else None
+    if short is None:
+        last_pull = _last(lake, TICKERS, session)
+        since = min(session, last_pull[0]) if last_pull else session
+        sf1 = client.query(
+            SF1, {"lastupdated.gte": since - SF1_LOOKBACK, "lastupdated.lte": session}
+        )
+        sf1 = sf1.filter(pc.greater_equal(sf1.column("datekey"), pa.scalar(SINCE)))
+        tickers = client.tickers()
+        if tickers.num_rows == 0:
+            raise LakeError("the vendor returned no tickers")
+    landed = [p for day, rows in complete for p in land(lake, SEP, rows, day)]
+    if history is not None:
+        landed += restate(lake, history)
+    if short is not None:
+        raise NotYet(short, landed)
+    return [*landed, *land(lake, SF1, sf1, session), *land(lake, TICKERS, tickers, session)]
 
 
 def _sql(text: object) -> str:
@@ -726,17 +809,87 @@ def connect(lake: Path = DEFAULT_DIR) -> duckdb.DuckDBPyConnection:
     return conn
 
 
+# Each row's two adjustment factors: the dividend factor `closeadj / close`, which the vendor's
+# backward adjustment keeps in (0, 1] and never lets fall from one session to the next, and the
+# split factor `closeunadj / close`, which moves only on a split's ex-date, where it takes up the
+# jump in the unadjusted price. A row's slack is its prices' rounding as a share of its close.
+_INCONSISTENT = """
+WITH f AS (
+    SELECT ticker, date, close, closeunadj,
+        closeadj / close AS dividend,
+        closeunadj / close AS split,
+        ? + ? / close AS slack
+    FROM sep
+    WHERE close > 0 AND closeadj IS NOT NULL AND closeunadj > 0
+), d AS (
+    SELECT *,
+        lag(dividend) OVER w AS prior_dividend,
+        lag(split) OVER w AS prior_split,
+        lag(close) OVER w AS prior_close,
+        lag(closeunadj) OVER w AS prior_unadj,
+        lag(slack) OVER w AS prior_slack
+    FROM f
+    WINDOW w AS (PARTITION BY ticker ORDER BY date)
+)
+SELECT DISTINCT ticker FROM d
+WHERE dividend <= 0
+    OR dividend > 1 + slack
+    OR dividend < prior_dividend - slack - prior_slack
+    OR (
+        abs(ln(split / prior_split)) > slack + prior_slack
+        AND abs(ln(close / prior_close)) > abs(ln(closeunadj / prior_unadj))
+    )
+ORDER BY ticker
+"""
+
+
+def inconsistent(lake: Path = DEFAULT_DIR) -> list[str]:
+    """The tickers whose stored SEP prices are not on one adjustment basis.
+
+    The vendor adjusts backwards, so one consistent series has a dividend factor
+    `closeadj / close` in (0, 1] that never falls from one session to the next, and a split
+    factor `closeunadj / close` that changes only on a split's ex-date, where the split-adjusted
+    close moves less than the unadjusted one. A ticker flagged here has two bases meeting: the
+    newer rows rescaled for a dividend the older ones were not, or a jump in `close` where the
+    unadjusted price did not jump, which is a split the older rows missed. ROUNDING allows for
+    the vendor's rounding of prices.
+
+    A lake that missed a refresh across the whole of a ticker's history, so that every row
+    stands as the vendor showed it on its own day, has no seam to find: each row is consistent
+    with its neighbours on its own basis. Re-landing history with the backfill is what repairs
+    that."""
+    if not any(lake.glob(f"{SEP.name}/{SEP.partition}=*/{FILE}")):
+        return []
+    with connect(lake) as conn:
+        rows = conn.execute(_INCONSISTENT, [RELATIVE_SLACK, ROUNDING]).fetchall()
+    return [str(ticker) for (ticker,) in rows]
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="python -m agb.lake",
         description="Run one DuckDB query over the lake's views: sep, sf1 and tickers. "
         "Prints tab-separated rows under a header.",
     )
-    parser.add_argument("sql")
+    parser.add_argument("sql", nargs="?")
     parser.add_argument(
         "--lake", type=Path, default=Path(os.environ.get("AGB_LAKE_DIR", DEFAULT_DIR))
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="instead of a query, list the tickers whose SEP prices are not on one adjustment"
+        " basis, and exit 1 if there are any",
+    )
     args = parser.parse_args(argv)
+    if args.check:
+        flagged = inconsistent(args.lake)
+        for ticker in flagged:
+            print(ticker)
+        print(f"{len(flagged)} tickers inconsistent", file=sys.stderr)
+        raise SystemExit(1 if flagged else 0)
+    if args.sql is None:
+        parser.error("give a query, or --check")
     relation = connect(args.lake).sql(args.sql)
     if relation is None:
         return
