@@ -42,6 +42,7 @@ from test_gate import (
 from test_preflight import scored_run
 
 from agb import approval, execution, ladder, mechanics, panel, preflight
+from agb.roles import OWNER
 
 # Long enough at L1 for the time criterion to be met.
 A_YEAR = timedelta(days=400)
@@ -78,9 +79,10 @@ def a_command(db, verb, raw_text=None, outcome="accepted"):
 
 def at_level(db, level, *, since=None, attestation="the record is sound", actor="ada"):
     """The level set by hand the way `agb level` records it, optionally timestamped in the
-    past so the time spent at the level can be measured."""
+    past so the time spent at the level can be measured. Written as the owner, which the
+    database's climb check exempts, so a fixture can stand at a level it never earned."""
     command_id = a_command(db, "level", f"agb level {level}")
-    db.connect("cli").execute(
+    db.connect(OWNER).execute(
         "INSERT INTO agb.ladder_event (level, actor, at, reason, attestation, command_id)"
         " VALUES (%s, %s, coalesce(%s::timestamptz, now()), %s, %s, %s)",
         (level, actor, since, f"raised to {level} by {actor}", attestation, command_id),
@@ -613,13 +615,14 @@ def test_the_opt_out_window_is_the_submission_window(db):
 
 def test_the_system_still_never_rejects_a_pending_basket(db):
     """L1 lets the system answer a pending basket one way only. A rejection is the human's
-    word, so the loop's policy still refuses one however the mode and the level stand."""
+    word, so it is refused however the mode and the level stand: the human's surfaces may not
+    write as the system, and the loop's policy stands behind that."""
     go_live(db)
     at_level(db, "L1")
     basket_id = insert(db, replace(BASE, orders=()))
     move(db, basket_id, 2, "proposed", "pending", "bot", "telegram")
 
-    with pytest.raises(errors.InsufficientPrivilege, match="only a human rejects"):
+    with pytest.raises(errors.InsufficientPrivilege, match="basket_actor: bot .* as system"):
         move(db, basket_id, 3, "pending", "rejected", "bot", "telegram", actor="system")
 
 

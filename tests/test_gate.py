@@ -476,11 +476,25 @@ def insert(db, target=BASE, reference=None, proposed=True):
     return basket_id
 
 
+# Who each human surface decides as: the database binds the bot to the Telegram operator who
+# answered and the UI to its operator (the actor_binding migration).
+SPEAKS_FOR = {"bot": "telegram:7", "ui": "ui:operator"}
+
+
+def actor_for(role, to_state):
+    """The actor `role` writes a move to `to_state` as, when a test does not say: the bot puts
+    a basket to the human as itself, a human surface decides as its operator, and a service
+    writes as its own name."""
+    if role == "bot" and to_state == "pending":
+        return "bot"
+    return SPEAKS_FOR.get(role, role)
+
+
 def move(db, basket_id, seq, from_state, to_state, role, surface=None, actor=None):
     db.connect(role).execute(
         "INSERT INTO agb.basket_event (basket_id, seq, from_state, to_state, actor, surface)"
         " VALUES (%s, %s, %s, %s, %s, %s)",
-        (basket_id, seq, from_state, to_state, actor or role, surface or role),
+        (basket_id, seq, from_state, to_state, actor or actor_for(role, to_state), surface or role),
     )
 
 
@@ -925,7 +939,7 @@ def test_in_live_mode_a_pass_waits_for_the_human(db):
 
     move(db, basket_id, 2, "proposed", "pending", "bot", "telegram")
     move(db, basket_id, 3, "pending", "approved", "bot", "telegram")
-    assert state(db, basket_id) == ("approved", 3, "bot", "telegram")
+    assert state(db, basket_id) == ("approved", 3, "telegram:7", "telegram")
 
 
 def record(db, basket_id, declared, passed):

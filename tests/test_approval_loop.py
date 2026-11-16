@@ -29,7 +29,7 @@ from test_execution import (
     expect_submission,
     halts,
 )
-from test_gate import EVENING, LATE, SOUND, insert, move, rows, run, state
+from test_gate import EVENING, LATE, SOUND, SPEAKS_FOR, actor_for, insert, move, rows, run, state
 
 from agb import approval, cli, execution, gate, jobs, migrate, schedule
 from agb.roles import OWNER
@@ -461,7 +461,7 @@ def move_at(db, at, basket_id, seq, from_state, to_state, role, surface=None, ac
     conn.execute(
         "INSERT INTO agb.basket_event (basket_id, seq, from_state, to_state, actor, surface)"
         " VALUES (%s, %s, %s, %s, %s, %s)",
-        (basket_id, seq, from_state, to_state, actor or role, surface or role),
+        (basket_id, seq, from_state, to_state, actor or actor_for(role, to_state), surface or role),
     )
 
 
@@ -728,11 +728,14 @@ def test_the_cli_writes_no_basket_event(db, pending_basket):
 
 def test_the_system_never_decides_a_pending_basket(db, pending_basket):
     # A rejection is the human's word at every level. An approval is the human's too until
-    # the ladder reaches L1, where the gate's own check holds the system to live and L1.
-    with pytest.raises(errors.InsufficientPrivilege, match="basket_policy.*only a human rejects"):
-        move(db, pending_basket, 3, "pending", "rejected", "bot", "telegram", actor="system")
-    with pytest.raises(errors.InsufficientPrivilege, match="basket_gate.*only at L1 in live"):
-        move(db, pending_basket, 3, "pending", "approved", "bot", "telegram", actor="system")
+    # the ladder reaches L1, where the gate's own check holds the system to live and L1. The
+    # human's surfaces cannot speak as the system at all, so the actor binding refuses them
+    # first; the loop's policy and the gate's check (the test above) stand behind it.
+    for to_state in ("rejected", "approved"):
+        with pytest.raises(
+            errors.InsufficientPrivilege, match="basket_actor: bot .* as system from telegram"
+        ):
+            move(db, pending_basket, 3, "pending", to_state, "bot", "telegram", actor="system")
 
 
 def test_while_paper_asks_the_gate_may_not_approve_alone(db, asks):
@@ -744,5 +747,5 @@ def test_while_paper_asks_the_gate_may_not_approve_alone(db, asks):
 @pytest.mark.parametrize("to_state", ["approved", "rejected"])
 @pytest.mark.parametrize(("role", "surface"), [("bot", "telegram"), ("ui", "ui")])
 def test_the_bot_and_the_ui_decide(db, pending_basket, role, surface, to_state):
-    move(db, pending_basket, 3, "pending", to_state, role, surface, actor="telegram:7")
-    assert state(db, pending_basket) == (to_state, 3, "telegram:7", surface)
+    move(db, pending_basket, 3, "pending", to_state, role, surface)
+    assert state(db, pending_basket) == (to_state, 3, SPEAKS_FOR[role], surface)
