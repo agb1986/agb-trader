@@ -31,7 +31,7 @@ COMPOSE := docker compose --env-file $(ENV_DIR)/db.env
 
 .DEFAULT_GOAL := help
 .PHONY: help env up down status logs agb reconcile backfill lake sync-lake research measure \
-	promote sizing panel-check deploy rollback test test-fast test-live lint
+	promote sizing panel-check deploy rollback test test-fast test-live lint types cover
 
 help: ## List the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-9s %s\n", $$1, $$2}'
@@ -113,3 +113,9 @@ test-live: ## Run the live tests that their AGB_LIVE_* variables enable; they to
 lint: ## Lint and check formatting
 	uv run ruff check .
 	uv run ruff format --check .
+
+types: ## Type-check src/agb: strict on four modules, permissive elsewhere (docs/build/type-checking.md)
+	uv run mypy
+
+cover: ## Run the fast tests with coverage; fails below the floor in pyproject.toml
+	uv run pytest -m "not stack and not live" --cov

@@ -1,5 +1,6 @@
-# Lint, the fast tests and the app image build on every pull request, whatever branch it
-# targets (the wave integration branches as well as main), and on every push to main.
+# Lint, the type check, the fast tests, the coverage floor and the app image build on every pull
+# request, whatever branch it targets (the wave integration branches as well as main), and on
+# every push to main.
 #
 # No job sets an AGB_LIVE_* variable or reads a secret: the live tests never run here, and the
 # stack test (-m stack) waits for #144. tests/test_ci.py holds this file to that.
@@ -52,6 +53,36 @@ jobs:
       # The tests start their own throwaway Postgres container, and the Compose checks run
       # `docker compose config`; the hosted runner provides both.
       - run: uv run pytest -m "not stack and not live"
+
+  # The type checker, strict on four modules and permissive elsewhere (docs/build/type-checking.md).
+  types:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.10.10"
+      - run: uv sync --frozen
+      - run: uv run mypy
+
+  # The fast tests again, measured, failing below the floor in pyproject.toml. A separate job
+  # from fast-tests so that job keeps its name and its meaning for the branch-protection rule.
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.10.10"
+      - run: uv sync --frozen
+      - run: uv python install 3.9
+      - run: uv run pytest -m "not stack and not live" --cov
 
   image-build:
     runs-on: ubuntu-24.04

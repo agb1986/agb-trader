@@ -55,6 +55,7 @@ import psycopg
 
 from agb import basket, blend, corporate, jobs, nyse, rebalance, schedule, universe
 from agb.roles import PIPELINE
+from agb.rows import one
 
 SYSTEM = "system"
 PAPER = "paper"
@@ -574,7 +575,21 @@ def load(conn: psycopg.Connection, basket_id: int) -> Basket:
     if blended is not None:
         run_id, w, scored, shortlisted, spread = blended
         panel = Panel(run_id, w, scored, shortlisted, None if scored < 2 else float(spread))
-    return Basket(*row, targets, orders, panel, corporate.for_period(conn, row[1]))
+    id_, period, session_date, snapshot_date, universe_size, ranker, model_sha256, capital = row
+    return Basket(
+        id_,
+        period,
+        session_date,
+        snapshot_date,
+        universe_size,
+        ranker,
+        model_sha256,
+        capital,
+        targets,
+        orders,
+        panel,
+        corporate.for_period(conn, period),
+    )
 
 
 def run(
@@ -596,8 +611,9 @@ def run(
         current = conn.execute(_STATE, (basket_id,)).fetchone()
         if recorded is not None:
             run_id, mode = recorded
-            checks = tuple(Check(*c) for c in conn.execute(_CHECKS, (run_id,)).fetchall())
-            return Verdict(basket_id, mode, current[0], checks, recorded=True)
+            assert current is not None  # a recorded verdict belongs to a basket with a state
+            gated = tuple(Check(*c) for c in conn.execute(_CHECKS, (run_id,)).fetchall())
+            return Verdict(basket_id, mode, current[0], gated, recorded=True)
         if current is None or current[0] != "proposed":
             state = current[0] if current else "unproposed"
             raise GateError(f"basket {basket_id} is {state}, not proposed")
@@ -617,10 +633,10 @@ def run(
             limits=limits,
             calendar=calendar,
         )
-        (mode,) = conn.execute("SELECT mode FROM agb.current_mode").fetchone()
-        (asks,) = conn.execute("SELECT required FROM agb.paper_approval").fetchone()
-        (level,) = conn.execute("SELECT level FROM agb.current_level").fetchone()
-        (run_id,) = conn.execute(_INSERT_RUN, (basket_id, len(checks), mode, PIPELINE)).fetchone()
+        (mode,) = one(conn.execute("SELECT mode FROM agb.current_mode"))
+        (asks,) = one(conn.execute("SELECT required FROM agb.paper_approval"))
+        (level,) = one(conn.execute("SELECT level FROM agb.current_level"))
+        (run_id,) = one(conn.execute(_INSERT_RUN, (basket_id, len(checks), mode, PIPELINE)))
         with conn.cursor() as cur:
             cur.executemany(
                 _INSERT_CHECK,
@@ -637,9 +653,9 @@ def run(
             state = "halted"
         elif mode == PAPER and not asks:
             reason = "passed the pre-trade gate in paper mode"
-            (event_id,) = conn.execute(
-                _MOVE, (basket_id, seq, "approved", SYSTEM, basket.SURFACE, reason)
-            ).fetchone()
+            (event_id,) = one(
+                conn.execute(_MOVE, (basket_id, seq, "approved", SYSTEM, basket.SURFACE, reason))
+            )
             # Nobody is asked, so the approval the month expects is this one.
             jobs.fulfil(
                 conn, schedule.APPROVAL_REQUEST, target.period, "basket_event", event_id, PIPELINE
