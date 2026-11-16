@@ -13,7 +13,7 @@ import registry_fake
 from conftest import SUPERUSER
 from market_fake import PERIOD, TRADE
 from psycopg import errors
-from test_bot import CHAT, FakeTelegram, events
+from test_bot import CHAT, UPDATE_IDS, FakeTelegram, events, sent
 from test_execution import (
     AFTER,
     CALENDAR,
@@ -33,14 +33,18 @@ SENDER = 7
 ET = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} ET"
 
 
-def say(telegram, *texts, chat=CHAT, sender=SENDER):
-    """Queue one message per text, as Telegram would hand them to the bot."""
+def say(telegram, *texts, chat=CHAT, sender=SENDER, at=AFTER):
+    """Queue one message per text, sent at `at`, as Telegram would hand them to the bot."""
     for text in texts:
-        update_id = 100 + len(telegram.updates)
-        message = {"message_id": update_id, "chat": {"id": int(chat)}, "from": {"id": sender}}
+        message = {
+            "message_id": 100 + len(telegram.updates),
+            "chat": {"id": int(chat)},
+            "from": {"id": sender},
+            "date": sent(at),
+        }
         if text is not None:
             message["text"] = text
-        telegram.updates.append({"update_id": update_id, "message": message})
+        telegram.updates.append({"update_id": next(UPDATE_IDS), "message": message})
 
 
 def ask(db, *texts):

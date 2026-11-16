@@ -143,6 +143,7 @@ Rejected: everything in Postgres, which grows the dump by hundreds of megabytes 
 | `job`, `job_event` | scheduler (create), pipeline / execution (claim, events) | lease columns on `job` only |
 | basket content tables, `basket_event`, `basket_transition` | pipeline (content), bot / ui / scheduler / execution (events per transition table) | no |
 | `command` | bot, ui, cli | no |
+| `telegram_update` | bot (each Telegram update handled, with its command) | no |
 | `liquidation` | bot, ui (token, confirm), execution (result) | no |
 | `liquidation_order`, `liquidation_fill` | execution | no |
 | `halt_event`, `broker_state` | pipeline (gate_breach), execution (lease, broker_state), bot / ui (pause, resume, liquidation) | no |

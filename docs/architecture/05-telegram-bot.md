@@ -41,6 +41,8 @@ The set divides in three. `/status`, `/positions`, `/pnl` and `/log` are read-on
 
 **Every inbound command is a `command` row, refused ones included**, with the raw text as typed, the parsed verb and arguments, and the outcome. A bare `/approve`, a basket reference that does not match the pending basket, and a wrong liquidation token are all part of the record, because a refusal is evidence of what the operator attempted.
 
+**Each message is handled once, and only while it is fresh.** Every Telegram update the bot handles is a `telegram_update` row keyed on Telegram's `update_id`, written in the same transaction as the update's `command` row and whatever the command did, so either all of it is on record or none of it is; the reply goes out after the commit. A restart asks Telegram from one past the newest `update_id` on record, and an update that comes back anyway finds its row and is skipped, so a crash between handling a batch and confirming it to Telegram cannot run `/pause`, `/resume` or a bare `/liquidate` a second time. A message sent more than five minutes before the bot reads it (`STALE_COMMAND`), or one with no send time, is refused whatever it says: it is recorded as a refused `command` with its age as the reason, logged, and answered with `STALE — /<verb> refused` and an invitation to send it again. Telegram holds an unread message for a day, and a `/resume` typed before an outage must not clear a halt raised after it.
+
 ## The bot's own messages
 
 Seven messages the bot sends unprompted:
