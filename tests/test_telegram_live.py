@@ -82,8 +82,15 @@ def test_a_command_is_answered_in_the_real_chat_and_recorded(db):
     assert len(readout.log(conn, 100)) > MESSAGE_MAX
 
     for text in ("/help", "/log 100"):
-        message = {"message_id": None, "chat": {"id": chat}, "from": {"id": 0}, "text": text}
-        bot.answer(conn, message, datetime.now(UTC))
+        now = datetime.now(UTC)
+        message = {
+            "message_id": None,
+            "chat": {"id": chat},
+            "from": {"id": 0},
+            "date": int(now.timestamp()),
+            "text": text,
+        }
+        bot.answer(conn, message, now)
 
     assert db.connect("cli").execute(
         "SELECT verb, outcome FROM agb.command WHERE verb IS NOT NULL ORDER BY id"

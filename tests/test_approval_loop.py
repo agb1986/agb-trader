@@ -64,7 +64,7 @@ class Chat:
 
     def say(self, *texts):
         """The human sends `texts`; returns the replies."""
-        say(self.telegram, *texts)
+        say(self.telegram, *texts, at=self.now)
         self.bot.poll(self.conn, self.now)
         return self.new()
 

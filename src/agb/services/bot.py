@@ -8,9 +8,11 @@ configured chat. Each of those duties runs under its own handler: one that raise
 raises one alert for its run of failures, and leaves the rest to run, so delivery is always
 attempted.
 
-It holds no state beyond the Telegram update offset and which duties are failing. Every
+It holds no state beyond a cached Telegram update offset and which duties are failing. Every
 message it sends is computed from the database, every message it receives is a `command` row
 whatever became of it, and every delivery attempt is an `alert_event`. Alerts notify and never act.
+Each update it handles is a `telegram_update` row written with its command, so a restart neither
+loses nor repeats one, and a command older than `STALE_COMMAND` is refused rather than acted on.
 
 `/pause`, `/resume` and `/liquidate` are the kill switch, and `/approve` and `/reject`
 answer the approval request. Neither is written here: the kill switch lives in
@@ -35,6 +37,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from agb import approval, health, jobs, killswitch, ladder, readout, schedule
+from agb.cli import format_age
 from agb.health import Finding
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.nyse import NEW_YORK, NyseCalendar, trading_date
@@ -80,6 +83,11 @@ MESSAGE_MAX = 4096
 # How long a liquidation token stays valid. The kill switch owns it; it is named here
 # because this is the surface that tells the operator how long they have.
 TOKEN_VALID = killswitch.TOKEN_VALID
+# A command older than this when the bot reads it is refused, not acted on. Telegram keeps an
+# unread message for a day, so a `/resume` typed before an outage would otherwise clear a halt
+# raised since. Five minutes is several poll cycles and a retried poll, and far less than the
+# time it takes for the state a command was meant for to change.
+STALE_COMMAND = timedelta(minutes=5)
 
 # The commands this bot answers, and what each shows, in the order /help lists them.
 COMMANDS = {
@@ -245,6 +253,17 @@ _RECORD = """
 """
 
 
+# Claim an update before handling it. A row already there means it was handled.
+_CLAIM = """
+    INSERT INTO agb.telegram_update (update_id, chat_id, telegram_message_id, actor)
+    VALUES (%(update_id)s, %(chat_id)s, %(message_id)s, %(actor)s)
+    ON CONFLICT (update_id) DO NOTHING
+    RETURNING update_id
+"""
+# Where to ask Telegram from on start: one past the newest update handled.
+_OFFSET = "SELECT max(update_id) + 1 FROM agb.telegram_update"
+
+
 class Bot:
     """One bot cycle, run by `serve`. Telegram and the clock are injectable for tests.
 
@@ -338,21 +357,52 @@ class Bot:
     # Messages in.
 
     def poll(self, conn: psycopg.Connection, now: datetime | None = None) -> None:
-        """Read new messages and record each as a command. Only the configured chat is ever
-        answered."""
+        """Read new messages and handle each once. Only the configured chat is ever answered.
+
+        The offset starts from the newest update on record, so a restart does not ask again
+        for what was handled before it.
+        """
         now = now or self.clock()
+        if self._offset is None:
+            (self._offset,) = conn.execute(_OFFSET).fetchone()
         updates = self._updates()
         if updates is None:
             return
         for update in updates:
             self._offset = max(self._offset or 0, update["update_id"] + 1)
-            message = update.get("message")
+            reply = self.handle(conn, update, now)
+            if reply is not None:
+                self._send(reply)
+
+    def handle(self, conn: psycopg.Connection, update: dict[str, Any], now: datetime) -> str | None:
+        """Handle one update, at most once, and return the reply it is owed, if any.
+
+        The update's `telegram_update` row, its `command` row and whatever the command did are
+        one transaction, so either all of it is on record or none of it is. An update already on
+        record is skipped: that is what makes a replay after a crash harmless. The reply goes
+        out after the commit, because a sent message cannot be rolled back.
+        """
+        message = update.get("message")
+        chat = message.get("chat", {}).get("id") if message is not None else None
+        with conn.transaction():
+            claimed = conn.execute(
+                _CLAIM,
+                {
+                    "update_id": update["update_id"],
+                    "chat_id": str(chat) if chat is not None else None,
+                    "message_id": message.get("message_id") if message is not None else None,
+                    "actor": ACTOR,
+                },
+            ).fetchone()
+            if claimed is None:
+                log.info("update %s was handled before; skipped", update["update_id"])
+                return None
             if message is None:
-                continue
-            if str(message.get("chat", {}).get("id")) == self.chat_id:
-                self.answer(conn, message, now)
-            else:
+                return None
+            if str(chat) != self.chat_id:
                 self.refuse(conn, message)
+                return None
+            return self.reply_to(conn, message, now)
 
     def _updates(self) -> list[dict[str, Any]] | None:
         """New messages, or `None` when Telegram could not be reached.
@@ -374,28 +424,58 @@ class Bot:
         return None
 
     def answer(self, conn: psycopg.Connection, message: dict[str, Any], now: datetime) -> None:
-        """Record the command, then answer it: the command's readout, or why it was refused
-        and what is available."""
-        parsed = parse(message.get("text") or "")
-        if parsed.refusal is not None:
-            self._command(conn, message, parsed.verb, {"args": parsed.args}, parsed.refusal)
-            reply = help_text(parsed.refusal)
-        elif parsed.verb == "pause":
-            reply = self.pause(conn, message)
-        elif parsed.verb == "resume":
-            reply = self.resume(conn, message)
-        elif parsed.verb == "liquidate":
-            reply = self.liquidate(conn, message, parsed.args, now)
-        elif parsed.verb in DECISIONS:
-            reply = self.decide(conn, message, parsed, now)
-        else:
-            self._command(conn, message, parsed.verb, {"args": parsed.args})
-            reply = self.run(conn, parsed.verb, parsed.args, now)
+        """Record the command, then send its reply."""
+        self._send(self.reply_to(conn, message, now))
+
+    def _send(self, reply: str) -> None:
         try:
             for part in split(reply):
                 self.telegram.send_message(self.chat_id, part)
         except TelegramError as exc:
-            log.warning("could not answer /%s: %s", parsed.verb, exc)
+            log.warning("could not send the reply %r: %s", reply.splitlines()[0], exc)
+
+    def reply_to(self, conn: psycopg.Connection, message: dict[str, Any], now: datetime) -> str:
+        """Record the command and return its reply: the command's readout, or why it was
+        refused and what is available. A message older than `STALE_COMMAND` is refused
+        whatever it says."""
+        parsed = parse(message.get("text") or "")
+        stale = self.stale(message, now)
+        if stale is not None:
+            self._command(conn, message, parsed.verb, {"args": parsed.args}, stale)
+            what = f"/{parsed.verb}" if parsed.verb else "a message"
+            log.warning("refused %s from %s: %s", what, operator(message), stale)
+            return (
+                f"STALE — {what} refused\n{stale}\n"
+                "Nothing has been done. Send it again if you still mean it."
+            )
+        if parsed.refusal is not None:
+            self._command(conn, message, parsed.verb, {"args": parsed.args}, parsed.refusal)
+            return help_text(parsed.refusal)
+        if parsed.verb == "pause":
+            return self.pause(conn, message)
+        if parsed.verb == "resume":
+            return self.resume(conn, message)
+        if parsed.verb == "liquidate":
+            return self.liquidate(conn, message, parsed.args, now)
+        if parsed.verb in DECISIONS:
+            return self.decide(conn, message, parsed, now)
+        self._command(conn, message, parsed.verb, {"args": parsed.args})
+        return self.run(conn, parsed.verb, parsed.args, now)
+
+    @staticmethod
+    def stale(message: dict[str, Any], now: datetime) -> str | None:
+        """Why a message is too old to act on, or `None` when it is fresh. A message without a
+        send time is refused too, since its age cannot be known."""
+        sent_at = message.get("date")
+        if sent_at is None:
+            return "stale: Telegram gave no time it was sent, so its age is unknown."
+        sent = datetime.fromtimestamp(sent_at, UTC)
+        if now - sent <= STALE_COMMAND:
+            return None
+        return (
+            f"stale: sent {health.ago(now, sent)}, at {health.et(sent)}; "
+            f"nothing older than {format_age(STALE_COMMAND)} is acted on."
+        )
 
     def run(self, conn: psycopg.Connection, verb: str, args: list[str], now: datetime) -> str:
         if verb == "status":
