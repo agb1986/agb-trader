@@ -10,17 +10,31 @@ import io
 import json
 import re
 import urllib.error
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 from psycopg import errors
 from psycopg.types.json import Jsonb
-from test_execution import AFTER, MID, NAMES, NOW, Clock, broker, rows, state, submitted
+from test_execution import (
+    AFTER,
+    CALENDAR,
+    MID,
+    NAMES,
+    NEXT,
+    NOW,
+    TRADE,
+    Clock,
+    broker,
+    rows,
+    state,
+    submitted,
+)
 from test_pause_resume import ACTOR, BEFORE_DEADLINE, Operator, commands, kinds, open_causes
 
 from agb import execution
 from agb.alpaca import Alpaca, AlpacaError, Closed
+from agb.execution import ExecutionError
 from agb.services.bot import TOKEN_VALID, parse
 from agb.services.execution import Execution
 
@@ -452,6 +466,139 @@ def test_an_order_still_being_cancelled_is_named_when_a_liquidation_halts_its_ba
     ) == [("status", "pending_cancel")]
 
 
+# -- the record of the answer --------------------------------------------------------------
+
+
+def answered(db):
+    return rows(
+        db,
+        "SELECT o.symbol, o.status, o.broker_order_id IS NOT NULL, o.message, o.actor"
+        " FROM agb.liquidation_order o ORDER BY o.id",
+    )
+
+
+def test_the_closing_fills_are_recorded_so_the_next_snapshot_matches(db, operator):
+    """Issue #150: the closing orders' fills are recorded against the liquidation, so the
+    snapshot after it finds the book it expects, not a mismatch on every closed name."""
+    conn = db.connect("execution")
+    fake = holding()
+    assert execution.snapshot(conn, fake, TRADE, CALENDAR) is True
+    token = issued(operator.says("/liquidate"))
+    operator.says(f"/liquidate {token}")
+
+    assert execution.apply_liquidation(conn, fake, CALENDAR, NOW) == 1
+    assert answered(db) == [(name, 200, True, None, "execution") for name in HELD]
+    fake.close(datetime.now(UTC))
+    assert fake.positions() == []
+    fake.now = CALENDAR.close_at(NEXT)
+    assert execution.snapshot(conn, fake, NEXT, CALENDAR) is True
+
+    assert rows(db, "SELECT count(*) FROM agb.position_mismatch") == [(0,)]
+    assert rows(
+        db,
+        "SELECT o.symbol, f.side, f.qty, f.price, f.actor FROM agb.liquidation_fill f"
+        " JOIN agb.liquidation_order o ON o.id = f.order_id ORDER BY f.id",
+    ) == [(name, "sell", qty, MID, "execution") for name, qty in HELD.items()]
+    assert rows(db, "SELECT count(*) FROM agb.fill") == [(0,)]
+    # Recording the fills again adds nothing.
+    assert execution.ingest_fills(conn, fake, NOW - timedelta(days=1)) == 0
+
+
+def test_a_failure_after_close_all_keeps_the_answer_and_is_retried_from_it(
+    db, operator, monkeypatch
+):
+    """Issue #150: the broker's answer is in the database before anything that could fail, so
+    a failure after close-all neither loses it nor sends a second close-all."""
+    conn = db.connect("execution")
+    fake = holding(close_fails={NAMES[1]: "asset is halted"})
+    token = issued(operator.says("/liquidate"))
+    operator.says(f"/liquidate {token}")
+
+    def broken(*_):
+        raise RuntimeError("the database went away")
+
+    with monkeypatch.context() as m:
+        m.setattr(execution, "_liquidation_text", broken)
+        with pytest.raises(RuntimeError, match="the database went away"):
+            execution.apply_liquidation(conn, fake, CALENDAR, NOW)
+
+    assert answered(db) == [
+        (NAMES[0], 200, True, None, "execution"),
+        (NAMES[1], 403, False, "asset is halted", "execution"),
+        (NAMES[2], 200, True, None, "execution"),
+    ]
+    assert rows(db, "SELECT 1 FROM agb.liquidation WHERE kind = 'result'") == []
+    assert len(execution.pending_liquidation(conn)) == 1
+
+    cycle(db, fake, NOW + timedelta(minutes=1))
+
+    assert fake.calls.count(("close_all",)) == 1
+    symbols, detail = result(db)
+    assert [(s["symbol"], s["status"], s["message"]) for s in symbols] == [
+        (NAMES[0], 200, None),
+        (NAMES[1], 403, "asset is halted"),
+        (NAMES[2], 200, None),
+    ]
+    assert detail.splitlines()[1] == "2 of 3 positions closing, 1 FAILED and still held"
+    assert execution.pending_liquidation(conn) == []
+
+
+def test_a_basket_that_moves_under_the_liquidation_cancel_is_alerted_and_retried(
+    db, operator, monkeypatch
+):
+    """Issue #150: `cancel_in_flight` raises `ExecutionError` when a basket moves under it;
+    the liquidation alerts and waits for the next cycle instead of failing the cycle."""
+    conn = db.connect("execution")
+    fake = holding()
+    token = issued(operator.says("/liquidate"))
+    operator.says(f"/liquidate {token}")
+
+    def moved(*_):
+        raise ExecutionError("basket 1 is no longer submitted")
+
+    with monkeypatch.context() as m:
+        m.setattr(execution, "cancel_in_flight", moved)
+        assert execution.apply_liquidation(conn, fake, CALENDAR, NOW) == 0
+
+    assert ("close_all",) not in fake.calls
+    assert kinds(db) == ["liquidation_failed"]
+    assert "could not reach the broker: basket 1 is no longer submitted" in alert(
+        db, "liquidation_failed"
+    )
+    assert answered(db) == []
+    assert len(execution.pending_liquidation(conn)) == 1
+
+    cycle(db, fake, NOW + timedelta(minutes=1))
+
+    assert fake.calls.count(("close_all",)) == 1
+    assert result(db)[1].splitlines()[1] == "all 3 positions closing"
+
+
+def test_a_basket_that_moves_under_the_pause_cancel_is_alerted_and_retried(
+    db, operator, monkeypatch
+):
+    """Issue #150: the same for a pause, whose cancel is the same call."""
+    conn = db.connect("execution")
+    fake = holding()
+    operator.says("/pause")
+
+    def moved(*_):
+        raise ExecutionError("basket 1 is no longer submitted")
+
+    with monkeypatch.context() as m:
+        m.setattr(execution, "cancel_in_flight", moved)
+        assert execution.apply_latch(conn, fake, CALENDAR, NOW) == 0
+
+    assert ("suspend", True) not in fake.calls
+    assert kinds(db) == ["latch_failed"]
+    assert "basket 1 is no longer submitted" in alert(db, "latch_failed")
+    assert len(execution.pending_latch(conn)) == 1
+
+    assert execution.apply_latch(conn, fake, CALENDAR, NOW + timedelta(minutes=1)) == 1
+    assert ("suspend", True) in fake.calls
+    assert execution.pending_latch(conn) == []
+
+
 # -- the schema --------------------------------------------------------------------------------
 
 
@@ -493,6 +640,48 @@ def test_who_writes_which_liquidation_row(db, operator):
         with pytest.raises(errors.InsufficientPrivilege):
             conn.execute("UPDATE agb.liquidation SET detail = 'changed'")
         conn.rollback()
+
+
+def test_who_writes_the_record_of_a_liquidation(db, operator):
+    """Only execution records a closing order or its fill; a closing order answers a
+    confirmation and nothing else; and neither is changed afterwards."""
+    token = issued(operator.says("/liquidate"))
+    operator.says(f"/liquidate {token}")
+    [(token_id,), (confirm_id,)] = rows(db, "SELECT id FROM agb.liquidation ORDER BY id")
+    insert = (
+        "INSERT INTO agb.liquidation_order (confirm_id, symbol, status, broker_order_id, actor)"
+        " VALUES (%s, 'N01', 200, %s, %s)"
+    )
+
+    bot = db.connect("bot")
+    with pytest.raises(errors.InsufficientPrivilege):
+        bot.execute(insert, (confirm_id, "ord-x", "bot"))
+    bot.rollback()
+
+    ex = db.connect("execution")
+    with pytest.raises(errors.CheckViolation):
+        ex.execute(insert, (token_id, "ord-x", "execution"))
+    ex.rollback()
+    ex.execute(insert, (confirm_id, "ord-x", "execution"))
+    with pytest.raises(errors.UniqueViolation):
+        ex.execute(insert, (confirm_id, "ord-x", "execution"))
+    ex.rollback()
+    with pytest.raises(errors.CheckViolation):
+        ex.execute(
+            "INSERT INTO agb.liquidation_fill (order_id, execution_id, side, qty, price,"
+            " filled_at, fee_model_version, actor)"
+            " SELECT id, 'act-x', 'sell_short', 1, 1, now(), 'v', 'execution'"
+            " FROM agb.liquidation_order"
+        )
+    ex.rollback()
+
+    for table in ("liquidation_order", "liquidation_fill"):
+        with pytest.raises(errors.InsufficientPrivilege):
+            ex.execute(f"UPDATE agb.{table} SET actor = 'execution'")
+        ex.rollback()
+        with pytest.raises(errors.InsufficientPrivilege):
+            ex.execute(f"DELETE FROM agb.{table}")
+        ex.rollback()
 
 
 def test_the_audit_log_shows_each_step_without_the_token(db, operator):
