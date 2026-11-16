@@ -118,7 +118,10 @@ CAPITAL = 100_000.0
 DIRECTORY = "certifications"
 PATHS = "paths.json"
 REPORT = "report.md"
-MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+# The one pattern for a model id; scripts/deploy/promote.sh holds the same one for the same reason,
+# and tests/test_compose.py checks that the two agree. It is matched against the whole string:
+# `$` alone would let a trailing newline through.
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # The trial kinds whose results carry monthly net returns the overfitting gate can read.
 CANDIDATE_KINDS = ("backtest",)
 
@@ -134,7 +137,7 @@ class Options:
     thresholds: gates.Thresholds = field(default_factory=gates.Thresholds)
 
     def __post_init__(self) -> None:
-        if not MODEL_ID.match(self.model_id):
+        if not MODEL_ID.fullmatch(self.model_id):
             raise ValueError(f"model id {self.model_id!r}: letters, digits, dot, dash, underscore")
 
 

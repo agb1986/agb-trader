@@ -28,6 +28,7 @@ def test_the_command_pulls_from_the_server_into_a_local_directory(tmp_path):
 
     assert argv[0] == "rsync"
     assert argv[-2:] == ["casaos.local:/mnt/data/AppData/agb-trader/lake/", f"{tmp_path}/lake/"]
+    assert argv[-3] == "--", "the operands follow the end of the options"
     assert "--archive" in argv
     assert "--exclude=/.query/" in argv
     assert not [flag for flag in argv if "delete" in flag], "nothing is deleted on either side"
