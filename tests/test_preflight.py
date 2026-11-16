@@ -304,9 +304,8 @@ def test_the_spot_check_takes_the_operators_verdict_and_nothing_else(
         }
     ]
     # One verdict per name per operator, and nobody rewrites one.
-    with pytest.raises(psycopg.errors.UniqueViolation):
+    with pytest.raises(preflight.PreflightError, match="alice has already recorded"):
         preflight.review(conn, run_id, reviews[0].symbol, "agree", None, "alice")
-    conn.rollback()
     with pytest.raises(psycopg.Error):
         conn.execute("UPDATE agb.panel_spot_check SET verdict = 'agree'")
 
@@ -383,3 +382,28 @@ def test_fixtures_needs_a_recall_run_before_it_can_report(db, config, monkeypatc
     assert cli.main(["panel-preflight", "fixtures", str(config)]) == 1
 
     assert "has no recall run" in capsys.readouterr().err
+
+
+def test_a_spot_check_of_one_name_samples_the_middle_one_and_does_not_divide_by_zero(db, config):
+    run_id = scored_run(db, config)
+    conn = db.connect("cli")
+    everyone = preflight.sample(conn, run_id, preflight.SPOT_CHECK_N)
+
+    (only,) = preflight.sample(conn, run_id, 1)
+
+    assert min(r.total for r in everyone) <= only.total <= max(r.total for r in everyone)
+    with pytest.raises(preflight.PreflightError, match="at least one name"):
+        preflight.sample(conn, run_id, 0)
+
+
+def test_a_second_verdict_from_one_actor_on_one_name_is_a_named_error(db, config):
+    run_id = scored_run(db, config)
+    conn = db.connect("cli")
+    first = preflight.sample(conn, run_id)[0]
+    preflight.review(conn, run_id, first.symbol, "agree", None, "alice")
+
+    with pytest.raises(preflight.PreflightError, match="alice has already recorded a verdict"):
+        preflight.review(conn, run_id, first.symbol, "disagree", "changed my mind", "alice")
+
+    # The connection is still usable, and another actor's verdict is accepted.
+    preflight.review(conn, run_id, first.symbol, "agree", None, "bob")

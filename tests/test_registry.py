@@ -482,10 +482,10 @@ def _waiving_the_voided(db, models, monkeypatch):
 
 
 def _waiving_the_stale(db, models, monkeypatch):
-    """A cost-model bump leaves the failed certification stale, and promotion voids the stale
-    before it reads the candidate, so the waiver meets the voiding its own promotion wrote."""
+    """A cost-model bump leaves the failed certification stale, and the waiver is refused as
+    stale without anything being voided."""
     bump(monkeypatch)
-    return FAILED_ID, WAIVER, f"certified under cost model .*, superseded by {NEXT}"
+    return FAILED_ID, WAIVER, f"certified under cost model .*; the cost model is now {NEXT}"
 
 
 def _waiving_without_the_artifact(db, models, monkeypatch):
@@ -694,18 +694,25 @@ def test_a_cost_model_bump_voids_every_certification_made_under_the_old_one(
     ]
 
 
-def test_promotion_voids_stale_certifications_first(db, models, certification_id, monkeypatch):
+def test_a_refused_promotion_leaves_every_certification_row_unchanged(
+    db, models, certification_id, monkeypatch
+):
     bump(monkeypatch)
+    tables = ("model_certification", "certification_event", "promotion_event")
+    before = {t: rows(db, f"SELECT * FROM agb.{t} ORDER BY 1") for t in tables}
 
-    with pytest.raises(
-        registry.Refused, match=f"certified under cost model .*, superseded by {NEXT}"
-    ):
+    # The certification is stale and so refused; another model has none at all.
+    with pytest.raises(registry.Refused, match=f"the cost model is now {NEXT}"):
         promote(db, models)
+    with pytest.raises(registry.Refused, match="no certification of model nope"):
+        registry.promote(db.connect("cli"), "nope", source("promote"), models)
 
-    assert [(verb, outcome) for verb, _, outcome, *_ in commands(db)] == [
-        ("void_stale", "accepted"),
+    assert {t: rows(db, f"SELECT * FROM agb.{t} ORDER BY 1") for t in tables} == before
+    assert [(verb, outcome) for verb, _, outcome, *_ in commands(db)][-2:] == [
+        ("promote", "refused"),
         ("promote", "refused"),
     ]
+    assert "void_stale" not in [verb for verb, *_ in commands(db)]
 
 
 def test_the_cli_records_the_certification_the_operator_copied_in(db, models, monkeypatch, capsys):
@@ -924,3 +931,27 @@ def test_the_placeholder_ranker_is_gone():
         if "placeholder" in path.read_text().lower()
     ]
     assert mentions == []
+
+
+def test_a_ledger_with_a_null_start_time_is_refused_clearly_and_not_with_a_type_error(tmp_path):
+    window = {
+        "features": ("mom_12_1",), "train_start": date(2024, 1, 31),
+        "train_end": date(2025, 12, 31), "cost_model_version": "v1",
+    }  # fmt: skip
+    ledger = Ledger(tmp_path / "ledger.parquet")
+    for seed in (0, 1):
+        with ledger.trial("scan", {"seed": seed}, partition_hash="p", **window):
+            pass
+    table = pa.Table.from_pylist(ledger.rows(), schema=trials.SCHEMA)
+    kind = table.schema.field("started_at").type
+    dates = [None, *table["started_at"].to_pylist()[1:]]
+    undated = table.set_column(
+        table.column_names.index("started_at"), "started_at", pa.array(dates, type=kind)
+    )
+    path = tmp_path / trials.FILE
+    pq.write_table(undated, path)
+
+    assert registry.declared_trials_of(path, "rows") == 2
+    for rule in ("configurations", "started"):
+        with pytest.raises(registry.RegistryError, match="1 trials with no start time"):
+            registry.declared_trials_of(path, rule)

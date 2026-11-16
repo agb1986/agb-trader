@@ -10,10 +10,11 @@ operator then promotes it with `agb promote <model id>`, which refuses, and reco
 refusal as a refused command:
 
   * a model with no certification, or one that failed its gates;
-  * a voided certification. Promotion first voids every certification made under a cost
-    model the current one supersedes, as `agb void-stale` does, so a stale certification is
-    refused as voided. One made under a cost model this code does not know yet, by newer
-    research code, is refused but left for the release that brings it;
+  * a voided certification, or one made under a cost model other than the current one. A
+    refused promotion changes nothing; one that goes ahead first voids every certification
+    made under a cost model the current one supersedes, as `agb void-stale` does. One made
+    under a cost model this code does not know yet, by newer research code, is refused but
+    left for the release that brings it;
   * an artifact missing from the models directory, or one whose shipped ledger holds a
     number of trials other than the certification declared, or whose files or digest differ
     from the certification's;
@@ -48,6 +49,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
+from itertools import groupby
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -123,6 +125,12 @@ class Certification:
     waived_by: str | None
     waived_reason: str | None
 
+    def stale(self, current: str) -> str:
+        return (
+            f"model {self.model_id} was certified under cost model"
+            f" {self.cost_model_version}; the cost model is now {current}"
+        )
+
     def problem(self, current: str) -> str | None:
         """Why this certification cannot be live whatever its artifact, or None."""
         if self.voided_at is not None:
@@ -133,10 +141,7 @@ class Certification:
         if not self.passed:
             return f"model {self.model_id} failed certification"
         if self.cost_model_version != current:
-            return (
-                f"model {self.model_id} was certified under cost model"
-                f" {self.cost_model_version}; the cost model is now {current}"
-            )
+            return self.stale(current)
         return None
 
     def waiver(self, mode: str, current: str) -> str | None:
@@ -207,6 +212,10 @@ def live(conn: psycopg.Connection) -> Certification | None:
 # The artifact.
 
 
+def _started(row: dict) -> datetime:
+    return row["started_at"]
+
+
 def declared_trials_of(ledger: Path, rule: str) -> int:
     """How many trials the ledger at `ledger` holds, under `rule`.
 
@@ -228,6 +237,12 @@ def declared_trials_of(ledger: Path, rule: str) -> int:
     chain = [name for name in ("parent", "previous") if name in table.column_names]
     columns = ["trial_id", "status", "started_at", "finished_at", *_IDENTITY, *chain]
     rows = table.select(columns).to_pylist()
+    undated = sorted(str(row["trial_id"]) for row in rows if row["started_at"] is None)
+    if undated:
+        raise RegistryError(
+            f"the ledger holds {len(undated)} trials with no start time, such as"
+            f" {undated[0]}; the trials cannot be counted without when each began"
+        )
     ends = {row["trial_id"]: row["finished_at"] or row["started_at"] for row in rows}
     by_id = {row["trial_id"]: row for row in rows}
 
@@ -237,8 +252,20 @@ def declared_trials_of(ledger: Path, rule: str) -> int:
             and ends[other["trial_id"]] >= ends[row["trial_id"]]
         )
 
+    # A row is inside another when one that began strictly earlier ended no sooner. Sweeping the
+    # rows by start with the latest end of the earlier starts answers that for all of them in
+    # one pass, where asking every row of every other is quadratic.
+    nested: set = set()
+    latest = None
+    for _, tied in groupby(sorted(rows, key=lambda row: row["started_at"]), _started):
+        group = list(tied)
+        if latest is not None:
+            nested.update(r["trial_id"] for r in group if latest >= ends[r["trial_id"]])
+        group_end = max(ends[row["trial_id"]] for row in group)
+        latest = group_end if latest is None else max(latest, group_end)
+
     def inside(row: dict) -> bool:
-        return any(holds(o, row) for o in rows if o["trial_id"] != row["trial_id"])
+        return row["trial_id"] in nested
 
     counted = set()
     for row in rows:
@@ -429,10 +456,11 @@ def promote(
 ) -> str:
     """Make `model_id`'s certification the live model. The promotion is a `promote` command
     and a promotion_event naming it; a refusal is recorded too, and raised as Refused.
-    Stale certifications are voided first. `waive_for_paper` is the operator's reason for a
+    The refusal is decided first, on the certification as it stands, so a refused promotion
+    changes nothing but the refused command; only a promotion that goes ahead voids the stale
+    certifications. `waive_for_paper` is the operator's reason for a
     paper-only measurement waiver: it is refused outside paper mode, and refused for any
     certification whose problem is anything but the failed gate."""
-    void_stale(conn, source)
     args: dict[str, Any] = {"model_id": model_id}
     if waive_for_paper is not None:
         args["waive_for_paper"] = waive_for_paper
@@ -451,6 +479,7 @@ def promote(
     if why is not None or candidate is None:
         approval.record(conn, source, PROMOTE, args, why)
         raise Refused(why)
+    void_stale(conn, source)
     args |= {"certification_id": candidate.id, "artifact_sha256": candidate.artifact_sha256}
     with conn.transaction():
         command_id = approval.record(conn, source, PROMOTE, args)
@@ -502,8 +531,10 @@ def _refusal(
             return "a measurement waiver needs a reason"
         if candidate.passed:
             return f"model {model_id} passed certification and needs no waiver"
-        if candidate.voided_at is not None or candidate.cost_model_version != current:
+        if candidate.voided_at is not None:
             return candidate.problem(current)
+        if candidate.cost_model_version != current:
+            return candidate.stale(current)
     elif (why := candidate.problem(current)) is not None:
         return why
     if was is not None and was[0] == candidate.id:
