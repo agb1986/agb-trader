@@ -1,17 +1,20 @@
 """Static checks on the deployment files: acceptance criterion (g) of T01 and the Compose
 conventions every later ticket inherits."""
 
+import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 import yaml
 from conftest import ROOT
 
+from agb.research import certify
 from agb.roles import PASSWORD_VARS
 
 ONE_SHOT = {"migrate", "cli", "certification-import", "reconcile", "research"}
@@ -400,15 +403,31 @@ def test_research_runs_only_on_the_workstation_with_a_read_only_lake(resolved):
 # The remote commands promote.sh issues, with ssh replaced by a stub that logs the command it
 # was given instead of connecting. `test -e` answers no, so the artifact is shipped, imported
 # and promoted in one run, and the tar receiver drains its stdin so the sender sees no SIGPIPE.
+# The verification after the copy reads the digests it was sent on stdin and finds the files the
+# artifact lists, and nothing more.
 FAKE_SSH = """#!/usr/bin/env bash
 cmd=${!#}
 case $cmd in
 *"test -e"*) echo "$cmd" >> "$AGB_SSH_LOG"; exit 1 ;;
 true|*"test -d"*|*"test -x"*) echo "$cmd" >> "$AGB_SSH_LOG"; exit 0 ;;
 *"tar -xzf -"*) cat > /dev/null ;;
+*"sha256sum --check"*) cat > /dev/null ;;
+*"ls -A"*) echo "$cmd" >> "$AGB_SSH_LOG"; printf 'manifest.json\\nmodel.txt\\n'; exit 0 ;;
 esac
 echo "$cmd" >> "$AGB_SSH_LOG"
 """
+
+
+def write_artifact(root, model_id: str = "ranker-2026.1", payload: bytes = b"booster") -> Path:
+    """A certification artifact as far as promote.sh reads one: a manifest whose `files` map
+    gives every other file's digest."""
+    artifact = root / "certifications" / model_id
+    artifact.mkdir(parents=True, exist_ok=True)
+    (artifact / "model.txt").write_bytes(payload)
+    (artifact / "manifest.json").write_text(
+        json.dumps({"files": {"model.txt": hashlib.sha256(payload).hexdigest()}})
+    )
+    return artifact
 
 
 def promote(tmp_path, *args, reason: str = "") -> subprocess.CompletedProcess:
@@ -419,9 +438,7 @@ def promote(tmp_path, *args, reason: str = "") -> subprocess.CompletedProcess:
     ssh = bin_dir / "ssh"
     ssh.write_text(FAKE_SSH)
     ssh.chmod(0o755)
-    artifact = tmp_path / "certifications" / "ranker-2026.1"
-    artifact.mkdir(parents=True, exist_ok=True)
-    (artifact / "manifest.json").write_text("{}")
+    write_artifact(tmp_path)
     log = tmp_path / "ssh.log"
     log.write_text("")
     done = subprocess.run(
@@ -477,6 +494,196 @@ def test_a_waiver_without_a_reason_is_refused_before_anything_is_shipped(tmp_pat
     assert done.returncode == 1
     assert "a waiver needs a reason" in done.stderr
     assert done.stdout == "", "it refuses before it reaches the server"
+
+
+# promote.sh and certify each hold a model id pattern, and one has to refuse what the other does.
+# An id becomes a path on the server and an argument to tools that read a leading dash as an
+# option, so the dash and the dot are the cases that matter, and a newline is the one `$` lets by.
+MODEL_IDS = [
+    "ranker-2026.1",
+    "lgbm_2026-10",
+    "0",
+    "-ranker",
+    "--help",
+    ".ranker",
+    "..",
+    "ranker 1",
+    "ranker/1",
+    "ranker\n",
+    "",
+]
+
+
+@pytest.mark.parametrize("model_id", MODEL_IDS)
+def test_promote_and_certify_agree_on_what_a_model_id_is(tmp_path, model_id):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    ssh = bin_dir / "ssh"
+    ssh.write_text(FAKE_SSH)
+    ssh.chmod(0o755)
+    done = subprocess.run(
+        [str(ROOT / "scripts/deploy/promote.sh"), model_id, "check"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "AGB_SSH_LOG": str(tmp_path / "ssh.log"),
+            "AGB_RESEARCH_DIR": str(tmp_path),
+            "AGB_DEPLOY_HOST": "server.test",
+            "AGB_DEPLOY_DIR": "/deploy",
+        },
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    # An id it accepts goes on to look for the artifact, which this directory does not hold; one
+    # it refuses stops before that, and before it could reach the server.
+    refused = "is not a model id" in done.stderr
+    if model_id == "":
+        assert done.returncode == 2, "an empty id is a usage error"
+        return
+    assert done.returncode == 1, done.stderr
+    assert refused is (certify.MODEL_ID.fullmatch(model_id) is None), done.stderr
+    assert not (tmp_path / "ssh.log").exists(), "it never reached the server"
+
+
+def test_certify_refuses_an_id_that_starts_with_a_dash():
+    with pytest.raises(ValueError, match="model id"):
+        certify.Options(model_id="-ranker")
+    with pytest.raises(ValueError, match="model id"):
+        certify.Options(model_id="ranker\n")
+
+
+# A server that is a directory: ssh runs the command it is given in a local shell, so the
+# commands promote.sh sends for a copy, a rename and a check do what they would do there, under
+# a temporary directory. `AGB_FAKE_CUT` cuts the stream a tar receiver is sent short, which is
+# what a lost connection does. agb-stack records what it was asked and changes nothing: no model
+# is imported or promoted anywhere.
+FAKE_SERVER_SSH = """#!/usr/bin/env bash
+cmd=${!#}
+case $cmd in
+*"tar -xzf -"*)
+    if [ -n "${AGB_FAKE_CUT:-}" ]; then
+        head -c "$AGB_FAKE_CUT" | bash -c "$cmd"
+        exit 1
+    fi
+    ;;
+esac
+exec bash -c "$cmd"
+"""
+
+
+class Server:
+    """promote.sh against a directory standing in for the server."""
+
+    model = "ranker-2026.1"
+
+    def __init__(self, tmp_path):
+        self.root = tmp_path
+        self.deploy = tmp_path / "server" / "deploy"
+        self.models = self.deploy / "models"
+        self.deploy.mkdir(parents=True)
+        self.calls = tmp_path / "agb-stack.log"
+        self.calls.write_text("")
+        stack = self.deploy / "agb-stack"
+        stack.write_text(f'#!/usr/bin/env bash\necho "$*" >> {shlex.quote(str(self.calls))}\n')
+        stack.chmod(0o755)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        ssh = bin_dir / "ssh"
+        ssh.write_text(FAKE_SERVER_SSH)
+        ssh.chmod(0o755)
+        self.bin_dir = bin_dir
+        # Incompressible, so the stream is long enough to be cut part way through.
+        self.artifact = write_artifact(tmp_path, self.model, payload=os.urandom(1 << 16))
+
+    def run(self, command: str = "all", cut: int | None = None):
+        env = {
+            **os.environ,
+            "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
+            "AGB_RESEARCH_DIR": str(self.root),
+            "AGB_DEPLOY_HOST": "server.test",
+            "AGB_DEPLOY_DIR": str(self.deploy),
+        }
+        if cut is not None:
+            env["AGB_FAKE_CUT"] = str(cut)
+        return subprocess.run(
+            [str(ROOT / "scripts/deploy/promote.sh"), self.model, command],
+            cwd=ROOT,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def stack_calls(self) -> list[str]:
+        return self.calls.read_text().splitlines()
+
+    def held(self) -> list[str]:
+        return sorted(p.name for p in self.models.iterdir()) if self.models.exists() else []
+
+
+def test_a_rerun_after_an_interrupted_transfer_ships_the_whole_artifact(tmp_path):
+    server = Server(tmp_path)
+    cut = server.run(cut=400)
+    assert cut.returncode != 0
+    # Nothing is left under the model's name, and nothing else is left behind.
+    assert server.held() == []
+    assert not [call for call in server.stack_calls() if "import" in call]
+    # A leftover from a transfer that could not clean up after itself is cleared by the rerun.
+    (server.models / f".incoming.{server.model}.stale").mkdir()
+
+    done = server.run()
+    assert done.returncode == 0, done.stderr
+    assert "shipped " in done.stdout
+    assert server.held() == [server.model]
+    for name in ("manifest.json", "model.txt"):
+        assert (server.models / server.model / name).read_bytes() == (
+            server.artifact / name
+        ).read_bytes()
+    assert any(call.endswith(f"import {server.model}") for call in server.stack_calls())
+
+
+def test_a_copy_that_lost_a_file_is_not_treated_as_shipped(tmp_path):
+    """A copy made before the extraction was atomic can hold the manifest and not the file after
+    it; the manifest's digest is the same, and the old check called that shipped."""
+    server = Server(tmp_path)
+    assert server.run().returncode == 0
+    (server.models / server.model / "model.txt").unlink()
+    for command in ("all", "check"):
+        done = server.run(command)
+        assert "already shipped" not in done.stdout
+    assert "DOES NOT MATCH" in done.stdout
+    refused = server.run()
+    assert refused.returncode == 1
+    assert "does not match" in refused.stderr
+    assert not (server.models / server.model / "model.txt").exists(), "nothing was written over it"
+
+
+def test_a_copy_with_an_altered_or_extra_file_is_not_treated_as_shipped(tmp_path):
+    server = Server(tmp_path)
+    assert server.run().returncode == 0
+    copy = server.models / server.model
+    (copy / "model.txt").write_bytes(b"altered")
+    assert server.run().returncode == 1
+    (copy / "model.txt").write_bytes((server.artifact / "model.txt").read_bytes())
+    assert server.run().returncode == 0
+    (copy / "extra.bin").write_bytes(b"unlisted")
+    refused = server.run()
+    assert refused.returncode == 1
+    assert "holds files the manifest does not list" in refused.stderr
+
+
+def test_a_verified_copy_is_shipped_once(tmp_path):
+    server = Server(tmp_path)
+    first = server.run()
+    assert first.returncode == 0, first.stderr
+    again = server.run()
+    assert again.returncode == 0, again.stderr
+    assert "already shipped" in again.stdout
+    assert "every file verified" in server.run("check").stdout
 
 
 # ssh for sizing.sh: the `pgrep` call is run for real, through a shell that carries the pattern

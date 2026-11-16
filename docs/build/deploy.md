@@ -258,11 +258,21 @@ anything, including the waiver it is live under, if any. Neither `make agb` nor
 database, where no certification was ever imported, and the `research` service has no database
 at all. The steps by hand are:
 
-1. Copy the artifact directory, unchanged, to `models/<model id>/` in the deploy directory:
+1. Copy the artifact directory, unchanged, to `models/<model id>/` in the deploy directory.
+   `make promote` extracts it into a temporary directory beside the destination and renames
+   it into place, so an interrupted transfer leaves nothing under the model's name and a rerun
+   ships the whole artifact. It treats a copy already there as shipped only after checking, on
+   the server, the digest of every file the manifest lists and of the manifest itself, and that
+   nothing else is in the directory; a copy that does not match is refused, not completed or
+   replaced. By hand, copy to a temporary name and rename:
 
    ```sh
-   rsync -a research/certifications/<model id> <server>:/mnt/data/AppData/agb-trader/models/
+   rsync -a -- research/certifications/<model id>/ <server>:/mnt/data/AppData/agb-trader/models/.incoming.<model id>/
+   ssh <server> mv -T -- /mnt/data/AppData/agb-trader/models/.incoming.<model id> /mnt/data/AppData/agb-trader/models/<model id>
    ```
+
+   A model id starts with a letter or digit and holds only letters, digits, dot, dash and
+   underscore; `make promote` and `certify` refuse any other, a leading dash included.
 
 2. Record its certification, on the server:
 

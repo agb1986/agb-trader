@@ -75,8 +75,8 @@ def command(source: str, lake: Path, *, dry_run: bool = False) -> list[str]:
     if dry_run:
         argv.append("--dry-run")
     # A trailing slash on both sides copies the lake's contents into the directory, not the
-    # directory into it.
-    argv += [source.rstrip("/") + "/", str(lake).rstrip("/") + "/"]
+    # directory into it. `--` ends the options, so an operand is never read as one.
+    argv += ["--", source.rstrip("/") + "/", str(lake).rstrip("/") + "/"]
     return argv
 
 

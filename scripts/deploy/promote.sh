@@ -62,10 +62,15 @@ cd "$(git rev-parse --show-toplevel)"
 model=${1:-}
 [ -n "$model" ] || usage
 # The id becomes a path component on the server and a SQL literal below, so it is checked
-# rather than quoted: certify accepts nothing wider than this either.
-case $model in
-*[!A-Za-z0-9._-]* | .*) die "'$model' is not a model id; use letters, digits, dot, dash and underscore" ;;
-esac
+# rather than quoted. This is certify.MODEL_ID, the one pattern for a model id: a letter or
+# digit first, so an id cannot start with a dash (an option to the tools it reaches) or a dot
+# (a hidden directory), then letters, digits, dot, dash and underscore. bash's =~ anchors at
+# the end of the string, where Python's `$` also accepts a trailing newline, so certify matches
+# the whole string. tests/test_compose.py holds the two to the same answers.
+model_id='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+[[ $model =~ $model_id ]] ||
+    die "'$model' is not a model id; start with a letter or digit, then use letters, digits," \
+        "dot, dash and underscore"
 artifact="$research/certifications/$model"
 
 # The certification's own row on the server, and the model that is live there.
@@ -88,28 +93,69 @@ deployed() {
         die "nothing is deployed in $host:$dir yet; run make deploy first"
 }
 
-# The manifest's digest stands for the whole artifact: it lists every file's digest, and the
-# import verifies each file against it, so two equal manifests mean the same artifact.
-manifest_sha256() { sha256sum "$artifact/manifest.json" | cut -d' ' -f1; }
+# What the artifact is, as `sha256sum --check` reads it: the digest of every file the manifest
+# lists, and of the manifest itself. The manifest's own digest cannot stand for the rest, because
+# an interrupted transfer can leave the manifest and lose a file after it.
+expected() {
+    python3 -I - "$artifact/manifest.json" <<'PY'
+import hashlib, json, re, sys
+
+path = sys.argv[1]
+name_ok = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*").fullmatch
+digest_ok = re.compile(r"[0-9a-f]{64}").fullmatch
+files = json.load(open(path))["files"]
+for name, digest in sorted(files.items()):
+    if not name_ok(name) or not digest_ok(digest):
+        sys.exit(f"{path} lists {name!r}, which is not a plain file name with a sha256 digest")
+print(hashlib.sha256(open(path, "rb").read()).hexdigest() + "  manifest.json")
+for name, digest in sorted(files.items()):
+    print(f"{digest}  {name}")
+PY
+}
+
+# Whether the copy on the server is, file for file, the artifact here: every listed file
+# digests as the manifest says, and nothing else is in the directory. Says what is wrong on
+# stderr and returns 1 otherwise; it reads, and writes nothing.
+matches() {
+    local sums names there
+    sums=$(expected) || die "cannot read $artifact/manifest.json"
+    names=$(printf '%s\n' "$sums" | cut -d' ' -f3- | LC_ALL=C sort)
+    printf '%s\n' "$sums" |
+        remote "cd $(q "$models/$model") && sha256sum --check --strict --quiet" >&2 || return 1
+    there=$(remote "cd $(q "$models/$model") && ls -A" </dev/null | LC_ALL=C sort) || return 1
+    [ "$there" = "$names" ] || {
+        echo "promote: $host:$models/$model holds files the manifest does not list" >&2
+        return 1
+    }
+}
 
 ship() {
     if remote "test -e $(q "$models/$model")"; then
-        local there
-        there=$(remote "sha256sum $(q "$models/$model/manifest.json") 2>/dev/null | cut -d' ' -f1")
-        [ -n "$there" ] ||
-            die "$host:$models/$model exists but holds no manifest.json; remove it and rerun"
-        [ "$there" = "$(manifest_sha256)" ] ||
-            die "$host:$models/$model is a different artifact under the same model id; an" \
-                "imported certification is never replaced, so remove that copy by hand if it" \
-                "is the stale one"
-        echo "already shipped: $models/$model"
+        # Nothing here writes a half-copied artifact under this name: the copy below is
+        # extracted beside it and renamed. So a copy that does not match is not a transfer to
+        # resume, and the import never replaces a certification, so it is left for the
+        # operator to look at.
+        matches ||
+            die "$host:$models/$model does not match $artifact (see above); remove that copy" \
+                "by hand if it is the stale one, and rerun"
+        echo "already shipped: $models/$model, every file verified"
         return
     fi
     remote "mkdir -p $(q "$models")"
     # tar rather than scp: it keeps the mode and mtime of each file, and the artifact's
-    # digests are over contents the import reads back.
-    tar -cz -C "$research/certifications" -- "$model" | remote "tar -xzf - -C $(q "$models")"
-    echo "shipped $artifact to $host:$models/$model"
+    # digests are over contents the import reads back. It extracts into a directory beside the
+    # destination, on the same filesystem, and the rename is the only moment the model appears
+    # there: an interrupted transfer leaves nothing under the model's name, and the trap
+    # removes what it did leave, so a rerun starts clean. Leftovers from a transfer that could
+    # not clean up after itself (the connection lost, the server rebooted) are cleared first.
+    remote "rm -rf -- $(q "$models")/.incoming.$model.*"
+    tar -cz -C "$research/certifications" -- "$model" |
+        remote "set -eu; tmp=\$(mktemp -d $(q "$models")/.incoming.$model.XXXXXX);
+                trap 'rm -rf -- \"\$tmp\"' EXIT;
+                tar -xzf - -C \"\$tmp\";
+                mv -T -- \"\$tmp/$model\" $(q "$models/$model")"
+    matches || die "$host:$models/$model was copied but does not match $artifact (see above)"
+    echo "shipped $artifact to $host:$models/$model, every file verified"
 }
 
 record() {
@@ -140,12 +186,10 @@ check() {
     echo "artifact: $artifact"
     deployed
     if remote "test -e $(q "$models/$model")"; then
-        local there
-        there=$(remote "sha256sum $(q "$models/$model/manifest.json") 2>/dev/null | cut -d' ' -f1")
-        if [ "$there" = "$(manifest_sha256)" ]; then
-            echo "shipped: $host:$models/$model, the same artifact"
+        if matches; then
+            echo "shipped: $host:$models/$model, every file verified"
         else
-            echo "shipped: $host:$models/$model, a DIFFERENT artifact under this model id"
+            echo "shipped: $host:$models/$model, but it DOES NOT MATCH this artifact (see above)"
         fi
     else
         echo "not shipped yet: $host:$models/$model"
