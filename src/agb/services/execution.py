@@ -308,7 +308,7 @@ class Execution:
                 continue
             outcome = "interrupted before the submission returned"
             try:
-                execution.submit(conn, self.broker, basket, now)
+                execution.submit(conn, self.broker, basket, self.clock, end)
                 outcome = None
             except psycopg.Error:
                 raise

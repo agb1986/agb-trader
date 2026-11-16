@@ -19,6 +19,7 @@ from test_bot_commands import ET, blocks, say
 from test_execution import (
     CALENDAR,
     CLOSE_AT,
+    CUTOFF,
     NOW,
     Clock,
     alerts,
@@ -236,7 +237,9 @@ def test_approve_moves_the_basket_on_and_execution_submits_it(db, asks):
             "/approve 2026-10",
         )
     ]
-    submitted = execution.submit(db.connect("execution"), broker(), basket(db, basket_id), NOW)
+    submitted = execution.submit(
+        db.connect("execution"), broker(), basket(db, basket_id), lambda: NOW, CUTOFF
+    )
     assert submitted.state == "submitted"
 
 
