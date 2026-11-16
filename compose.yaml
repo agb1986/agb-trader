@@ -153,9 +153,12 @@ services:
       test: ["CMD", "python", "-m", "agb.heartbeat", "http://127.0.0.1:8080/"]
     mem_limit: 192m
 
-  # Takes the scheduler's nightly backup job and writes a dated pg_dump into the backup
-  # directory. It runs as the host user that owns that directory, so the dumps belong to the
-  # operator: `make up` and `agb-stack` both set AGB_BACKUP_USER to the caller's uid:gid.
+  # Takes the scheduler's nightly backup job, writes a dated pg_dump into the backup
+  # directory, and copies the panel store's new bodies into backups/panel/. It runs as the host
+  # user that owns that directory, so the dumps belong to the operator: `make up` and
+  # `agb-stack` both set AGB_BACKUP_USER to the caller's uid:gid. The panel bodies are mode
+  # 0600, so it must be the pipeline's user too, which both also set it to. It only reads the
+  # panel store.
   backup:
     <<: *app-image
     command: ["python", "-m", "agb.services.backup"]
@@ -167,8 +170,10 @@ services:
       AGB_HEARTBEAT_SECONDS: ${AGB_HEARTBEAT_SECONDS:-30}
       AGB_BACKUP_DIR: /backups
       AGB_BACKUP_KEEP: ${AGB_BACKUP_KEEP:-14}
+      AGB_PANEL_DIR: /panel
     volumes:
       - ${AGB_BACKUP_DIR:-./backups}:/backups
+      - ${AGB_PANEL_DIR:-./panel}:/panel:ro
     depends_on:
       migrate:
         condition: service_completed_successfully

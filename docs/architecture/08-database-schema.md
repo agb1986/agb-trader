@@ -168,7 +168,6 @@ Views: current basket state, open halt causes, audit log, shortfall, eligibility
 
 - Concrete DDL, the migration tool, indexes, poll intervals and lease durations, tuned against measured runs.
 - The CLI's full surface beyond the verbs named here (promote, level, mode, panel configuration).
-- Backup of the content-addressed panel store on `/mnt/data`, which follows whatever protects the lake.
 - The workstation-side tooling that produces the trial ledger. The contract is fixed; the tool is the open experiment-tracking item.
 
 ## Sources

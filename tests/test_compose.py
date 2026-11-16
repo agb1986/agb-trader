@@ -184,10 +184,25 @@ def test_nothing_with_the_broker_keys_shares_a_network_with_the_proxy(resolved):
 def test_backup_writes_to_a_host_directory_as_its_owner(resolved):
     backup = resolved["services"]["backup"]
     assert backup.get("user"), "the dumps must belong to the host user that owns the directory"
-    [volume] = backup["volumes"]
-    assert (volume["type"], volume["target"]) == ("bind", "/backups")
+    volumes = {v["target"]: (v["type"], v.get("read_only", False)) for v in backup["volumes"]}
+    assert volumes == {"/backups": ("bind", False), "/panel": ("bind", True)}
     assert backup["environment"]["AGB_BACKUP_DIR"] == "/backups"
+    assert backup["environment"]["AGB_PANEL_DIR"] == "/panel"
     assert backup["environment"]["PGUSER"] == "backup"
+
+
+def test_backup_reads_the_panel_store_the_pipeline_writes_as_the_same_user(resolved):
+    """The panel bodies are mode 0600 and belong to the pipeline's user, so the backup can copy
+    them only as that user, from the same host directory, which it may not change."""
+    backup, pipeline = (resolved["services"][name] for name in ("backup", "pipeline"))
+    [(source, read_only)] = [
+        (v["source"], v.get("read_only", False))
+        for v in backup["volumes"]
+        if v["target"] == "/panel"
+    ]
+    assert read_only
+    assert [v["source"] for v in pipeline["volumes"] if v["target"] == "/panel"] == [source]
+    assert backup["user"] == pipeline["user"]
 
 
 def test_pipeline_writes_the_lake_and_panel_store_to_host_directories_as_their_owner(resolved):

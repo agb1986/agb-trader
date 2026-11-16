@@ -65,6 +65,7 @@ def compose(tmp_path_factory, image_tag, lake_dir):
         "AGB_BACKUP_DIR": str(tmp_path_factory.mktemp("backups")),
         "AGB_BACKUP_USER": f"{os.getuid()}:{os.getgid()}",
         "AGB_LAKE_DIR": str(lake_dir),
+        "AGB_PANEL_DIR": str(tmp_path_factory.mktemp("panel")),
         "AGB_MODELS_DIR": str(tmp_path_factory.mktemp("models")),
         "AGB_PIPELINE_USER": f"{os.getuid()}:{os.getgid()}",
     }

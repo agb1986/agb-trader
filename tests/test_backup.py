@@ -1,7 +1,10 @@
 """The backup service: a dated dump for each night's job, retention, a missed or failed backup in
-the overdue view, and a real dump restored into a scratch database."""
+the overdue view, a real dump restored into a scratch database, the dumps' modes, and the panel
+store's mirror and its restore."""
 
 import gzip
+import os
+import stat
 import subprocess
 import threading
 import time
@@ -12,8 +15,10 @@ from conftest import SUPERUSER, create_database, drop_database
 from psycopg import errors, sql
 
 from agb import heartbeat, jobs, schedule
+from agb.panel_store import PanelStore, StoreError
 from agb.schedule import Expected, Planned
-from agb.services.backup import Backup, prune
+from agb.services import backup
+from agb.services.backup import Backup, copy_bodies, prune
 
 PERIOD = "2026-09-14"
 DUMP = f"agb-{PERIOD}.sql.gz"
@@ -271,3 +276,174 @@ def test_a_real_dump_restores_into_a_scratch_database(db, tmp_path, monkeypatch)
     assert restored == live
     assert live["agb.heartbeat"] == 2
     assert live["agb.job"] == 2
+
+
+def mode(path):
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+@pytest.fixture
+def loose_umask():
+    old = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(old)
+
+
+def test_a_dump_is_readable_by_its_owner_alone(db, tmp_path, loose_umask):
+    # A partial dump a crash left with the default mode is truncated, and its mode reset.
+    (tmp_path / f"{DUMP}.partial").write_bytes(b"left over")
+    (tmp_path / f"{DUMP}.partial").chmod(0o644)
+    old = seed_dumps(tmp_path, "2026-09-13")[0]
+    (tmp_path / old).chmod(0o644)
+    tmp_path.chmod(0o755)
+    plan_backup(db)
+
+    Backup(tmp_path, pg_dump=FAKE_DUMP)(db.connect("backup"))
+
+    assert backup_state(db) == "completed"
+    assert mode(tmp_path / DUMP) == 0o600
+    assert mode(tmp_path / old) == 0o600, "a dump written before the change is tightened"
+    assert mode(tmp_path) == 0o700
+
+
+@pytest.mark.parametrize("left_over", [False, True], ids=["new", "left-over-partial"])
+def test_dump_creates_its_file_with_mode_0600(tmp_path, loose_umask, left_over):
+    target = tmp_path / f"{DUMP}.partial"
+    if left_over:
+        target.write_bytes(b"left by a crash")
+        target.chmod(0o644)
+
+    backup.dump(FAKE_DUMP, target, DUMP)
+
+    assert mode(target) == 0o600
+    with gzip.open(target) as written:
+        assert written.read() == COMPLETE
+
+
+def test_prune_leaves_the_panel_mirror_alone(tmp_path):
+    seed_dumps(tmp_path, "2026-09-01", "2026-09-02")
+    (tmp_path / "panel" / "ab").mkdir(parents=True)
+
+    prune(tmp_path, 1)
+
+    assert names(tmp_path) == ["agb-2026-09-02.sql.gz", "panel"]
+    assert (tmp_path / "panel" / "ab").is_dir()
+
+
+@pytest.fixture
+def panel(tmp_path):
+    """A live panel store holding three bodies, and the backup directory beside it."""
+    store = PanelStore(tmp_path / "panel")
+    digests = [store.put(f"body {n}".encode()) for n in range(3)]
+    (tmp_path / "backups").mkdir()
+    return store, digests, tmp_path / "backups"
+
+
+def mirror_of(backups):
+    return PanelStore(backups / "panel")
+
+
+def test_a_night_backs_up_the_panel_store_and_its_restore_brings_back_a_deleted_body(
+    db, panel, loose_umask
+):
+    store, digests, backups = panel
+    plan_backup(db)
+
+    Backup(backups, pg_dump=FAKE_DUMP, panel=store.root)(db.connect("backup"))
+
+    assert backup_state(db) == "completed"
+    mirror = mirror_of(backups)
+    assert sorted(backup.bodies(mirror.root)) == sorted(digests)
+    for digest in digests:
+        assert mirror.get(digest) == store.get(digest)
+        assert mode(mirror.path(digest)) == 0o600
+    assert mode(mirror.root) == 0o700
+
+    lost = digests[1]
+    store.path(lost).unlink()
+    with pytest.raises(StoreError):
+        store.get(lost)
+
+    backup.main(["restore-panel", str(mirror.root), str(store.root)])
+
+    assert store.get(lost) == b"body 1"
+    assert sorted(backup.bodies(store.root)) == sorted(digests)
+
+
+def test_the_restore_replaces_a_corrupt_body_and_leaves_sound_ones(panel):
+    store, digests, backups = panel
+    copy_bodies(store.root, mirror_of(backups).root)
+    broken, sound = digests[0], digests[2]
+    store.path(broken).write_bytes(b"not zstd")
+    before = store.path(sound).stat().st_mtime_ns
+
+    done = copy_bodies(mirror_of(backups).root, store.root, replace_bad=True)
+
+    assert (done.copied, done.bad) == ([broken], [])
+    assert store.get(broken) == b"body 0"
+    assert store.path(sound).stat().st_mtime_ns == before
+
+
+def test_the_mirror_is_incremental_and_never_loses_a_good_body(panel):
+    store, digests, backups = panel
+    mirror = mirror_of(backups)
+    assert sorted(copy_bodies(store.root, mirror.root).copied) == sorted(digests)
+
+    # The live store loses one body, another goes bad, and a new one is written.
+    store.path(digests[0]).unlink()
+    store.path(digests[1]).write_bytes(b"bit rot")
+    new = store.put(b"body 3")
+    (store.root / new[:2] / f".{new}.123.tmp").write_bytes(b"a writer's temporary file")
+
+    done = copy_bodies(store.root, mirror.root)
+
+    assert (done.copied, done.bad) == ([new], [])
+    assert sorted(backup.bodies(mirror.root)) == sorted([*digests, new])
+    assert mirror.get(digests[0]) == b"body 0", "a body the live store lost stays"
+    assert mirror.get(digests[1]) == b"body 1", "a body gone bad live never overwrites its copy"
+
+
+def test_a_bad_live_body_is_skipped_and_the_night_still_completes(db, panel):
+    store, digests, backups = panel
+    store.path(digests[2]).write_bytes(b"truncated")
+    due = plan_backup(db)
+
+    Backup(backups, pg_dump=FAKE_DUMP, panel=store.root)(db.connect("backup"))
+
+    assert backup_state(db) == "completed"
+    assert late_backups(db, due + MINUTE) == []
+    assert sorted(backup.bodies(mirror_of(backups).root)) == sorted(digests[:2])
+
+
+def test_a_panel_store_that_cannot_be_read_fails_the_night_and_prunes_nothing(db, tmp_path):
+    before = seed_dumps(tmp_path, "2026-09-11", "2026-09-12", "2026-09-13")
+    due = plan_backup(db)
+
+    Backup(tmp_path, keep=1, pg_dump=FAKE_DUMP, panel=tmp_path / "missing")(db.connect("backup"))
+
+    assert backup_state(db) == "failed"
+    assert set(before) < set(names(tmp_path)), "the dump is still written, and nothing pruned"
+    [(failure,)] = (
+        db.connect("cli")
+        .execute("SELECT detail FROM agb.job_event WHERE event = 'failed'")
+        .fetchall()
+    )
+    assert failure.startswith("panel store:")
+    assert late_backups(db, due + MINUTE) == [(PERIOD,)]
+
+
+def test_a_failed_dump_still_backs_up_the_panel_store(db, panel):
+    store, digests, backups = panel
+    plan_backup(db)
+
+    Backup(backups, pg_dump=fake("exit 3"), panel=store.root)(db.connect("backup"))
+
+    assert backup_state(db) == "failed"
+    assert sorted(backup.bodies(mirror_of(backups).root)) == sorted(digests)
+
+
+def test_the_restore_refuses_a_missing_mirror(tmp_path):
+    with pytest.raises(SystemExit, match="no panel mirror"):
+        backup.main(["restore-panel", str(tmp_path / "nowhere"), str(tmp_path / "panel")])
