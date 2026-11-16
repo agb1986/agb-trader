@@ -42,7 +42,10 @@ Liquidation, straight after the latch. The bot opens the `liquidation` halt caus
 transaction as the operator's confirmation, so nothing new goes out; execution then cancels
 what a submitted basket has in flight, as a pause does, and calls the broker's close-all,
 which cancels every open order and closes every position at market. Its HTTP 207 answer is
-recorded symbol by symbol, failures included, and raised as an alert. `suspend_trade` is left
+recorded symbol by symbol, failures included, the moment it arrives, so a failure after that
+is retried from the record and never sends a second close-all; then it is written up as the
+confirmation's result and raised as an alert. The closing orders' fills are recorded like a
+basket's, so the next snapshot accounts for them. `suspend_trade` is left
 alone, since it would refuse the closing orders, and the `liquidation` cause stays open until
 `/resume`. A confirmation whose cause has been cleared before execution reached it is
 recorded as not carried out.
@@ -264,6 +267,15 @@ _ORDER_BY_BROKER_ID = """
     WHERE EXISTS (SELECT 1 FROM agb.order_event e
                   WHERE e.order_id = o.id AND e.broker_order_id = %s)
 """
+_LIQUIDATION_ORDER_BY_BROKER_ID = """
+    SELECT id FROM agb.liquidation_order WHERE broker_order_id = %s
+"""
+_INSERT_LIQUIDATION_FILL = """
+    INSERT INTO agb.liquidation_fill (order_id, execution_id, side, qty, price, filled_at,
+        sec_fee_usd, taf_fee_usd, cat_fee_usd, commission_usd, fee_model_version, actor)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (execution_id) DO NOTHING
+"""
 _EARLIEST_ORDER = "SELECT min(created_at) FROM agb.broker_order WHERE basket_id = %s"
 _SNAPSHOT = "SELECT id, observed_at FROM agb.position_snapshot WHERE snapshot_date = %s"
 _LAST_SNAPSHOT = """
@@ -287,6 +299,15 @@ _LIQUIDATION_PENDING = "SELECT id, actor, at FROM agb.liquidation_pending"
 _INSERT_RESULT = """
     INSERT INTO agb.liquidation (kind, follows, symbols, detail, actor)
     VALUES ('result', %s, %s, %s, %s)
+"""
+_INSERT_ANSWER = """
+    INSERT INTO agb.liquidation_order (confirm_id, symbol, status, broker_order_id, message,
+        actor)
+    VALUES (%s, %s, %s, %s, %s, %s)
+"""
+_ANSWER = """
+    SELECT symbol, status, broker_order_id, message FROM agb.liquidation_order
+    WHERE confirm_id = %s ORDER BY id
 """
 _HALTED_SINCE = """
     SELECT b.reference, e.at, e.reason
@@ -719,35 +740,43 @@ def _fees(side: str, qty: Decimal, price: Decimal) -> cost.Fees:
 
 def ingest_fills(conn: psycopg.Connection, broker: Broker, after: datetime) -> int:
     """Record every fill the account reports after `after` on an order this database knows,
-    one row each with the schedule's fees on it. Returns how many rows were new."""
+    one row each with the schedule's fees on it: a basket's order in `agb.fill`, a
+    liquidation's closing order in `agb.liquidation_fill`. Returns how many rows were new."""
     added = 0
-    known: dict[str, int | None] = {}
+    known: dict[str, tuple[str, int] | None] = {}
     for fill in broker.fills(after):
         if fill.order_id not in known:
-            row = conn.execute(_ORDER_BY_BROKER_ID, (fill.order_id,)).fetchone()
-            known[fill.order_id] = row[0] if row else None
-        order_id = known[fill.order_id]
-        if order_id is None:
+            known[fill.order_id] = _known_order(conn, fill.order_id)
+        order = known[fill.order_id]
+        if order is None:
             continue
+        kind, order_id = order
         fees = _fees(fill.side, fill.qty, fill.price)
-        done = conn.execute(
-            _INSERT_FILL,
-            (
-                order_id,
-                fill.id,
-                fill.qty,
-                fill.price,
-                fill.at,
-                fees.sec,
-                fees.taf,
-                fees.cat,
-                fees.commission,
-                cost.CURRENT.version,
-                ACTOR,
-            ),
-        )
+        charged = (fees.sec, fees.taf, fees.cat, fees.commission, cost.CURRENT.version, ACTOR)
+        if kind == ORDER:
+            done = conn.execute(
+                _INSERT_FILL,
+                (order_id, fill.id, fill.qty, fill.price, fill.at, *charged),
+            )
+        else:
+            side = "sell" if fill.side.startswith("sell") else "buy"
+            done = conn.execute(
+                _INSERT_LIQUIDATION_FILL,
+                (order_id, fill.id, side, fill.qty, fill.price, fill.at, *charged),
+            )
         added += done.rowcount
     return added
+
+
+def _known_order(conn: psycopg.Connection, broker_order_id: str) -> tuple[str, int] | None:
+    """Which recorded order a broker order id is: a basket's or a liquidation's, or neither."""
+    row = conn.execute(_ORDER_BY_BROKER_ID, (broker_order_id,)).fetchone()
+    if row is not None:
+        return ORDER, row[0]
+    row = conn.execute(_LIQUIDATION_ORDER_BY_BROKER_ID, (broker_order_id,)).fetchone()
+    if row is not None:
+        return LIQUIDATION, row[0]
+    return None
 
 
 def reconcile(conn: psycopg.Connection, broker: Broker, basket: Basket, now: datetime) -> Outcome:
@@ -923,9 +952,9 @@ def apply_latch(
     conn: psycopg.Connection, broker: Broker, calendar: nyse.NyseCalendar, now: datetime
 ) -> int:
     """Carry each waiting pause and resume to the broker, oldest first, and raise its
-    confirmation. A broker error raises a `latch_failed` alert once per command and stops,
-    leaving that command and those after it for the next cycle. Returns how many were
-    carried."""
+    confirmation. A broker error, or a basket that moves under the pause's cancel, raises a
+    `latch_failed` alert once per command and stops, leaving that command and those after it
+    for the next cycle. Returns how many were carried."""
     done = 0
     for command in pending_latch(conn):
         wanted = command.verb == PAUSE
@@ -933,7 +962,7 @@ def apply_latch(
             left = cancel_in_flight(conn, broker, calendar, now) if wanted else []
             broker.suspend(wanted)
             observed, _ = record_state(conn, broker)
-        except AlpacaError as exc:
+        except (AlpacaError, ExecutionError) as exc:
             raise_alert(
                 conn,
                 LATCH_FAILED,
@@ -1007,13 +1036,17 @@ def apply_liquidation(
     conn: psycopg.Connection, broker: Broker, calendar: nyse.NyseCalendar, now: datetime
 ) -> int:
     """Carry each confirmed liquidation to the broker and record its answer symbol by symbol.
-    A broker error raises a `liquidation_failed` alert once per confirmation and stops,
-    leaving it for the next cycle. Returns how many were carried."""
+    The answer is recorded the moment the broker gives it, so a failure after that is retried
+    from the record and never sends a second close-all. A broker error, or a basket that
+    moves under the cancel, raises a `liquidation_failed` alert once per confirmation and
+    stops, leaving it for the next cycle. Returns how many were carried."""
     done = 0
     for confirmed in pending_liquidation(conn):
         subject = f"liquidation {confirmed.id}"
         period = confirmed.at.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-        if LIQUIDATION not in open_halts(conn):
+        closed = answer(conn, confirmed.id)
+        left: list[str] = []
+        if not closed and LIQUIDATION not in open_halts(conn):
             body = (
                 f"LIQUIDATION by {confirmed.actor} at {_at(confirmed.at)}: not carried out, "
                 "the liquidation cause was cleared before execution reached it\n"
@@ -1025,21 +1058,23 @@ def apply_liquidation(
             log.warning("liquidation %d: cause cleared, not carried out", confirmed.id)
             done += 1
             continue
-        try:
-            left = cancel_in_flight(conn, broker, calendar, now)
-            closed = broker.close_all()
-        except AlpacaError as exc:
-            raise_alert(
-                conn,
-                LIQUIDATION_FAILED,
-                subject,
-                period,
-                f"LIQUIDATION by {confirmed.actor} at {_at(confirmed.at)} could not reach the "
-                f"broker: {exc}\nhalt cause liquidation: open. Execution tries again each "
-                "cycle; /resume clears the cause and stops it.",
-            )
-            log.error("liquidation %d: %s", confirmed.id, exc)
-            return done
+        if not closed:
+            try:
+                left = cancel_in_flight(conn, broker, calendar, now)
+                closed = broker.close_all()
+            except (AlpacaError, ExecutionError) as exc:
+                raise_alert(
+                    conn,
+                    LIQUIDATION_FAILED,
+                    subject,
+                    period,
+                    f"LIQUIDATION by {confirmed.actor} at {_at(confirmed.at)} could not reach "
+                    f"the broker: {exc}\nhalt cause liquidation: open. Execution tries again "
+                    "each cycle; /resume clears the cause and stops it.",
+                )
+                log.error("liquidation %d: %s", confirmed.id, exc)
+                return done
+            record_answer(conn, confirmed.id, closed)
         halted = conn.execute(_HALTED_SINCE, (SURFACE, confirmed.at)).fetchall()
         left = [f"basket {ref} halted at {_at(at)}: {why}" for ref, at, why in halted] + left
         body = _liquidation_text(confirmed, closed, left)
@@ -1063,3 +1098,19 @@ def apply_liquidation(
         )
         done += 1
     return done
+
+
+def record_answer(conn: psycopg.Connection, confirm_id: int, closed: Sequence[Closed]) -> None:
+    """Record the broker's close-all answer for a confirmation, one row per symbol, in one
+    transaction. Its closing orders are what `ingest_fills` later records fills against."""
+    with conn.transaction(), conn.cursor() as cur:
+        cur.executemany(
+            _INSERT_ANSWER,
+            [(confirm_id, c.symbol, c.status, c.order_id, c.message, ACTOR) for c in closed],
+        )
+
+
+def answer(conn: psycopg.Connection, confirm_id: int) -> list[Closed]:
+    """The close-all answer recorded for a confirmation, in the broker's order; empty if the
+    broker has not answered it, or answered that there was nothing to close."""
+    return [Closed(*row) for row in conn.execute(_ANSWER, (confirm_id,)).fetchall()]
