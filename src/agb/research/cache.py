@@ -68,7 +68,7 @@ ENTRY = "entry.json"  # written last: its presence is what marks an entry comple
 SCORES = "scores.parquet"
 # What an entry holds and how its key is built. Bump it for any change to either, and every
 # entry written before the change misses rather than being read under the new rules.
-FORMAT = 2  # 2: a backtest's monthly rows carry the benchmark's return (issue #167)
+FORMAT = 3  # 3: the first month carries the first basket's fees (issue #168)
 KINDS = ("cpcv", "backtest", "path")
 _DIGITS = 32  # of the key's digest, which names the entry's directory
 _SCORES_SCHEMA = pa.schema([

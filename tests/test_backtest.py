@@ -224,16 +224,21 @@ def test_the_cost_multiple_scales_every_charge(research_panel, research_lake, le
 # Delisting ------------------------------------------------------------------------------------
 
 
-def test_a_delisted_name_is_traded_and_exited_at_its_last_print(tmp_path, ledger, monkeypatch):
+@pytest.mark.parametrize("delisting_return", [backtest.DELISTING_RETURN, 0.0])
+def test_a_delisted_name_is_traded_and_exited_at_its_last_print(
+    tmp_path, ledger, monkeypatch, delisting_return
+):
     """A name whose bars stop mid-panel is bought like any other, then sold on its last listed
-    session at that session's close, and the report counts the exit."""
+    session at that session's close less the delisting return, and the report counts the exit
+    and what the return took (issue #168). The fee is the cost model's on the print's
+    notional: the return is a loss on the shares, not a cost of trading them."""
     root = (
         Market(tmp_path / "lake").names(12).name("DEL", drift=0.004, until=date(2024, 9, 15)).land()
     )
     panel = panel_module.build(root, PANEL_START, date(2025, 3, 31))
     captured: list = []
     capturing(monkeypatch, captured)
-    options = backtest.Options(**SMALL)
+    options = backtest.Options(delisting_return=delisting_return, **SMALL)
 
     run = backtest.run(panel, options, ledger, lake_dir=root)
 
@@ -246,13 +251,26 @@ def test_a_delisted_name_is_traded_and_exited_at_its_last_print(tmp_path, ledger
         [(last, close)] = conn.execute(
             "SELECT date, closeadj FROM sep WHERE ticker = 'DEL' ORDER BY date DESC LIMIT 1"
         ).fetchall()
+        rows = conn.execute(
+            "SELECT high, low, close, volume FROM ("
+            "  SELECT * FROM sep WHERE ticker = 'DEL' ORDER BY date DESC LIMIT ?"
+            ") ORDER BY date",
+            [backtest.LIQUIDITY_BARS],
+        ).fetchall()
     assert last == date(2024, 9, 13), "the fake's last session on or before the cutoff"
-    assert fills[-1].side is cost.Side.SELL
-    assert (fills[-1].day, fills[-1].price) == (last, pytest.approx(close))
-    assert fills[-1].qty == sum(f.qty if f.side is cost.Side.BUY else -f.qty for f in fills[:-1])
-    assert fills[-1].fee > 0, "the exit is costed like any fill"
+    exit_ = fills[-1]
+    assert exit_.side is cost.Side.SELL
+    assert (exit_.day, exit_.price) == (last, pytest.approx(close * (1 + delisting_return)))
+    assert exit_.qty == sum(f.qty if f.side is cost.Side.BUY else -f.qty for f in fills[:-1])
+    liquidity = cost.liquidity(*(list(column) for column in zip(*rows, strict=True)))
+    priced = cost.trade_cost(cost.Side.SELL, exit_.qty * close, exit_.qty, liquidity)
+    assert exit_.fee == pytest.approx(priced.total_usd, abs=0.005), "costed like any fill"
+    assert exit_.delisting == pytest.approx(exit_.qty * close * -delisting_return, abs=0.005)
     assert "DEL" not in simulation.positions
     assert run.results["delisting_exits"] == 1
+    assert run.results["delisting_return"] == delisting_return
+    assert run.results["delisting_loss"] == pytest.approx(exit_.delisting)
+    assert run.results["fees_paid"] == pytest.approx(sum(f.fee for f in simulation.fills))
     assert not any(fill.ticker == "DEL" for fill in simulation.fills if fill.day > last)
     assert all(day <= last for day in (fill.day for fill in fills))
     # The exit is on a session that is not a trade session, and the report still balances.
@@ -260,6 +278,87 @@ def test_a_delisted_name_is_traded_and_exited_at_its_last_print(tmp_path, ledger
     assert run.results["final_value"] == pytest.approx(
         options.init_cash * (1 + run.results["total_return"])
     )
+
+
+def test_a_name_whose_bars_stop_before_the_trade_session_is_planned_and_goes_unfilled(
+    tmp_path, ledger, monkeypatch
+):
+    """Tradeability is read from the signal session alone, as live reads it: a name that
+    prints at the signal close and never again is selected like any other, its buy finds no
+    print at the trade session and goes unfilled, and the name below it is not bought in its
+    place, because nothing known at the signal said it would not trade (issue #168)."""
+    months = forced_panel(tmp_path / "plain")[0].months
+    root = (
+        Market(tmp_path / "lake")
+        .names(12)
+        .name("GONE", drift=0.0005, until=months[1].snapshot_date)
+        .land()
+    )
+    panel = panel_module.build(root, PANEL_START, FORCED_END)
+    assert panel.months == months
+    picks = [
+        ["N01", "N02", "N03"],
+        ["GONE", "N04", "N05", "N06"],
+        ["N04", "N05", "N06"],
+    ]
+    captured: list = []
+    capturing(monkeypatch, captured)
+
+    run = backtest.run(
+        panel, backtest.Options(**SMALL), ledger, lake_dir=root, scores=by_hand(panel, picks)
+    )
+
+    _, simulation = captured[0]
+    assert not [fill for fill in simulation.fills if fill.ticker == "GONE"]
+    bought = [ticker for ticker, side in traded_on(simulation, months[1].entry) if side == "BUY"]
+    assert bought == ["N04", "N05"], "the slot is left in cash, not filled from below"
+    assert run.results["unfilled"] == 1
+    assert run.results["delisting_exits"] == 0, "never held, so never exited"
+
+
+def test_per_share_fees_count_the_shares_as_traded(tmp_path, ledger, monkeypatch):
+    """The engine trades adjusted shares at adjusted prices, so its equity curve is the
+    adjusted one; the per-share fees count the shares live would have sent at the as-traded
+    price. A name that has split 4:1 since printed at four times its adjusted close, so its
+    sell pays TAF and CAT on a quarter of the engine's shares, and nothing else moves."""
+    picks = [["SPL", "N01", "N02"], ["N01", "N02", "N03"], ["N01", "N02", "N03"]]
+    runs = {}
+    for as_traded in (1.0, 4.0):
+        root = (
+            Market(tmp_path / str(as_traded))
+            .names(12)
+            .name("SPL", drift=0.0005, as_traded=as_traded)
+            .land()
+        )
+        panel = panel_module.build(root, PANEL_START, FORCED_END)
+        captured: list = []
+        capturing(monkeypatch, captured)
+        backtest.run(
+            panel, backtest.Options(**SMALL), ledger, lake_dir=root, scores=by_hand(panel, picks)
+        )
+        runs[as_traded] = (root, panel, captured[0][1])
+
+    root, panel, simulation = runs[4.0]
+    [sold] = [f for f in simulation.fills if f.ticker == "SPL" and f.side is cost.Side.SELL]
+    month = next(month for month in panel.months if month.entry == sold.day)
+    with lake.connect(root) as conn:
+        rows = conn.execute(
+            "SELECT high, low, close, volume FROM ("
+            "  SELECT * FROM sep WHERE ticker = 'SPL' AND date <= ? ORDER BY date DESC LIMIT ?"
+            ") ORDER BY date",
+            [month.snapshot_date, backtest.LIQUIDITY_BARS],
+        ).fetchall()
+    liquidity = cost.liquidity(*(list(column) for column in zip(*rows, strict=True)))
+    notional = sold.qty * sold.price
+    as_traded = cost.trade_cost(cost.Side.SELL, notional, sold.qty / 4, liquidity)
+    adjusted = cost.trade_cost(cost.Side.SELL, notional, sold.qty, liquidity)
+    assert sold.fee == pytest.approx(as_traded.total_usd, abs=0.005)
+    assert as_traded.fees.taf < adjusted.fees.taf, "the test can tell the two apart"
+    plain = runs[1.0][2]
+    assert [(f.day, f.ticker, f.side, f.qty, f.price) for f in plain.fills] == [
+        (f.day, f.ticker, f.side, f.qty, f.price) for f in simulation.fills
+    ], "the same trades at the same adjusted prices"
+    assert sum(f.fee for f in simulation.fills) < sum(f.fee for f in plain.fills)
 
 
 # Forced corporate events ----------------------------------------------------------------------
@@ -514,8 +613,11 @@ def test_the_report_has_gross_and_net_turnover_participation_and_start_dates(
     assert all(month["gross"] >= month["net"] for month in results["monthly"])
     assert any(month["gross"] > month["net"] for month in results["monthly"])
     compounded = float(np.prod([1 + month["net"] for month in results["monthly"]])) - 1
-    # The first rebalance's fees come off before the first month's return is measured.
-    assert 0 < compounded - results["total_return"] < results["fees_fraction"]
+    # The first month is marked from the starting cash, so it carries the first basket's fees
+    # and the months compound to the run's return (issue #168).
+    assert compounded == pytest.approx(results["total_return"])
+    assert sum(month["fees"] for month in results["monthly"]) == pytest.approx(results["fees_paid"])
+    assert results["monthly"][0]["fees"] > 0
     assert results["final_value"] == pytest.approx(
         REFERENCE.init_cash * (1 + results["total_return"])
     )
@@ -723,8 +825,18 @@ def test_each_combinatorial_path_is_reported_for_the_gates(research_panel, resea
         assert {"participation_max", "delisting_exits", "orders", "fees_paid"} <= set(path)
         assert len(path["monthly"]) == 6
         assert all(
-            set(month) == {"as_of", "net", "gross", "benchmark"} for month in path["monthly"]
+            set(month) == {"as_of", "net", "gross", "fees", "benchmark"}
+            for month in path["monthly"]
         )
+        # The first month runs from the starting cash, so it carries the first basket's fees,
+        # the months compound to the run's return and their fees add up to what it paid
+        # (issue #168).
+        monthly = path["monthly"]
+        assert np.prod([1 + month["net"] for month in monthly]) == pytest.approx(
+            1 + path["total_return"]
+        )
+        assert sum(month["fees"] for month in monthly) == pytest.approx(path["fees_paid"])
+        assert monthly[0]["fees"] > 0 and monthly[0]["gross"] > monthly[0]["net"]
     # Each month's benchmark return runs over the same two sessions as the book's, from that
     # month's entry to the next one's and from the last entry to the final exit, so the gates
     # can subtract the one from the other month by month (issue #167).
@@ -801,6 +913,7 @@ def test_a_backtest_is_a_trial_that_reproduces(research_panel, research_lake, le
             "init_cash": 1e6,
             "cost_multiple": 1.0,
             "starts": ["2024-04-01"],
+            "delisting_return": backtest.DELISTING_RETURN,
         }
     }
     assert (row["train_start"], row["train_end"]) == (date(2024, 1, 31), date(2024, 6, 28))
