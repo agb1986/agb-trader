@@ -14,7 +14,8 @@ import psycopg
 import pyarrow as pa
 import pytest
 import registry_fake
-from market_fake import Market
+from account_fake import read_book
+from market_fake import SIGNAL, TRADE, Market
 from panel_fake import FakePanel
 from psycopg import errors
 from sharadar_fake import sample, sep_row, status
@@ -520,6 +521,7 @@ def run_at(db, root, at, **kwargs):
 def test_a_rebalance_gated_past_its_cutoff_fails_once_with_an_alert(db, tmp_path):
     plan_rebalance(db)
     root = market(tmp_path).land()
+    read_book(db, SIGNAL)
 
     run_at(db, root, LATE)
 
@@ -563,6 +565,7 @@ def test_a_rerun_gated_past_its_cutoff_alerts_once_and_the_cycle_carries_on(
     claimed = "SELECT count(*) FROM agb.job_event WHERE event = 'claimed'"
     [(before,)] = cli_rows(db, claimed)
     rerun_cutoff = datetime(2026, 10, 2, 19, 45, tzinfo=UTC)
+    read_book(db, TRADE)
 
     with caplog.at_level(logging.ERROR, logger="agb.services.pipeline"):
         run_at(db, root, rerun_cutoff, clock=lambda: NEXT_MORNING)

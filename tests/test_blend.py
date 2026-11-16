@@ -11,7 +11,7 @@ from datetime import UTC, date, datetime, timedelta
 import psycopg
 import pytest
 from edgar_fake import AS_OF, client
-from market_fake import SECTOR, SIGNAL, Market
+from market_fake import SECTOR, SIGNAL, TRADE, Market
 from panel_fake import FakePanel
 from test_basket import EVENING, plan_rebalance, rows, run
 from test_execution import CALENDAR
@@ -226,13 +226,14 @@ def test_the_shadow_basket_holds_its_own_names_and_is_never_traded(db, tmp_path)
     run(
         db,
         market(tmp_path / "m2", end=NEXT_SIGNAL).land(),
+        read=NEXT_SIGNAL,
         runner=second,
         clock=lambda: NEXT_EVENING,
     )
 
     assert len(second.calls) == 1
     # Nothing has filled, so the traded book is still empty and month 2 buys everything.
-    assert basket.book(db.connect("pipeline")) == {}
+    assert basket.book(db.connect("pipeline"), NEXT_SIGNAL) == {}
     assert [h for _, h, _ in targets(db, LIVE)] == [False] * SIZE
     # The shadow book is month 1's shadow, so month 2's shadow carries those names through.
     assert basket.shadow_book(db.connect("pipeline")).keys() == held
@@ -325,7 +326,7 @@ def test_a_rerun_of_a_blended_basket_is_gated_and_flagged_as_one(db, tmp_path):
     source = approval.Source("ada", "cli", "agb rerun 2026-10")
     approval.request_rerun(db.connect("cli"), "2026-10", source, LATE + MINUTE, CALENDAR)
 
-    run(db, root, runner=fake, clock=lambda: NEXT_MORNING)
+    run(db, root, read=TRADE, runner=fake, clock=lambda: NEXT_MORNING)
 
     [(rerun,)] = rows(db, "SELECT id FROM agb.basket WHERE reference = '2026-10r1'")
     panel_of = "SELECT panel_config_id, panel_run_id, panel_w FROM agb.basket WHERE id = %s"

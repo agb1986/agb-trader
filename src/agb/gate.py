@@ -38,7 +38,8 @@ The gate itself is not part of the ladder: it runs, and halts what fails, at eve
 
 Equity is the capital the basket was sized against until execution reads the broker's
 account; that source changes later and the checks do not. The book is `basket.book`: the
-positions the broker reported at its last read, not what any basket was planned to hold.
+positions the broker reported at its last read, not what any basket was planned to hold, and
+a read older than the basket's signal session is `basket.NotReady` rather than a book.
 
 The gate is safe to redo. It runs once per basket, in one transaction with its verdict, and
 a rebalance job reclaimed after the gate ran reads the recorded verdict back.
@@ -609,7 +610,7 @@ def run(
             target,
             members=members,
             marks=marks,
-            book=basket.book(conn),
+            book=basket.book(conn, basket.signal_session(target.session_date, calendar)),
             now=now,
             promoted=Promoted(*live) if live is not None else None,
             held=Held(*anchor) if anchor is not None else None,
