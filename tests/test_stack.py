@@ -1,12 +1,16 @@
 """The whole stack, end to end: acceptance criteria (a), (b) and (c) of T01.
 
 Builds the app image and brings the stack up under a Compose project name unique to this
-worktree, with the committed example env files, then tears it down with its volume.
+worktree, with the committed example env files and a free port for the UI, so it runs beside
+a local stack that holds 127.0.0.1:8080. It tears the project down with its volume when the
+tests finish, fail, are interrupted with Ctrl-C or are terminated with SIGTERM.
 """
 
 import http.client
 import os
 import shutil
+import signal
+import socket
 import subprocess
 import time
 from datetime import date
@@ -19,6 +23,13 @@ from agb import lake
 
 pytestmark = pytest.mark.stack
 
+# The services that write a heartbeat, so the ones `agb status` lists. The bot only runs with
+# the telegram profile, and db and migrate write no heartbeat.
+BEATING = ("scheduler", "ui", "backup", "pipeline", "execution")
+# Short enough that a stopped service reads as stale inside a test's patience; the heartbeat
+# interval is one second.
+STALE_AFTER_SECONDS = 10
+
 
 @pytest.fixture(scope="module")
 def image_tag():
@@ -28,6 +39,13 @@ def image_tag():
 @pytest.fixture(scope="module")
 def lake_dir(tmp_path_factory):
     return tmp_path_factory.mktemp("lake")
+
+
+def free_port() -> int:
+    """A port nothing listens on at this moment, which Compose publishes the UI on."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
 
 
 @pytest.fixture(scope="module")
@@ -40,7 +58,10 @@ def compose(tmp_path_factory, image_tag, lake_dir):
         **os.environ,
         "AGB_ENV_DIR": str(env_dir),
         "AGB_IMAGE_TAG": project,
+        "AGB_EXPECTED_SERVICES": " ".join(BEATING),
         "AGB_HEARTBEAT_SECONDS": "1",
+        "AGB_STALE_AFTER_SECONDS": str(STALE_AFTER_SECONDS),
+        "AGB_UI_PORT": str(free_port()),
         "AGB_BACKUP_DIR": str(tmp_path_factory.mktemp("backups")),
         "AGB_BACKUP_USER": f"{os.getuid()}:{os.getgid()}",
         "AGB_LAKE_DIR": str(lake_dir),
@@ -58,17 +79,34 @@ def compose(tmp_path_factory, image_tag, lake_dir):
     def run(*args, check=True):
         return subprocess.run([*base, *args], env=env, check=check, capture_output=True, text=True)
 
-    run("down", "--volumes", "--remove-orphans")
+    def terminated(signum, frame):
+        raise KeyboardInterrupt
+
+    # pytest's own handler covers Ctrl-C; a SIGTERM would otherwise end the process with the
+    # project still up.
+    previous = signal.signal(signal.SIGTERM, terminated)
     try:
+        run("down", "--volumes", "--remove-orphans")
         up = run("up", "--detach", "--build", "--wait", check=False)
         assert up.returncode == 0, up.stderr[-4000:]
         yield run
     finally:
-        run("down", "--volumes", "--remove-orphans", check=False)
+        signal.signal(signal.SIGTERM, previous)
+        # An interrupt that arrives during this call must not leave the project behind.
+        try:
+            run("down", "--volumes", "--remove-orphans", check=False)
+        except KeyboardInterrupt:
+            run("down", "--volumes", "--remove-orphans", check=False)
+            raise
+
+
+def status(run) -> subprocess.CompletedProcess:
+    """`agb status` in the cli container, which exits 1 when an expected service is stale."""
+    return run("run", "--rm", "cli", "status", check=False)
 
 
 def status_line(run, service) -> list[str]:
-    out = run("run", "--rm", "cli", "status").stdout
+    out = status(run).stdout
     [line] = [line for line in out.splitlines() if line.split()[:1] == [service]]
     return line.split()
 
@@ -77,10 +115,8 @@ def test_one_command_brings_up_the_database_and_the_services(compose):
     ps = compose("ps", "--all", "--format", "{{.Service}} {{.State}} {{.ExitCode}}").stdout
     states = dict(line.split(" ", 1) for line in ps.splitlines())
     assert states["db"].startswith("running")
-    assert states["scheduler"].startswith("running")
-    assert states["backup"].startswith("running")
-    assert states["pipeline"].startswith("running")
-    assert states["execution"].startswith("running")
+    for service in BEATING:
+        assert states[service].startswith("running"), (service, states[service])
     assert states["migrate"] == "exited 0"
 
 
@@ -101,7 +137,7 @@ def test_duckdb_queries_the_lake_inside_the_pipeline_container(compose, lake_dir
     assert out == "n\tlatest\n3\t2026-09-14\n"
 
 
-@pytest.mark.parametrize("service", ["scheduler", "backup", "pipeline", "execution"])
+@pytest.mark.parametrize("service", BEATING)
 def test_cli_lists_the_heartbeat_and_it_advances(compose, service):
     first = status_line(compose, service)
     assert first[1] != "never", first
@@ -114,6 +150,14 @@ def test_cli_lists_the_heartbeat_and_it_advances(compose, service):
 def test_heartbeat_reports_the_image_version(compose, image_tag):
     # The image is built with AGB_VERSION set to its tag, and the scheduler reports it.
     assert status_line(compose, "scheduler")[-1] == image_tag
+
+
+def test_agb_status_reports_every_service_and_passes(compose):
+    result = status(compose)
+    assert result.returncode == 0, result.stdout + result.stderr
+    listed = [line.split()[0] for line in result.stdout.splitlines()[1:]]
+    for service in BEATING:
+        assert service in listed, result.stdout
 
 
 # Issue #170. Opens a connection to an outside address by number, so no name has to resolve,
@@ -165,3 +209,26 @@ def test_the_ui_answers_on_the_loopback_address(compose):
         assert connection.getresponse().status == 200
     finally:
         connection.close()
+    # The landing page itself, not only the routing table that answers a HEAD.
+    connection = http.client.HTTPConnection(host, int(port), timeout=10)
+    try:
+        connection.request("GET", "/", headers={"Host": "127.0.0.1:8080"})
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.read()
+    finally:
+        connection.close()
+
+
+# Last in the module, because it stops a service the tests above need. It shows that the
+# assertions above can fail: with one service's process gone its heartbeat goes stale and
+# `agb status` exits 1 and names it.
+def test_stopping_a_service_makes_agb_status_fail(compose):
+    compose("stop", "pipeline")
+    deadline = time.monotonic() + STALE_AFTER_SECONDS + 30
+    result = status(compose)
+    while result.returncode == 0:
+        assert time.monotonic() < deadline, "agb status still passes with pipeline stopped"
+        time.sleep(1)
+        result = status(compose)
+    assert "pipeline is stale" in result.stderr, result.stderr

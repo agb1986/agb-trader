@@ -295,6 +295,8 @@ services:
       # Who `agb status` insists is beating; empty means every service. `make status` leaves
       # the bot out unless the telegram profile runs.
       AGB_EXPECTED_SERVICES: ${AGB_EXPECTED_SERVICES:-}
+      # How old a heartbeat may be before `agb status` calls it stale; empty means five minutes.
+      AGB_STALE_AFTER_SECONDS: ${AGB_STALE_AFTER_SECONDS:-}
     volumes:
       - ${AGB_MODELS_DIR:-./models}:/models:ro
     depends_on:
