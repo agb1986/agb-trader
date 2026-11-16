@@ -251,10 +251,13 @@ _INSERT_EVENT = """
         filled_avg_price, detail, actor)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
 """
+# Each reading carries the trading mode in force when it was taken. The service only runs
+# against the broker endpoint of that mode (agb.alpaca.check_mode), so the mode says which
+# account the figures are of, and a reader sizing a basket takes only the current mode's.
 _INSERT_STATE = """
     INSERT INTO agb.broker_state (account_status, suspend_trade, no_shorting, trading_blocked,
-        account_blocked, equity_usd, cash_usd, buying_power_usd, actor)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        account_blocked, equity_usd, cash_usd, buying_power_usd, actor, mode)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, (SELECT m.mode FROM agb.current_mode m))
 """
 _INSERT_FILL = """
     INSERT INTO agb.fill (order_id, execution_id, qty, price, filled_at, sec_fee_usd,
@@ -348,7 +351,8 @@ def submit_window(calendar: nyse.NyseCalendar, session: date) -> tuple[datetime,
 
 def record_state(conn: psycopg.Connection, broker: Broker) -> tuple[bool, bool]:
     """Read the account and its configuration and append what the broker said to
-    `broker_state`. Returns (suspend_trade, anything blocked)."""
+    `broker_state`, stamped with the trading mode in force. Returns (suspend_trade, anything
+    blocked)."""
     account = broker.account()
     configuration = broker.configuration()
     conn.execute(

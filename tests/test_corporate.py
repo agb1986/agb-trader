@@ -485,4 +485,6 @@ def test_an_event_that_took_effect_before_the_previous_snapshot_is_not_counted_t
     next_session(conn, fake)
 
     # The book still holds N01, and the event belongs to the window before this snapshot.
-    assert mismatches(db) == []
+    # That earlier window (the signal-session read to the trade session) does flag N01,
+    # since the book kept what the event says left it; this snapshot must not flag it again.
+    assert rows(db, "SELECT symbol FROM agb.position_mismatch WHERE snapshot_date = %s", NEXT) == []

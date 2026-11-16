@@ -15,7 +15,7 @@ import pytest
 import yaml
 from alpaca_fake import FakeBroker
 from conftest import ROOT
-from market_fake import PERIOD, TRADE
+from market_fake import PERIOD, SIGNAL, TRADE
 from psycopg import errors
 from test_gate import (
     BASE,
@@ -25,6 +25,7 @@ from test_gate import (
     SOUND,
     Case,
     buy,
+    go_live,
     hold,
     insert,
     move,
@@ -771,9 +772,9 @@ def test_the_daily_snapshot_records_positions_and_flags_a_discrepancy(db):
     assert execution.snapshot(conn, fake, TRADE, CALENDAR) is True
     assert execution.snapshot(conn, fake, TRADE, CALENDAR) is False
 
-    assert rows(db, "SELECT snapshot_date, positions, actor FROM agb.position_snapshot") == [
-        (TRADE, 20, "execution")
-    ]
+    assert rows(
+        db, "SELECT snapshot_date, positions, actor FROM agb.position_snapshot ORDER BY id"
+    ) == [(SIGNAL, 0, "execution"), (TRADE, 20, "execution")]
     assert rows(
         db,
         "SELECT p.symbol, p.qty, p.avg_entry_price, p.market_value_usd"
@@ -841,6 +842,20 @@ def test_the_observed_suspend_trade_is_compared_with_the_pause_latch(db):
         (True,),
         (False,),
     ]
+
+
+def test_each_account_reading_records_the_mode_it_was_taken_in(db):
+    """Paper and live are two accounts, so a reading says which one it read. The basket is
+    sized only on a reading of the mode in force (tests/test_basket.py)."""
+    conn = db.connect("execution")
+    fake = broker()
+
+    execution.record_state(conn, fake)
+    go_live(db)
+    execution.record_state(conn, fake)
+
+    assert rows(db, "SELECT mode FROM agb.broker_state ORDER BY id") == [("paper",), ("live",)]
+    assert rows(db, "SELECT mode FROM agb.broker_state_now") == [("live",)]
 
 
 # -- the service ---------------------------------------------------------------------------

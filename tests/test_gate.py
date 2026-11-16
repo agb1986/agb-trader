@@ -7,16 +7,17 @@ the pipeline end to end, and tests/test_registry.py on a basket ranked by a real
 model."""
 
 from dataclasses import dataclass, field, replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
 import registry_fake
+from account_fake import read_book
 from market_fake import PERIOD, SIGNAL, TRADE
 from psycopg import errors
 from registry_fake import ARTIFACT
 
-from agb import approval, corporate, gate
+from agb import approval, basket, corporate, gate
 from agb.gate import GateError
 
 NAMES = [f"N{i:02d}" for i in range(1, 21)]
@@ -520,7 +521,10 @@ def snapshot(db, positions, snapshot_date=date(2026, 8, 31)):
 
 
 def run(db, basket_id, case=SOUND):
-    """Gate the basket, with the stand-in model promoted (and voided) as `case` says."""
+    """Gate the basket, with the stand-in model promoted (and voided) as `case` says, and the
+    account read at its signal session's close as execution would have read it."""
+    [(session_date,)] = rows(db, "SELECT session_date FROM agb.basket WHERE id = %s", basket_id)
+    read_book(db, basket.signal_session(session_date))
     if case.promoted is not None:
         registry_fake.promote(db)
         if case.promoted.voided:
@@ -608,6 +612,24 @@ def test_the_gate_measures_against_the_broker_read_and_not_the_declared_targets(
     assert {s for n, s in failed if n == "side"} == set(HELD[3:])
     [(measured,)] = rows(db, "SELECT measured FROM agb.gate_check WHERE name = 'turnover'")
     assert measured == "700.00%"
+
+
+def test_a_book_read_before_the_signal_session_is_not_gated_against(db):
+    """Execution reads the account at every close, so a latest read three days before the
+    signal session means it has stopped reading. The gate waits rather than measuring turnover
+    and the sells against positions that may since have moved."""
+    snapshot(db, {"H01": Decimal(300)}, SIGNAL - timedelta(days=3))
+    basket_id = insert(db)
+    registry_fake.promote(db)
+
+    with pytest.raises(basket.NotReady, match="2026-09-27, before the signal session 2026-09-30"):
+        gate.run(
+            db.connect("pipeline"), basket_id, members=SOUND.members, marks=SOUND.marks,
+            now=SOUND.now,
+        )  # fmt: skip
+
+    assert rows(db, "SELECT count(*) FROM agb.gate_run") == [(0,)]
+    assert state(db, basket_id)[0] == "proposed"
 
 
 def fill(db, basket_id, symbol):

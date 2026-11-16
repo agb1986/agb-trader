@@ -12,9 +12,11 @@ from decimal import Decimal
 
 import pytest
 import registry_fake
+from account_fake import read_book
 from market_fake import PERIOD, SIGNAL, TRADE, Market
 from psycopg import errors
 from registry_fake import ARTIFACT, MODEL_ID
+from test_gate import go_live
 
 from agb import approval, basket, corporate, gate, jobs, lake, schedule
 from agb.corporate import Event, Kind
@@ -45,9 +47,12 @@ def plan_rebalance(db, period=PERIOD, session_date=TRADE):
     return due
 
 
-def run(db, root, **kwargs):
-    """One pipeline cycle, ranking with the promoted stand-in model (tests/registry_fake.py)."""
+def run(db, root, read=SIGNAL, **kwargs):
+    """One pipeline cycle, ranking with the promoted stand-in model (tests/registry_fake.py),
+    with the account read at the close of `read` unless it is None."""
     kwargs = {"limits": LIMITS, "clock": lambda: EVENING, "capital": CAPITAL, **kwargs}
+    if read is not None:
+        read_book(db, read)
     ranker = registry_fake.ranker(db)
     Pipeline(root, "", ranker=ranker, **kwargs)(db.connect("pipeline"))
 
@@ -198,7 +203,7 @@ def test_the_basket_is_the_book_and_the_order_plan_moves_it(db, tmp_path):
     [(turnover,)] = rows(db, "SELECT measured FROM agb.gate_check WHERE name = 'turnover'")
     assert turnover == "35.56%"
     # The book is the broker's latest snapshot, so the proposal has not moved it yet.
-    assert basket.book(db.connect("pipeline")) == book
+    assert basket.book(db.connect("pipeline"), SIGNAL) == book
 
 
 # The four forced corporate events, down the live path. Each is recorded against the period
@@ -334,6 +339,7 @@ def test_a_proposal_already_made_is_kept_when_the_job_is_redone(db, tmp_path):
     root = Market(tmp_path).names(25).land()
     conn = db.connect("pipeline")
     claim = jobs.claim(conn, [schedule.REBALANCE], "pipeline", timedelta(hours=1))
+    read_book(db, SIGNAL)
 
     ranker = registry_fake.ranker(db)
     first = basket.propose(conn, claim, root, ranker, capital=CAPITAL)
@@ -350,6 +356,7 @@ def test_a_lease_that_expired_mid_proposal_is_reclaimed_and_completed(db, tmp_pa
     root = Market(tmp_path).names(25).land()
     conn = db.connect("pipeline")
     claim = jobs.claim(conn, [schedule.REBALANCE], "pipeline", timedelta(milliseconds=1))
+    read_book(db, SIGNAL)
     basket.propose(conn, claim, root, registry_fake.ranker(db), capital=CAPITAL)
     time.sleep(0.05)
 
@@ -412,13 +419,13 @@ def test_the_environment_only_overrides_the_capital(monkeypatch):
 
 _STATE = """
     INSERT INTO agb.broker_state (observed_at, account_status, suspend_trade, no_shorting,
-        trading_blocked, account_blocked, equity_usd, actor)
-    VALUES (%s, 'ACTIVE', false, false, false, false, %s, 'execution')
+        trading_blocked, account_blocked, equity_usd, actor, mode)
+    VALUES (%s, 'ACTIVE', false, false, false, false, %s, 'execution', %s)
 """
 
 
-def observe(db, equity, observed_at=EVENING):
-    db.connect("execution").execute(_STATE, (observed_at, equity))
+def observe(db, equity, observed_at=EVENING, mode="paper"):
+    db.connect("execution").execute(_STATE, (observed_at, equity, mode))
 
 
 def test_the_capital_is_the_accounts_equity_as_execution_last_read_it(db):
@@ -439,6 +446,34 @@ def test_an_account_reading_too_old_to_size_against_defers_the_basket(db):
     assert basket.account_capital(
         db.connect("pipeline"), EVENING, fresh=basket.EQUITY_FRESH + timedelta(hours=1)
     ) == Decimal("41234.56")
+
+
+def test_an_account_reading_from_the_future_defers_the_basket(db):
+    """A reading stamped after now comes from a skewed clock, and its age says nothing about
+    how fresh it is. Within the skew allowance it is the same moment."""
+    observe(db, Decimal("41234.56"), EVENING + basket.EQUITY_SKEW + MINUTE)
+    with pytest.raises(basket.NotReady, match="from the future"):
+        basket.account_capital(db.connect("pipeline"), EVENING)
+    observe(db, Decimal("41234.56"), EVENING + basket.EQUITY_SKEW)
+    assert basket.account_capital(db.connect("pipeline"), EVENING) == Decimal("41234.56")
+
+
+def test_a_paper_reading_does_not_size_a_live_basket(db):
+    """Paper and live are two accounts. The paper account's equity, read moments before the
+    switch, is not what the live account holds."""
+    observe(db, Decimal("41234.56"))
+    go_live(db)
+    with pytest.raises(basket.NotReady, match="taken in paper mode, not the live mode in force"):
+        basket.account_capital(db.connect("pipeline"), EVENING)
+    observe(db, Decimal("5000.00"), mode="live")
+    assert basket.account_capital(db.connect("pipeline"), EVENING) == Decimal("5000.00")
+
+
+def test_a_reading_with_no_mode_on_record_sizes_nothing(db):
+    """Readings taken before the mode was recorded with them match neither account."""
+    observe(db, Decimal("41234.56"), mode=None)
+    with pytest.raises(basket.NotReady, match="an unrecorded mode"):
+        basket.account_capital(db.connect("pipeline"), EVENING)
 
 
 def test_a_basket_is_sized_on_the_account_when_the_capital_is_not_given(db, tmp_path):
@@ -562,15 +597,43 @@ def test_the_book_is_what_the_broker_holds_and_not_what_the_basket_declared(db):
     # BBB's MOC order expired unfilled, so the next read of the account holds AAA alone.
     snapshot(db, {"AAA": 10})
 
-    assert basket.book(db.connect("pipeline")) == {"AAA": Decimal(10)}
+    assert basket.book(db.connect("pipeline"), SIGNAL) == {"AAA": Decimal(10)}
 
 
-def test_a_book_is_empty_until_the_broker_has_been_read(db):
+def test_there_is_no_book_until_the_broker_has_been_read(db):
     """Targets on their own are not a book. Until execution has read the account there is
     nothing to start a rebalance from, whatever a basket says it bought."""
     filled_basket(db, "2026-09", {"AAA": 10}, read=False)
 
-    assert basket.book(db.connect("pipeline")) == {}
+    with pytest.raises(basket.NotReady, match="no position snapshot"):
+        basket.book(db.connect("pipeline"), SIGNAL)
+
+
+def test_a_book_read_before_the_signal_session_is_not_a_book(db):
+    """Execution reads the account at every close. A latest read three days before the signal
+    session means it has stopped, and the positions may have moved since."""
+    snapshot(db, {"AAA": 10}, SIGNAL - timedelta(days=3))
+
+    with pytest.raises(
+        basket.NotReady,
+        match="latest position snapshot is of 2026-09-27, before the signal session 2026-09-30",
+    ):
+        basket.book(db.connect("pipeline"), SIGNAL)
+    snapshot(db, {"AAA": 10}, SIGNAL + timedelta(days=1))  # a later read is as good
+    assert basket.book(db.connect("pipeline"), SIGNAL) == {"AAA": Decimal(10)}
+
+
+def test_a_rebalance_on_a_stale_book_keeps_the_job_and_tries_again(db, tmp_path):
+    due = plan_rebalance(db)
+    snapshot(db, {}, SIGNAL - timedelta(days=3))
+
+    run(db, Market(tmp_path).names(25).land(), read=None)
+
+    assert job_state(db) == "claimed"
+    [(left,)] = rows(db, "SELECT lease_until - now() FROM agb.job")
+    assert timedelta(0) < left <= RETRY
+    assert rows(db, "SELECT count(*) FROM agb.basket") == [(0,)]
+    assert late_proposals(db, due + MINUTE) == [(PERIOD,)]
 
 
 def test_an_account_that_holds_nothing_reads_as_an_empty_book(db):
@@ -578,7 +641,7 @@ def test_an_account_that_holds_nothing_reads_as_an_empty_book(db):
     nothing, which is a book, not a missing one."""
     snapshot(db, {})
 
-    assert basket.book(db.connect("pipeline")) == {}
+    assert basket.book(db.connect("pipeline"), SIGNAL) == {}
 
 
 def test_two_transitions_from_the_same_state_let_exactly_one_through(db):
