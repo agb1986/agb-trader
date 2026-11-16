@@ -15,8 +15,9 @@ Everything on the server lives in one directory, `/mnt/data/AppData/agb-trader` 
 | Path               | Holds                                                                  |
 | ------------------ | ---------------------------------------------------------------------- |
 | `env/`             | The real env files. They exist only here, and nothing copies them off. |
-| `backups/`         | The nightly dumps, `agb-YYYY-MM-DD.sql.gz`.                            |
+| `backups/`         | The nightly dumps, `agb-YYYY-MM-DD.sql.gz`, and the panel mirror.      |
 | `lake/`            | The Parquet lake: the vendor's data in `sep/`, `sf1/` and `tickers/`.  |
+| `panel/`           | The panel store: the compressed prompts and answers behind the panel.  |
 | `models/`          | Certified model artifacts, one `<model id>/` each. See below.          |
 | `releases/<tag>/`  | `compose.yaml` and `agb-stack` as of commit `<tag>`.                   |
 | `current`          | A link to the release that is running.                                 |
@@ -182,9 +183,21 @@ job, runs `pg_dump` as the `backup` role, and writes the dump to
 After a good dump, the service keeps the newest fourteen and deletes the rest.
 `AGB_BACKUP_KEEP` in the service's environment changes that number.
 
-A dump that fails is recorded as a failed job. The partial file is deleted, and nothing is
-pruned. The job's expected event stays unfulfilled, so from 05:00 New York time the night
-shows in the overdue view, as a night whose backup never ran does. To check:
+The same job then backs up the panel store. The store keeps each prompt and answer the panel
+sent or received as a zstd body named by the SHA-256 of its text, under `panel/`. The service
+reads it through a read-only mount and copies each body the mirror, `backups/panel/`, does not
+yet hold. It checks each body twice: before copying it, and after, from the copy it wrote. A
+body is renamed into place only once it has read back sound. The mirror only grows. A body
+already in the mirror is never overwritten, and a body lost from the live store stays in the
+mirror. A live body that does not decompress or match its hash is not copied. The service logs
+it and goes on, and `panel_audit` already raises an alert for it. Pruning ignores
+`backups/panel/`.
+
+A dump that fails, or a panel store the service cannot read or a mirror it cannot write, is
+recorded as a failed job. Both parts still run, and the failure names each part that failed.
+The partial dump is deleted, and nothing is pruned. The job's expected event stays
+unfulfilled, so from 05:00 New York time the night shows in the overdue view, as a night whose
+backup never ran does. To check:
 
 ```sh
 ls -l backups/
@@ -195,6 +208,50 @@ ls -l backups/
 
 The failure's message is in `./agb-stack logs backup` and in the job's `failed` event in
 `agb.job_event`.
+
+### What the backups hold, and who can read them
+
+The dumps hold every table in the database: orders, fills, positions, the audit log, and the
+panel's database rows. The mirror holds the panel's prompts and answers, and the filing
+sections the panel read. Neither holds an API key, a password or a bot token: those live
+only in the env files in `env/`, which are never copied into `backups/`, nor anywhere else.
+The database roles' passwords are not in a dump either, since `pg_dump` dumps one database
+and not its cluster's roles.
+
+A dump is created with mode 0600, whatever the umask, and the panel bodies are 0600 too. The
+service sets `backups/` and `backups/panel/` to 0700. After each good night it also sets any
+older dump that is not 0600 to 0600, and `backups/` back to 0700, so dumps written before this
+change are tightened on the first night after it. A failure to tighten is logged as a warning
+and does not fail the night. Only the host user the stack runs as can read the backups.
+
+The backups are not encrypted by the stack. They sit on the same data disk as the live
+database and the panel store, so they protect against a lost or damaged table, file or volume,
+not against losing the disk. Encryption at rest is the host's concern: encrypt the data disk or
+its filesystem. A copy off the host is also left to the operator.
+
+### The lake is not backed up
+
+The backup service does not copy `lake/`. The lake holds only the vendor's data, so the
+pipeline can pull it again:
+
+```sh
+./agb-stack run --rm pipeline python -m agb.services.pipeline backfill
+```
+
+A pull lands the vendor's data as it stands now, though. Where the vendor has revised a
+partition since it landed, the new partition's SHA-256 differs from the one recorded in
+`agb.lake_snapshot` and in the certification manifests that name it, and a certification
+checked against the lake stops matching. The workstation's copy from `make sync-lake` keeps
+the partitions as they landed, because that sync only pulls and never deletes. To restore the
+lake with its recorded hashes, copy that copy back from the workstation:
+
+```sh
+rsync -a lake/ casaos.local:/mnt/data/AppData/agb-trader/lake/
+```
+
+Sessions that landed after the workstation last synced are not in its copy, and only a
+new pull brings them back, with the caveat above. The panel store is backed up, unlike
+the lake, because the panel's answers were paid for and cannot be pulled again.
 
 ## The Parquet lake
 
@@ -404,6 +461,25 @@ deploy directory:
    `migrate` runs first and gives the database back to its owner, with its grants. The
    migration ledger came with the dump, so `migrate` applies only migrations newer than the
    dump.
+
+### Restoring panel bodies
+
+The panel store's bodies sit beside its database rows, and a row whose body is missing or
+damaged fails `panel_audit`. To bring the bodies back from the mirror, run the restore in the
+`pipeline` service, which writes the panel store as its owner, with the mirror mounted
+read-only:
+
+```sh
+./agb-stack run --rm --no-deps --volume "$PWD/backups/panel:/panel-backup:ro" pipeline \
+  python -m agb.services.backup restore-panel /panel-backup /panel
+```
+
+The restore copies each body the store lacks, and replaces each body in the store that does
+not decompress or match its hash. It checks every body as the nightly backup does, and leaves
+the store's sound bodies alone. It deletes nothing. It logs how many bodies it restored, and
+exits with status 1 if the mirror holds a bad body, naming it. After a database restore, run
+it as well, so that the bodies match the restored rows; bodies the restored rows no longer
+name do no harm.
 
 ## Moving from the hand-made checkout
 

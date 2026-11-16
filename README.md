@@ -16,7 +16,8 @@ make down     # stop the stack; the database volume is kept
 
 The real `env/*.env` files are git-ignored and never committed. `make ENV_DIR=/some/dir up`
 reads them from elsewhere. The stack's backup service writes a dump of the database into
-`backups/` each night, also git-ignored; `make BACKUP_DIR=/some/dir up` puts them elsewhere.
+`backups/` each night, and copies the panel store's new bodies into `backups/panel/`. It is
+also git-ignored; `make BACKUP_DIR=/some/dir up` puts it elsewhere.
 
 ## Deploying to the server
 
