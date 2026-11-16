@@ -33,7 +33,11 @@ Run `agb-stack` from the deploy directory as `./agb-stack`, or by its full path.
 ## Before the first deploy
 
 - Key-based SSH from the workstation to the server works without a prompt, and the server
-  user can run `docker compose` without `sudo`. See
+  user can run `docker compose` without `sudo`. The server's Compose must be v2.20 or newer
+  (`docker compose version` on the server shows it): `compose.yaml` relies on the top-level
+  `name`, on `depends_on` conditions, and on `up --wait --wait-timeout`, which `agb-stack`
+  passes. The Docker Engine on the server is 20.10, so the file uses only fields that engine
+  knows. See
   [Operator setup](operator-setup.md#1-server-access-and-storage).
 - `env/db.env` exists in the deploy directory and sets every variable that
   `env/db.env.example` sets, including `BACKUP_DB_PASSWORD`. Generate each password on the
@@ -73,7 +77,12 @@ That runs `scripts/deploy/deploy.sh`, which:
    its example does. The variable names are read on the server, so no value leaves it. A
    missing file or variable stops the deploy before anything is built.
 3. Builds `agb-trader-app:<tag>` from `git archive HEAD`, for `linux/amd64`, with the tag as
-   `AGB_VERSION`. Each service reports that version with its heartbeat.
+   `AGB_VERSION`. Each service reports that version with its heartbeat. Compose takes the same
+   value from `AGB_IMAGE_TAG`, which `agb-stack` sets from the release it activates.
+   The workstation's research image takes its version from `AGB_VERSION` instead, which `make
+   research` sets to the checkout's commit, with `-dirty` when the tree has changes. Both
+   default to `dev` when unset, and `certify` refuses to run under `dev`, so a research image
+   built by hand without `AGB_VERSION` cannot certify a model.
 4. Ships the image with `docker save | gzip | ssh … docker load`, unless the server already
    has it.
 5. Installs the release: the commit's `compose.yaml` and `agb-stack` go into
@@ -115,8 +124,11 @@ This runs `agb-stack rollback` on the server, which activates the `previous` rel
 release it leaves becomes `previous`, so running `make rollback` again returns to it. To go back
 further, deploy an older commit: check it out and run `make deploy`.
 
-A rollback does not undo migrations. It does not need to: migrations only ever add, so the
-older image runs against the newer schema, and `migrate` ignores ledger entries it has no file
+A rollback does not undo migrations. It does not need to: migrations only ever widen: they add tables
+and nullable or defaulted columns, and they loosen a `CHECK` constraint by dropping it and
+adding it back with a longer list (`migrations/20261014000000_execution_recovery.sql`), never
+by narrowing it. Every row an older image wrote stays valid, so the older image runs against
+the newer schema, and `migrate` ignores ledger entries it has no file
 for. Those entries still count as applied: a later deploy whose new migration is older than
 one the rolled-back release had applied is refused as out of order, and
 `AGB_MIGRATE_ALLOW_OUT_OF_ORDER=1 ./agb-stack activate <tag>` lets it through. See

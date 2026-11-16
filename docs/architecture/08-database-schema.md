@@ -46,7 +46,7 @@ The audit log is a `UNION ALL` view over the domain event tables: `basket_event`
 
 Append-only is enforced in three layers:
 
-- **Per-service Postgres roles.** `scheduler`, `pipeline`, `execution`, `bot`, `ui` and `cli` each connect as their own role, plus an owner/migration role that no service uses. Service roles have `INSERT` and `SELECT` only on history tables. This carries the credential-line boundaries of the service decomposition into the database.
+- **Per-service Postgres roles.** `scheduler`, `pipeline`, `execution`, `bot`, `ui`, `backup`, `cli` and `research` each connect as their own role, plus an owner/migration role that no service uses. `research` is not a service on the server: it is the role of the certification import, which writes `model_certification` and nothing else. `backup` reads every table through `pg_read_all_data`, and writes only its heartbeat and the claim and completion of its own job. Every other role has `INSERT` and `SELECT` only on history tables. This carries the credential-line boundaries of the service decomposition into the database.
 - **Triggers.** A `BEFORE UPDATE OR DELETE` row trigger on every history table raises for every role, the owner included, so an accidental fix-up in `psql` fails too. A statement-level `BEFORE TRUNCATE` trigger is added as well, because row triggers do not fire on `TRUNCATE`.
 - **Role-restricted transitions.** The `basket_transition` table names which role may perform each transition. Only `execution` moves a basket from approved to submitted. Only `bot` or `ui` approve or reject, and only `scheduler` marks an approval missed. A bug in the bot cannot mark a basket submitted.
 

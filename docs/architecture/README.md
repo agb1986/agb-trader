@@ -33,7 +33,7 @@ These apply across every document and no build session may relax them.
 | [04 — Risk limits and approval workflow](04-risk-and-approval.md) | The pre-trade gate, halt semantics and named causes, per-basket approval, timeout, the autonomy ladder, the kill-switch, performance alerts, paper-to-live criteria |
 | [05 — Telegram bot](05-telegram-bot.md) | Fourteen commands, seven unprompted messages, the approval message, `/why`, `/liquidate`, the audit vocabulary |
 | [06 — Local UI](06-local-ui.md) | The decision-log shell and its eight named views, the approval affordance, exposure |
-| [07 — Services and deployment](07-services-deployment.md) | The seven server services and the research profile, database-only coupling, networks and VPN egress, secrets, resource limits, images and delivery, observability, lake and model hand-off |
+| [07 — Services and deployment](07-services-deployment.md) | The eight server services and the research profile, database-only coupling, networks and VPN egress, secrets, resource limits, images and delivery, observability, lake and model hand-off |
 | [08 — Database schema](08-database-schema.md) | Job claims, baskets and events, commands, the audit view and immutability, the halt latch, orders and fills, the certification registry, ladder and mode, health, panel logs, conventions |
 
 Read them in order the first time. Documents 02 through 08 each depend on the ones before them.

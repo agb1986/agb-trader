@@ -12,7 +12,9 @@ Purging keeps the training set clean of the test months. A training month whose 
 overlaps a test month's label window is dropped: its return is partly the test's. The
 embargo then drops the training months whose features were computed inside a test month's
 window, or in the `embargo_months` after it, whose features are the test's returns in
-another guise. What remains is proven disjoint by the tests."""
+another guise. It is one-sided: nothing before a test month is embargoed, because a
+training month that ends before the test starts shares none of its returns, and one whose
+label window runs into it is already purged. What remains is proven disjoint by the tests."""
 
 import itertools
 from dataclasses import asdict, dataclass
