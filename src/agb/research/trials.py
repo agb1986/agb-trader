@@ -40,6 +40,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from itertools import groupby
 from pathlib import Path
 
 import pyarrow as pa
@@ -51,9 +52,9 @@ STATUSES = ("running", "succeeded", "failed", "abandoned")
 # which is what certifications up to lgbm-2026-10 declared; `configurations` is the distinct
 # configurations that came back with a result, nested by clock; `started` is the distinct
 # configurations started, whatever became of them, nested by the parent a row names, which is
-# what they declare now. Each certification's manifest records the rule it used, so an
-# artifact is checked against the rule it was certified under rather than the one in force
-# when it is read.
+# what they declare now. `RULE` is the only rule a certification is checked under: a manifest
+# naming another, or none, is refused at import and when the registry loads it, and the model
+# has to be certified again (issue #211). The other rules stay for comparing counts.
 RULES = ("rows", "configurations", "started")
 RULE = "started"
 # What the first chained row links to, when nothing was appended before it.
@@ -215,17 +216,32 @@ def nested(rows: list[dict[str, object]], *, current: str | None = None) -> set[
     inner rows are not configurations the search tried. Containment is read off the intervals,
     which is all a row from before the `parent` column carries; rows that start at the same
     instant as another are siblings, not children, so a batch written in one go stays counted.
+    A row with no start time cannot be placed, and is refused rather than compared.
     """
-    inside = set()
-    for row in rows:
-        start, end = row["started_at"], _closes_at(row, current)
-        for other in rows:
-            if other["trial_id"] == row["trial_id"]:
-                continue
-            if other["started_at"] < start and _closes_at(other, current) >= end:
-                inside.add(str(row["trial_id"]))
-                break
+    undated = sorted(str(row["trial_id"]) for row in rows if row["started_at"] is None)
+    if undated:
+        raise LedgerError(
+            f"the ledger holds {len(undated)} trials with no start time, such as {undated[0]};"
+            " the trials cannot be counted without when each began"
+        )
+    # A row is inside another when one that began strictly earlier closed no sooner. Sweeping
+    # the rows by start, with the latest close among the earlier starts, answers that for all of
+    # them in one pass, where asking every row of every other is quadratic.
+    inside: set[str] = set()
+    latest: datetime | None = None
+    for _, tied in groupby(sorted(rows, key=_started), key=_started):
+        group = [(row, _closes_at(row, current)) for row in tied]
+        if latest is not None:
+            inside.update(str(row["trial_id"]) for row, end in group if latest >= end)
+        group_end = max(end for _, end in group)
+        latest = group_end if latest is None else max(latest, group_end)
     return inside
+
+
+def _started(row: dict[str, object]) -> datetime:
+    started = row["started_at"]
+    assert isinstance(started, datetime)
+    return started
 
 
 def roots(rows: list[dict[str, object]], *, current: str | None = None) -> dict[str, dict]:

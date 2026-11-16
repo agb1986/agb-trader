@@ -202,26 +202,17 @@ def rebalance(db, lake_dir: Path, models: Path, **kwargs) -> None:
 
 
 def test_the_registry_reads_the_layout_the_research_profile_writes(models):
-    assert (registry.MANIFEST, registry.MODEL, registry.LEDGER) == (
-        artifact.MANIFEST,
-        artifact.MODEL,
-        trials.FILE,
-    )
-    # The server recounts the artifact's trials itself, without importing the research
-    # profile, so its counter has to agree with the one that wrote the number.
-    ledger = models / MODEL_ID / trials.FILE
-    assert registry.RULES == trials.RULES
-    for rule in trials.RULES:
-        assert registry.declared_trials_of(ledger, rule) == Ledger(ledger).declared(rule=rule)
-    with pytest.raises(registry.RegistryError, match="unknown rule 'guesses'"):
-        registry.declared_trials_of(ledger, "guesses")
+    assert (registry.MANIFEST, registry.MODEL) == (artifact.MANIFEST, artifact.MODEL)
+    # The registry verifies through the import's own check, so there is one trial counter and
+    # one nesting rule on the server rather than a copy to keep in step (issue #211).
+    assert registry.artifact is artifact
 
 
-def test_the_registry_counts_failed_nested_and_old_rows_as_the_ledger_does(tmp_path):
-    """The certification's own ledger holds only runs that succeeded, so the counters are also
-    held together over one holding everything the rules treat differently: rows from before the
-    chain, a failure, a rerun, a certification's nested runs and a scan that merely overlapped
-    it from another thread."""
+def test_the_rules_count_failed_nested_and_old_rows_apart(tmp_path):
+    """The certification's own ledger holds only runs that succeeded, so the rules are also
+    held to a ledger holding everything they treat differently: rows from before the chain, a
+    failure, a rerun, a certification's nested runs and a scan that merely overlapped it from
+    another thread."""
     window = {
         "features": ("mom_12_1",), "train_start": date(2024, 1, 31),
         "train_end": date(2025, 12, 31), "cost_model_version": "v1",
@@ -254,8 +245,7 @@ def test_the_registry_counts_failed_nested_and_old_rows_as_the_ledger_does(tmp_p
         thread.start()
         thread.join()
     ledger.verify()
-    counts = {rule: registry.declared_trials_of(path, rule) for rule in trials.RULES}
-    assert counts == {rule: ledger.declared(rule=rule) for rule in trials.RULES}
+    counts = {rule: ledger.declared(rule=rule) for rule in trials.RULES}
     assert counts == {"rows": 8, "configurations": 3, "started": 5}
 
 
@@ -325,40 +315,82 @@ def _no_artifact(db, models):
     return MODEL_ID, f"model {MODEL_ID} has no artifact at {models / MODEL_ID}"
 
 
+def _forge(directory: Path, **changes) -> None:
+    """Rewrite the manifest as a forger would who knows the digest scheme: every file digest
+    and the manifest's own digest recomputed over whatever was changed."""
+    path = directory / registry.MANIFEST
+    manifest = {**json.loads(path.read_text()), **changes}
+    manifest["files"] = {
+        p.name: artifact.file_sha256(p)
+        for p in sorted(directory.iterdir())
+        if p.name != registry.MANIFEST
+    }
+    manifest["ledger_sha256"] = manifest["files"][trials.FILE]
+    manifest["artifact_sha256"] = artifact.artifact_sha256(manifest)
+    path.write_text(json.dumps(manifest))
+
+
 def _fewer_trials(db, models):
     """The artifact's ledger with its first trial dropped: a prior backtest, which is a
     configuration the search counted, so the count the ledger ships no longer matches the count
     the certification declared. The last row would be the backtest the certification nests,
-    which the count never charged for."""
+    which the count never charged for. The rows after it are relinked, and the row count and
+    every digest are covered over it, so only the recount refuses it."""
     ledger = Ledger(models / MODEL_ID / trials.FILE)
     rows = ledger.rows()
-    pq.write_table(pa.Table.from_pylist(rows[1:], schema=trials.SCHEMA), ledger.path)
+    kept = [dict(row) for row in rows[1:]]
+    for i, row in enumerate(kept):
+        row["previous"] = trials.link(kept[i - 1]) if i else trials.GENESIS
+    pq.write_table(pa.Table.from_pylist(kept, schema=trials.SCHEMA), ledger.path)
+    _forge(models / MODEL_ID, ledger_rows=len(rows) - 1)
     return MODEL_ID, (
-        f"the artifact's ledger holds {trials.declared(rows[1:])} trials counted as"
-        f" {trials.RULE}; the certification declared {trials.declared(rows)}"
+        f"the artifact in .* is refused: trials.parquet holds {trials.declared(rows[1:])} trials"
+        f" counted as {trials.RULE}; the certification declared {trials.declared(rows)}"
     )
 
 
 def _altered(db, models):
     with (models / MODEL_ID / "report.md").open("a") as report:
         report.write("\nbetter than it looks\n")
-    return MODEL_ID, "report.md in .* has been altered since certification"
+    return MODEL_ID, "the artifact in .* is refused: report.md has been altered since certification"
+
+
+def _edited(db, models):
+    """A manifest edited after certification with its file list left as it was: the digest
+    covers the manifest, so the edit alone breaks it."""
+    path = models / MODEL_ID / registry.MANIFEST
+    path.write_text(json.dumps({**json.loads(path.read_text()), "dsr": 0.99}))
+    return MODEL_ID, "the artifact in .* is refused: manifest.json has been altered"
 
 
 def _swapped(db, models):
-    """An altered report with a manifest listing it, as a forger would write: every file
-    matches the manifest, but the digest over them is not the certification's."""
+    """An altered report with every digest recomputed, as a forger would write: the artifact
+    is self-consistent, but its digest is not the one the certification row recorded."""
     directory = models / MODEL_ID
     with (directory / "report.md").open("a") as report:
         report.write("\nbetter than it looks\n")
-    path = directory / registry.MANIFEST
-    files = {
-        p.name: registry._sha256(p)
-        for p in sorted(directory.iterdir())
-        if p.name != registry.MANIFEST
-    }
-    path.write_text(json.dumps({**json.loads(path.read_text()), "files": files}))
+    _forge(directory)
     return MODEL_ID, "the artifact in .* has digest [0-9a-f]{12}; the certification's is"
+
+
+def _forged_dsr(db, models):
+    """A deflated Sharpe raised with every digest recomputed: the server runs the gates again
+    over the paths and the ledger shipped, so the edit is the difference it reports."""
+    manifest = json.loads((models / MODEL_ID / registry.MANIFEST).read_text())
+    _forge(models / MODEL_ID, dsr=manifest["dsr"] + 0.01)
+    return MODEL_ID, (
+        "the artifact in .* is refused: the verdict recomputed from paths.json and"
+        r" trials.parquet differs from manifest.json in 1 field\(s\): dsr: manifest"
+    )
+
+
+def _rows_rule(db, models):
+    """A manifest that counts its trials as ledger rows, with every digest recomputed."""
+    _forge(models / MODEL_ID, declared_trials_rule="rows")
+    return MODEL_ID, (
+        "the artifact in .* is refused: manifest.json counted its trials as 'rows', and the only"
+        " rule this code accepts is 'started'; re-certify"
+    )
 
 
 def _unlisted(db, models):
@@ -380,7 +412,10 @@ def _already_live(db, models):
         pytest.param(_no_artifact, id="no_artifact"),
         pytest.param(_fewer_trials, id="trial_count_mismatch"),
         pytest.param(_altered, id="altered"),
+        pytest.param(_edited, id="manifest_edited"),
         pytest.param(_swapped, id="digest_mismatch"),
+        pytest.param(_forged_dsr, id="forged_dsr"),
+        pytest.param(_rows_rule, id="rows_rule"),
         pytest.param(_unlisted, id="unlisted_file"),
         pytest.param(_already_live, id="already_live"),
     ],
@@ -854,13 +889,19 @@ def _promoted_then_voided(db, models):
 def _promoted_then_altered(db, models):
     promote(db, models)
     _altered(db, models)
-    return "report.md in .* has been altered since certification"
+    return "report.md has been altered since certification"
 
 
 def _promoted_then_swapped(db, models):
     promote(db, models)
     _swapped(db, models)
     return "the artifact in .* has digest"
+
+
+def _promoted_then_forged(db, models):
+    promote(db, models)
+    _forged_dsr(db, models)
+    return "the verdict recomputed from paths.json and trials.parquet differs"
 
 
 @pytest.mark.parametrize(
@@ -870,6 +911,7 @@ def _promoted_then_swapped(db, models):
         pytest.param(_promoted_then_voided, id="voided"),
         pytest.param(_promoted_then_altered, id="altered"),
         pytest.param(_promoted_then_swapped, id="hash_mismatch"),
+        pytest.param(_promoted_then_forged, id="forged_dsr"),
     ],
 )
 def test_the_pipeline_refuses_a_model_it_cannot_trust(
@@ -951,7 +993,8 @@ def test_a_ledger_with_a_null_start_time_is_refused_clearly_and_not_with_a_type_
     path = tmp_path / trials.FILE
     pq.write_table(undated, path)
 
-    assert registry.declared_trials_of(path, "rows") == 2
+    shipped = Ledger(path).rows()
+    assert trials.declared(shipped, rule="rows") == 2
     for rule in ("configurations", "started"):
-        with pytest.raises(registry.RegistryError, match="1 trials with no start time"):
-            registry.declared_trials_of(path, rule)
+        with pytest.raises(trials.LedgerError, match="1 trials with no start time"):
+            trials.declared(shipped, rule=rule)

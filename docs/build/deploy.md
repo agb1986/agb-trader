@@ -363,9 +363,11 @@ service has no database at all. The steps by hand are:
    This runs on the server because the database is reachable only from the stack's own
    network, and in its own container because only the `research` role may insert into
    `agb.model_certification`. It verifies the artifact before it writes: a missing, altered
-   or unlisted file, a shipped ledger that does not recount to the trial count the
-   certification declared, and a model that is already certified are each refused, and
-   nothing is written. The row's `artifact_path` records where the model was certified, from
+   or unlisted file, a manifest altered since certification, a trial count by any rule but
+   `started`, a shipped ledger that does not recount to the trial count the certification
+   declared, a verdict that the gates do not give again when they are rerun over the shipped
+   `paths.json` and `trials.parquet`, and a model that is already certified are each
+   refused, and nothing is written. The row's `artifact_path` records where the model was certified, from
    the manifest, not the path the import read.
 
 3. Promote it on the server:
@@ -376,11 +378,19 @@ service has no database at all. The steps by hand are:
 
 `agb promote` refuses a model with no certification, one that failed its gates (unless it is
 waived for paper, below), a voided one, one certified under an earlier cost model, and one
-whose artifact is missing from `models/`, altered since certification, or ships a trial ledger
-that does not recount to the trial count the certification declared. The recount uses the rule
-the manifest says the certification counted by, so a model certified before the rule changed is
-still checked against the number it declared. It also refuses the model
-that is already live. Each refusal says why and is recorded in `agb.command`, as is each
+whose artifact is missing from `models/` or fails the same check the import runs, which is
+the same code. It also refuses the model that is already live.
+
+The check recomputes the deflated Sharpe, the PBO, the Sharpe, every gate and the verdict from
+the paths and the ledger the artifact ships, and refuses the artifact if any of them differs
+from the manifest by more than a relative 1e-9 (an absolute 1e-12 near zero), naming each field
+that differs. The trial count is always counted as `started`, the rule in the code; the
+manifest's own field only has to agree with it. The digest covers the whole manifest, so no
+field the server reads can be edited without changing the digest the certification row holds.
+A model certified before issue #211 (every model up to and including `lgbm-2026-10`) names no
+rule and has a digest over its files only, so it is refused with that cause and has to be
+certified again under the current code, imported and promoted; see
+[Checking a promoted model after issue #211](#checking-a-promoted-model-after-issue-211). Each refusal says why and is recorded in `agb.command`, as is each
 promotion, which also writes an `agb.promotion_event`. The next rebalance loads the new model
 and checks its artifact again.
 
@@ -397,6 +407,45 @@ too. Each voiding is an `agb.certification_event`. A certification made under a 
 running release does not know yet, by research code ahead of the deploy, is refused but not
 voided, so it can be promoted once that release is live; for the same reason a rollback voids
 nothing.
+
+### Checking a promoted model after issue #211
+
+A release with issue #211 runs the import's check every time the pipeline loads the promoted
+model, so before deploying it, check the model that is live. Checking writes nothing:
+
+```sh
+./agb-stack import lgbm-2026-10
+```
+
+The import verifies the artifact before it looks for an existing certification, so for a model
+that is already certified this either prints the check's refusal or, once the check passes,
+`model 'lgbm-2026-10' is already certified`, which is the pass. `lgbm-2026-10` (artifact
+`3c7b4e50f2f2`) was certified before the fix and is refused before anything is recomputed:
+
+```text
+manifest.json names no trial count rule: the model was certified before the rule was fixed at 'started' (issue #211); re-certify the model under the current code and import the new artifact
+```
+
+Once that release is deployed, the rebalance job fails on that model as it does on a missing
+artifact, so a model certified under the current code has to be imported and promoted with
+the deploy, before the next rebalance. Its copy under `research/certifications/` also shows
+why it cannot be recomputed as it stands: its ledger counts 13 trials by `rows` and 2 by
+`started`; its paths ship no SPY return, so its deflated Sharpe and its Sharpe are undefined
+on the excess basis the gates now use; and its overfitting matrix has one candidate, so its
+PBO is undefined. Its total-return Sharpe, 0.5741, does recompute exactly.
+
+For a model certified under the current code, a difference between the manifest and the gates
+run again names each field, with both values:
+
+```text
+the verdict recomputed from paths.json and trials.parquet differs from manifest.json in 1 field(s): dsr: manifest 0.9312, recomputed 0.9212
+```
+
+A manifest edited after certification without its digest being recomputed reads
+`manifest.json has been altered since certification`, and one whose digest was recomputed
+too reads `has digest <new>; the certification's is <old>` when it is promoted or loaded,
+since the certification row holds the digest it was imported with. Either is a refusal to
+investigate, not to work around: certify the model again.
 
 ### Promoting a failed certification to measure in paper
 

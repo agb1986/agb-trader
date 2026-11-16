@@ -664,8 +664,10 @@ def main(argv: list[str] | None = None) -> int:
         description="The research profile certifies on the workstation and the artifact is "
         "copied to the models directory; this records it. Only the research role may insert, "
         "so run it with PGUSER=research. The artifact is verified first: an altered or "
-        "unlisted file, a ledger whose trial count disagrees with the certification's, and a "
-        "model already certified are each refused, and nothing is written.",
+        "unlisted file or manifest, a trial count by any rule but `started`, a ledger whose "
+        "count disagrees with the certification's, gate values the gates do not give when run "
+        "again over the shipped paths and ledger, and a model already certified are each "
+        "refused, and nothing is written.",
     )
     certification.add_argument("model_id", help="the artifact's directory under AGB_MODELS_DIR")
     certification.set_defaults(run=_import_certification)
@@ -673,8 +675,9 @@ def main(argv: list[str] | None = None) -> int:
         "promote",
         help="make a certified model the one the pipeline ranks with",
         description="Refuses a model with no passing certification, a voided or stale one, and "
-        "one whose artifact under AGB_MODELS_DIR is missing, altered or ships a trial count "
-        "other than the certification declared. Every refusal is recorded. "
+        "one whose artifact under AGB_MODELS_DIR is missing or fails the check "
+        "import-certification runs, or whose digest or trial count is not the "
+        "certification's. Every refusal is recorded. "
         "--waive-for-paper --reason <why> promotes a model whose only problem is that it "
         "failed its gates, in paper mode alone, so that the stack can be exercised while "
         "nothing has passed; a move to live is then refused until a model that passed is "
