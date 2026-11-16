@@ -279,6 +279,16 @@ def test_released_versions_are_pinned():
     assert CURRENT.fingerprint() == RELEASED[CURRENT.version]
 
 
+def test_every_released_version_has_its_model_and_the_model_matches_its_fingerprint():
+    # The registry fee checks read: a version in VERSIONS with no model, or a model whose
+    # constants drifted from the fingerprint pinned for it, fails here.
+    assert set(cost.MODELS) == set(RELEASED)
+    for version, model in cost.MODELS.items():
+        assert model.version == version
+        assert model.fingerprint() == RELEASED[version]
+    assert cost.MODELS[CURRENT.version] is CURRENT
+
+
 def changed(value):
     if isinstance(value, bool):
         return not value

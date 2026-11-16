@@ -229,7 +229,70 @@ def test_a_fee_that_does_not_reproduce_and_an_unknown_version_both_fail(db):
     assert [row["fee"] for row in result.detail["wrong"]] == ["sec_fee_usd", "fee_model_version"]
     assert result.detail["wrong"][0]["recorded"] == str(fees.sec + Decimal("0.05"))
     assert result.detail["wrong"][0]["expected"] == str(fees.sec)
-    assert result.detail["wrong"][1]["expected"] == (f"one of {', '.join(sorted(cost.VERSIONS))}")
+    assert result.detail["wrong"][1]["expected"] == (f"one of {', '.join(sorted(cost.MODELS))}")
+
+
+def test_fills_on_both_sides_of_a_fee_change_each_reproduce_under_their_own_version(
+    db, monkeypatch
+):
+    """A fee change puts a new version in force, and fills made before it still name the old
+    one. Each is checked under its own version's schedule, so neither side fails; a fill
+    recorded under one version but priced under the other does."""
+    conn = db.connect("execution")
+    target = with_a_sale(db, conn)
+    [(sale,)] = rows(
+        db, "SELECT id FROM agb.broker_order WHERE basket_id = %s AND side = 'sell'", target.id
+    )
+    old = cost.CURRENT
+    dearer = old.sec_fee_per_million + 5
+    pinned = cost.fingerprint({**old.constants(), "sec_fee_per_million": repr(dearer)})
+    monkeypatch.setattr(cost, "VERSIONS", {**cost.VERSIONS, "2": pinned})
+    new = replace(old, version="2", sec_fee_per_million=dearer)
+    monkeypatch.setattr(cost, "MODELS", {**cost.MODELS, "2": new})
+    monkeypatch.setattr(cost, "CURRENT", new)
+    owner = db.connect("agb_owner")
+
+    def sell(execution_id, model, version):
+        fees = cost.fees(cost.Side.SELL, Decimal(100) * MID, Decimal(100), model)
+        owner.execute(
+            _FILL,
+            (
+                sale,
+                execution_id,
+                100,
+                MID,
+                CLOSE_AT,
+                fees.sec,
+                fees.taf,
+                fees.cat,
+                fees.commission,
+                version,
+            ),
+        )
+        return fees
+
+    sell("under-the-old-fee", old, "1")
+    sell("under-the-new-fee", new, "2")
+    assert (
+        cost.fees(cost.Side.SELL, Decimal(100) * MID, Decimal(100), old).sec
+        != cost.fees(cost.Side.SELL, Decimal(100) * MID, Decimal(100), new).sec
+    )
+
+    result = mechanics.fee_arithmetic(conn)
+
+    assert result.passed is True
+    assert result.detail["wrong"] == []
+    assert result.detail["versions"] == ["1", "2"]
+    assert result.detail["model_version"] == "2"
+
+    mispriced = sell("new-fee-named-old", new, "1")
+
+    result = mechanics.fee_arithmetic(conn)
+
+    assert result.passed is False
+    [row] = result.detail["wrong"]
+    assert row["fee"] == "sec_fee_usd"
+    assert row["recorded"] == str(mispriced.sec)
 
 
 def test_a_paper_record_with_no_sale_refuses(db):
