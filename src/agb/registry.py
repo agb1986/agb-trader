@@ -10,13 +10,15 @@ operator then promotes it with `agb promote <model id>`, which refuses, and reco
 refusal as a refused command:
 
   * a model with no certification, or one that failed its gates;
-  * a voided certification. Promotion first voids every certification made under a cost
-    model the current one supersedes, as `agb void-stale` does, so a stale certification is
-    refused as voided. One made under a cost model this code does not know yet, by newer
-    research code, is refused but left for the release that brings it;
-  * an artifact missing from the models directory, or one whose shipped ledger holds a
-    number of trials other than the certification declared, or whose files or digest differ
-    from the certification's;
+  * a voided certification, or one made under a cost model other than the current one. A
+    refused promotion changes nothing; one that goes ahead first voids every certification
+    made under a cost model the current one supersedes, as `agb void-stale` does. One made
+    under a cost model this code does not know yet, by newer research code, is refused but
+    left for the release that brings it;
+  * an artifact missing from the models directory, or one `agb.research.artifact.load`
+    refuses: altered files or manifest, a trial count by any rule but `trials.RULE`, or a
+    verdict the gates do not give when run again over the paths and ledger it ships; or one
+    whose manifest digest or declared trial count is not the certification's;
   * the model already live.
 
 A promotion can carry one waiver, and one only. `agb promote <model id> --waive-for-paper
@@ -35,15 +37,15 @@ nothing promoted, voided, stale, altered. It never falls back to another model. 
 names the certification and the artifact digest it was ranked with, and the gate halts one
 whose digest is not the live certification's.
 
-This module never imports agb.research, which needs pandas; it reads the artifact's layout
-itself, and the tests hold the two to the same file names and to the same trial count over the
-same ledger. LightGBM is imported when a model is loaded.
+Verifying an artifact is `agb.research.artifact.load`, the same function the import runs, so
+the import and the registry cannot disagree on what an artifact must satisfy (issue #211). That
+module and the two it uses, `agb.research.recompute` and `agb.research.gates`, import nothing
+the app image lacks; tests/test_artifact.py holds that line. Nothing else from agb.research is
+imported here. LightGBM is imported when a model is loaded.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -54,11 +56,15 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import psycopg
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from agb import approval, cost, features
 from agb.approval import Source
 from agb.ranker import Ranked, order
+from agb.research import artifact
+
+# The artifact layout, re-exported for the readers of `models_dir`.
+from agb.research.artifact import MANIFEST as MANIFEST
+from agb.research.artifact import MODEL, CertificationError
 
 if TYPE_CHECKING:
     import duckdb
@@ -67,23 +73,6 @@ if TYPE_CHECKING:
 
 MODELS_ENV = "AGB_MODELS_DIR"
 DEFAULT_MODELS_DIR = Path("/models")
-
-# The artifact layout agb.research.certify writes.
-MANIFEST = "manifest.json"
-MODEL = "model.txt"
-LEDGER = "trials.parquet"
-# How the certification counted its declared trials, from agb.research.trials, reimplemented
-# here for the same reason as the file names above. A manifest that names no rule was written
-# before there was more than one and declared the ledger's row count. `_IDENTITY` is what makes
-# two rows the same configuration; a row inside another row's interval, or, under `started`,
-# inside the interval of the parent it names, is that run's own cross-validation or backtest
-# rather than another configuration searched. The ledger's chain is checked by the import, not
-# here.
-RULES = ("rows", "configurations", "started")
-_IDENTITY = (
-    "kind", "config", "features", "train_start", "train_end",
-    "partition_hash", "cost_model_version", "code_version",
-)  # fmt: skip
 
 PROMOTE = "promote"
 VOID = "void"
@@ -123,6 +112,12 @@ class Certification:
     waived_by: str | None
     waived_reason: str | None
 
+    def stale(self, current: str) -> str:
+        return (
+            f"model {self.model_id} was certified under cost model"
+            f" {self.cost_model_version}; the cost model is now {current}"
+        )
+
     def problem(self, current: str) -> str | None:
         """Why this certification cannot be live whatever its artifact, or None."""
         if self.voided_at is not None:
@@ -133,10 +128,7 @@ class Certification:
         if not self.passed:
             return f"model {self.model_id} failed certification"
         if self.cost_model_version != current:
-            return (
-                f"model {self.model_id} was certified under cost model"
-                f" {self.cost_model_version}; the cost model is now {current}"
-            )
+            return self.stale(current)
         return None
 
     def waiver(self, mode: str, current: str) -> str | None:
@@ -207,121 +199,28 @@ def live(conn: psycopg.Connection) -> Certification | None:
 # The artifact.
 
 
-def declared_trials_of(ledger: Path, rule: str) -> int:
-    """How many trials the ledger at `ledger` holds, under `rule`.
-
-    The same count `agb.research.trials.declared` computes, over the ledger shipped in the
-    artifact. `rows` is every row. `configurations` is the distinct configurations that came
-    back with a result: rows nested inside another run's interval are that one run's
-    cross-validation and backtest, repeats of a configuration are one configuration, and a
-    configuration that never succeeded is left out. `started` is the distinct configurations
-    started, however they ended, with a row folded into the parent it names when the parent's
-    interval holds it; a row from before the chain, which has no `previous`, names no parent
-    and is folded by interval as under `configurations`.
-    """
-    table = pq.read_table(ledger)
-    if rule == "rows":
-        return table.num_rows
-    if rule not in ("configurations", "started"):
-        raise RegistryError(f"the certification counted its trials by an unknown rule {rule!r}")
-    # Ledgers from before the chain have neither column, which reads as every row having none.
-    chain = [name for name in ("parent", "previous") if name in table.column_names]
-    columns = ["trial_id", "status", "started_at", "finished_at", *_IDENTITY, *chain]
-    rows = table.select(columns).to_pylist()
-    ends = {row["trial_id"]: row["finished_at"] or row["started_at"] for row in rows}
-    by_id = {row["trial_id"]: row for row in rows}
-
-    def holds(other: dict, row: dict) -> bool:
-        return (
-            other["started_at"] < row["started_at"]
-            and ends[other["trial_id"]] >= ends[row["trial_id"]]
-        )
-
-    def inside(row: dict) -> bool:
-        return any(holds(o, row) for o in rows if o["trial_id"] != row["trial_id"])
-
-    counted = set()
-    for row in rows:
-        if rule == "configurations":
-            if row["status"] != "succeeded" or inside(row):
-                continue
-        elif row.get("previous") is None:
-            if inside(row):
-                continue
-        else:
-            parent = by_id.get(row.get("parent"))
-            if parent is not None and holds(parent, row):
-                continue
-        counted.add(tuple(row[name] for name in _IDENTITY))
-    return len(counted)
-
-
 def verify(directory: Path, artifact_sha256: str, declared_trials: int) -> None:
-    """Check that `directory` holds the certified artifact: its shipped ledger holds exactly
-    the declared number of trials, counted the way the manifest says they were counted, it has
-    a booster, every listed file is present with its listed digest, nothing unlisted is there,
-    and the digest over the digests is the certification's."""
-    path = directory / MANIFEST
-    if not path.is_file():
-        raise RegistryError(f"{directory} holds no {MANIFEST}")
+    """Check that `directory` holds the certified artifact: `agb.research.artifact.load`
+    accepts it, which recomputes its verdict, and its manifest digest and declared trial count
+    are the ones the certification row recorded. The digest covers the whole manifest, so an
+    artifact that passes is the one that was imported, field for field."""
     try:
-        manifest = json.loads(path.read_text())
-        files = manifest["files"]
-        if not isinstance(files, dict):
-            raise TypeError("files is not a mapping")
-    except (ValueError, KeyError, TypeError) as exc:
-        raise RegistryError(f"{path} is not a certification manifest: {exc}") from None
-    ledger = directory / LEDGER
-    if LEDGER not in files or not ledger.is_file():
-        raise RegistryError(f"{directory} holds no {LEDGER}")
-    # The rule is read from the manifest, not the database, which keeps the count alone; the
-    # ledger it is applied to is pinned by the digest the database holds, so the recount is of
-    # the file the certification shipped whatever the manifest says about how to count it.
-    rule = manifest.get("declared_trials_rule", "rows")
-    try:
-        trials = declared_trials_of(ledger, rule)
-    except (OSError, pa.ArrowException, KeyError) as exc:
-        raise RegistryError(f"{ledger} is not a trial ledger: {exc}") from None
-    if trials != declared_trials:
-        raise RegistryError(
-            f"the artifact's ledger holds {trials} trials counted as {rule}; the certification"
-            f" declared {declared_trials}"
-        )
-    if MODEL not in files:
-        raise RegistryError(f"{directory} holds no {MODEL}")
-    for name, digest in files.items():
-        file = directory / name
-        if not file.is_file():
-            raise RegistryError(f"{name} is missing from {directory}")
-        if _sha256(file) != digest:
-            raise RegistryError(f"{name} in {directory} has been altered since certification")
-    unlisted = sorted(
-        p.name for p in directory.iterdir() if p.name not in files and p.name != MANIFEST
-    )
-    if unlisted:
-        raise RegistryError(f"{directory} holds unlisted files: {', '.join(unlisted)}")
-    digest = artifact_sha256_of(files)
+        manifest = artifact.load(directory)
+    except CertificationError as exc:
+        raise RegistryError(f"the artifact in {directory} is refused: {exc}") from None
+    except (OSError, pa.ArrowException) as exc:
+        raise RegistryError(f"the artifact in {directory} cannot be read: {exc}") from None
+    digest = manifest["artifact_sha256"]
     if digest != artifact_sha256:
         raise RegistryError(
             f"the artifact in {directory} has digest {digest[:12]}; the certification's is"
             f" {artifact_sha256[:12]}"
         )
-
-
-def artifact_sha256_of(files: dict[str, str]) -> str:
-    """One digest over every file's name and digest, in name order, as certify computes it."""
-    hasher = hashlib.sha256()
-    for name in sorted(files):
-        hasher.update(f"{name}\0{files[name]}\n".encode())
-    return hasher.hexdigest()
-
-
-def _sha256(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+    if manifest["declared_trials"] != declared_trials:
+        raise RegistryError(
+            f"the artifact in {directory} declares {manifest['declared_trials']} trials; the"
+            f" certification declared {declared_trials}"
+        )
 
 
 # The ranker.
@@ -429,10 +328,11 @@ def promote(
 ) -> str:
     """Make `model_id`'s certification the live model. The promotion is a `promote` command
     and a promotion_event naming it; a refusal is recorded too, and raised as Refused.
-    Stale certifications are voided first. `waive_for_paper` is the operator's reason for a
+    The refusal is decided first, on the certification as it stands, so a refused promotion
+    changes nothing but the refused command; only a promotion that goes ahead voids the stale
+    certifications. `waive_for_paper` is the operator's reason for a
     paper-only measurement waiver: it is refused outside paper mode, and refused for any
     certification whose problem is anything but the failed gate."""
-    void_stale(conn, source)
     args: dict[str, Any] = {"model_id": model_id}
     if waive_for_paper is not None:
         args["waive_for_paper"] = waive_for_paper
@@ -451,6 +351,7 @@ def promote(
     if why is not None or candidate is None:
         approval.record(conn, source, PROMOTE, args, why)
         raise Refused(why)
+    void_stale(conn, source)
     args |= {"certification_id": candidate.id, "artifact_sha256": candidate.artifact_sha256}
     with conn.transaction():
         command_id = approval.record(conn, source, PROMOTE, args)
@@ -502,8 +403,10 @@ def _refusal(
             return "a measurement waiver needs a reason"
         if candidate.passed:
             return f"model {model_id} passed certification and needs no waiver"
-        if candidate.voided_at is not None or candidate.cost_model_version != current:
+        if candidate.voided_at is not None:
             return candidate.problem(current)
+        if candidate.cost_model_version != current:
+            return candidate.stale(current)
     elif (why := candidate.problem(current)) is not None:
         return why
     if was is not None and was[0] == candidate.id:

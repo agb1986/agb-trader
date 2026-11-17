@@ -24,7 +24,8 @@ from conftest import ROOT
 APP, RESEARCH = "app", "research"
 # What runs on the server and so must import without the research group. `agb.cli` is the whole
 # command line, because `agb import-certification` is the entry point the import service runs.
-SERVER_MODULES = ("agb.research.artifact", "agb.cli")
+# `agb.registry` verifies a promoted model through `agb.research.artifact` (issue #211).
+SERVER_MODULES = ("agb.research.artifact", "agb.registry", "agb.cli")
 
 SCRIPT = """
 import sys

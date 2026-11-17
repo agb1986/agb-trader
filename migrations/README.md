@@ -7,6 +7,10 @@ role `agb_owner`, and is recorded in `agb.schema_migration` with its SHA-256.
 ## The rule
 
 **Schema changes only add columns that are nullable or carry a default, and never backfill.**
+The one alteration allowed is loosening a `CHECK` constraint: Postgres cannot extend one, so
+the migration drops it and adds it back with the whole, longer list, as
+`20261014000000_execution_recovery.sql` does. A migration never narrows a constraint, drops a
+column or changes a type.
 
 History is append-only: every history table refuses `UPDATE`, `DELETE` and `TRUNCATE` for
 every role, the owner included. A backfill is an `UPDATE`, so the trigger refuses it anyway.

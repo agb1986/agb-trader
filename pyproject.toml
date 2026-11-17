@@ -33,9 +33,13 @@ research = [
     "vectorbt>=1.1.0",
 ]
 dev = [
+    "mypy>=2.4.1",
     "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "pytest-timeout>=2.4.0",
     "pyyaml>=6.0.3",
     "ruff>=0.16.7",
+    "types-pyyaml>=6.0.12.20261113",
 ]
 
 [tool.uv]
@@ -55,10 +59,24 @@ testpaths = ["tests"]
 # A live test runs only when asked for with `-m live` (make test-live): a later -m replaces
 # this one, so a target that passes its own -m must keep "not live" in it.
 addopts = "-ra --strict-markers -m 'not live'"
+# Seconds per test, setup and teardown included (pytest-timeout). The slowest tests in the fast
+# suite, the certification tests that build a research panel, took 54 s on a loaded machine; this
+# is five times that. A test that needs longer takes @pytest.mark.timeout(n) and says why.
+timeout = 300
 markers = [
     "stack: brings up the Compose stack (builds the app image)",
     "live: needs the real vendor API or the real lake; each module names the variable that enables it",
 ]
+
+[tool.coverage.run]
+source = ["agb"]
+
+[tool.coverage.report]
+# The coverage floor, recorded here and nowhere else (`make cover` fails below it). The fast
+# suite measured 94.3% on 2026-11-16; the floor sits a little under that. Raise it when
+# coverage rises; do not lower it to make a change pass.
+fail_under = 92
+show_missing = false
 
 [tool.ruff]
 line-length = 100
@@ -68,3 +86,72 @@ extend-exclude = ["scripts/orca"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+# The type checker (#192). `make types` checks the package; the four modules that move money and
+# state are held to `strict`, and every other module is checked permissively, so it still has
+# to import and type-check at the level a plain `mypy` reads, but may leave functions
+# unannotated. See docs/build/type-checking.md for the permissive list, which only shrinks.
+[tool.mypy]
+python_version = "3.12"
+files = ["src/agb"]
+warn_unused_configs = true
+warn_redundant_casts = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "agb.approval",
+    "agb.execution",
+    "agb.gate",
+    "agb.jobs",
+]
+# `strict` itself is a global-only switch; these are the flags it stands for.
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+warn_unused_ignores = true
+warn_return_any = true
+no_implicit_reexport = true
+strict_equality = true
+extra_checks = true
+
+# The permissive list: modules that do not yet pass a plain check (97 errors on 2026-11-16,
+# counted per module in docs/build/type-checking.md). Their errors are not reported, and every
+# other module is checked at the permissive level. Fix a module, delete its line here, and run
+# `make types`; the list only shrinks.
+[[tool.mypy.overrides]]
+module = [
+    "agb.basket",
+    "agb.cli",
+    "agb.features",
+    "agb.health",
+    "agb.heartbeat",
+    "agb.lake",
+    "agb.migrate",
+    "agb.panel",
+    "agb.panel_audit",
+    "agb.preflight",
+    "agb.readout",
+    "agb.recovery",
+    "agb.registry",
+    "agb.research.__main__",
+    "agb.research.artifact",
+    "agb.research.backtest",
+    "agb.research.certify",
+    "agb.research.cpcv",
+    "agb.research.reproduce",
+    "agb.research.trials",
+    "agb.schedule",
+    "agb.services.backup",
+    "agb.services.bot",
+    "agb.services.execution",
+    "agb.services.pipeline",
+    "agb.services.ui",
+    "agb.ui",
+    "agb.universe",
+]
+ignore_errors = true

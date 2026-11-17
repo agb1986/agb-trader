@@ -32,6 +32,7 @@ from datetime import date
 from typing import Any
 
 import psycopg
+from psycopg.errors import UniqueViolation
 
 from agb import analyst, blend, edgar, panel
 from agb.disclosures import FIXTURES, Disclosure
@@ -388,6 +389,8 @@ def sample(conn: psycopg.Connection, run_id: int, n: int = SPOT_CHECK_N) -> list
     score range so the sample carries the panel's best and worst reading of the month and not
     just its middle. The same names every time, so the review can be done over several
     sittings."""
+    if n < 1:
+        raise PreflightError(f"a spot check needs at least one name, not {n}")
     rows = conn.execute(_SCORED, (run_id,)).fetchall()
     if len(rows) < n:
         raise PreflightError(
@@ -396,7 +399,9 @@ def sample(conn: psycopg.Connection, run_id: int, n: int = SPOT_CHECK_N) -> list
     verdicts: dict[int, list[tuple[str, str | None, str]]] = {}
     for retrieval_id, verdict, note, actor in conn.execute(_VERDICTS, (run_id,)).fetchall():
         verdicts.setdefault(retrieval_id, []).append((verdict, note, actor))
-    picked = [rows[round(i * (len(rows) - 1) / (n - 1))] for i in range(n)]
+    # One name has no range to span, so it is the middle one.
+    spread = (len(rows) - 1) / (n - 1) if n > 1 else 0
+    picked = [rows[round(i * spread)] if n > 1 else rows[len(rows) // 2] for i in range(n)]
     return [Review(*row, verdicts=tuple(verdicts.get(row[0], ()))) for row in dict.fromkeys(picked)]
 
 
@@ -423,14 +428,21 @@ def review(
     found = next((r for r in reviews if r.symbol == symbol), None)
     if found is None:
         raise PreflightError(f"{symbol} is not among the {len(reviews)} names under spot check")
-    conn.execute(
-        """
-        INSERT INTO agb.panel_spot_check
-            (run_id, retrieval_id, score_id, verdict, note, actor)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        """,
-        (run_id, found.retrieval_id, found.score_id, verdict, note, actor),
-    )
+    try:
+        with conn.transaction():
+            conn.execute(
+                """
+                INSERT INTO agb.panel_spot_check
+                    (run_id, retrieval_id, score_id, verdict, note, actor)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (run_id, found.retrieval_id, found.score_id, verdict, note, actor),
+            )
+    except UniqueViolation:
+        raise PreflightError(
+            f"{actor} has already recorded a verdict on {symbol} in panel_run {run_id};"
+            " a recorded verdict is never changed"
+        ) from None
     return found
 
 

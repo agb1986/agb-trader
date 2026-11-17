@@ -33,7 +33,11 @@ Run `agb-stack` from the deploy directory as `./agb-stack`, or by its full path.
 ## Before the first deploy
 
 - Key-based SSH from the workstation to the server works without a prompt, and the server
-  user can run `docker compose` without `sudo`. See
+  user can run `docker compose` without `sudo`. The server's Compose must be v2.20 or newer
+  (`docker compose version` on the server shows it): `compose.yaml` relies on the top-level
+  `name`, on `depends_on` conditions, and on `up --wait --wait-timeout`, which `agb-stack`
+  passes. The Docker Engine on the server is 20.10, so the file uses only fields that engine
+  knows. See
   [Operator setup](operator-setup.md#1-server-access-and-storage).
 - `env/db.env` exists in the deploy directory and sets every variable that
   `env/db.env.example` sets, including `BACKUP_DB_PASSWORD`. Generate each password on the
@@ -73,7 +77,12 @@ That runs `scripts/deploy/deploy.sh`, which:
    its example does. The variable names are read on the server, so no value leaves it. A
    missing file or variable stops the deploy before anything is built.
 3. Builds `agb-trader-app:<tag>` from `git archive HEAD`, for `linux/amd64`, with the tag as
-   `AGB_VERSION`. Each service reports that version with its heartbeat.
+   `AGB_VERSION`. Each service reports that version with its heartbeat. Compose takes the same
+   value from `AGB_IMAGE_TAG`, which `agb-stack` sets from the release it activates.
+   The workstation's research image takes its version from `AGB_VERSION` instead, which `make
+   research` sets to the checkout's commit, with `-dirty` when the tree has changes. Both
+   default to `dev` when unset, and `certify` refuses to run under `dev`, so a research image
+   built by hand without `AGB_VERSION` cannot certify a model.
 4. Ships the image with `docker save | gzip | ssh … docker load`, unless the server already
    has it.
 5. Installs the release: the commit's `compose.yaml` and `agb-stack` go into
@@ -115,8 +124,11 @@ This runs `agb-stack rollback` on the server, which activates the `previous` rel
 release it leaves becomes `previous`, so running `make rollback` again returns to it. To go back
 further, deploy an older commit: check it out and run `make deploy`.
 
-A rollback does not undo migrations. It does not need to: migrations only ever add, so the
-older image runs against the newer schema, and `migrate` ignores ledger entries it has no file
+A rollback does not undo migrations. It does not need to: migrations only ever widen: they add tables
+and nullable or defaulted columns, and they loosen a `CHECK` constraint by dropping it and
+adding it back with a longer list (`migrations/20261014000000_execution_recovery.sql`), never
+by narrowing it. Every row an older image wrote stays valid, so the older image runs against
+the newer schema, and `migrate` ignores ledger entries it has no file
 for. Those entries still count as applied: a later deploy whose new migration is older than
 one the rolled-back release had applied is refused as out of order, and
 `AGB_MIGRATE_ALLOW_OUT_OF_ORDER=1 ./agb-stack activate <tag>` lets it through. See
@@ -267,8 +279,12 @@ lake/tickers/snapshot=YYYY-MM-DD/part.parquet  the tickers table as it stood tha
 The scheduler plans a `data_pull` job for every session. It becomes claimable two hours after
 the close, and its expected event is due at the next open. The service pulls the prices for
 every session since the last one that landed, so a session missed to a vendor error is picked
-up by the next pull. It also pulls the fundamentals the vendor changed since a week before the
-last pull, and the tickers table, delisted tickers included. It records each partition's date
+up by the next pull. The vendor adjusts prices backwards, so a split or dividend rescales a
+ticker's earlier sessions. Each pull also fetches the last session that landed, and a ticker
+the vendor now prices differently on it has its whole history fetched again and rewritten
+across the sessions the lake holds, which changes those partitions' hashes. It also pulls
+the fundamentals the vendor changed since a week before the last pull, and the tickers table,
+delisted tickers included. It records each partition's date
 and SHA-256 in `agb.lake_snapshot`. If the vendor has not published a session yet, or has
 published fewer than 90% of the rows the session before it had, the service lands the
 complete sessions before it and tries again every 15 minutes, without an alert of its own.
@@ -290,11 +306,16 @@ To query the lake with DuckDB, and to see the latest snapshots:
 
 ```sh
 ./agb-stack exec pipeline python -m agb.lake "SELECT max(date), count(*) FROM sep"
+./agb-stack exec pipeline python -m agb.lake --check
 ./agb-stack exec -T db psql -U postgres -d agb -c \
   "SELECT snapshot_date, partition, sha256 FROM agb.lake_snapshot ORDER BY id DESC LIMIT 5"
 ./agb-stack exec -T db psql -U postgres -d agb -c \
   "SELECT period, state FROM agb.job_state WHERE kind = 'data_pull' ORDER BY period DESC LIMIT 5"
 ```
+
+`--check` lists each ticker whose stored adjusted prices sit on two bases, an action the lake
+missed, and exits 1 if there is one. Running the backfill again rewrites the history on the
+vendor's current basis.
 
 The views are `sep`, `sf1`, which shows the latest version of each fundamentals row, and
 `tickers`, which shows the newest snapshot. `sf1_as_of('2020-06-30')` shows the fundamentals
@@ -342,9 +363,11 @@ service has no database at all. The steps by hand are:
    This runs on the server because the database is reachable only from the stack's own
    network, and in its own container because only the `research` role may insert into
    `agb.model_certification`. It verifies the artifact before it writes: a missing, altered
-   or unlisted file, a shipped ledger that does not recount to the trial count the
-   certification declared, and a model that is already certified are each refused, and
-   nothing is written. The row's `artifact_path` records where the model was certified, from
+   or unlisted file, a manifest altered since certification, a trial count by any rule but
+   `started`, a shipped ledger that does not recount to the trial count the certification
+   declared, a verdict that the gates do not give again when they are rerun over the shipped
+   `paths.json` and `trials.parquet`, and a model that is already certified are each
+   refused, and nothing is written. The row's `artifact_path` records where the model was certified, from
    the manifest, not the path the import read.
 
 3. Promote it on the server:
@@ -355,11 +378,19 @@ service has no database at all. The steps by hand are:
 
 `agb promote` refuses a model with no certification, one that failed its gates (unless it is
 waived for paper, below), a voided one, one certified under an earlier cost model, and one
-whose artifact is missing from `models/`, altered since certification, or ships a trial ledger
-that does not recount to the trial count the certification declared. The recount uses the rule
-the manifest says the certification counted by, so a model certified before the rule changed is
-still checked against the number it declared. It also refuses the model
-that is already live. Each refusal says why and is recorded in `agb.command`, as is each
+whose artifact is missing from `models/` or fails the same check the import runs, which is
+the same code. It also refuses the model that is already live.
+
+The check recomputes the deflated Sharpe, the PBO, the Sharpe, every gate and the verdict from
+the paths and the ledger the artifact ships, and refuses the artifact if any of them differs
+from the manifest by more than a relative 1e-9 (an absolute 1e-12 near zero), naming each field
+that differs. The trial count is always counted as `started`, the rule in the code; the
+manifest's own field only has to agree with it. The digest covers the whole manifest, so no
+field the server reads can be edited without changing the digest the certification row holds.
+A model certified before issue #211 (every model up to and including `lgbm-2026-10`) names no
+rule and has a digest over its files only, so it is refused with that cause and has to be
+certified again under the current code, imported and promoted; see
+[Checking a promoted model after issue #211](#checking-a-promoted-model-after-issue-211). Each refusal says why and is recorded in `agb.command`, as is each
 promotion, which also writes an `agb.promotion_event`. The next rebalance loads the new model
 and checks its artifact again.
 
@@ -376,6 +407,45 @@ too. Each voiding is an `agb.certification_event`. A certification made under a 
 running release does not know yet, by research code ahead of the deploy, is refused but not
 voided, so it can be promoted once that release is live; for the same reason a rollback voids
 nothing.
+
+### Checking a promoted model after issue #211
+
+A release with issue #211 runs the import's check every time the pipeline loads the promoted
+model, so before deploying it, check the model that is live. Checking writes nothing:
+
+```sh
+./agb-stack import lgbm-2026-10
+```
+
+The import verifies the artifact before it looks for an existing certification, so for a model
+that is already certified this either prints the check's refusal or, once the check passes,
+`model 'lgbm-2026-10' is already certified`, which is the pass. `lgbm-2026-10` (artifact
+`3c7b4e50f2f2`) was certified before the fix and is refused before anything is recomputed:
+
+```text
+manifest.json names no trial count rule: the model was certified before the rule was fixed at 'started' (issue #211); re-certify the model under the current code and import the new artifact
+```
+
+Once that release is deployed, the rebalance job fails on that model as it does on a missing
+artifact, so a model certified under the current code has to be imported and promoted with
+the deploy, before the next rebalance. Its copy under `research/certifications/` also shows
+why it cannot be recomputed as it stands: its ledger counts 13 trials by `rows` and 2 by
+`started`; its paths ship no SPY return, so its deflated Sharpe and its Sharpe are undefined
+on the excess basis the gates now use; and its overfitting matrix has one candidate, so its
+PBO is undefined. Its total-return Sharpe, 0.5741, does recompute exactly.
+
+For a model certified under the current code, a difference between the manifest and the gates
+run again names each field, with both values:
+
+```text
+the verdict recomputed from paths.json and trials.parquet differs from manifest.json in 1 field(s): dsr: manifest 0.9312, recomputed 0.9212
+```
+
+A manifest edited after certification without its digest being recomputed reads
+`manifest.json has been altered since certification`, and one whose digest was recomputed
+too reads `has digest <new>; the certification's is <old>` when it is promoted or loaded,
+since the certification row holds the digest it was imported with. Either is a refusal to
+investigate, not to work around: certify the model again.
 
 ### Promoting a failed certification to measure in paper
 

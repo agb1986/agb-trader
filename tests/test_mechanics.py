@@ -18,6 +18,7 @@ from test_approval_loop import cli_main
 from test_execution import (
     AFTER,
     CLOSE_AT,
+    CUTOFF,
     MID,
     NOW,
     PAUSE,
@@ -40,7 +41,7 @@ _FILL = """
 def filled(db, conn, fake, case=SOUND, price=MID, short=None):
     """One paper rebalance, gated and filled the way the services run it."""
     target = approved(db, case)
-    assert execution.submit(conn, fake, target, NOW).state == "submitted"
+    assert execution.submit(conn, fake, target, lambda: NOW, CUTOFF).state == "submitted"
     fake.close(CLOSE_AT, price, short=short)
     assert execution.reconcile(conn, fake, target, AFTER).state == "filled"
     return target
@@ -335,7 +336,7 @@ def test_a_short_fill_that_passed_in_silence_fails(db):
     catch, so the check names the order and fails."""
     conn = db.connect("execution")
     target = approved(db, SOUND)
-    assert execution.submit(conn, broker(), target, NOW).state == "submitted"
+    assert execution.submit(conn, broker(), target, lambda: NOW, CUTOFF).state == "submitted"
     by_hand(db, target.id, short={"N05": Decimal(200)})
 
     result = mechanics.partial_fills(conn)
@@ -362,7 +363,7 @@ def test_a_short_fill_alerted_only_at_submission_fails(db):
     target = approved(db, SOUND)
     fake = broker()
     fake.refuse.add("N03")
-    assert execution.submit(conn, fake, target, NOW).state == "submitted"
+    assert execution.submit(conn, fake, target, lambda: NOW, CUTOFF).state == "submitted"
     by_hand(db, target.id, short={"N03": Decimal(0), "N05": Decimal(200)})
 
     result = mechanics.partial_fills(conn)
@@ -389,7 +390,7 @@ def test_a_short_fill_alerted_under_the_shared_kind_passes_and_a_refusal_under_i
     and hid the close's, does not."""
     conn = db.connect("execution")
     target = approved(db, SOUND)
-    assert execution.submit(conn, broker(), target, NOW).state == "submitted"
+    assert execution.submit(conn, broker(), target, lambda: NOW, CUTOFF).state == "submitted"
     by_hand(db, target.id, short={"N05": Decimal(200)})
 
     refused = "submitted with 1 of 20 orders refused by the broker: N03"
@@ -413,7 +414,7 @@ def test_a_halted_basket_with_an_order_still_live_passes_on_its_halt_alert(db):
 
     fake = broker(on_submit=pause_after_two)
     fake.cancel_fails.add("ord-0002")
-    assert execution.submit(conn, fake, target, NOW).state == "halted"
+    assert execution.submit(conn, fake, target, lambda: NOW, CUTOFF).state == "halted"
 
     result = mechanics.partial_fills(conn)
 

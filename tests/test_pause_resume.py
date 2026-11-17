@@ -5,6 +5,7 @@ flight), and the confirmation comes back to the chat as an alert. The broker is
 execution tests.
 """
 
+import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -12,7 +13,7 @@ import pytest
 from alpaca_fake import FakeBroker
 from market_fake import PERIOD
 from psycopg import errors
-from test_bot import FakeTelegram
+from test_bot import UPDATE_IDS, FakeTelegram, sent
 from test_execution import (
     AFTER,
     CLOSE_AT,
@@ -29,7 +30,7 @@ from test_execution import (
 from agb import execution, health
 from agb.alpaca import AlpacaError
 from agb.roles import OWNER
-from agb.services.bot import Bot, help_text
+from agb.services.bot import STALE_COMMAND, Bot, help_text
 from agb.services.execution import Execution
 
 CHAT = "4242"
@@ -47,15 +48,18 @@ class Operator:
         self.db = db
         self.telegram = FakeTelegram()
         self.bot = Bot(self.telegram, CHAT, clock)
-        self._update = 0
 
-    def says(self, text: str, user: int = OPERATOR) -> str:
-        """Send `text` and run one bot cycle. Returns the bot's reply."""
-        self._update += 1
+    def says(self, text: str, user: int = OPERATOR, at: datetime | None = None) -> str:
+        """Send `text`, at `at` or else now by the bot's clock, and poll. Returns the reply."""
         self.telegram.updates.append(
             {
-                "update_id": self._update,
-                "message": {"chat": {"id": int(CHAT)}, "from": {"id": user}, "text": text},
+                "update_id": next(UPDATE_IDS),
+                "message": {
+                    "chat": {"id": int(CHAT)},
+                    "from": {"id": user},
+                    "date": sent(at or self.bot.clock()),
+                    "text": text,
+                },
             }
         )
         before = len(self.telegram.sent)
@@ -518,6 +522,106 @@ def test_only_pause_and_resume_reach_the_latches(db, operator):
     ]
     assert execution.pending_latch(db.connect("execution")) == []
     assert open_causes(db) == []
+
+
+# -- each command once, and only while fresh -------------------------------------------------
+
+
+def handled(db):
+    """Everything a handled command leaves behind: its row, the halt history, the alerts."""
+    return (
+        commands(db),
+        rows(db, "SELECT cause, action, actor FROM agb.halt_event ORDER BY id"),
+        rows(db, "SELECT update_id, chat_id, actor FROM agb.telegram_update ORDER BY update_id"),
+    )
+
+
+def test_a_batch_handled_before_a_crash_is_not_handled_again_on_restart(db):
+    first = Operator(db)
+    first.telegram.updates = [
+        {
+            "update_id": next(UPDATE_IDS),
+            "message": {
+                "message_id": i,
+                "chat": {"id": int(CHAT)},
+                "from": {"id": OPERATOR},
+                "date": sent(NOW),
+                "text": text,
+            },
+        }
+        for i, text in enumerate(["/pause", "/liquidate", "/status"], start=1)
+    ]
+    first.bot.poll(db.connect("bot"))
+    assert [verb for _, _, _, verb, _, _, _ in commands(db)] == ["pause", "liquidate", "status"]
+    assert len(first.telegram.sent) == 3
+    before = handled(db)
+    newest = first.telegram.updates[-1]["update_id"]
+
+    # The service dies before its next poll would have confirmed the batch to Telegram, so
+    # Telegram still holds all of it. The restarted bot asks from past what is on record.
+    restarted = Bot(first.telegram, CHAT, lambda: NOW)
+    restarted.poll(db.connect("bot"))
+    assert first.telegram.offsets[-1] == newest + 1
+
+    # And were the batch handed over again anyway, each update is already on record.
+    replaying = Bot(first.telegram, CHAT, lambda: NOW)
+    replaying._offset = 0
+    replaying.poll(db.connect("bot"))
+    assert first.telegram.offsets[-1] == 0
+
+    assert handled(db) == before
+    assert open_causes(db) == [("pause", ACTOR)]
+    assert len(first.telegram.sent) == 3
+    [(liquidations,)] = rows(db, "SELECT count(*) FROM agb.command WHERE verb = 'liquidate'")
+    assert liquidations == 1
+
+
+def test_a_ten_minute_old_resume_is_refused_and_clears_no_halt(db, operator, caplog):
+    operator.says("/pause")
+    before = rows(db, "SELECT cause, action FROM agb.halt_event ORDER BY id")
+
+    with caplog.at_level(logging.WARNING, logger="agb.services.bot"):
+        reply = operator.says("/resume", at=NOW - timedelta(minutes=10))
+
+    reason = "stale: sent 10m 0s ago, at 2026-10-01 15:25 ET; nothing older than 5m 0s is acted on."
+    assert reply == (
+        f"STALE — /resume refused\n{reason}\n"
+        "Nothing has been done. Send it again if you still mean it."
+    )
+    assert open_causes(db) == [("pause", ACTOR)]
+    assert rows(db, "SELECT cause, action FROM agb.halt_event ORDER BY id") == before
+    assert commands(db)[-1] == (
+        ACTOR,
+        "telegram",
+        "/resume",
+        "resume",
+        {"args": []},
+        "refused",
+        reason,
+    )
+    assert f"refused /resume from {ACTOR}: {reason}" in caplog.text
+    assert execution.pending_latch(db.connect("execution"))[-1].verb == "pause"
+
+
+def test_a_command_is_acted_on_up_to_the_stale_age_and_not_without_a_send_time(db, operator):
+    operator.says("/pause")
+
+    assert operator.says("/resume", at=NOW - STALE_COMMAND).startswith("RESUMED\n")
+    assert open_causes(db) == []
+
+    operator.telegram.updates.append(
+        {
+            "update_id": next(UPDATE_IDS),
+            "message": {"chat": {"id": int(CHAT)}, "from": {"id": OPERATOR}, "text": "/pause"},
+        }
+    )
+    operator.bot.poll(db.connect("bot"))
+    assert operator.telegram.sent[-1][1].startswith("STALE — /pause refused\n")
+    assert open_causes(db) == []
+    assert commands(db)[-1][5:] == (
+        "refused",
+        "stale: Telegram gave no time it was sent, so its age is unknown.",
+    )
 
 
 def test_commands_are_append_only_and_only_the_surfaces_write_them(db, operator):

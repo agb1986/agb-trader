@@ -52,10 +52,11 @@ recorded as not carried out.
 """
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -64,6 +65,7 @@ from agb import cost, jobs, nyse, schedule
 from agb.alpaca import AlpacaError, Broker, Closed, Order, Quote
 from agb.gate import Check
 from agb.roles import EXECUTION
+from agb.rows import one
 
 log = logging.getLogger(__name__)
 
@@ -192,7 +194,7 @@ class Command:
     verb: str
     actor: str
     at: datetime
-    args: dict
+    args: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -477,7 +479,7 @@ def check(conn: psycopg.Connection, broker: Broker, basket: Basket) -> tuple[boo
         recorded = conn.execute(_CHECK_RUN, (basket.id,)).fetchone()
         if recorded is not None:
             return _verdict(conn, recorded[0])
-        (run_id,) = conn.execute(_INSERT_CHECK_RUN, (basket.id, len(checks), ACTOR)).fetchone()
+        (run_id,) = one(conn.execute(_INSERT_CHECK_RUN, (basket.id, len(checks), ACTOR)))
         with conn.cursor() as cur:
             cur.executemany(
                 _INSERT_CHECK,
@@ -529,7 +531,7 @@ def _event(
     )
 
 
-def raise_alert(conn: psycopg.Connection, kind: str, subject: str, period: str, body: str):
+def raise_alert(conn: psycopg.Connection, kind: str, subject: str, period: str, body: str) -> None:
     conn.execute(_RAISE, (kind, subject, period, body, ACTOR))
 
 
@@ -552,7 +554,7 @@ def _cancel_sent(conn: psycopg.Connection, broker: Broker, orders: Sequence[Sent
     one the broker is still cancelling, and one that filled in part or in full first."""
     remaining = []
     for order in orders:
-        if not order.live or order.done:
+        if not order.live or order.done or order.broker_order_id is None:
             continue
         _event(conn, order.id, "cancel_requested", None, status=PENDING_CANCEL)
         try:
@@ -621,7 +623,52 @@ def _stop(
     return Outcome(basket.id, "halted", len(live), reason)
 
 
-def submit(conn: psycopg.Connection, broker: Broker, basket: Basket, now: datetime) -> Outcome:
+def _cut_off(
+    conn: psycopg.Connection,
+    basket: Basket,
+    unsent: Sequence[Planned],
+    total: int,
+    cutoff: datetime,
+    count: int,
+    at: datetime,
+) -> Outcome:
+    """The clock reached the cutoff with orders still unsent: stop, halt the basket, and alert
+    on the partial rebalance, naming the orders that did not go in. The orders already sent
+    are left to the close; only a pause cancels them. With nothing sent there is no partial
+    rebalance to report: the basket stays approved for the scheduler to mark missed, and the
+    submission fails."""
+    when = f"{cutoff.astimezone(nyse.NEW_YORK):%H:%M} ET"
+    if count == 0:
+        raise ExecutionError(
+            f"basket {basket.reference}: the {when} cutoff passed before the first order went "
+            f"in, at {at.astimezone(UTC):%H:%M:%SZ}; none sent"
+        )
+    names = ", ".join(f"{o.side} {o.qty} {o.symbol}" for o in unsent)
+    reason = (
+        f"the {when} cutoff passed mid-submission, at {at.astimezone(UTC):%H:%M:%SZ}: "
+        f"{count} of {total} orders sent, {len(unsent)} not sent"
+    )
+    with conn.transaction():
+        _halt(conn, basket, reason, breach=False)
+    raise_alert(
+        conn,
+        PARTIAL_HALTED,
+        basket.reference,
+        basket.period,
+        f"basket {basket.reference} halted mid-submission; the {when} cutoff passed with "
+        f"{count} of {total} orders sent. Not sent: {names}",
+    )
+    log.warning("basket %s: %s", basket.reference, reason)
+    return Outcome(basket.id, "halted", count, reason)
+
+
+def submit(
+    conn: psycopg.Connection,
+    broker: Broker,
+    basket: Basket,
+    clock: Callable[[], datetime],
+    cutoff: datetime,
+) -> Outcome:
     """Send the basket's orders, one at a time, and move it to submitted when each has an
     answer. `conn` is in autocommit mode: each order's row is committed before the broker is
     called, so a crash between the call and the answer leaves a row to look up under its
@@ -630,7 +677,12 @@ def submit(conn: psycopg.Connection, broker: Broker, basket: Basket, now: dateti
     The halt latch is read before the broker checks, so a pause the broker already carries
     as `suspend_trade` halts the basket as a pause rather than as a failed check. Every quote
     an unsent order needs is read in one request before the first order goes out; a symbol
-    without one raises, and nothing is sent."""
+    without one raises, and nothing is sent.
+
+    `clock` is read before each order, not once for the cycle: a slow submission that starts
+    inside the window must not send past `cutoff`. When it reads `cutoff` or later with
+    orders unsent, the rest are not sent, the basket is halted and the partial-rebalance
+    alert names them."""
     causes = open_halts(conn)
     if causes:
         return _stop(conn, broker, basket, causes)
@@ -643,7 +695,7 @@ def submit(conn: psycopg.Connection, broker: Broker, basket: Basket, now: dateti
     quotes = _quotes(broker, [o.symbol for o in orders if o.id not in answered])
     rejected: list[Sent] = []
     count = 0
-    for order in orders:
+    for position, order in enumerate(orders):
         existing = answered.get(order.id)
         if existing is not None and existing.answered:
             if existing.kind == "rejected":
@@ -661,30 +713,36 @@ def submit(conn: psycopg.Connection, broker: Broker, basket: Basket, now: dateti
             except AlpacaError as exc:
                 if not exc.not_found:
                     raise ExecutionError(f"{order.client_order_id}: {exc}") from exc
+                if (at := clock()) >= cutoff:
+                    return _cut_off(conn, basket, orders[position:], len(orders), cutoff, count, at)
             else:
                 _event(conn, order_id, "lookup", found)
                 count += 1
                 continue
         else:
+            if (at := clock()) >= cutoff:
+                return _cut_off(conn, basket, orders[position:], len(orders), cutoff, count, at)
             quote = quotes[order.symbol]
-            (order_id,) = conn.execute(
-                _INSERT_ORDER,
-                (
-                    basket.id,
-                    order.id,
-                    order.client_order_id,
-                    order.symbol,
-                    order.side,
-                    order.qty,
-                    order.cost_model_version,
-                    order.modelled_cost_bps,
-                    quote.bid,
-                    quote.ask,
-                    quote.mid,
-                    quote.at,
-                    ACTOR,
-                ),
-            ).fetchone()
+            (order_id,) = one(
+                conn.execute(
+                    _INSERT_ORDER,
+                    (
+                        basket.id,
+                        order.id,
+                        order.client_order_id,
+                        order.symbol,
+                        order.side,
+                        order.qty,
+                        order.cost_model_version,
+                        order.modelled_cost_bps,
+                        quote.bid,
+                        quote.ask,
+                        quote.mid,
+                        quote.at,
+                        ACTOR,
+                    ),
+                )
+            )
         try:
             acked = broker.submit(order.symbol, order.qty, order.side, order.client_order_id)
         except AlpacaError as exc:
@@ -717,10 +775,12 @@ def submit(conn: psycopg.Connection, broker: Broker, basket: Basket, now: dateti
         current = conn.execute(_STATE, (basket.id,)).fetchone()
         if current is None or current[0] != "approved":
             raise ExecutionError(f"basket {basket.id} is no longer approved")
-        reason = f"{count} orders answered by the broker at {now.astimezone(UTC):%H:%M:%SZ}"
-        (event_id,) = conn.execute(
-            _MOVE, (basket.id, current[1] + 1, "approved", "submitted", ACTOR, SURFACE, reason)
-        ).fetchone()
+        reason = f"{count} orders answered by the broker at {clock().astimezone(UTC):%H:%M:%SZ}"
+        (event_id,) = one(
+            conn.execute(
+                _MOVE, (basket.id, current[1] + 1, "approved", "submitted", ACTOR, SURFACE, reason)
+            )
+        )
         jobs.fulfil(conn, schedule.SUBMISSION, basket.period, "basket_event", event_id, ACTOR)
     if rejected:
         names = ", ".join(f"{o.side} {o.qty} {o.symbol}" for o in rejected)
@@ -788,12 +848,12 @@ def reconcile(conn: psycopg.Connection, broker: Broker, basket: Basket, now: dat
     move the basket to filled once the broker is done with every order."""
     orders = sent(conn, basket.id)
     for order in orders:
-        if not order.live or order.done:
+        if not order.live or order.done or order.broker_order_id is None:
             continue
         latest = broker.order(order.broker_order_id)
         if latest.status != order.status or latest.filled_qty != order.filled_qty:
             _event(conn, order.id, "status", latest)
-    (earliest,) = conn.execute(_EARLIEST_ORDER, (basket.id,)).fetchone()
+    (earliest,) = one(conn.execute(_EARLIEST_ORDER, (basket.id,)))
     if earliest is not None:
         ingest_fills(conn, broker, min(earliest, now) - FILL_LOOKBACK)
     orders = sent(conn, basket.id)
@@ -838,7 +898,7 @@ def snapshot(
     ingest_fills(conn, broker, since)
     positions = broker.positions()
     with conn.transaction():
-        (snapshot_id,) = conn.execute(_INSERT_SNAPSHOT, (session, len(positions), ACTOR)).fetchone()
+        (snapshot_id,) = one(conn.execute(_INSERT_SNAPSHOT, (session, len(positions), ACTOR)))
         with conn.cursor() as cur:
             cur.executemany(
                 _INSERT_POSITION,

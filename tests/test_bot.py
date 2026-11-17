@@ -1,6 +1,7 @@
 """The Telegram bot, with a fake Telegram: alerts and their delivery, the pre-flight, the
 configured chat, and the bot's own heartbeat. The commands are in tests/test_bot_commands.py."""
 
+import itertools
 import logging
 import threading
 from datetime import date, datetime, timedelta
@@ -21,6 +22,9 @@ CHAT = "4242"
 NOW = datetime(2026, 9, 15, 12, 0, tzinfo=NEW_YORK)
 # 10:05 New York on 2026-09-30, the session before the October rebalance.
 PREFLIGHT = datetime(2026, 9, 30, 10, 5, tzinfo=NEW_YORK)
+# Telegram numbers updates across the whole bot, and the bot keeps the ones it has handled,
+# so a fake update that reused a number would be skipped as handled before.
+UPDATE_IDS = itertools.count(1000)
 
 
 class FakeTelegram:
@@ -41,6 +45,11 @@ class FakeTelegram:
         if self.fail:
             raise TelegramError(self.fail)
         return [u for u in self.updates if offset is None or u["update_id"] >= offset]
+
+
+def sent(at: datetime) -> int:
+    """A message's send time, as Telegram gives it: unix seconds."""
+    return int(at.timestamp())
 
 
 @pytest.fixture
@@ -260,8 +269,24 @@ def test_each_alerting_service_can_raise_an_alert(db, role):
 
 def test_only_the_configured_chat_is_answered(db, telegram, rebalance_ahead, caplog):
     telegram.updates = [
-        {"update_id": 7, "message": {"chat": {"id": 999}, "from": {"id": 999}, "text": "/status"}},
-        {"update_id": 8, "message": {"chat": {"id": int(CHAT)}, "from": {"id": 1}, "text": "hi"}},
+        {
+            "update_id": 7,
+            "message": {
+                "chat": {"id": 999},
+                "from": {"id": 999},
+                "date": sent(NOW),
+                "text": "/status",
+            },
+        },
+        {
+            "update_id": 8,
+            "message": {
+                "chat": {"id": int(CHAT)},
+                "from": {"id": 1},
+                "date": sent(NOW),
+                "text": "hi",
+            },
+        },
         {"update_id": 9, "edited_message": {"chat": {"id": int(CHAT)}, "text": "hello"}},
     ]
     conn = db.connect("bot")
@@ -400,7 +425,15 @@ def test_a_poll_that_cannot_reach_telegram_is_tried_again_inside_the_cycle(db, t
 
 def test_a_poll_that_fails_once_still_reads_the_messages(db, telegram):
     telegram.updates = [
-        {"update_id": 11, "message": {"chat": {"id": int(CHAT)}, "from": {"id": 1}, "text": "hi"}}
+        {
+            "update_id": 11,
+            "message": {
+                "chat": {"id": int(CHAT)},
+                "from": {"id": 1},
+                "date": sent(NOW),
+                "text": "hi",
+            },
+        }
     ]
     reached = telegram.get_updates
 

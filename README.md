@@ -5,7 +5,7 @@ A semi-autonomous, AI-integrated US equities trader. The design lives in
 
 ## Quickstart
 
-Needs Docker with Compose v2, GNU Make and [uv](https://docs.astral.sh/uv/).
+Needs Docker with Compose v2.20 or newer, GNU Make and [uv](https://docs.astral.sh/uv/).
 
 ```sh
 make env      # copy each env/*.env.example to env/*.env; set real passwords in env/db.env
@@ -48,6 +48,8 @@ make test       # the whole suite, including a full stack bring-up, without the 
 make test-fast  # everything except the stack bring-up and the live tests
 make test-live  # only the live tests, each skipped unless its own variable is set
 make lint
+make types      # mypy: strict on four modules, permissive elsewhere
+make cover      # the fast tests with coverage; fails below the floor in pyproject.toml
 ```
 
 The tests start their own throwaway Postgres container on a random local port and never
@@ -57,12 +59,16 @@ beside a stack that holds `127.0.0.1:8080`; it asserts that every service beats,
 status` lists them all and that the UI answers on its landing page, and it removes its project
 when it fails or is interrupted.
 
-GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs three checks on
+[docs/build/type-checking.md](docs/build/type-checking.md) holds the permissive module list
+the type check lets through, where the coverage floor lives and how the per-test timeout works.
+
+GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs five checks on
 every pull request, whatever branch it targets, and on every push to `main`: `lint` (what
-`make lint` runs), `fast-tests` (what `make test-fast` runs) and `image-build` (`docker build
---target app .`). CI sets no `AGB_LIVE_*` variable and holds no secret, so the live tests never
-run there; the stack test is not run there either. Dependabot opens one grouped pull request a
-week for the `uv` lockfile and one for the pinned actions.
+`make lint` runs), `types` (`make types`), `fast-tests` (what `make test-fast` runs),
+`coverage` (`make cover`, the fast tests again with the coverage floor) and `image-build`
+(`docker build --target app .`). CI sets no `AGB_LIVE_*` variable and holds no secret, so the
+live tests never run there; the stack test is not run there either. Dependabot opens one grouped
+pull request a week for the `uv` lockfile and one for the pinned actions.
 
 Tests marked `live` talk to real services, so no default run collects them: `make test`,
 `make test-fast` and a plain `uv run pytest` all deselect them, whatever is exported in the
@@ -85,3 +91,9 @@ Name one module to run only it, e.g. `AGB_LIVE_TELEGRAM=1 uv run pytest -m live
 tests/test_telegram_live.py`.
 
 Schema changes go in [migrations/](migrations/); read its README first.
+
+## Licence
+
+The repository carries no `LICENSE` file, so all rights are reserved by default and nothing here
+is offered for reuse. That is deliberate and not an oversight: the choice of licence, if any,
+belongs to the owner.

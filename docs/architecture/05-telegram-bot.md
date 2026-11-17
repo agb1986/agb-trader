@@ -16,7 +16,7 @@ The bot is the only service holding the Telegram token, and the only one whose t
 
 ## The command set
 
-Fourteen commands.
+Fifteen commands.
 
 ```
 /status        — what the system is doing right now
@@ -33,13 +33,16 @@ Fourteen commands.
 /resume        — clear the halt and the pause
 /liquidate     — close every position at market (two steps)
 /log [n]       — recent audit lines
+/help          — this list
 ```
 
-The set divides in three. `/status`, `/positions`, `/pnl` and `/log` are read-only monitoring. `/pending`, `/approve`, `/reject`, `/basket`, `/why` and `/gate` are the approval loop and its drill-downs. `/pause`, `/resume` and `/liquidate` are the kill-switch. `/level` sits across the first two, because the autonomy ladder is both a fact about current state and the thing the approval loop is working toward.
+The set divides in three. `/status`, `/positions`, `/pnl` and `/log` are read-only monitoring. `/pending`, `/approve`, `/reject`, `/basket`, `/why` and `/gate` are the approval loop and its drill-downs. `/pause`, `/resume` and `/liquidate` are the kill-switch. `/level` sits across the first two, because the autonomy ladder is both a fact about current state and the thing the approval loop is working toward. `/help` lists the commands and touches nothing.
 
 **There is no command that changes a position outside the approval loop and `/liquidate`.** That is the standing constraint expressed as an interface: the bot offers no way to trim a name, add one, or override a weight. If the human wants a different book, the mechanism is to reject the rebalance or to liquidate, both recorded as deliberate divergences. There is no `/promote` and no way to move the ladder up: those are server CLI acts ([04 — Risk limits and approval workflow](04-risk-and-approval.md)), and `/level` is read-only.
 
 **Every inbound command is a `command` row, refused ones included**, with the raw text as typed, the parsed verb and arguments, and the outcome. A bare `/approve`, a basket reference that does not match the pending basket, and a wrong liquidation token are all part of the record, because a refusal is evidence of what the operator attempted.
+
+**Each message is handled once, and only while it is fresh.** Every Telegram update the bot handles is a `telegram_update` row keyed on Telegram's `update_id`, written in the same transaction as the update's `command` row and whatever the command did, so either all of it is on record or none of it is; the reply goes out after the commit. A restart asks Telegram from one past the newest `update_id` on record, and an update that comes back anyway finds its row and is skipped, so a crash between handling a batch and confirming it to Telegram cannot run `/pause`, `/resume` or a bare `/liquidate` a second time. A message sent more than five minutes before the bot reads it (`STALE_COMMAND`), or one with no send time, is refused whatever it says: it is recorded as a refused `command` with its age as the reason, logged, and answered with `STALE — /<verb> refused` and an invitation to send it again. Telegram holds an unread message for a day, and a `/resume` typed before an outage must not clear a halt raised after it.
 
 ## The bot's own messages
 

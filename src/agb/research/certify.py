@@ -72,8 +72,15 @@ for a month comes from the validation backtest, marked on the same two sessions 
 own. If the lake lacks it for any month of any path, the benchmark is missing for the whole
 run: the months are neither dropped nor counted as zero, the three gates fail with the cause
 named, and the artifact is still written, because a failed certification is still a record
-and the paper-only waiver needs one to waive. Certifications written before the change carry
-no `sharpe_basis` and are read as `total`.
+and the paper-only waiver needs one to waive.
+
+The server does not take the verdict as written: importing the artifact, and loading the model
+from the registry, runs the gates again over paths.json and trials.parquet and refuses any
+difference (issue #211). The candidate columns, the input matrices and the verdict's fields in
+the manifest are `agb.research.recompute`'s, which this module calls rather than copies, so the
+certification and the recomputation cannot drift apart. The artifact digest covers the whole
+manifest, and the trial count is always `trials.RULE`. Certifications written before either
+change, lgbm-2026-10 among them, are refused on import and must be certified again.
 
 Reading an artifact back and inserting its row is `agb.research.artifact`, which is separate
 because the import has to run where the server's database is reachable and nothing there may
@@ -97,7 +104,7 @@ import numpy as np
 import pandas as pd
 
 from agb import lake, rebalance
-from agb.research import backtest, cpcv, gates, train
+from agb.research import backtest, cpcv, gates, recompute, train
 from agb.research.artifact import (
     CERTIFIED_PATH,
     KIND,
@@ -109,29 +116,19 @@ from agb.research.artifact import (
 )
 from agb.research.cache import Cache
 from agb.research.panel import Panel
+from agb.research.recompute import PATHS, Candidates
 from agb.research.trials import FILE as LEDGER_FILE
 from agb.research.trials import RULE as TRIAL_RULE
-from agb.research.trials import (
-    UNVERSIONED,
-    Ledger,
-    LedgerError,
-    Run,
-    code_version,
-    configuration,
-    roots,
-)
+from agb.research.trials import UNVERSIONED, Ledger, LedgerError, Run, code_version
 
 CERTIFIES = gates.CERTIFIES
 CAPITAL = 100_000.0
 DIRECTORY = "certifications"
-PATHS = "paths.json"
 REPORT = "report.md"
 # The one pattern for a model id; scripts/deploy/promote.sh holds the same one for the same reason,
 # and tests/test_compose.py checks that the two agree. It is matched against the whole string:
 # `$` alone would let a trailing newline through.
 MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
-# The trial kinds whose results carry monthly net returns the overfitting gate can read.
-CANDIDATE_KINDS = ("backtest",)
 
 
 @dataclass(frozen=True)
@@ -147,17 +144,6 @@ class Options:
     def __post_init__(self) -> None:
         if not MODEL_ID.fullmatch(self.model_id):
             raise ValueError(f"model id {self.model_id!r}: letters, digits, dot, dash, underscore")
-
-
-@dataclass(frozen=True)
-class Candidates:
-    """The overfitting gate's columns, one per configuration and keyed by the trial id of the
-    row that supplied it, what was left out and why, and which of those leave a declared
-    configuration without the column it should have, which fails the gate."""
-
-    series: dict[str, np.ndarray]
-    dropped: list[dict[str, str]]
-    missing: list[str]
 
 
 @dataclass(frozen=True)
@@ -257,10 +243,10 @@ def run(
         # gates judge is the one it traded rather than every month the model was fitted over.
         # The trial's own window stays the panel's, which is what was fitted.
         labels = [month["as_of"] for month in paths[0]["monthly"]]
-        net = _matrix(paths, "net")
-        gross = _matrix(paths, "gross")
-        net_2x = _matrix(twice, "net")
-        benchmark, benchmark_missing = _benchmark(paths)
+        net = recompute.matrix(paths, "net")
+        gross = recompute.matrix(paths, "gross")
+        net_2x = recompute.matrix(twice, "net")
+        benchmark, benchmark_missing = recompute.benchmark(paths)
         others = candidates(
             ledger,
             panel,
@@ -332,88 +318,19 @@ def candidates(
     exclude: set[str] = frozenset(),
     current: str | None = None,
 ) -> Candidates:
-    """The monthly net return series the overfitting gate ranks this model against, one per
-    configuration among the succeeded backtests over this panel's months, partition and
-    cost-model version, keyed by the trial id of the run that supplied it. A backtest over
-    several paths contributes the paths' mean month.
-
-    A configuration is what `trials.configuration` says of the run at the root of a backtest's
-    `parent` links (`trials.roots`; by interval for rows from before the chain): every
-    certification trades its scores through a backtest whose own configuration is the same
-    whatever the model, so the backtest's row alone cannot tell two models apart,
-    and the certification around it can. `current` is the certification asking, and anything
-    of its configuration is this run, which is the matrix's first column already; `exclude`
-    names rows to leave out besides. The first usable series of a configuration is its column
-    and later runs of it are reruns, which add none.
-
-    A backtest's recorded window is the panel it was handed, while `labels` is the shorter
-    window it could trade, so the series a candidate contributes is held to the traded length:
-    two runs whose months differ are not two readings of the same thing. Every series left out
-    is in `dropped` with its reason, and a configuration none of whose runs left a usable
-    series is in `missing`, which fails the gate: it was tried, and a PBO without it is not
-    the PBO of the search."""
-    rows = ledger.rows()
-    top = roots(rows, current=current)
-    mine = next((configuration(r) for r in rows if r["trial_id"] == current), None)
-    start, end = panel.months[0].as_of, panel.months[-1].as_of
-    series: dict[str, np.ndarray] = {}
-    columns: dict[tuple[object, ...], str] = {}
-    unusable: dict[tuple[object, ...], list[str]] = {}
-    dropped: list[dict[str, str]] = []
-
-    def drop(row: dict[str, Any], reason: str) -> None:
-        dropped.append({"trial_id": str(row["trial_id"]), "reason": reason})
-
-    for row in rows:
-        if row["kind"] not in CANDIDATE_KINDS or row["trial_id"] in exclude:
-            continue
-        if row["status"] != "succeeded":
-            drop(row, f"status {row['status']}")
-            continue
-        if (
-            row["partition_hash"] != panel.partition_hash
-            or row["cost_model_version"] != panel.cost_model_version
-            or row["train_start"] != start
-            or row["train_end"] != end
-        ):
-            drop(row, "another panel, window or cost model")
-            continue
-        identity = configuration(top[str(row["trial_id"])])
-        if identity == mine:
-            drop(row, "this certification's own configuration")
-            continue
-        if identity in columns:
-            drop(row, f"rerun of the configuration of {columns[identity]}")
-            continue
-        found, reason = _series(row, labels)
-        if found is None:
-            drop(row, reason)
-            unusable.setdefault(identity, []).append(f"{row['trial_id']}: {reason}")
-            continue
-        columns[identity] = str(row["trial_id"])
-        series[str(row["trial_id"])] = found
-    missing = [
-        "; ".join(reasons) for identity, reasons in unusable.items() if identity not in columns
-    ]
-    return Candidates(series, dropped, missing)
-
-
-def _series(row: dict[str, Any], labels: Sequence[str]) -> tuple[np.ndarray | None, str]:
-    """A candidate row's mean monthly net return series, or none and why it cannot be read."""
-    if not row["results"]:
-        return None, "no results"
-    results = json.loads(row["results"])
-    if "paths" in results:
-        found = _matrix(results["paths"], "net").mean(axis=0)
-    elif "monthly" in results:
-        found = np.array([month["net"] for month in results["monthly"]], dtype="float64")
-    else:
-        return None, "no monthly returns"
-    if len(found) != len(labels):
-        return None, f"{len(found)} months, {len(labels)} traded"
-    if not np.isfinite(found).all():
-        return None, "a month that is not finite"
-    return found, ""
+    """The overfitting gate's columns for a certification over `panel`, from the rows of
+    `ledger`; see `recompute.candidates`, which the server runs over the shipped ledger to check
+    the same columns."""
+    return recompute.candidates(
+        ledger.rows(),
+        partition_hash=panel.partition_hash,
+        cost_model_version=panel.cost_model_version,
+        start=panel.months[0].as_of,
+        end=panel.months[-1].as_of,
+        labels=labels,
+        exclude=exclude,
+        current=current,
+    )
 
 
 # The artifact ---------------------------------------------------------------------------------
@@ -441,38 +358,17 @@ def _write(
     manifest = {
         "model_id": options.model_id,
         "certifies": CERTIFIES,
-        "passed": results["passed"],
         "features": list(config.features),
         "train_start": months[0].as_of.isoformat(),
         "train_end": months[-1].as_of.isoformat(),
-        "declared_trials": results["declared_trials"],
         "declared_trials_rule": results["declared_trials_rule"],
         "ledger_rows": results["ledger_rows"],
-        "dsr": results["dsr"],
-        "pbo": results["pbo"],
-        "sharpe_net": results["sharpe_net"],
-        "dsr_2x": results["dsr_2x"],
-        "sharpe_basis": results["sharpe_basis"],
-        "excess": results["excess"],
-        "sharpe_total": results["sharpe_total"],
-        "break_even_multiple": results["break_even_multiple"],
-        "sharpe_gross": results["sharpe_gross"],
-        "gross_sharpe_flag": results["gross_sharpe_flag"],
-        "participation_max": results["participation_max"],
-        "participation_mean": results["participation_mean"],
         "cost_model_version": panel.cost_model_version,
         "certified_capital": CAPITAL,
-        "path_quantiles": results["path_quantiles"],
-        "gates": {
-            **results["gates"],
-            "thresholds": results["thresholds"],
-            "start_dates": results["start_dates"],
-            "start_date_stable": results["start_date_stable"],
-            "paths": len(results["paths"]),
-            "months": results["months"],
-            "candidates": results["overfitting"]["candidates"],
-            "candidates_dropped": results["candidates_dropped"],
-        },
+        # The verdict, in exactly the fields the server recomputes and compares.
+        **recompute.recorded(
+            results, paths=len(results["paths"]), dropped=results["candidates_dropped"]
+        ),
         "certified_at": datetime.now(UTC).isoformat(),
         CERTIFIED_PATH: str(directory.resolve()),
         "trial_id": run.trial_id,
@@ -490,7 +386,9 @@ def _write(
     }
     manifest["files"] = files
     manifest["ledger_sha256"] = files[LEDGER_FILE]
-    manifest["artifact_sha256"] = artifact_sha256(files)
+    # Through JSON first, so the digest is over what a reader of the file will parse.
+    manifest = json.loads(json.dumps(manifest))
+    manifest["artifact_sha256"] = artifact_sha256(manifest)
     (directory / MANIFEST).write_text(json.dumps(manifest, indent=1, sort_keys=True) + "\n")
     return Certification(run.trial_id, directory, manifest)
 
@@ -578,21 +476,3 @@ def _basis(manifest: dict[str, Any]) -> list[str]:
             " number is not a measurement.",
         ]
     return lines
-
-
-def _benchmark(paths: list[dict[str, Any]]) -> tuple[np.ndarray | None, str | None]:
-    """The benchmark's return over each path's months, or why there is none: any month of any
-    path the lake has no benchmark return for makes the whole benchmark missing, because a gate
-    over the months that happen to be covered is not the gate over the run."""
-    values = [[month.get("benchmark") for month in path["monthly"]] for path in paths]
-    absent = sum(value is None for row in values for value in row)
-    if absent:
-        total = sum(len(row) for row in values)
-        return None, (
-            f"the lake holds no {gates.BENCHMARK} return for {absent} of {total} traded path-months"
-        )
-    return np.array(values, dtype="float64"), None
-
-
-def _matrix(paths: list[dict[str, Any]], key: str) -> np.ndarray:
-    return np.array([[month[key] for month in path["monthly"]] for path in paths], dtype="float64")

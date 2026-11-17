@@ -22,6 +22,8 @@ from datetime import datetime, timedelta
 
 import psycopg
 
+from agb.rows import one
+
 
 class LeaseLost(Exception):
     """The worker no longer holds the job's lease: it expired, or someone reclaimed it."""
@@ -87,7 +89,8 @@ def _event(
         "lease_until": lease_until,
         "detail": detail,
     }
-    return conn.execute(_EVENT, params).fetchone()[0]
+    event_id: int = one(conn.execute(_EVENT, params))[0]
+    return event_id
 
 
 def claim(
@@ -114,14 +117,16 @@ def claim(
             job_id, kind, period, previous_holder, previous_lease = row
             # The candidate query's snapshot predates the lock, so a job that ended just
             # before we locked it can slip through. Check again now that we hold the row.
-            if conn.execute(_ENDED, (job_id,)).fetchone()[0]:
+            if one(conn.execute(_ENDED, (job_id,)))[0]:
                 passed.append(job_id)
                 continue
-            (lease_until,) = conn.execute(
-                "UPDATE agb.job SET claimed_by = %s, lease_until = now() + %s "
-                "WHERE id = %s RETURNING lease_until",
-                (worker, lease, job_id),
-            ).fetchone()
+            (lease_until,) = one(
+                conn.execute(
+                    "UPDATE agb.job SET claimed_by = %s, lease_until = now() + %s "
+                    "WHERE id = %s RETURNING lease_until",
+                    (worker, lease, job_id),
+                )
+            )
             reclaimed = previous_holder is not None
             if reclaimed:
                 conn.execute(_EXPIRY, (job_id, worker, previous_lease))
@@ -165,11 +170,13 @@ def hold(
         job_id, holder, _, live = row
         if holder is not None and not (holder == worker and live):
             return None
-        (lease_until,) = conn.execute(
-            "UPDATE agb.job SET claimed_by = %s, lease_until = now() + %s "
-            "WHERE id = %s RETURNING lease_until",
-            (worker, lease, job_id),
-        ).fetchone()
+        (lease_until,) = one(
+            conn.execute(
+                "UPDATE agb.job SET claimed_by = %s, lease_until = now() + %s "
+                "WHERE id = %s RETURNING lease_until",
+                (worker, lease, job_id),
+            )
+        )
         if holder is None:
             _event(conn, job_id, "claimed", worker, lease_until)
         return Claim(job_id, kind, period, worker, lease_until, False)

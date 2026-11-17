@@ -2,7 +2,7 @@
 
 CI runs on every pull request and on pushes to main, with read-only repository access, and
 never reaches a live service: no job sets an AGB_LIVE_* variable or reads a secret, and the
-test job deselects the live and stack tests as `make test-fast` does.
+test jobs deselect the live and stack tests as `make test-fast` does.
 """
 
 import re
@@ -15,7 +15,9 @@ from test_measure import SERVER_PYTHON
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 DEPENDABOT = ROOT / ".github" / "dependabot.yml"
 # A branch-protection rule requires the checks by these names.
-JOBS = {"lint", "fast-tests", "image-build"}
+REQUIRED_JOBS = {"lint", "fast-tests", "image-build"}
+# Checks added beside them, which no rule requires yet.
+JOBS = REQUIRED_JOBS | {"types", "coverage"}
 
 
 @pytest.fixture(scope="module")
@@ -58,8 +60,9 @@ def test_the_token_can_only_read_the_repository(workflow):
         assert "permissions" not in job, name
 
 
-def test_the_three_jobs(workflow):
+def test_the_jobs_and_the_three_required_names(workflow):
     assert set(workflow["jobs"]) == JOBS
+    assert REQUIRED_JOBS <= set(workflow["jobs"])
 
 
 def test_lint_runs_what_make_lint_runs(workflow):
@@ -75,6 +78,20 @@ def test_the_fast_tests_run_what_make_test_fast_runs(workflow):
         *recipe("test-fast"),
     ]
     assert recipe("test-fast") == ['uv run pytest -m "not stack and not live"']
+
+
+def test_the_type_check_runs_what_make_types_runs(workflow):
+    assert commands(workflow["jobs"]["types"]) == ["uv sync --frozen", *recipe("types")]
+
+
+def test_the_coverage_job_runs_what_make_cover_runs(workflow):
+    assert commands(workflow["jobs"]["coverage"]) == [
+        "uv sync --frozen",
+        f"uv python install {SERVER_PYTHON}",
+        *recipe("cover"),
+    ]
+    # The same tests as test-fast, measured.
+    assert recipe("cover") == ['uv run pytest -m "not stack and not live" --cov']
 
 
 def test_the_image_build_builds_the_app_target(workflow):
