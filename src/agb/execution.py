@@ -40,9 +40,11 @@ The broker latch, first thing each cycle. The operator's surfaces write the data
 `/pause` and `/resume` themselves and record the command; execution carries each accepted
 command to the broker in the order they arrived. A pause first cancels the sent orders of any
 submitted basket whose session has not reached its cancel deadline, ten minutes before the
-close, and halts that basket, then sets `suspend_trade`; a resume unsets it. Either way the
-account is read back, the result recorded against the command, and a confirmation raised for
-the bot to deliver. A broker that refuses leaves the command waiting for the next cycle.
+close, and halts that basket, then sets `suspend_trade`; a resume unsets it, unless it left the
+`pause` cause open, which a resume of chosen causes can, and then `suspend_trade` stays on.
+Either way the account is read back, the result recorded against the command, and a
+confirmation raised for the bot to deliver. A broker that refuses leaves the command waiting for
+the next cycle.
 
 Liquidation, straight after the latch. The bot opens the `liquidation` halt cause in the same
 transaction as the operator's confirmation, so nothing new goes out; execution then cancels
@@ -1142,10 +1144,13 @@ def _at(at: datetime) -> str:
 
 
 def _confirmation(
-    conn: psycopg.Connection, command: Command, observed: bool, left: Sequence[str]
+    conn: psycopg.Connection,
+    command: Command,
+    wanted: bool,
+    observed: bool,
+    left: Sequence[str],
 ) -> str:
     """The message the operator gets once execution has carried `command` to the broker."""
-    wanted = command.verb == PAUSE
     broker_line = f"broker suspend_trade: {'on' if observed else 'off'}"
     if observed != wanted:
         broker_line += f", asked for {'on' if wanted else 'off'}"
@@ -1154,7 +1159,7 @@ def _confirmation(
         pause_line = f"halt cause pause: open since {_at(pause[0])}, by {pause[1]}"
     else:
         pause_line = "halt cause pause: not open"
-    if wanted:
+    if command.verb == PAUSE:
         lines = [f"PAUSE by {command.actor} at {_at(command.at)}", pause_line, broker_line]
         halted = conn.execute(_HALTED_SINCE, (SURFACE, command.at)).fetchall()
         lines += [f"basket {ref} halted at {_at(at)}: {reason}" for ref, at, reason in halted]
@@ -1181,9 +1186,12 @@ def apply_latch(
     for the next cycle. Returns how many were carried."""
     done = 0
     for command in pending_latch(conn):
-        wanted = command.verb == PAUSE
+        pausing = command.verb == PAUSE
+        # A resume that left `pause` open, which it records, keeps the broker suspended. It is
+        # read from the command, not the latch now, so that a batch is applied as it was given.
+        wanted = pausing or PAUSE in (command.args.get("left_open") or [])
         try:
-            left = cancel_in_flight(conn, broker, calendar, now) if wanted else []
+            left = cancel_in_flight(conn, broker, calendar, now) if pausing else []
             broker.suspend(wanted)
             observed, _ = record_state(conn, broker)
         except (AlpacaError, ExecutionError) as exc:
@@ -1198,7 +1206,7 @@ def apply_latch(
             )
             log.error("command %d (%s): %s", command.id, command.verb, exc)
             return done
-        body = _confirmation(conn, command, observed, left)
+        body = _confirmation(conn, command, wanted, observed, left)
         with conn.transaction():
             conn.execute(_INSERT_LATCH, (command.id, wanted, observed, body, ACTOR))
             raise_alert(

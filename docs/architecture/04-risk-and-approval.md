@@ -74,7 +74,7 @@ Two properties make the latch real. It is **persisted outside the process**, as 
 - `pause` — a human pulled the pause lever.
 - `liquidation` — a liquidation was executed; the system pauses itself afterwards.
 
-Trading is blocked while *any* cause is open, and the open set is a database view. A second cause arriving while halted neither overwrites nor hides the first. `/resume` clears every open cause but records one clear per cause, attributed, and its reply lists what it cleared, so a pause cleared together with an unexplained gate breach stays visible afterwards.
+Trading is blocked while *any* cause is open, and the open set is a database view. A second cause arriving while halted neither overwrites nor hides the first. `/resume` clears every open cause but records one clear per cause, attributed, and its reply lists what it cleared, so a pause cleared together with an unexplained gate breach stays visible afterwards. The local UI's resume clears only the causes the operator ticked, with the same per-cause rows; it records which it cleared and which it left open, and the broker's `suspend_trade` stays on while `pause` is among those left.
 
 **Execution re-reads the latch before each individual order**, not only when it claims the job, so a pause at 15:44 stops every order not yet sent.
 
@@ -168,7 +168,7 @@ Having the lever is not the same as wiring it to a threshold. Automatic liquidat
 
 Both levers are available in paper as well as live. Paper is where the muscle memory is built, and a kill-switch first used in anger is a kill-switch nobody knows how to use.
 
-As built, both levers live in `agb.killswitch`, and Telegram and the local UI call it with nothing but a source of their own — who threw the switch, from which surface, and the text they typed — so the reply the UI shows is the text Telegram sends, word for word, and each step is a `command` row either way. The UI's Kill switch view lists every open halt cause with who opened it, says what a resume would clear before it clears it, and says whether a liquidation token is outstanding and until when, but never shows the token: a page that redisplayed it would hand the second step to whoever reloaded the page, and the second step exists to be typed.
+As built, both levers live in `agb.killswitch`, and Telegram and the local UI call it with nothing but a source of their own — who threw the switch, from which surface, and the text they typed — so the reply the UI shows is the text Telegram sends, word for word, and each step is a `command` row either way. The UI's Kill switch view lists every open halt cause with who opened it, links each lever to a confirmation page that says what it will change before anything is written (Resume's lists the open causes, each with an unticked box, and clears only the ticked ones), and says whether a liquidation token is outstanding and until when, but never shows the token: a page that redisplayed it would hand the second step to whoever reloaded the page, and the second step exists to be typed.
 
 ## Performance monitoring: alerts that never act
 
