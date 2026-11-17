@@ -11,19 +11,23 @@ The gate runs every check that does not need the broker, in three groups:
     (agb.blend), every shortlisted name was scored, and the scores are spread: a panel that
     scores every name alike is useless whatever each score is, because stage 2 ranks its
     output into percentiles and a flat distribution ranks to noise.
-  * **The basket.** Twenty positions whose weights sum to one, no symbol twice, cash left
-    over after the targets are bought, and turnover below 60% of the book, or a full
-    rotation where the model behind the book is not the model that ranked the basket. Fewer
-    than twenty
-    passes only where a recorded forced corporate event (agb.corporate) explains it, and a
-    name the rebalance carried with no event on the record halts the month: a name that has
-    quietly stopped printing looks exactly like a halted one, and the difference is a human's
-    judgement. A basket short a slot keeps the same weight per name and leaves the missing
-    slot's weight in cash, so its weights sum to its share of the twenty.
+  * **The basket.** Twenty positions, no symbol twice, and turnover below 60% of the book, or
+    a full rotation where the model behind the book is not the model that ranked the basket.
+    Weights are measured on value, each target's shares at its mark against equity, not read
+    off the stored weight: each name sits within one percentage point (`rebalance.TOP_UP`) or
+    one share under its twentieth, a name the basket buys sits no more than that over it, the
+    weights sum to the basket's share of the twenty less that slack and to no more than one,
+    and the cash left once the targets are held and every order's modelled cost is paid is
+    not negative. Fewer than twenty passes only where a recorded forced corporate event
+    (agb.corporate) explains it, and a name the rebalance carried with no event on the
+    record halts the month: a name that has quietly stopped printing looks exactly like a
+    halted one, and the difference is a human's judgement. A basket short a slot keeps the
+    same weight per name and leaves the missing slot's weight in cash.
   * **Each order.** Its symbol is in the universe, its side agrees with the book (a buy opens
-    a position, a sell closes one it holds), a buy's notional is at most 8% of equity (a
-    sell is exempt, because it reduces exposure), it is market-on-close, and the clock is
-    before the session's MOC cutoff (15:45 ET on a full day).
+    a position or tops a kept one up to its target, a sell closes one it holds), a buy's
+    notional is at most 8% of equity (a sell is exempt, because it reduces exposure), it is
+    market-on-close, and the clock is before the session's MOC cutoff (15:45 ET on a full
+    day).
 
 Every check is recorded with what it measured and the threshold it had to meet, whether it
 passed or not, so the result reads check by check. A single failure halts the whole
@@ -77,7 +81,8 @@ class Limits:
     universe_min: int = universe.MIN_SIZE
     universe_max: int = universe.MAX_SIZE
     positions: int = rebalance.SIZE
-    weight_tolerance: Decimal = Decimal("0.0001")
+    # How far a name's value may sit from its twentieth, as a share of equity.
+    weight_tolerance: Decimal = rebalance.TOP_UP
     turnover: Decimal = Decimal("0.60")
     notional: Decimal = Decimal("0.08")
     dispersion: float = blend.DISPERSION_MIN
@@ -102,6 +107,8 @@ class Order:
     qty: Decimal
     tif: str
     notional: Decimal
+    # The modelled cost of the order in dollars, fees included, as the basket recorded it.
+    cost: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True)
@@ -305,7 +312,8 @@ def _basket(
 ) -> list[Check]:
     return [
         _positions(target, limits),
-        _weight_sum(target, limits),
+        _weight_sum(target, marks, limits),
+        _weights(target, marks, limits),
         _duplicates(target),
         _cash(target, marks),
         _turnover(target, marks, book, limits, held),
@@ -340,22 +348,64 @@ def _positions(target: Basket, limits: Limits) -> Check:
     return Check(BASKET, "positions", None, measured, threshold, passed)
 
 
-def _weight_sum(target: Basket, limits: Limits) -> Check:
-    """The weights sum to the share of the twenty slots the basket filled, which is one for a
-    full basket. A slot a forced event took out leaves its weight in cash rather than being
-    spread over the rest (agb.rebalance), so a nineteen-name basket sums to 0.95 by
-    construction, and one whose weights were rescaled to one would be a different portfolio
-    at a weight nobody chose."""
-    total = sum((t.weight for t in target.targets), Decimal(0))
-    expected = Decimal(len(target.targets)) / limits.positions
-    return Check(
-        BASKET,
-        "weight_sum",
-        None,
-        str(total),
-        f"{expected} within {limits.weight_tolerance}",
-        abs(total - expected) <= limits.weight_tolerance,
+def _weight_sum(target: Basket, marks: Mapping[str, Decimal], limits: Limits) -> Check:
+    """The real weights, each target's shares at its mark over equity, sum to no more than one
+    and to no less than the share of the twenty slots the basket filled, less the tolerance
+    for each name. A slot a forced event took out leaves its weight in cash rather than being
+    spread over the rest (agb.rebalance), so a nineteen-name basket sums to just under 0.95,
+    and one whose weights were rescaled to one would be a different portfolio at a weight
+    nobody chose. Whole shares leave every bought name a little short, which the per-name
+    tolerance absorbs; a basket short by more than that in total is underinvested."""
+    count = len(target.targets)
+    floor = (Decimal(count) / limits.positions - count * limits.weight_tolerance).max(0)
+    threshold = f"{floor:.4f} to 1"
+    unpriced = _unpriced(target, marks)
+    if unpriced:
+        return Check(BASKET, "weight_sum", None, unpriced, threshold, False)
+    total = _value(target, marks) / target.capital
+    return Check(BASKET, "weight_sum", None, f"{total:.4f}", threshold, floor <= total <= 1)
+
+
+def _weights(target: Basket, marks: Mapping[str, Decimal], limits: Limits) -> Check:
+    """Each name's real weight, its shares at its mark over equity, against its twentieth.
+
+    Every name the rebalance could trade sits under its twentieth by no more than the
+    tolerance or one share, whichever is more: a bought name is short by less than a share,
+    because buys are whole shares rounded down, and a kept name further short than the
+    tolerance is topped up (agb.rebalance). A name the basket buys, entering or topped up,
+    sits over its twentieth by no more than the tolerance. A kept name that has grown past it
+    is not trimmed, so it has no upper bound, and a carried name cannot trade at all, so it is
+    not held to the band. The check passes when every name is in its band and names each one
+    that is not; a name with no mark cannot be weighed and fails unless it is carried."""
+    goal = Decimal(1) / limits.positions
+    slack = target.capital * limits.weight_tolerance
+    threshold = (
+        f"each name {goal:.2%} within {limits.weight_tolerance:.2%}, or under by at most one"
+        " share; a kept name not bought may sit over, and a carried name is exempt"
     )
+    bought = {o.symbol for o in target.orders if o.side == "buy"}
+    weighed, outside = [], []
+    for name in target.targets:
+        mark = marks.get(name.symbol)
+        if mark is None:
+            if not name.carried:
+                outside.append(f"{name.symbol} no mark")
+            continue
+        value = name.shares * mark
+        weighed.append(value / target.capital)
+        short = target.capital * goal - value
+        inside = name.carried or (
+            short <= max(slack, mark) and (name.symbol not in bought or -short <= slack)
+        )
+        if not inside:
+            outside.append(f"{name.symbol} {value / target.capital:.2%}")
+    if outside:
+        measured = ", ".join(outside)
+    elif weighed:
+        measured = f"{min(weighed):.2%} to {max(weighed):.2%}"
+    else:
+        measured = "no names"
+    return Check(BASKET, "weights", None, measured, threshold, not outside)
 
 
 def _duplicates(target: Basket) -> Check:
@@ -371,13 +421,28 @@ def _duplicates(target: Basket) -> Check:
 
 
 def _cash(target: Basket, marks: Mapping[str, Decimal]) -> Check:
-    """The cash left once the basket holds its targets: equity less the targets' value at
-    their marks."""
-    unpriced = sorted(t.symbol for t in target.targets if t.symbol not in marks)
+    """The cash left once the basket holds its targets and has paid for getting there: equity
+    less the targets' value at their marks and every order's modelled cost. Negative cash is a
+    plan that buys more than the account holds, which the broker would refuse part of, and
+    which part is not ours to leave to chance."""
+    threshold = ">= 0 after modelled costs"
+    unpriced = _unpriced(target, marks)
     if unpriced:
-        return Check(BASKET, "cash", None, f"no mark for {', '.join(unpriced)}", ">= 0", False)
-    cash = target.capital - sum((t.shares * marks[t.symbol] for t in target.targets), Decimal(0))
-    return Check(BASKET, "cash", None, _dollars(cash), ">= 0", cash >= 0)
+        return Check(BASKET, "cash", None, unpriced, threshold, False)
+    costs = sum((o.cost for o in target.orders), Decimal(0))
+    cash = target.capital - _value(target, marks) - costs
+    return Check(BASKET, "cash", None, _dollars(cash), threshold, cash >= 0)
+
+
+def _unpriced(target: Basket, marks: Mapping[str, Decimal]) -> str | None:
+    """What a basket-wide value check measures when a target has no mark, or None."""
+    unpriced = sorted(t.symbol for t in target.targets if t.symbol not in marks)
+    return f"no mark for {', '.join(unpriced)}" if unpriced else None
+
+
+def _value(target: Basket, marks: Mapping[str, Decimal]) -> Decimal:
+    """The targets' value at their marks: what the basket holds once its orders fill."""
+    return sum((t.shares * marks[t.symbol] for t in target.targets), Decimal(0))
 
 
 def _turnover(
@@ -454,7 +519,12 @@ def _order(
     else:
         membership = "not in the universe"
     if order.side == "buy":
-        side_ok = held == 0
+        # A buy opens a position, or tops a kept one up: then the target it buys towards is
+        # what is held plus the order. The weight check bounds how far it may go.
+        side_ok = held == 0 or any(
+            t.symbol == symbol and not t.carried and t.shares == held + order.qty
+            for t in target.targets
+        )
     else:
         side_ok = order.side == "sell" and 0 < order.qty <= held
     share = order.notional / target.capital
@@ -473,7 +543,8 @@ def _order(
             "side",
             symbol,
             f"{order.side} {order.qty}, holding {held}",
-            "a buy opens a position; a sell closes at most what is held",
+            "a buy opens a position or tops a kept one up to its target;"
+            " a sell closes at most what is held",
             side_ok,
         ),
         # The cap bounds the exposure a buy adds. A sell takes exposure off, so it is exempt:
@@ -535,7 +606,8 @@ _TARGETS = """
     WHERE basket_id = %s ORDER BY id
 """
 _ORDERS = """
-    SELECT symbol, side, qty, tif, notional_usd FROM agb.basket_order
+    SELECT symbol, side, qty, tif, notional_usd, notional_usd * modelled_cost_bps / 10000
+    FROM agb.basket_order
     WHERE basket_id = %s ORDER BY id
 """
 _RUN = "SELECT id, mode FROM agb.gate_run WHERE basket_id = %s"

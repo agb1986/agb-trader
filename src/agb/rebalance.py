@@ -20,10 +20,16 @@ docs/architecture/02-classical-ranker.md:
     acquirer shares a merger paid in were never chosen, so they are sold at the next
     rebalance even where the ranking would have kept them (`agb.corporate`).
 
-Orders take a name in or out whole. Incumbents kept are not traded back to weight; drift is
-left alone between rebalances, which is the spec's no-intra-month-action rule applied at the
-rebalance too. Buys are sized from the capital the basket is run against, at the signal
-session's close, in whole shares.
+  * **A kept name below its weight is topped up.** An incumbent kept whose value at the
+    signal close is short of its weight of capital by more than `TOP_UP` of capital (one
+    percentage point of the book) gets a buy of the whole shares that bring it back to weight.
+    A residual a partial fill left behind therefore costs one month at most, not a slot for as
+    long as the name ranks. A kept name above its weight is not trimmed; the spec has no rule
+    for winners, so the drift up is left alone, and a carried name is never traded.
+
+Orders take an entering or leaving name in or out whole. Buys are sized from the capital the
+basket is run against, at the signal session's close, in whole shares, so a bought name ends
+at or under its weight and short of it by less than one share.
 """
 
 from collections.abc import Iterable, Mapping, Sequence
@@ -33,6 +39,9 @@ from enum import StrEnum
 
 SIZE = 20
 HOLD_THROUGH = 30
+# How far below its weight a kept name may sit, as a share of capital, before the rebalance
+# buys it back to weight: one percentage point of the book.
+TOP_UP = Decimal("0.01")
 
 
 class Side(StrEnum):
@@ -125,10 +134,18 @@ def orders(
     prices: Mapping[str, Decimal],
     positions: Mapping[str, Decimal | int],
     capital: Decimal,
+    *,
+    top_up: bool = True,
 ) -> list[Order]:
-    """The order plan: a buy of each entering name sized to its weight of `capital` at its
-    price, in whole shares, and a sell of each leaving name's whole position. Sells come
-    first, so the plan reads as the cash it raises before the cash it spends."""
+    """The order plan: a sell of each leaving name's whole position, a buy of each entering
+    name sized to its weight of `capital` at its price, in whole shares, and a top-up of each
+    kept name more than `TOP_UP` of capital below its weight. Sells come first, so the plan
+    reads as the cash it raises before the cash it spends, and entering names come before
+    top-ups, best rank first within each.
+
+    `top_up=False` leaves kept names alone, as the backtest does: its validated results were
+    produced without top-ups, and bringing them in changes those results, which needs a
+    re-certification rather than a quiet change to the engine."""
     if capital <= 0:
         raise ValueError("capital must be positive")
     plan = []
@@ -139,11 +156,23 @@ def orders(
         plan.append(Order(symbol, Side.SELL, qty, _price(prices, symbol)))
     for symbol in selection.buy:
         price = _price(prices, symbol)
-        qty = int((capital * weight[symbol] / price).to_integral_value(rounding=ROUND_FLOOR))
+        qty = _shares(capital * weight[symbol], price)
         if qty <= 0:
             raise ValueError(f"{symbol}: {capital * weight[symbol]} buys no whole share at {price}")
         plan.append(Order(symbol, Side.BUY, qty, price))
+    for symbol in selection.keep if top_up else ():
+        price = _price(prices, symbol)
+        gap = capital * weight[symbol] - Decimal(positions[symbol]) * price
+        if gap > capital * TOP_UP:
+            qty = _shares(gap, price)
+            if qty > 0:  # a share dearer than the gap leaves the name where it is
+                plan.append(Order(symbol, Side.BUY, qty, price))
     return plan
+
+
+def _shares(amount: Decimal, price: Decimal) -> int:
+    """The whole shares `amount` buys at `price`, rounded down."""
+    return int((amount / price).to_integral_value(rounding=ROUND_FLOOR))
 
 
 def _by_rank(position: Mapping[str, int]):

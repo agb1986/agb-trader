@@ -41,16 +41,17 @@ Checks span three levels, because a basket can be perfectly self-consistent and 
 
 **Basket invariants.**
 - Exactly 20 target positions (or fewer only through the forced-event cases the ranker defines). As built, a short basket passes only when a recorded forced event explains each missing name; a name carried with nothing on the record, or a shortfall the record does not cover, breaches. The weight-sum check scales its expectation to the names the basket actually holds, so a legitimate 19-name basket does not breach it as well.
-- Weights sum to 100% within tolerance.
+- Weights sum to 100% within tolerance. As built, weights are measured on value, each target's shares at its mark over equity, rather than read off the stored target weight: the sum must not exceed 1 and must not fall below the basket's share of the twenty less one percentage point per name.
+- Each name sits within one percentage point (`rebalance.TOP_UP`), or one share, under its twentieth, and a name the basket buys sits no more than one point over it. A kept name that has grown past its twentieth is not trimmed, so it has no upper bound, and a carried name is exempt. This is one basket-level check, `weights`, which names every name outside its band.
 - No duplicate symbols.
-- Projected cash non-negative.
+- Projected cash non-negative. As built, projected cash is equity less the targets' value at their marks and less every order's modelled cost, the stored `modelled_cost_bps` on its notional. The basket trims its lowest-ranked buys a share at a time to fit before the gate runs ([02 — Classical ranker](02-classical-ranker.md)), so this check is the backstop for a plan the trim could not fit.
 - Turnover below roughly 60% of the book. The 20-buy/30-hold rank buffer should produce far less, so 60% indicates something upstream moved that should not have.
   - Exception, as built: where the model behind the book is not the model that ranked the basket, the check admits up to a full rotation and records the change that admitted it. The rank buffer only holds the overlap up within one ranking; across two it says nothing, so a changed model has a declared reason to turn the book over and a flat 60% would halt every month that promotes one. The model behind the book is the ranker and artifact digest of the last live basket whose orders actually filled, and the exemption needs that change on the record: an unknown model, or the same name with a digest missing, reads as unchanged. Turnover above 100% stays a breach under any model, because a plan cannot sell more than the book is worth.
 
 **Order level.**
 - Symbol present in the current universe snapshot.
 - Alpaca reports the asset tradable, and fractionable where fractional shares are used.
-- Side consistent with the current position.
+- Side consistent with the current position. As built, a buy either opens a position or tops a kept one up to exactly its target, and a sell closes at most what is held.
 - Per-order notional at or below roughly 8% of equity, the band absorbing intra-month drift around the 5% target.
   - Exception: sells are exempt. The cap bounds the exposure a buy adds, and a sell takes exposure off. A held name that has drifted past 8% and leaves the ranking is sold whole in one order, not split into orders under the cap; holding it to the cap would halt that rebalance, and every one after it, until a human intervened. The check is still recorded on a sell, with its measured share and the threshold `none on a sell`.
 - Time-in-force is `cls`.

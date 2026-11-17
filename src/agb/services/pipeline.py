@@ -372,6 +372,8 @@ class Pipeline:
             proposal.orders,
             f", shadow basket {proposal.shadow_id}" if proposal.shadow_id else "",
         )
+        if proposal.sizing_note:
+            log.warning("rebalance %s: %s", claim.period, proposal.sizing_note)
         if verdict.failed:
             log.error(
                 "rebalance %s halted: basket %d failed %d of %d pre-trade checks: %s",
