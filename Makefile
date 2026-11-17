@@ -71,7 +71,7 @@ lake: ## Query the lake with DuckDB, e.g. make lake SQL="SELECT count(*) FROM se
 
 sync-lake: ## Pull the server's lake into $(LAKE_DIR), read-only against the server
 	@mkdir -p $(AGB_LAKE_DIR)
-	uv run python -m agb.research sync --env-file $(ENV_DIR)/research.env --lake $(AGB_LAKE_DIR)
+	uv run --frozen python -m agb.research sync --env-file $(ENV_DIR)/research.env --lake $(AGB_LAKE_DIR)
 
 # The research image is built with this checkout's commit as its AGB_VERSION, which keys the
 # certification cache and is recorded in every trial and artifact; `certify` refuses to run
@@ -84,7 +84,7 @@ research: sync-lake ## Sync the lake, then run a research command, e.g. make res
 	AGB_VERSION=$(RESEARCH_VERSION) $(COMPOSE) --profile research run --build --rm research $(CMD)
 
 measure: ## Sample each container's memory until interrupted, e.g. make measure OUT=peaks.md
-	uv run python -m agb.measure $(if $(OUT),--out $(OUT),)
+	uv run --frozen python -m agb.measure $(if $(OUT),--out $(OUT),)
 
 promote: ## Ship a certification to the server, record it and make the model live, e.g. make promote MODEL=lgbm-2026-10
 	REASON="$(REASON)" scripts/deploy/promote.sh $(MODEL) $(CMD)
@@ -102,20 +102,21 @@ rollback: ## Restart the server's stack on the previously deployed image
 	scripts/deploy/rollback.sh
 
 test: ## Run the test suite against throwaway Postgres containers, without the live tests
-	uv run pytest -m "not live"
+	uv run --frozen pytest -m "not live"
 
 test-fast: ## Run the test suite without building and starting the whole stack or the live tests
-	uv run pytest -m "not stack and not live"
+	uv run --frozen pytest -m "not stack and not live"
 
 test-live: ## Run the live tests that their AGB_LIVE_* variables enable; they touch real services, see README
-	uv run pytest -m live
+	uv run --frozen pytest -m live
 
 lint: ## Lint and check formatting
-	uv run ruff check .
-	uv run ruff format --check .
+	uv run --frozen ruff check .
+	uv run --frozen ruff format --check .
+	shellcheck scripts/deploy/*
 
 types: ## Type-check src/agb: strict on four modules, permissive elsewhere (docs/build/type-checking.md)
-	uv run mypy
+	uv run --frozen mypy
 
 cover: ## Run the fast tests with coverage; fails below the floor in pyproject.toml
-	uv run pytest -m "not stack and not live" --cov
+	uv run --frozen pytest -m "not stack and not live" --cov

@@ -85,7 +85,41 @@ target-version = "py312"
 extend-exclude = ["scripts/orca"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "S", "SIM", "PTH", "RET", "DTZ", "PL"]
+# Rules switched off for the whole tree, each because fixing it is a wide edit across src (many
+# modules are being changed in parallel) or because the rule is wrong for this code. A finding
+# the rule would still catch elsewhere stays caught; shrink this list, do not grow it.
+ignore = [
+    "S101",     # assert: src uses it to narrow types for mypy and to state invariants; tests are all asserts
+    "PLR2004",  # magic values: thresholds, tolerances and counts read better inline than as constants
+    "PLR0913",  # too many arguments: keyword-only parameter lists on job and gate functions
+    "PLR0917",  # too many positional arguments: same signatures as PLR0913
+    "PLR0911",  # too many returns: early-return guards in gate and approval logic
+    "PLR0912",  # too many branches: the gate checks, one branch per rule
+    "PLR0915",  # too many statements: CLI and report builders
+    "PLC0415",  # import outside top level: deliberate lazy imports of heavy research dependencies
+    "S608",     # SQL built by string: identifiers come from constants, values are always bound
+    "S603",     # subprocess call: argument lists, never shell=True; the inputs are our own commands
+    "S607",     # partial executable path: docker, git and uv are resolved from PATH on purpose
+    "PLW1510",  # subprocess.run without check: callers read the return code themselves
+    "S310",     # urlopen scheme audit: every URL is a fixed https vendor endpoint
+    "S105",     # hardcoded password: false positive on token names and test fixtures
+    "PTH123",   # open() in lake.py: the Path rewrite touches a module others are editing
+    "PTH105",   # os.replace in four modules: the Path rewrite touches modules others are editing
+    "PLW2901",  # loop variable overwritten: deliberate normalising in two loops
+    "PLR0124",  # volume == volume: the NaN check, written that way on purpose
+    "PLC0414",  # redundant import alias: an explicit re-export in registry.py
+    "PLE2515",  # zero-width space in edgar.py is the character being matched
+    "RET504",   # assign before return: kept for readability in one gate helper
+    "SIM102",   # nested if in killswitch.py reads clearer than the merged condition
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert, build throwaway data with a seeded generator, use fixture secrets and tmp paths,
+# bind test servers to all interfaces, and nest `with` blocks for patches.
+"tests/**" = [
+    "S104", "S108", "S311", "SIM117", "SIM300", "PTH119", "DTZ011",
+]
 
 # The type checker (#192). `make types` checks the package; the four modules that move money and
 # state are held to `strict`, and every other module is checked permissively, so it still has
