@@ -14,7 +14,7 @@ from agb.health import Finding
 from agb.nyse import NEW_YORK, NyseCalendar
 from agb.roles import OWNER
 from agb.services import bot as bot_service
-from agb.services.bot import POLL_BACKOFF, Bot, help_text
+from agb.services.bot import POLL_BACKOFF, Bot, help_text, split
 from agb.telegram import TelegramError
 
 CHAT = "4242"
@@ -33,10 +33,16 @@ class FakeTelegram:
         self.updates: list[dict] = []
         self.offsets: list[int | None] = []
         self.fail: str | None = None
+        # The send number (counting from 1, the ones accepted so far plus this one) that fails
+        # once; the next attempt at it goes through.
+        self.fail_once_on: int | None = None
 
     def send_message(self, chat_id: str, text: str) -> int:
         if self.fail:
             raise TelegramError(self.fail)
+        if self.fail_once_on == len(self.sent) + 1:
+            self.fail_once_on = None
+            raise TelegramError("sendMessage: Bad Gateway")
         self.sent.append((chat_id, text))
         return 1000 + len(self.sent)
 
@@ -201,6 +207,120 @@ def test_a_failed_delivery_is_recorded_and_retried_after_a_backoff(db, telegram,
     assert events(db)[1:] == [("overdue", "delivered", "telegram", CHAT, 1001, None, "bot")]
     assert cli.execute("SELECT * FROM agb.undelivered_alert").fetchall() == []
     assert len(telegram.sent) == 1
+
+
+def raise_long_alert(db, parts=3):
+    """An alert whose body needs `parts` messages: one block of 3,000 characters per part."""
+    blocks = [f"{n}" * 3000 for n in range(1, parts + 1)]
+    db.connect("bot").execute(
+        "INSERT INTO agb.alert (kind, subject, period, body, raised_by) "
+        "VALUES ('overdue', 'long', '2026-09', %s, 'bot')",
+        ("\n\n".join(blocks),),
+    )
+    return blocks
+
+
+def parts_recorded(db):
+    return (
+        db.connect("cli")
+        .execute("SELECT part, telegram_message_id FROM agb.alert_part ORDER BY part")
+        .fetchall()
+    )
+
+
+def test_a_delivery_that_fails_part_way_resumes_at_the_first_part_not_sent(
+    db, telegram, rebalance_ahead
+):
+    blocks = raise_long_alert(db)
+    conn = db.connect("bot")
+    telegram.fail_once_on = 2
+    bot = Bot(telegram, CHAT, lambda: NOW, retry_after=timedelta(0))
+    bot(conn)
+    assert [text for _, text in telegram.sent] == blocks[:1]
+    assert parts_recorded(db) == [(1, 1001)]
+    assert events(db) == [
+        (
+            "overdue",
+            "failed",
+            "telegram",
+            CHAT,
+            None,
+            "part 2 of 3: sendMessage: Bad Gateway",
+            "bot",
+        )
+    ]
+
+    bot(conn)
+    # Parts 1, 2 and 3, each once, in order.
+    assert [text for _, text in telegram.sent] == blocks
+    assert parts_recorded(db) == [(1, 1001), (2, 1002), (3, 1003)]
+    # The delivery names the last message sent.
+    assert events(db)[1:] == [("overdue", "delivered", "telegram", CHAT, 1003, None, "bot")]
+    bot(conn)
+    assert len(telegram.sent) == 3
+
+
+def test_a_delivery_that_fails_twice_in_a_row_still_repeats_nothing(db, telegram, rebalance_ahead):
+    blocks = raise_long_alert(db)
+    conn = db.connect("bot")
+    bot = Bot(telegram, CHAT, lambda: NOW, retry_after=timedelta(0))
+    telegram.fail_once_on = 2
+    bot(conn)
+    telegram.fail_once_on = 3
+    bot(conn)
+    assert parts_recorded(db) == [(1, 1001), (2, 1002)]
+    bot(conn)
+    assert [text for _, text in telegram.sent] == blocks
+    assert [event for _, event, *_ in events(db)] == ["failed", "failed", "delivered"]
+
+
+def test_a_part_is_recorded_once_and_only_by_the_bot(db, telegram, rebalance_ahead):
+    raise_long_alert(db, parts=2)
+    Bot(telegram, CHAT, lambda: NOW)(db.connect("bot"))
+    bot = db.connect("bot")
+    (alert_id,) = bot.execute("SELECT id FROM agb.alert").fetchone()
+    insert = (
+        "INSERT INTO agb.alert_part (alert_id, part, channel, telegram_message_id, actor) "
+        "VALUES (%s, %s, 'telegram', 7, %s)"
+    )
+    with pytest.raises(errors.UniqueViolation):
+        bot.execute(insert, (alert_id, 1, "bot"))
+    with pytest.raises(errors.CheckViolation):
+        bot.execute(insert, (alert_id, 0, "bot"))
+    with pytest.raises(errors.CheckViolation):
+        bot.execute(insert, (alert_id, 3, "cli"))
+    with pytest.raises(errors.InsufficientPrivilege):
+        db.connect("cli").execute(insert, (alert_id, 3, "bot"))
+    with pytest.raises(errors.InsufficientPrivilege):
+        bot.execute("DELETE FROM agb.alert_part")
+
+
+def test_an_alert_with_a_blank_body_is_delivered_without_a_message(db, telegram, rebalance_ahead):
+    conn = db.connect("bot")
+    # `body <> ''` lets a body of whitespace through, and Telegram refuses one.
+    conn.execute(
+        "INSERT INTO agb.alert (kind, subject, period, body, raised_by) "
+        "VALUES ('overdue', 'blank', '2026-09', ' \n\n ', 'bot')"
+    )
+    conn.execute(
+        "INSERT INTO agb.alert (kind, subject, period, body, raised_by) "
+        "VALUES ('overdue', 'after', '2026-09', 'still delivered', 'bot')"
+    )
+    bot = Bot(telegram, CHAT, lambda: NOW)
+    bot(conn)
+    bot(conn)
+    # The blank one is closed, not retried every cycle, and does not hold up the next one.
+    assert [text for _, text in telegram.sent] == ["still delivered"]
+    blank, after = events(db)
+    assert blank[:5] == ("overdue", "delivered", "telegram", CHAT, None)
+    assert "blank" in blank[5]
+    assert after[:5] == ("overdue", "delivered", "telegram", CHAT, 1001)
+    assert db.connect("cli").execute("SELECT * FROM agb.undelivered_alert").fetchall() == []
+
+
+@pytest.mark.parametrize("text", ["", "   ", "\n\n"])
+def test_a_blank_message_has_no_parts(text):
+    assert split(text) == []
 
 
 def test_the_backoff_doubles_up_to_the_cap(db, telegram, rebalance_ahead):
@@ -461,6 +581,71 @@ def test_a_poll_tries_no_more_than_it_is_told_to(db, telegram, caplog):
     assert len(telegram.offsets) == 1
     assert waits == []
     assert "trying again" not in caplog.text
+
+
+# A reply Telegram would not take.
+
+
+def message(text, update_id=None):
+    return {
+        "update_id": update_id or next(UPDATE_IDS),
+        "message": {
+            "chat": {"id": int(CHAT)},
+            "from": {"id": 1},
+            "date": sent(NOW),
+            "text": text,
+        },
+    }
+
+
+def test_a_reply_that_fails_once_arrives_on_the_next_cycle(db, telegram, rebalance_ahead):
+    telegram.updates = [message("hi", update_id=2001)]
+    conn = db.connect("bot")
+    bot = Bot(telegram, CHAT, lambda: NOW)
+    telegram.fail_once_on = 1
+    bot(conn)
+    assert telegram.sent == []
+    assert events(db) == [
+        ("reply", "failed", "telegram", CHAT, None, "sendMessage: Bad Gateway", "bot")
+    ]
+
+    bot(conn)  # still backing off
+    assert telegram.sent == []
+    bot.retry_after = timedelta(0)
+    bot(conn)
+    assert telegram.sent == [(CHAT, help_text("not a command"))]
+    assert events(db)[1:] == [("reply", "delivered", "telegram", CHAT, 1001, None, "bot")]
+    # The update was claimed once, so the next cycle does not answer it again.
+    bot(conn)
+    assert len(telegram.sent) == 1
+    assert db.connect("cli").execute("SELECT * FROM agb.undelivered_alert").fetchall() == []
+
+
+def test_a_long_reply_that_fails_part_way_resumes_without_repeating(db, telegram, rebalance_ahead):
+    blocks = [f"{n}" * 3000 for n in range(1, 4)]
+    conn = db.connect("bot")
+    bot = Bot(telegram, CHAT, lambda: NOW, retry_after=timedelta(0))
+    bot._reply(conn, "update 77", "\n\n".join(blocks), NOW)
+    assert [text for _, text in telegram.sent] == blocks
+    assert events(db) == []
+
+    telegram.sent.clear()
+    telegram.fail_once_on = 2
+    bot._reply(conn, "update 78", "\n\n".join(blocks), NOW)
+    assert [text for _, text in telegram.sent] == blocks[:1]
+    assert events(db) == [
+        (
+            "reply",
+            "failed",
+            "telegram",
+            CHAT,
+            None,
+            "part 2 of 3: sendMessage: Bad Gateway",
+            "bot",
+        )
+    ]
+    bot(conn)
+    assert [text for _, text in telegram.sent] == blocks
 
 
 # The pre-flight.

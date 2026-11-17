@@ -116,7 +116,7 @@ Rejected: stored counters. Rejected: the shadow as extra columns on the traded b
 
 **Expected events are what tell a dead system from a quiet month.** The scheduler writes `expected_event` rows ahead of time: the data pull due at T, the rebalance proposal due at T, the approval request due at T, submission due by T. Each is completed by a reference to the row that fulfilled it. An overdue view flags any expected event past its time with no completion. The same view also flags when no rebalance is expected within the next cycle's horizon, which is how a dead scheduler shows up: it simply stops writing future rows. A month without a rebalance is quiet only if nothing was expected. This view drives `/status`, the pre-flight message and the UI banner.
 
-`alert` rows are append-only with a dedupe key `(kind, subject, period)`, so a stale heartbeat produces one alert rather than one per cycle. `alert_event` records delivery (with the Telegram message id) and acknowledgement, so an alert the bot never delivered is visible in the UI.
+`alert` rows are append-only with a dedupe key `(kind, subject, period)`, so a stale heartbeat produces one alert rather than one per cycle. `alert_event` records delivery (with the Telegram message id) and acknowledgement, so an alert the bot never delivered is visible in the UI. `alert_part` records each part of a long alert Telegram accepted, with its message id, so a delivery that fails part-way resumes where it stopped. A `delivered` event carries a message id unless it says in `detail` why there was nothing to send.
 
 The bot evaluates the health of every other service and alerts. The UI evaluates everything, including the bot, and shows a banner. The bot's pre-flight message on the session before each rebalance is how a dead bot is noticed with a session to spare.
 
@@ -157,6 +157,7 @@ Rejected: everything in Postgres, which grows the dump by hundreds of megabytes 
 | `heartbeat` | every service | upsert |
 | `expected_event` | scheduler (create), fulfilling service (completion reference) | completion by append or reference, never rewrite |
 | `alert`, `alert_event` | bot, ui, execution, scheduler, pipeline (`alert` only, for a job that failed) | no |
+| `alert_part` | bot | no |
 | `dividend` | cli, ui (the operator, from a broker statement) | no |
 
 Views: current basket state, open halt causes, audit log, shortfall, eligibility (ladder and mode), overdue expected events, reconcile state (each planned order beside what the broker last said about it), per-fill and live cost shortfall, equity by New York month, and the promoted certification's alert thresholds.
