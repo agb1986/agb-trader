@@ -554,10 +554,13 @@ def _write(conn: psycopg.Connection, run_id: int, name: Name, store: PanelStore)
             store,
         )
     failure = name.failure
+    failed = "analyst_failure"
     quotes: list[analyst.Quote] = []
     if name.completion is not None:
         try:
             quotes = analyst.verify(analyst.parse(name.completion), name.documents)
+        except analyst.Refusal as exc:
+            failure, failed = str(exc), "analyst_refusal"
         except analyst.AnalystError as exc:
             failure = str(exc)
     if failure is not None:
@@ -565,9 +568,9 @@ def _write(conn: psycopg.Connection, run_id: int, name: Name, store: PanelStore)
             """
             INSERT INTO agb.panel_extract
                 (retrieval_id, model_call_id, outcome, detail, scrubber_version)
-            VALUES (%s, %s, 'analyst_failure', %s, %s)
+            VALUES (%s, %s, %s, %s, %s)
             """,
-            (retrieval_id, call_id, failure, SCRUBBER_VERSION),
+            (retrieval_id, call_id, failed, failure, SCRUBBER_VERSION),
         )
         return
 
@@ -683,6 +686,7 @@ class Debate:
     answers: dict[str, str] = field(default_factory=dict)
     score: debate.Score | None = None
     failure: str | None = None
+    refused: bool = False
 
 
 def score(
@@ -861,6 +865,7 @@ def _read(d: Debate, call: Call) -> None:
     except debate.DebateError as exc:
         log.warning("%s: the %s's answer is unusable: %s", d.symbol, call.role.capitalize(), exc)
         d.failure = f"{call.role}: {exc}"
+        d.refused = isinstance(exc, debate.Refusal)
 
 
 def _write_score(conn: psycopg.Connection, run_id: int, config_id: int, d: Debate) -> None:
@@ -882,7 +887,7 @@ def _write_score(conn: psycopg.Connection, run_id: int, config_id: int, d: Debat
             call_ids.get("prosecutor"),
             call_ids.get("defender"),
             call_ids.get("judge"),
-            "debate_failure" if result is None else "scored",
+            "scored" if result is not None else "debate_refusal" if d.refused else "debate_failure",
             d.failure,
             None if result is None else result.total,
             None if result is None else result.value,

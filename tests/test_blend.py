@@ -207,6 +207,20 @@ def test_a_name_the_panel_did_not_score_takes_the_neutral_middle(db, tmp_path):
     ) == [(1,)]
 
 
+def test_a_name_the_model_refused_is_neutral_and_flagged_as_a_refusal(db, tmp_path):
+    plan_rebalance(db)
+    fake = fake_panel(db, 0.2, analyst_refusal=("N04",))
+    root = market(tmp_path).land()
+
+    run(db, root, runner=fake)
+
+    rows_by_symbol = {s: row for s, *row in blends(db, LIVE)}
+    assert rows_by_symbol["N04"][2:4] == [None, True]
+    basket = rows(db, f"SELECT {LIVE}")[0][0]
+    flagged = dict(blend.flags(db.connect("cli"), basket))
+    assert flagged["N04"] == "the model refused to extract it, scored neutral"
+
+
 # The shadow basket.
 
 

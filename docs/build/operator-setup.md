@@ -62,6 +62,8 @@ Needed for T04 (Sharadar lake).
 
 The direct API is `https://api.sharadar.com/v1.0/data/<table>`, with the key passed as `api_key`. It accepts the Nasdaq Data Link table names (`sep`, `sf1`, `tickers`) as well as its own (`stocks`, `fundamentals`, `tickers`). Two things differ from the Nasdaq Data Link version: SF1's SEC filing date is called `date`, not `datekey`, and the `table` column in TICKERS says `stocks` rather than `SEP`. A query returns at most 10,000 rows, so the backfill uses the bulk download instead: adding `years=full` to a table request redirects to a zipped CSV of the whole table. The public key `test-api-key` returns AAPL only, which is enough to exercise the pull without a subscription.
 
+The key travels in the query string because the lake client sends it that way, and no header form could be confirmed without a live request, which the build does not make. Errors and logs from the client replace the key with `***` before they are printed, so it is not written to a log. The request goes over HTTPS, so only Sharadar's own server logs see the full URL.
+
 After T03 and T04 have both merged, run the **full backfill from 1998** onto the server's `/mnt/data`. It must finish before the T17 live check (wave 6), which syncs the lake from the server. T04's own live check only pulls a small date range.
 
 ### 3. Telegram bot

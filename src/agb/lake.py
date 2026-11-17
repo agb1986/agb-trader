@@ -275,8 +275,9 @@ def urlopen(url: str) -> AbstractContextManager[BinaryIO]:
 
 class Sharadar:
     """The vendor's table API. `opener` fetches a URL, following redirects; tests pass a fake,
-    and a `sleep` that does not wait. The key goes in each URL, so no error message this
-    raises includes a URL with it."""
+    and a `sleep` that does not wait. The key goes in each URL's query string, the only form the
+    vendor documentation available here confirms (a header form could not be checked offline),
+    so every message this raises has the key replaced with "***" and none includes a URL."""
 
     def __init__(
         self,

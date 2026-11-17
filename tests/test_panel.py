@@ -37,12 +37,14 @@ DOCUMENT = re.compile(r'<document id="(D\d+)"[^>]*section="([^"]*)">\n(.*?)\n</d
 
 class FakeAnalyst:
     """Quotes every passage in PASSAGES that the request's documents contain, plus the
-    fabricated one. `fail` names tickers whose call errors, `garble` ones answered in prose."""
+    fabricated one. `fail` names tickers whose call errors, `garble` ones answered in prose
+    and `refuse` ones the model declines."""
 
-    def __init__(self, fail=(), garble=()):
+    def __init__(self, fail=(), garble=(), refuse=()):
         self.calls = []
         self.fail = set(fail)
         self.garble = set(garble)
+        self.refuse = set(refuse)
         self._lock = threading.Lock()
 
     def complete(self, request):
@@ -60,8 +62,9 @@ class FakeAnalyst:
         ]
         quotes.append({"dimension": 3, "document": "D1", "section": "Item 1A", "quote": FABRICATED})
         text = "I found some quotes." if ticker in self.garble else json.dumps({"quotes": quotes})
+        stop = "refusal" if ticker in self.refuse else "end_turn"
         return Completion(
-            text, f"{request['model']}-20251001", 20_000, 900, 1_800, 0, "end_turn", f"req_{ticker}"
+            text, f"{request['model']}-20251001", 20_000, 900, 1_800, 0, stop, f"req_{ticker}"
         )
 
 
@@ -365,6 +368,31 @@ def test_a_failed_or_garbled_answer_is_an_analyst_failure(db, config, store):
     assert sorted(again.calls) == ["ACME", "NEWCO"]
     assert extract(db, store, "ACME", run_id + 1)[0] == "extracted"
     assert extract(db, store, "NEWCO", run_id + 1)[0] == "extracted"
+
+
+def test_a_refusal_is_stored_as_a_refusal_and_asked_again(db, config, store):
+    model = FakeAnalyst(refuse={"ACME"}, fail={"NEWCO"})
+
+    run_id = run(db, config, store, model)
+
+    assert extract(db, store, "ACME")[:2] == ("analyst_refusal", "the model declined to answer")
+    assert extract(db, store, "NEWCO")[0] == "analyst_failure"
+    assert extract(db, store, "LATE")[0] == "extracted"
+    # The refused call is logged, and the next run asks for it again.
+    [(logged,)] = rows(
+        db,
+        """
+        SELECT e.model_call_id IS NOT NULL
+        FROM agb.panel_extract e JOIN agb.panel_retrieval r ON r.id = e.retrieval_id
+        WHERE r.run_id = %s AND r.symbol = 'ACME'
+        """,
+        run_id,
+    )
+    assert logged
+    again = FakeAnalyst()
+    run(db, config, store, again)
+    assert "ACME" in again.calls
+    assert extract(db, store, "ACME", run_id + 1)[0] == "extracted"
 
 
 def test_a_missing_body_is_not_a_cache_hit(db, config, store):

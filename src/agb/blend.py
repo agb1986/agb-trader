@@ -190,9 +190,17 @@ _FLAGS = """
         FROM held h JOIN agb.panel_extract e ON e.retrieval_id = h.id
         WHERE e.outcome = 'analyst_failure'
         UNION ALL
+        SELECT h.symbol, 'the model refused to extract it, scored neutral'
+        FROM held h JOIN agb.panel_extract e ON e.retrieval_id = h.id
+        WHERE e.outcome = 'analyst_refusal'
+        UNION ALL
         SELECT h.symbol, 'the debate failed, scored neutral'
         FROM held h JOIN agb.panel_score s ON s.retrieval_id = h.id
         WHERE s.outcome = 'debate_failure'
+        UNION ALL
+        SELECT h.symbol, 'the model refused to debate it, scored neutral'
+        FROM held h JOIN agb.panel_score s ON s.retrieval_id = h.id
+        WHERE s.outcome = 'debate_refusal'
         UNION ALL
         SELECT h.symbol, 'dimension ' || d.dimension || ' scored ' || d.score || ' of 4'
         FROM held h

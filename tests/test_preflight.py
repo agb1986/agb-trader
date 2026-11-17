@@ -95,6 +95,16 @@ def test_retrieval_fidelity_passes_a_run_whose_every_quote_is_in_the_filing(db, 
     assert result.detail["quotes"] == []
 
 
+def test_fidelity_counts_a_refusal_apart_from_a_failure(db, config, store):
+    run_id = analyst_run(db, config, store, HonestAnalyst(refuse={"NEWCO"}, fail={"LATE"}))
+
+    result = preflight.fidelity(db.connect("cli"), run_id, minimum=1)
+
+    assert result.detail["names"] == 1
+    assert result.detail["analyst_failures"] == 1
+    assert result.detail["analyst_refusals"] == 1
+
+
 def test_fidelity_refuses_a_run_too_small_or_too_quiet_to_measure(db, config, store):
     run_id = analyst_run(db, config, store, FakeAnalyst())
     conn = db.connect("cli")
