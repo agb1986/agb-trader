@@ -17,6 +17,10 @@ cost-model version, which counts as a trial and voids existing certifications. `
 each version to a fingerprint of its constants, and a `CostModel` whose constants do not match
 its version's fingerprint cannot be constructed, so a constant cannot change without the
 version changing too.
+
+The model prices only from numbers it can stand behind. A NaN or infinite input, or a price
+of zero or below, raises `CostInputError` rather than flowing through as a NaN cost or
+surfacing as a bare arithmetic error; see that class for what counts as each.
 """
 
 import dataclasses
@@ -39,6 +43,22 @@ CENT = Decimal("0.01")
 VERSIONS: dict[str, str] = {
     "1": "f883716f6f69eccfb547e77db8742102cbc0691a5a2a20b5f1f3d3eaee35168d",
 }
+
+
+class CostInputError(ValueError):
+    """An input the cost model will not price from: a NaN or infinite number anywhere it reads
+    one, a high, low or close of zero or below, or a negative volume.
+
+    A zero price is refused, not treated as a name that did not trade: the spread estimate
+    takes the log of each price and the volatility divides by the day before's close, so a
+    zero would otherwise raise a bare `math domain error` or `ZeroDivisionError`, and any
+    stand-in value would invent a cost. A zero volume is a day with no trades and stands; a
+    trailing window of them leaves ADV_$ at zero, which `trade_cost` refuses as before.
+
+    Nothing about the model's constants is wrong, and the same call fails the same way until
+    the bars it is given are mended, so the pipeline fails a job that raises it rather than
+    trying again (agb.services.pipeline). It is a ValueError, as the refusals before it were.
+    """
 
 
 class Side(StrEnum):
@@ -154,6 +174,7 @@ def two_day_spreads(
     before the square root, so there is one estimate per consecutive pair, oldest first.
     """
     _same_length(high, low, close)
+    _prices(high=high, low=low, close=close)
     c = [math.log(x) for x in close]
     eta = [(math.log(h) + math.log(lo)) / 2 for h, lo in zip(high, low, strict=True)]
     return [
@@ -175,6 +196,7 @@ def spread_floor_bps(
 def daily_volatility(close: Sequence[float], model: CostModel = CURRENT) -> float:
     """The sample standard deviation of the trailing window's daily close-to-close returns."""
     (closes,) = _trailing(model.window + 1, close)
+    _prices(close=closes)
     return statistics.stdev(b / a - 1 for a, b in pairwise(closes))
 
 
@@ -183,6 +205,8 @@ def median_dollar_volume(
 ) -> float:
     """ADV_$: the trailing window's median daily dollar volume, close times shares traded."""
     closes, volumes = _trailing(model.window, close, volume)
+    _prices(close=closes)
+    _volumes(volumes)
     return statistics.median(c * v for c, v in zip(closes, volumes, strict=True))
 
 
@@ -205,6 +229,29 @@ def liquidity(
 def _same_length(*series: Sequence[float]) -> None:
     if len({len(s) for s in series}) > 1:
         raise ValueError("daily series must all have the same length")
+
+
+def _finite(name: str, value: float | Decimal) -> None:
+    """Refuse a NaN or infinite `value`, naming it as `name`."""
+    finite = value.is_finite() if isinstance(value, Decimal) else math.isfinite(value)
+    if not finite:
+        raise CostInputError(f"{name} is {value}, not a finite number")
+
+
+def _prices(**series: Sequence[float]) -> None:
+    """Refuse a price series holding a NaN, an infinity, or a price of zero or below."""
+    for name, values in series.items():
+        for i, value in enumerate(values):
+            _finite(f"{name}[{i}]", value)
+            if value <= 0:
+                raise CostInputError(f"{name}[{i}] is {value}; a price must be above zero")
+
+
+def _volumes(values: Sequence[float]) -> None:
+    for i, value in enumerate(values):
+        _finite(f"volume[{i}]", value)
+        if value < 0:
+            raise CostInputError(f"volume[{i}] is {value}; a volume cannot be negative")
 
 
 def _trailing(n: int, *series: Sequence[float]) -> list[Sequence[float]]:
@@ -239,6 +286,8 @@ def fees(
 ) -> Fees:
     """The fee schedule. Regulatory fees fall on sells only; commission on every order."""
     principal, qty = _decimal(principal_usd), _decimal(shares)
+    _finite("principal", principal)
+    _finite("shares", qty)
     if principal <= 0 or qty <= 0:
         raise ValueError("principal and shares must be positive")
     if Side(side) is Side.BUY:
@@ -294,6 +343,10 @@ def trade_cost(
             f"liquidity was computed under cost-model version {liq.model_version!r}, "
             f"not {model.version!r}"
         )
+    for name in ("floor_bps", "sigma_daily", "adv_usd"):
+        _finite(name, getattr(liq, name))
+    _finite("order_usd", float(order_usd))
+    _finite("shares", float(shares))
     if liq.adv_usd <= 0 or liq.sigma_daily < 0:
         raise ValueError("ADV_$ must be positive and σ_daily non-negative")
     notional = float(order_usd)

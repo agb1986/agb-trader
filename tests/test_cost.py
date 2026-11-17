@@ -207,6 +207,90 @@ def test_series_of_different_lengths_are_refused():
         cost.liquidity(high, low, close, [1_000.0] * (len(close) - 1))
 
 
+# Inputs the model will not price from: a NaN or infinity anywhere, and a price of zero.
+
+
+def _window():
+    high, low, close = bars([0.0015] * WINDOW, [0.01, -0.01] * (WINDOW // 2))
+    return {"high": high, "low": low, "close": close, "volume": [100_000.0] * len(close)}
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize("column", ["high", "low", "close", "volume"])
+def test_liquidity_refuses_a_number_that_is_not_finite(column, bad):
+    series = _window()
+    series[column][-3] = bad
+    with pytest.raises(cost.CostInputError, match=rf"{column}\[\d+\] is -?(nan|inf)"):
+        cost.liquidity(**series)
+
+
+@pytest.mark.parametrize("price", [0.0, -1.0])
+@pytest.mark.parametrize("column", ["high", "low", "close"])
+def test_liquidity_refuses_a_price_of_zero_or_below(column, price):
+    # A zero once raised a bare `math domain error` from the log, or a ZeroDivisionError from
+    # the return the day after; now it is refused by name, never priced around.
+    series = _window()
+    series[column][-3] = price
+    with pytest.raises(cost.CostInputError, match="a price must be above zero"):
+        cost.liquidity(**series)
+
+
+def test_volatility_refuses_a_zero_close_it_would_divide_by():
+    close = closes_from_returns([0.02, -0.02] * (WINDOW // 2))
+    close[-2] = 0.0
+    with pytest.raises(cost.CostInputError, match="above zero"):
+        cost.daily_volatility(close)
+
+
+def test_a_zero_volume_stands_and_a_negative_one_is_refused():
+    series = _window()
+    series["volume"][-3] = 0.0
+    assert cost.liquidity(**series).adv_usd > 0  # one quiet day leaves the median standing
+    series["volume"] = [0.0] * len(series["close"])
+    with pytest.raises(ValueError, match=r"ADV_\$ must be positive"):  # refused as before
+        cost.trade_cost(Side.BUY, ORDER_USD, 100, cost.liquidity(**series))
+    series["volume"][-3] = -1.0
+    with pytest.raises(cost.CostInputError, match="cannot be negative"):
+        cost.liquidity(**series)
+
+
+def test_a_bad_bar_before_the_window_is_not_read():
+    # Only the window is priced from, as before: an old NaN that no estimate reads still stands.
+    series = _window()
+    for column in ("high", "low", "close", "volume"):
+        series[column] = [math.nan, *series[column]]
+    series["close"][0] = 0.0
+    assert cost.liquidity(**series) == cost.liquidity(**_window())
+
+
+@pytest.mark.parametrize("field", ["floor_bps", "sigma_daily", "adv_usd"])
+@pytest.mark.parametrize("bad", [math.nan, math.inf])
+def test_trade_cost_refuses_liquidity_that_is_not_finite(field, bad):
+    liq = dataclasses.replace(TYPICAL, **{field: bad})
+    with pytest.raises(cost.CostInputError, match=field):
+        cost.trade_cost(Side.BUY, ORDER_USD, 100, liq)
+
+
+@pytest.mark.parametrize(
+    ("order_usd", "shares"),
+    [(math.nan, 100), (ORDER_USD, math.nan), (math.inf, 100), (Decimal("NaN"), 100)],
+)
+@pytest.mark.parametrize("side", list(Side))
+def test_trade_cost_refuses_an_order_that_is_not_finite(order_usd, shares, side):
+    with pytest.raises(cost.CostInputError, match="not a finite number"):
+        cost.trade_cost(side, order_usd, shares, TYPICAL)
+
+
+@pytest.mark.parametrize(("principal", "shares"), [(math.nan, 100), (5_000, Decimal("NaN"))])
+def test_fees_refuse_a_number_that_is_not_finite(principal, shares):
+    with pytest.raises(cost.CostInputError, match="not a finite number"):
+        cost.fees(Side.SELL, principal, shares)
+
+
+def test_the_named_error_is_still_a_value_error():
+    assert issubclass(cost.CostInputError, ValueError)
+
+
 # The fee schedule.
 
 
