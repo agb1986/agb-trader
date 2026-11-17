@@ -106,12 +106,14 @@ _FILLS = """
     ORDER BY f.id
 """
 # The partial-rebalance alert that says a settled rebalance was left short, by the state it
-# settled in: a filled one filled short at the close, a halted one was halted with orders
-# still live. Each with the start of the body the same alert carried under the one kind every
-# cause shared before they were split, which is how an alert raised then is told from the
-# submission's refusal alert that shared its key.
+# settled in: a filled one filled short at the close, an unfilled one filled nothing at all,
+# a halted one was halted with orders still live. Each with the start of the body the same
+# alert carried under the one kind every cause shared before they were split, which is how an
+# alert raised then is told from the submission's refusal alert that shared its key. The
+# unfilled alert came after the split and was never raised under the shared kind.
 _CAUSES = (
     ("filled", execution.PARTIAL_SHORT_FILL, "filled short on "),
+    ("unfilled", execution.BASKET_UNFILLED, "filled nothing: "),
     ("halted", execution.PARTIAL_HALTED, "halted mid-submission; "),
     ("halted", execution.PARTIAL_PAUSED, "halted by a pause mid-submission; "),
 )
@@ -301,6 +303,7 @@ def partial_fills(conn: psycopg.Connection) -> Result:
         ),
         threshold=(
             f"every rebalance with a short fill raises {execution.PARTIAL_SHORT_FILL}, "
+            f"{execution.BASKET_UNFILLED} if it filled nothing, "
             f"or {execution.PARTIAL_HALTED} or {execution.PARTIAL_PAUSED} if it was halted"
         ),
         detail={

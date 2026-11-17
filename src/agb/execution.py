@@ -22,9 +22,15 @@ submitted.
 
 Reconciliation, after the close. Each order is read back and every status change appended;
 each fill the account reports is one `fill` row carrying the regulatory fees the shared
-schedule charges on that fill alone; and the basket is filled once the broker is done with
-every order. A basket that filled short raises a `partial_rebalance_short_fill` alert naming
-what happened.
+schedule charges on that fill alone; and once the broker is done with every order the basket
+is settled, its outcome recorded as filled in full, filled in part or not filled at all. A
+basket that filled anything is filled; one that filled in part raises a
+`partial_rebalance_short_fill` alert naming each order left short. A basket whose every order
+expired, was refused or was cancelled with nothing filled is `unfilled`, and raises one
+`basket_unfilled` alert. The alert is written in the same transaction as the state change, so
+neither is ever recorded without the other. A basket the broker is still not done with an hour
+after the close raises one `reconcile_overdue` alert naming the orders still open; later
+cycles keep reading it back and raise no second one.
 
 The daily snapshot, once per closed session: the broker's positions and the account flags,
 so the halt latch can be compared with the broker's `suspend_trade`, and a snapshot with the
@@ -81,6 +87,12 @@ SUBMIT_WINDOW = schedule.SUBMIT_WINDOW
 SUBMISSION_LEASE = schedule.SUBMIT_WINDOW
 # How long after the close the broker is given before fills and positions are read back.
 SETTLE = timedelta(minutes=5)
+# How long after the close a submitted basket may wait on the broker before the wait is
+# itself raised, as one `reconcile_overdue` alert naming each order still open. The closing
+# auction settles within minutes; an order still open an hour later is not going to fill on
+# its own, and nothing re-submits it, so a human has to look.
+RECONCILE_DEADLINE = timedelta(hours=1)
+RECONCILE_OVERDUE = "reconcile_overdue"
 # How far before a basket's first order, or before the reconcile itself, the fills are read. The
 # broker's clock is not this database's clock, and `created_at` is this database's, so a fill
 # stamped a moment before the row that caused it would be dropped for good by an exact window.
@@ -107,6 +119,10 @@ PARTIAL_REFUSED = "partial_rebalance_refused"
 PARTIAL_HALTED = "partial_rebalance_halted"
 PARTIAL_PAUSED = "partial_rebalance_paused"
 PARTIAL_SHORT_FILL = "partial_rebalance_short_fill"
+# A basket the broker is done with that filled nothing at all: every order expired, was
+# refused or was cancelled with no shares filled. It settles as `unfilled`, not `filled`.
+BASKET_UNFILLED = "basket_unfilled"
+UNFILLED = "unfilled"
 # The kind all four shared until they were split, still on the alerts raised before then.
 PARTIAL_REBALANCE = "partial_rebalance"
 # A pause cancels a submitted basket's orders only up to this long before the close.
@@ -238,6 +254,11 @@ _INSERT_CHECK = """
 _MOVE = """
     INSERT INTO agb.basket_event (basket_id, seq, from_state, to_state, actor, surface, reason)
     VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id
+"""
+_OUTCOME = """
+    INSERT INTO agb.basket_outcome (basket_id, event_id, outcome, orders, in_full, in_part,
+        unfilled, actor)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
 """
 _BREACH = """
     INSERT INTO agb.halt_event (cause, action, basket_id, actor, reason)
@@ -587,7 +608,8 @@ def _cancel_sent(conn: psycopg.Connection, broker: Broker, orders: Sequence[Sent
 
 
 def _named(order: Sent) -> str:
-    """An order `_cancel_sent` left behind, as a halt's reason and alert name it."""
+    """An order `_cancel_sent` left behind, or one that ended unfilled, as a halt's reason
+    and the alerts name it."""
     name = f"{order.side} {order.qty} {order.symbol}"
     if order.status in DONE or order.status == PENDING_CANCEL:
         return f"{name} ({order.status}, {order.filled_qty} filled)"
@@ -609,16 +631,16 @@ def _stop(
     )
     with conn.transaction():
         _halt(conn, basket, reason, breach=False)
-    if remaining:
-        names = ", ".join(_named(o) for o in remaining)
-        raise_alert(
-            conn,
-            PARTIAL_HALTED,
-            basket.reference,
-            basket.period,
-            f"basket {basket.reference} halted mid-submission; still live or filled at the "
-            f"broker: {names}",
-        )
+        if remaining:
+            names = ", ".join(_named(o) for o in remaining)
+            raise_alert(
+                conn,
+                PARTIAL_HALTED,
+                basket.reference,
+                basket.period,
+                f"basket {basket.reference} halted mid-submission; still live or filled at the "
+                f"broker: {names}",
+            )
     log.warning("basket %s: %s", basket.reference, reason)
     return Outcome(basket.id, "halted", len(live), reason)
 
@@ -650,14 +672,14 @@ def _cut_off(
     )
     with conn.transaction():
         _halt(conn, basket, reason, breach=False)
-    raise_alert(
-        conn,
-        PARTIAL_HALTED,
-        basket.reference,
-        basket.period,
-        f"basket {basket.reference} halted mid-submission; the {when} cutoff passed with "
-        f"{count} of {total} orders sent. Not sent: {names}",
-    )
+        raise_alert(
+            conn,
+            PARTIAL_HALTED,
+            basket.reference,
+            basket.period,
+            f"basket {basket.reference} halted mid-submission; the {when} cutoff passed with "
+            f"{count} of {total} orders sent. Not sent: {names}",
+        )
     log.warning("basket %s: %s", basket.reference, reason)
     return Outcome(basket.id, "halted", count, reason)
 
@@ -782,16 +804,16 @@ def submit(
             )
         )
         jobs.fulfil(conn, schedule.SUBMISSION, basket.period, "basket_event", event_id, ACTOR)
-    if rejected:
-        names = ", ".join(f"{o.side} {o.qty} {o.symbol}" for o in rejected)
-        raise_alert(
-            conn,
-            PARTIAL_REFUSED,
-            basket.reference,
-            basket.period,
-            f"basket {basket.reference} submitted with {len(rejected)} of {count} orders "
-            f"refused by the broker: {names}",
-        )
+        if rejected:
+            names = ", ".join(f"{o.side} {o.qty} {o.symbol}" for o in rejected)
+            raise_alert(
+                conn,
+                PARTIAL_REFUSED,
+                basket.reference,
+                basket.period,
+                f"basket {basket.reference} submitted with {len(rejected)} of {count} orders "
+                f"refused by the broker: {names}",
+            )
     log.info("basket %s submitted: %s", basket.reference, reason)
     return Outcome(basket.id, "submitted", count, reason)
 
@@ -843,9 +865,31 @@ def _known_order(conn: psycopg.Connection, broker_order_id: str) -> tuple[str, i
     return None
 
 
-def reconcile(conn: psycopg.Connection, broker: Broker, basket: Basket, now: datetime) -> Outcome:
+def reconcile_deadline(calendar: nyse.NyseCalendar, session: date) -> datetime:
+    """When a basket for `session` still waiting on the broker is raised as overdue:
+    `RECONCILE_DEADLINE` after its close, early closes included."""
+    return calendar.close_at(session) + RECONCILE_DEADLINE
+
+
+def _open_order(order: Sent) -> str:
+    """An order the broker is not done with, as the overdue alert names it."""
+    return f"{order.side} {order.qty} {order.symbol} ({order.status}, {order.filled_qty} filled)"
+
+
+def reconcile(
+    conn: psycopg.Connection,
+    broker: Broker,
+    basket: Basket,
+    now: datetime,
+    deadline: datetime | None = None,
+) -> Outcome:
     """After the close: read each order back, append what changed, record the fills, and
-    move the basket to filled once the broker is done with every order."""
+    settle the basket once the broker is done with every order.
+
+    A basket that filled anything moves to filled, and one that filled nothing to unfilled.
+    The move, the basket's outcome row and its alert, if it has one, are one transaction.
+    While the broker is not done, a `now` at or past `deadline` raises the one
+    `reconcile_overdue` alert naming the orders still open; the basket keeps waiting."""
     orders = sent(conn, basket.id)
     for order in orders:
         if not order.live or order.done or order.broker_order_id is None:
@@ -857,33 +901,81 @@ def reconcile(conn: psycopg.Connection, broker: Broker, basket: Basket, now: dat
     if earliest is not None:
         ingest_fills(conn, broker, min(earliest, now) - FILL_LOOKBACK)
     orders = sent(conn, basket.id)
-    if not all(o.done for o in orders):
-        pending = [o.symbol for o in orders if not o.done]
-        return Outcome(basket.id, "submitted", len(orders), f"waiting on {', '.join(pending)}")
+    pending = [o for o in orders if not o.done]
+    if pending:
+        reason = f"waiting on {', '.join(o.symbol for o in pending)}"
+        if deadline is not None and now >= deadline:
+            names = ", ".join(_open_order(o) for o in pending)
+            raise_alert(
+                conn,
+                RECONCILE_OVERDUE,
+                basket.reference,
+                basket.period,
+                f"basket {basket.reference} is still waiting on the broker at "
+                f"{now.astimezone(UTC):%Y-%m-%dT%H:%M:%SZ}, past the "
+                f"{deadline.astimezone(nyse.NEW_YORK):%H:%M} ET reconcile deadline, with "
+                f"{len(pending)} of {len(orders)} orders still open: {names}",
+            )
+            reason += " past the reconcile deadline"
+        return Outcome(basket.id, "submitted", len(orders), reason)
+    in_full = [o for o in orders if o.filled_qty >= o.qty]
+    unfilled = [o for o in orders if o.filled_qty == 0]
     short = [o for o in orders if o.filled_qty < o.qty]
+    in_part = len(orders) - len(in_full) - len(unfilled)
+    if not short:
+        outcome, state = "filled", "filled"
+    elif len(unfilled) == len(orders):
+        outcome, state = UNFILLED, UNFILLED
+    else:
+        outcome, state = "partly_filled", "filled"
     with conn.transaction():
         current = conn.execute(_STATE, (basket.id,)).fetchone()
         if current is None or current[0] != "submitted":
             raise ExecutionError(f"basket {basket.id} is no longer submitted")
         reason = (
-            f"{len(orders) - len(short)} of {len(orders)} orders filled in full at "
+            f"{len(in_full)} of {len(orders)} orders filled in full at "
             f"{now.astimezone(UTC):%Y-%m-%dT%H:%M:%SZ}"
         )
+        (event_id,) = one(
+            conn.execute(
+                _MOVE, (basket.id, current[1] + 1, "submitted", state, ACTOR, SURFACE, reason)
+            )
+        )
         conn.execute(
-            _MOVE, (basket.id, current[1] + 1, "submitted", "filled", ACTOR, SURFACE, reason)
+            _OUTCOME,
+            (
+                basket.id,
+                event_id,
+                outcome,
+                len(orders),
+                len(in_full),
+                in_part,
+                len(unfilled),
+                ACTOR,
+            ),
         )
-    if short:
-        names = ", ".join(f"{o.side} {o.qty} {o.symbol} filled {o.filled_qty}" for o in short)
-        raise_alert(
-            conn,
-            PARTIAL_SHORT_FILL,
-            basket.reference,
-            basket.period,
-            f"basket {basket.reference} filled short on {len(short)} of {len(orders)} orders: "
-            f"{names}",
-        )
-    log.info("basket %s filled: %s", basket.reference, reason)
-    return Outcome(basket.id, "filled", len(orders), reason)
+        if outcome == UNFILLED:
+            names = ", ".join(_named(o) for o in unfilled)
+            raise_alert(
+                conn,
+                BASKET_UNFILLED,
+                basket.reference,
+                basket.period,
+                f"basket {basket.reference} filled nothing: all {len(orders)} orders ended "
+                f"with no shares filled: {names}",
+            )
+        elif short:
+            names = ", ".join(f"{o.side} {o.qty} {o.symbol} filled {o.filled_qty}" for o in short)
+            raise_alert(
+                conn,
+                PARTIAL_SHORT_FILL,
+                basket.reference,
+                basket.period,
+                f"basket {basket.reference} filled short on {len(short)} of {len(orders)} "
+                f"orders: {names}",
+            )
+    log.info("basket %s %s: %s", basket.reference, state, reason)
+    return Outcome(basket.id, state, len(orders), reason)
 
 
 def snapshot(
@@ -964,15 +1056,15 @@ def cancel_in_flight(
             conn.execute(
                 _MOVE, (basket.id, current[1] + 1, "submitted", "halted", ACTOR, SURFACE, reason)
             )
-        if remaining:
-            raise_alert(
-                conn,
-                PARTIAL_PAUSED,
-                basket.reference,
-                basket.period,
-                f"basket {basket.reference} halted by a pause mid-submission; still live or "
-                f"filled at the broker: {names}",
-            )
+            if remaining:
+                raise_alert(
+                    conn,
+                    PARTIAL_PAUSED,
+                    basket.reference,
+                    basket.period,
+                    f"basket {basket.reference} halted by a pause mid-submission; still live "
+                    f"or filled at the broker: {names}",
+                )
         log.warning("basket %s: %s", basket.reference, reason)
     return left
 

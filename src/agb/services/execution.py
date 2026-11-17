@@ -6,9 +6,10 @@ the resume unsets it. A confirmed `/liquidate` follows: the broker's close-all, 
 recorded symbol by symbol (`apply_liquidation`). Then it takes the approved live baskets
 whose trade session is in its submission window and sends their orders
 (`agb.execution.submit`), reads back the orders of submitted baskets once the session has
-closed (`reconcile`), and after the close of each session snapshots the broker's positions
-and account state once (`snapshot`). Between those it observes the account's flags every few
-minutes, so the bot can compare the broker's
+closed (`reconcile`), raising one alert for a basket still waiting on the broker an hour
+after the close (`agb.execution.RECONCILE_DEADLINE`), and after the close of each session
+snapshots the broker's positions and account state once (`snapshot`). Between those it
+observes the account's flags every few minutes, so the bot can compare the broker's
 `suspend_trade` with the halt latch.
 
 Without keys it beats and does nothing else, so the stack starts whole before the operator
@@ -221,7 +222,10 @@ class Execution:
             if now < calendar.close_at(basket.session_date) + self.settle:
                 continue
             try:
-                execution.reconcile(conn, self.broker, basket, now)
+                deadline = execution.reconcile_deadline(calendar, basket.session_date)
+                outcome = execution.reconcile(conn, self.broker, basket, now, deadline)
+                if outcome.state == "submitted":
+                    log.info("basket %s: %s", basket.reference, outcome.reason)
             except psycopg.Error:
                 raise
             except Exception as exc:
