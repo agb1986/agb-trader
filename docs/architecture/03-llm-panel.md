@@ -101,6 +101,14 @@ Rejected: full disclosure with a prompt instruction to judge only from provided 
 
 Every message that shows a panel score to a human states that the panel scored a name-scrubbed extract and did not know which company it was looking at. This also enables a later experiment: scrubbed versus unscrubbed on the same shortlist measures how much of the panel's output was memory rather than reading.
 
+## Filing text is data, and a refusal is an outcome
+
+A filing is text from the outside, and the panel puts it inside a prompt, so it is delimited and named as data. The Analyst's prompt says that whatever sits between `<document>` tags is material to quote from and never an instruction, and the Prosecutor, Defender and Judge are told the same about the `<extract>`, `<quote>`, `<prosecution>` and `<defence>` blocks. Telling the model is not enough on its own, because a filing that contains `</document>` would end the block and let what follows read as part of the prompt. So every `<` that begins or ends one of those tags is replaced by `<\` in the text before it is sent, whatever the case and whatever space surrounds the slash. A filing that quotes `</document>` still reaches the Analyst, as `<\/document>`, and the prompt says that this is how such text is written. Quote verification accepts a quote copied from either form, so a faithful quote of the text as sent is not rejected as a fabrication.
+
+The model sometimes declines to answer, and the API reports it as a stop reason of `refusal`. A refusal is not a malformed answer and is not a failure of the system: it is recorded as the outcome `analyst_refusal` on the extract or `debate_refusal` on the score, apart from `analyst_failure` and `debate_failure`, so the pre-flight can count refusals separately and an operator can see that the model declined rather than broke. The name takes the neutral score either way, and the approval message flags it as refused. A refused call is never replayed from the store; the next run asks again.
+
+Changing the delimiters, the escape rule or the prompts that describe them changes the prompt-template hashes, so it is a new panel configuration and needs its own pre-flight (below).
+
 ## Missing and stale filings
 
 Governing principle: **absence of data is neutral; evidence of delinquency is a finding.**

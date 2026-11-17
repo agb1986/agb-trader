@@ -37,6 +37,16 @@ class Messenger(Protocol):
     def get_updates(self, offset: int | None) -> list[dict[str, Any]]: ...
 
 
+def redact_url(url: str) -> str:
+    """`url` with any user name and password replaced by "***", so it can be printed or logged.
+    A URL with no credentials comes back unchanged."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.username is None and parts.password is None:
+        return url
+    host = parts.netloc.rpartition("@")[2]
+    return urllib.parse.urlunsplit(parts._replace(netloc=f"***@{host}"))
+
+
 class Telegram:
     def __init__(self, token: str, *, api: str = API, timeout: float = TIMEOUT) -> None:
         if not token:
@@ -60,6 +70,11 @@ class Telegram:
         self._opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({parts.scheme: proxy})
         )
+
+    @property
+    def proxy_shown(self) -> str:
+        """The proxy's URL as it may be printed: without the user name and password in it."""
+        return redact_url(self.proxy)
 
     @classmethod
     def from_env(cls) -> "Telegram":
@@ -113,7 +128,7 @@ def main() -> int:
     except (ValueError, TelegramError) as exc:
         print(f"telegram: {exc}", file=sys.stderr)
         return 1
-    print(f"reached Telegram as @{me.get('username')} through {telegram.proxy}")
+    print(f"reached Telegram as @{me.get('username')} through {telegram.proxy_shown}")
     return 0
 
 
