@@ -30,7 +30,7 @@ from test_execution import (
 from agb import execution, health
 from agb.alpaca import AlpacaError
 from agb.roles import OWNER
-from agb.services.bot import STALE_COMMAND, Bot, help_text
+from agb.services.bot import STALE_COMMAND, Bot, refusal_reply
 from agb.services.execution import Execution
 
 CHAT = "4242"
@@ -491,12 +491,12 @@ def test_a_suspend_trade_mismatch_alerts_once_per_episode_in_both_directions(db,
 
 def test_only_pause_and_resume_reach_the_latches(db, operator):
     assert operator.says("/status").startswith("agb-trader")
-    assert operator.says("hello") == help_text("not a command")
+    assert operator.says("hello") == refusal_reply("not a command")
     assert operator.says("/approve@agb_bot 2026-10 yes") == (
         "usage: /approve <reference>, nothing after it\n\n"
         "Nothing is waiting for an answer.  /status"
     )
-    assert operator.says("/pause now") == help_text("usage: /pause, no arguments")
+    assert operator.says("/pause now") == refusal_reply("usage: /pause, no arguments")
 
     assert commands(db) == [
         (ACTOR, "telegram", "/status", "status", {"args": []}, "accepted", None),
