@@ -14,7 +14,7 @@ Three guards for the test run, added for #192 (finding T-02 of
 - **Permissive**: every other module is checked at mypy's default level (unannotated
   functions are allowed and not looked into).
 - **Not yet passing**: the modules in the last `[[tool.mypy.overrides]]` block of
-  `pyproject.toml` (`ignore_errors = true`) still have type errors, 97 of them on 2026-11-16,
+  `pyproject.toml` (`ignore_errors = true`) still have type errors, 90 of them on 2026-11-17,
   and their errors are not reported. That block is the permissive list. It only shrinks: fix a
   module, delete its line, run `make types`. Fixing them is not part of #192.
 
@@ -22,19 +22,16 @@ A statement that always returns a row (`INSERT ... RETURNING`, an aggregate, a v
 one-row table) is read with `agb.rows.one`, which raises when no row comes back, so the
 strict modules need no `fetchone()[0]` on an optional.
 
-Errors per module in the permissive list, 2026-11-16:
+Errors per module in the permissive list, 2026-11-17:
 
 | Module | Errors |
 | --- | --- |
 | `agb.cli` | 13 |
-| `agb.research.certify` | 11 |
-| `agb.services.execution` | 8 |
-| `agb.research.backtest` | 7 |
-| `agb.ui` | 6 |
-| `agb.research.reproduce` | 5 |
-| `agb.services.bot`, `agb.research.trials`, `agb.readout`, `agb.health` | 4 each |
-| `agb.services.backup`, `agb.heartbeat`, `agb.basket` | 3 each |
-| `agb.services.ui`, `agb.research.cpcv`, `agb.research.artifact`, `agb.research.__main__`, `agb.registry`, `agb.lake`, `agb.features` | 2 each |
+| `agb.services.execution`, `agb.research.certify` | 9 each |
+| `agb.ui`, `agb.services.bot` | 6 each |
+| `agb.services.ui`, `agb.readout`, `agb.health` | 4 each |
+| `agb.services.backup`, `agb.research.trials`, `agb.research.backtest`, `agb.lake`, `agb.heartbeat` | 3 each |
+| `agb.research.cpcv`, `agb.research.artifact`, `agb.research.__main__`, `agb.registry`, `agb.features`, `agb.basket` | 2 each |
 | `agb.universe`, `agb.services.pipeline`, `agb.schedule`, `agb.recovery`, `agb.preflight`, `agb.panel_audit`, `agb.panel`, `agb.migrate` | 1 each |
 
 To count a module again, delete its line from the block and run `uv run --frozen mypy`.

@@ -10,7 +10,13 @@
                  exits 1 when the gates fail, after writing it
     import       verify a certification artifact and insert its model_certification row
     trials       list the trial ledger
-    reproduce    rerun a trial from its row and compare the results
+    reproduce    rerun a trial from its row, under the code version it ran, and compare
+                 the results; a certification, or a row nested in one, too. Exits 1
+                 when they differ.
+
+A command given an option it cannot run with exits 2 with one line on stderr, as a usage
+error does. Everything reads and writes the research directory AGB_RESEARCH_DIR names, which
+`make research` and the research container set; it has no default.
 
 `sync` needs nothing but the standard library, so it runs on the host outside the image.
 
@@ -28,6 +34,7 @@ import os
 import sys
 from datetime import date
 from pathlib import Path
+from typing import NoReturn
 
 from agb import lake, rebalance
 
@@ -140,8 +147,14 @@ def _run(args):
             result = reproduce.reproduce(ledger, args.trial_id, panel, lake_dir=_lake_dir())
         except reproduce.ReproduceError as error:
             sys.exit(f"reproduce: {error}")
+        except scan.ScanError as error:
+            _usage_error("reproduce", error)
         verdict = "match" if result.matches else "DIFFER"
         print(f"trial {args.trial_id} rerun as {result.rerun.trial_id}: results {verdict}")
+        for line in result.differences[:_SHOWN]:
+            print(f"  {line}")
+        if len(result.differences) > _SHOWN:
+            print(f"  and {len(result.differences) - _SHOWN} more")
         sys.exit(0 if result.matches else 1)
     if args.command == "scan":
         options = scan.Options(
@@ -150,7 +163,10 @@ def _run(args):
             hold_through=args.hold_through,
             init_cash=args.cash,
         )
-        return scan.run(panel, options, ledger, lake_dir=_lake_dir())
+        try:
+            return scan.run(panel, options, ledger, lake_dir=_lake_dir())
+        except scan.ScanError as error:
+            _usage_error("scan", error)
     if args.command == "backtest":
         options = backtest.Options(
             signal=args.signal,
@@ -164,11 +180,11 @@ def _run(args):
             return backtest.run(panel, options, ledger, lake_dir=_lake_dir())
         except backtest.BacktestError as error:
             sys.exit(f"backtest: {error}")
+        except scan.ScanError as error:
+            _usage_error("backtest", error)
     config = _config(args, train)
     if args.command == "cpcv":
-        options = cpcv.Options(
-            groups=args.groups, test_groups=args.test_groups, embargo_months=args.embargo_months
-        )
+        options = _validation(args, cpcv)
         # The cache keys on the code version, so a run with no version (`dev`) neither reads
         # nor fills it. A versioned run fills the entry a certification of the same
         # configuration over the same panel reads, which then refits only the shipped model.
@@ -180,9 +196,7 @@ def _run(args):
     if args.command == "certify":
         from agb.research import certify
 
-        validation = cpcv.Options(
-            groups=args.groups, test_groups=args.test_groups, embargo_months=args.embargo_months
-        )
+        validation = _validation(args, cpcv)
         try:
             options = certify.Options(
                 model_id=args.model_id, size=args.size, hold_through=args.hold_through
@@ -198,6 +212,8 @@ def _run(args):
             )
         except (ValueError, certify.CertificationError, backtest.BacktestError) as error:
             sys.exit(f"certify: {error}")
+        except scan.ScanError as error:
+            _usage_error("certify", error)
         verdict = "PASSED" if certification.passed else "FAILED"
         print(f"certification {verdict}: {certify.CERTIFIES}; artifact {certification.directory}")
         from agb.research.trials import Run
@@ -250,6 +266,27 @@ def _panel_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+# How many of a reproduction's differences are printed; the rest are counted.
+_SHOWN = 20
+
+
+def _usage_error(command: str, error: BaseException | str) -> NoReturn:
+    """Exit 2, as argparse does for an option it refuses, with one line on stderr and no
+    traceback: the command was asked for something it cannot do, and nothing ran."""
+    print(f"{command}: {' '.join(str(error).split())}", file=sys.stderr)
+    sys.exit(2)
+
+
+def _validation(args, cpcv):
+    """The cross-validation options, or a usage error when they cannot split the panel."""
+    try:
+        return cpcv.Options(
+            groups=args.groups, test_groups=args.test_groups, embargo_months=args.embargo_months
+        )
+    except ValueError as error:
+        _usage_error(args.command, error)
+
+
 def _model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--features", default=None, help="comma-separated subset of features")
     parser.add_argument("--rounds", type=int, default=None)
@@ -282,6 +319,13 @@ def _panel(path: Path | None):
 
     path = path or _research_dir() / "panel.parquet"
     if not path.exists():
+        # Building one reads the whole lake and takes a while; say so, rather than leave the
+        # command silent until it is done.
+        print(
+            f"panel: none saved at {path}; building it from the lake at {_lake_dir()}",
+            file=sys.stderr,
+            flush=True,
+        )
         _build_panel(lake.SINCE, None, path)
     return Panel.load(path)
 
@@ -305,9 +349,10 @@ def _list_trials() -> None:
         return
     for row in rows:
         started = row["started_at"].strftime("%Y-%m-%d %H:%M")
+        mark = f" reproduces={row['reproduces']}" if row.get("reproduces") else ""
         print(
             f"{row['trial_id']}  {started}  {row['kind']:<12} {row['status']:<10}"
-            f" refits={row['refits']:<4} partitions={row['partition_hash'][:12]}"
+            f" refits={row['refits']:<4} partitions={row['partition_hash'][:12]}{mark}"
         )
 
 
@@ -316,7 +361,17 @@ def _lake_dir() -> Path:
 
 
 def _research_dir() -> Path:
-    return Path(os.environ.get("AGB_RESEARCH_DIR", "/research"))
+    """The research directory AGB_RESEARCH_DIR names. There is no default: `/research` is the
+    container's mount and nothing on the host, and a ledger quietly started somewhere else is
+    a ledger whose trials no certification counts."""
+    value = os.environ.get("AGB_RESEARCH_DIR")
+    if not value:
+        _usage_error(
+            "research",
+            "AGB_RESEARCH_DIR is not set; `make research` and the research container set it to"
+            " the research directory, which holds the trial ledger and the panel",
+        )
+    return Path(value)
 
 
 if __name__ == "__main__":

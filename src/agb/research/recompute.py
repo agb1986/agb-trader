@@ -302,35 +302,43 @@ def verdict(
     return json.loads(json.dumps(recorded(result, paths=len(paths), dropped=others.dropped)))
 
 
-def differences(recorded: Any, recomputed: Any, at: str = "") -> list[str]:
+def differences(
+    recorded: Any,
+    recomputed: Any,
+    at: str = "",
+    *,
+    labels: tuple[str, str] = ("manifest", "recomputed"),
+) -> list[str]:
     """Every place `recorded` and `recomputed` disagree, as `<field>: manifest <x>, recomputed
     <y>`. Numbers may differ by `REL_TOL` or `ABS_TOL`, see the module docstring; a boolean is
     never a number here, and anything else must be equal. A dict must have the same keys and a
-    list the same length, so a field the manifest adds or drops is a difference too."""
-    where = at or "manifest"
+    list the same length, so a field the manifest adds or drops is a difference too. `labels`
+    names the two sides in the lines, for a caller comparing something other than a manifest."""
+    left_name, right_name = labels
+    where = at or left_name
     if isinstance(recorded, dict) and isinstance(recomputed, dict):
         prefix = f"{at}." if at else ""
         found = [
-            f"{prefix}{key}: manifest {'absent' if key not in recorded else 'has it'},"
-            f" recomputed {'absent' if key not in recomputed else 'has it'}"
+            f"{prefix}{key}: {left_name} {'absent' if key not in recorded else 'has it'},"
+            f" {right_name} {'absent' if key not in recomputed else 'has it'}"
             for key in sorted(set(recorded) ^ set(recomputed), key=str)
         ]
         for key in sorted(set(recorded) & set(recomputed), key=str):
-            found += differences(recorded[key], recomputed[key], f"{prefix}{key}")
+            found += differences(recorded[key], recomputed[key], f"{prefix}{key}", labels=labels)
         return found
     if isinstance(recorded, list) and isinstance(recomputed, list):
         if len(recorded) != len(recomputed):
-            return [f"{where}: manifest {len(recorded)} entries, recomputed {len(recomputed)}"]
+            return [f"{where}: {left_name} {len(recorded)} entries, {right_name} {len(recomputed)}"]
         found = []
         for index, (left, right) in enumerate(zip(recorded, recomputed, strict=True)):
-            found += differences(left, right, f"{where}[{index}]")
+            found += differences(left, right, f"{where}[{index}]", labels=labels)
         return found
     if _number(recorded) and _number(recomputed):
         if _close(float(recorded), float(recomputed)):
             return []
     elif type(recorded) is type(recomputed) and recorded == recomputed:
         return []
-    return [f"{where}: manifest {recorded!r}, recomputed {recomputed!r}"]
+    return [f"{where}: {left_name} {recorded!r}, {right_name} {recomputed!r}"]
 
 
 def _number(value: Any) -> bool:

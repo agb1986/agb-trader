@@ -22,7 +22,7 @@ from psycopg import errors
 from psycopg.rows import dict_row
 
 from agb.research import __main__ as cli
-from agb.research import artifact, backtest, certify, cpcv, gates, train, trials
+from agb.research import artifact, backtest, certify, cpcv, gates, reproduce, train, trials
 from agb.research.panel import Panel
 from agb.research.trials import Ledger
 from agb.roles import RESEARCH
@@ -1122,3 +1122,63 @@ def test_the_nesting_sweep_agrees_with_asking_every_row_of_every_other():
             )
         }
         assert trials.nested(rows, current=current) == pairwise
+
+
+# Reproduction (issue #212) --------------------------------------------------------------------
+
+
+def ledger_copy(certified: certify.Certification, tmp_path) -> Ledger:
+    """The module's ledger, copied: a reproduction appends to the ledger it reads, and the
+    module's other tests read the original."""
+    path = tmp_path / "research" / trials.FILE
+    path.parent.mkdir()
+    shutil.copyfile(certified.directory.parent.parent / trials.FILE, path)
+    return Ledger(path)
+
+
+def test_a_certification_reproduces_to_tolerance_and_is_no_new_trial(
+    panel, research_lake, certified, tmp_path
+):
+    ledger = ledger_copy(certified, tmp_path)
+    before = ledger.rows()
+    rows = len(before)
+    declared = {rule: ledger.declared(rule=rule) for rule in ("configurations", "started")}
+
+    result = reproduce.reproduce(ledger, certified.trial_id, panel, lake_dir=research_lake)
+
+    assert result.differences == ()
+    assert result.matches
+    assert result.rerun.trial_id != certified.trial_id
+    assert result.rerun.results["passed"] == certified.passed
+    added = ledger.rows()[rows:]
+    assert {row["kind"] for row in added} == {artifact.KIND, cpcv.KIND, backtest.KIND}
+    assert all(row["reproduces"] == certified.trial_id for row in added)
+    for rule, count in declared.items():
+        assert ledger.declared(rule=rule) == count, f"{rule}: a reproduction is not a new trial"
+    ledger.verify()
+    assert not (ledger.path.parent / "certifications").exists(), "its artifact is scratch"
+
+    # The same rerun against a recorded path that moved by a cent of net return a month.
+    moved = dict(ledger.get(certified.trial_id))
+    results = json.loads(moved["results"])
+    results["paths"][0]["monthly"][0]["net"] += 0.01
+    moved["results"] = trials.encode(results)
+    found = reproduce._compare(moved, result.rerun, before, ledger.rows())
+    assert any(line.startswith("paths[0].monthly[0].net: original") for line in found), found
+
+
+def test_the_model_score_backtest_of_a_certification_reproduces(
+    panel, research_lake, certified, tmp_path
+):
+    """A backtest nested in a certification has no options of its own to rerun from: the
+    certification reruns and its backtest is compared with the original's."""
+    ledger = ledger_copy(certified, tmp_path)
+    backtest_id = certified.manifest["backtest_trial_id"]
+
+    result = reproduce.reproduce(ledger, backtest_id, panel, lake_dir=research_lake)
+
+    assert result.matches, result.differences
+    rerun = ledger.get(result.rerun.trial_id)
+    assert rerun["kind"] == backtest.KIND
+    assert rerun["reproduces"] == backtest_id
+    assert rerun["parent"] != ledger.get(backtest_id)["parent"]
