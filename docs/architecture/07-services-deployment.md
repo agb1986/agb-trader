@@ -78,11 +78,17 @@ env/research.env    workstation only
 
 The file list *is* the credential inventory. Under one shared `.env`, the UI, which needs no credentials and has no route to the internet, would still hold the Alpaca keys and the Telegram token in its environment, which is exactly the boundary this decomposition exists to draw. Each file ships with a `.example` template; none is committed.
 
+`migrate` holds every role password because it is the one service that sets them: it connects as the superuser, then sets each service role's password and connects as the owner. It never sends a password to the server. It computes each role's SCRAM-SHA-256 verifier on its own side, as psql's `\password` does, and `ALTER ROLE … PASSWORD` carries only that verifier, so a statement log with `log_statement = 'all'` holds no password.
+
 ## Resource limits
 
-Every service declares an explicit memory limit, sized to its job: `pipeline` largest, `ui` and `scheduler` small.
+Every service declares an explicit memory limit, sized to its job: `pipeline` largest, `ui` and `scheduler` small. Every service also sets `pids_limit`, so a runaway fork or thread pool stops at its own ceiling instead of exhausting the host's process table.
 
 On a box with 3.6 GB available and swap fully consumed, the OOM killer is otherwise the only backstop, and it chooses by score; it does not know that `execution` holding an unsubmitted basket matters more than a transcode. With per-service limits, a runaway monthly feature build dies inside its own cgroup instead of putting the whole host under pressure. The limits double as the written statement of what this stack is allowed to cost on a shared machine. The known cost is that a limit set too tight kills a legitimate run with exit code 137 and no application-level explanation, so **the pipeline's limit is set from a measured run, not guessed**. [Measured memory limits, run times, and the panel-store check](../build/measured-limits.md) holds the sampler, the arithmetic from a peak to a limit, and the run that sets the numbers.
+
+## Hardening
+
+Every service drops all Linux capabilities and sets `no-new-privileges`. Every service but `vpn` runs on a read-only root filesystem, with a tmpfs at `/tmp` for what a process must write; the data a service keeps goes to its named volume or bind mount. `db` runs as the image's `postgres` user (uid 70) rather than starting as root and stepping down, so it needs no capability at all, and it has a second tmpfs at `/var/run/postgresql` for its socket and lock file. `vpn` is the exception: gluetun runs as root, writes `/etc/passwd` at start, and adds back `NET_ADMIN` for the tunnel and `CHOWN` and `DAC_OVERRIDE` for its own state files, so its root stays writable. `compose.yaml` states each of these through one `x-hardened` anchor, and `tests/test_compose.py` asserts them for every service.
 
 ## Postgres durability
 
@@ -97,6 +103,8 @@ One multi-stage Dockerfile with three targets:
 - **`base`** — shared feature definitions, the cost function, and data access.
 - **`app`** — what the server runs, as six commands (`scheduler`, `pipeline`, `execution`, `bot`, `ui`, `backup`) plus the `agb` CLI, alongside stock Postgres and stock gluetun.
 - **`research`** — workstation only, adding NautilusTrader, vectorbt and the training stack.
+
+Every image the stack does not build is pinned by digest: `python:3.12-slim` and the `uv` image in the Dockerfile, and Postgres and gluetun in `compose.yaml`. A tag such as `17-alpine` moves when upstream republishes it, so without the digest two deploys of the same commit could run different databases. Taking a newer base is an edit to the digest in a commit of its own ([Deploying to the server](../build/deploy.md#pinned-images)).
 
 Sharing `base` is what keeps the backtest and the live path from drifting: features and costs are defined once and both halves import the same definition. Splitting `app` from `research` keeps hundreds of megabytes of training dependencies off a 28 GB eMMC root that the server never imports. The UI is server-rendered Python within `app` rather than a separate JavaScript build, so the stack has no Node toolchain.
 

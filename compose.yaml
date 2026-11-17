@@ -6,7 +6,16 @@
 # Conventions, checked by tests/test_compose.py:
 #   - Every long-running service sets `restart: unless-stopped`. The only one-shots are
 #     `migrate`, `cli`, `certification-import`, `reconcile` and `research`.
-#   - Every service sets an explicit `mem_limit`.
+#   - Every service sets an explicit `mem_limit` and `pids_limit`.
+#   - Every service drops every Linux capability and sets `no-new-privileges`. Only `vpn` adds
+#     any back: NET_ADMIN for its tunnel and firewall, CHOWN and DAC_OVERRIDE for the files its
+#     entrypoint prepares as root.
+#   - Every service but `vpn` has a read-only root filesystem, writing only to its volumes and to
+#     a `/tmp` held in memory. gluetun creates its user in /etc/passwd at each start, so `vpn`
+#     cannot be read-only.
+#   - The stock images, `db` and `vpn`, are pinned by digest as well as tag, as the Dockerfile's
+#     base images are. The server pulls exactly that digest; moving a tag changes nothing until
+#     the digest here is changed too (docs/build/deploy.md).
 #   - Every service declares a healthcheck. Each long-running app service checks its own
 #     heartbeat's age (`python -m agb.heartbeat`), so `up --wait` only passes once every service
 #     is beating; db and vpn check themselves; the one-shots disable it and are judged by their
@@ -46,14 +55,30 @@ x-heartbeat-check: &heartbeat-check
 x-no-healthcheck: &no-healthcheck
   disable: true
 
+# The hardening every service shares: no Linux capabilities, no privilege gained through a
+# setuid binary, and a root filesystem nothing can write, so code and configuration in the image
+# cannot be changed at run time. /tmp is a tmpfs, counted against the service's memory. `db`
+# adds its socket directory; `vpn` spells out its own, since it is not read-only.
+x-hardened: &hardened
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+
 x-pg: &pg
   PGHOST: db
   PGDATABASE: agb
   PGTZ: UTC
 
 services:
+  # It runs as the image's postgres user (uid 70) from the start, rather than as root dropping
+  # to it, so the entrypoint has no ownership to fix and needs no capability. The data
+  # directory is already that user's: the entrypoint made it so when it first initialised it.
   db:
-    image: postgres:17-alpine
+    <<: *hardened
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    user: postgres
+    tmpfs: [/tmp, /var/run/postgresql]
     command: ["postgres", "-c", "timezone=UTC", "-c", "log_timezone=UTC"]
     environment:
       POSTGRES_DB: agb
@@ -69,10 +94,11 @@ services:
       start_period: 10s
     restart: unless-stopped
     mem_limit: 160m
+    pids_limit: 128
 
   # One-shot: creates the roles and applies migrations, then exits. Every service waits for it.
   migrate:
-    <<: *app-image
+    <<: [*app-image, *hardened]
     build:
       context: .
       target: app
@@ -101,9 +127,10 @@ services:
     restart: "no"
     healthcheck: *no-healthcheck
     mem_limit: 256m
+    pids_limit: 64
 
   scheduler:
-    <<: *app-image
+    <<: [*app-image, *hardened]
     command: ["python", "-m", "agb.services.scheduler"]
     environment:
       <<: *pg
@@ -117,6 +144,7 @@ services:
     restart: unless-stopped
     healthcheck: *heartbeat-check
     mem_limit: 192m
+    pids_limit: 64
 
   # The local UI: server-rendered pages over the database, read-only. It publishes on the
   # loopback address alone, so nothing on the network reaches it; the operator views it through
@@ -126,7 +154,7 @@ services:
   # which is internal, and the publication needs a network that is not, so it is also on
   # ui-port, whose bridge translates no address (see the networks at the end of this file).
   ui:
-    <<: *app-image
+    <<: [*app-image, *hardened]
     command: ["python", "-m", "agb.services.ui"]
     environment:
       <<: *pg
@@ -154,6 +182,7 @@ services:
       <<: *heartbeat-check
       test: ["CMD", "python", "-m", "agb.heartbeat", "http://127.0.0.1:8080/"]
     mem_limit: 192m
+    pids_limit: 128
 
   # Takes the scheduler's nightly backup job, writes a dated pg_dump into the backup
   # directory, and copies the panel store's new bodies into backups/panel/. It runs as the host
@@ -162,7 +191,7 @@ services:
   # 0600, so it must be the pipeline's user too, which both also set it to. It only reads the
   # panel store.
   backup:
-    <<: *app-image
+    <<: [*app-image, *hardened]
     command: ["python", "-m", "agb.services.backup"]
     user: "${AGB_BACKUP_USER:-agb}"
     environment:
@@ -183,6 +212,7 @@ services:
     restart: unless-stopped
     healthcheck: *heartbeat-check
     mem_limit: 160m
+    pids_limit: 64
 
   # agb-trader's own VPN tunnel: ProtonVPN over WireGuard, with no port forwarding. It exists
   # to give the bot an HTTP proxy on port 8888 whose traffic leaves only through the tunnel;
@@ -192,11 +222,17 @@ services:
   # leaves both out unless COMPOSE_PROFILES=telegram, because only one process may poll a bot
   # token at a time, and the server's bot is the one that should hold it. The workstation can
   # run the profile for a live check, with the server's bot stopped first.
+  #
+  # gluetun's entrypoint runs as root and writes its own files, so the capabilities it keeps are
+  # NET_ADMIN, for the tunnel and the firewall, and CHOWN and DAC_OVERRIDE, without which it
+  # cannot write or hand over the files under /tmp/gluetun.
   vpn:
-    image: qmcgaw/gluetun:v3
+    image: qmcgaw/gluetun:v3@sha256:fa19cc76b2af13d57a8d3dc3066f2ada061b1c761b8aecf989b3877c0486e027
     profiles: [telegram]
     env_file: ${AGB_ENV_DIR:-env}/vpn.env
-    cap_add: [NET_ADMIN]
+    cap_drop: [ALL]
+    cap_add: [NET_ADMIN, CHOWN, DAC_OVERRIDE]
+    security_opt: ["no-new-privileges:true"]
     devices: ["/dev/net/tun:/dev/net/tun"]
     networks: [egress]
     restart: unless-stopped
@@ -209,12 +245,13 @@ services:
       retries: 3
       start_period: 10s
     mem_limit: 384m
+    pids_limit: 128
 
   # The Telegram bot, the only service on both networks: it reads the database on core and
   # reaches Telegram through the vpn's proxy on egress. bot.env holds the Telegram token, and
   # no other service reads it.
   bot:
-    <<: *app-image
+    <<: [*app-image, *hardened]
     profiles: [telegram]
     command: ["python", "-m", "agb.services.bot"]
     env_file: ${AGB_ENV_DIR:-env}/bot.env
@@ -232,6 +269,7 @@ services:
     restart: unless-stopped
     healthcheck: *heartbeat-check
     mem_limit: 192m
+    pids_limit: 64
 
   # Takes the scheduler's data_pull job for each session and lands Sharadar's SEP, SF1 and
   # TICKERS in the Parquet lake. It is the only service that holds the Sharadar key, which
@@ -243,7 +281,7 @@ services:
   # beside the lake on the same data disk. Each rebalance ranks with the promoted
   # certification's artifact under /models, which it only reads.
   pipeline:
-    <<: *app-image
+    <<: [*app-image, *hardened]
     command: ["python", "-m", "agb.services.pipeline"]
     user: "${AGB_PIPELINE_USER:-agb}"
     env_file: ["${AGB_ENV_DIR:-env}/pipeline.env"]
@@ -266,12 +304,13 @@ services:
     restart: unless-stopped
     healthcheck: *heartbeat-check
     mem_limit: 2176m
+    pids_limit: 256
 
   # Execution: the only service with broker keys. It submits the approved basket's
   # market-on-close orders and reads the fills back. No lake, no proxy: it talks to the
   # broker directly, through outbound.
   execution:
-    <<: *app-image
+    <<: [*app-image, *hardened]
     command: ["python", "-m", "agb.services.execution"]
     env_file: ["${AGB_ENV_DIR:-env}/execution.env"]
     environment:
@@ -286,11 +325,12 @@ services:
     restart: unless-stopped
     healthcheck: *heartbeat-check
     mem_limit: 192m
+    pids_limit: 64
 
   # The operator CLI: `make status`, or `make agb CMD="..."`. `agb promote` verifies the
   # certified artifact under /models before it makes the model live.
   cli:
-    <<: *app-image
+    <<: [*app-image, *hardened]
     profiles: [cli]
     entrypoint: ["agb"]
     command: ["status"]
@@ -313,6 +353,7 @@ services:
     restart: "no"
     healthcheck: *no-healthcheck
     mem_limit: 256m
+    pids_limit: 64
 
   # The one service that runs as `research`: recording a certification is the research
   # profile's only write to this database, and only that role may insert into
@@ -320,7 +361,7 @@ services:
   # it, and writes nothing else. Everything else the research profile does runs on the
   # workstation, in the `research` service below, which has no network at all.
   certification-import:
-    <<: *app-image
+    <<: [*app-image, *hardened]
     profiles: [cli]
     entrypoint: ["agb", "import-certification"]
     environment:
@@ -337,6 +378,7 @@ services:
     restart: "no"
     healthcheck: *no-healthcheck
     mem_limit: 256m
+    pids_limit: 64
 
   # `make reconcile REF=2026-10`, after a submission died mid-flight. It asks the broker what
   # it knows about each of the basket's orders by client_order_id and appends what it learns.
@@ -344,7 +386,7 @@ services:
   # owns the order events; the `cli` service is never given those keys. Like `execution`, it
   # reaches the broker through outbound.
   reconcile:
-    <<: *app-image
+    <<: [*app-image, *hardened]
     profiles: [cli]
     entrypoint: ["agb", "reconcile"]
     env_file: ["${AGB_ENV_DIR:-env}/execution.env"]
@@ -359,12 +401,14 @@ services:
     restart: "no"
     healthcheck: *no-healthcheck
     mem_limit: 256m
+    pids_limit: 64
 
   # Workstation research: `make research CMD="cpcv"`. It reads a lake `make sync-lake` has
   # pulled from the server and writes only its trial ledger and models under /research. It has
   # no network at all: the workstation never pulls from the vendor, and the rsync that fetches
   # the lake runs on the host, where the operator's SSH configuration lives.
   research:
+    <<: *hardened
     image: ${AGB_RESEARCH_IMAGE:-agb-trader-research}:${AGB_IMAGE_TAG:-dev}
     build:
       context: .
@@ -393,6 +437,7 @@ services:
     # workstation's own limit and is not what the server's sizing run measures.
     healthcheck: *no-healthcheck
     mem_limit: 40g
+    pids_limit: 1024
 
 volumes:
   pgdata:

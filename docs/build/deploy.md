@@ -56,6 +56,13 @@ Run `agb-stack` from the deploy directory as `./agb-stack`, or by its full path.
   key generated for this stack alone (see
   [Operator setup](operator-setup.md#4-protonvpn-wireguard-key)).
 
+- The `agb-trader_pgdata` volume, if it already exists, is owned by uid 70. `db` runs as the
+  image's `postgres` user, not as root, so it cannot take ownership of a volume that root
+  owns. The image's own entrypoint gave the volume to uid 70 when it first initialised it, so
+  a volume made by this stack already is. To check, on the server:
+  `docker run --rm -v agb-trader_pgdata:/data --entrypoint stat postgres:17-alpine -c %u /data`
+  prints `70`.
+
 The other env files join the list as the services that read them are deployed.
 
 `vpn` and `bot` are in the `telegram` Compose profile. `agb-stack` enables it on the server,
@@ -113,6 +120,23 @@ Deploying the commit that is already running restarts nothing that has not chang
 If the stack does not come up, the deploy stops with an error. `current` already points at the
 new release, so `make rollback` returns to the one that was running. A rollback ends with the
 same `status`, so it too fails while a service is stale.
+
+## Pinned images
+
+`compose.yaml` pins `db` and `vpn` by digest, and the Dockerfile pins its `python` and `uv`
+bases by digest, so every deploy of a commit runs the same images. The server pulls the
+Postgres and gluetun digests itself the first time a release names them. To take a newer
+image, pull its tag on the workstation, read the digest, and put it in place of the old one
+in a commit of its own:
+
+```sh
+docker pull postgres:17-alpine
+docker image inspect --format '{{index .RepoDigests 0}}' postgres:17-alpine
+```
+
+The same two commands, with `qmcgaw/gluetun:v3`, `python:3.12-slim` or
+`ghcr.io/astral-sh/uv:0.10.10`, give the others. `tests/test_compose.py` fails on an image
+that is not pinned.
 
 ## Rolling back
 
