@@ -177,7 +177,6 @@ module = [
     "agb.research.backtest",
     "agb.research.certify",
     "agb.research.cpcv",
-    "agb.research.reproduce",
     "agb.research.trials",
     "agb.schedule",
     "agb.services.backup",

@@ -24,7 +24,8 @@ the ledger's row count, which is also recorded, as `ledger_rows`. Two things mak
 is not another configuration tried, and counting them charged the model for work nobody did:
 a certification writes three rows, its own and the cross-validation and backtest it nests,
 which is one configuration evaluated once; and the same configuration rerun after a crash,
-or rechecked by `reproduce`, writes a row every time. So the count folds each row into the
+or rechecked by `reproduce`, writes a row every time, the latter marked with the trial it
+reproduces. So the count folds each row into the
 run it names as its parent and takes distinct configurations rather than rows. A
 configuration that only ever failed or was abandoned still counts: it was started, and
 whoever chose what to certify saw how it went. The run refuses a ledger whose rows no longer

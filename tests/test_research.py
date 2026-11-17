@@ -5,6 +5,7 @@ CPCV, the walk-forward proof, the trial ledger, reproduction and the vectorbt sc
 two dozen names from 2022 to August 2026, so thirty month-ends from January 2024 carry a
 settled label."""
 
+import dataclasses
 import json
 import subprocess
 import sys
@@ -19,7 +20,8 @@ import pytest
 from research_fake import END, PANEL_START, Market
 
 from agb import cost, features
-from agb.research import cpcv, labels, reproduce, scan, train, trials, walkforward
+from agb.research import __main__ as cli
+from agb.research import cpcv, labels, recompute, reproduce, scan, train, trials, walkforward
 from agb.research.panel import Month, Panel
 from agb.research.trials import Ledger, LedgerError, Trial
 
@@ -709,6 +711,78 @@ def test_results_are_compared_to_nine_figures():
     assert not reproduce.same(True, 1)
 
 
+def test_a_rerun_is_marked_as_the_reproduction_of_its_trial(research_panel, ledger):
+    original = cpcv.run(research_panel, CONFIG, SMALL, ledger)
+    rows_before = ledger.count()
+    declared = {rule: ledger.declared(rule=rule) for rule in ("configurations", "started")}
+
+    result = reproduce.reproduce(ledger, original.trial_id, research_panel)
+
+    assert result.matches and result.differences == ()
+    assert ledger.get(original.trial_id)["reproduces"] is None
+    assert ledger.get(result.rerun.trial_id)["reproduces"] == original.trial_id
+    assert ledger.count() == rows_before + 1, "the rerun is a row"
+    for rule, count in declared.items():
+        assert ledger.declared(rule=rule) == count, f"{rule}: a reproduction is not a new trial"
+    ledger.verify()
+
+
+def test_a_trial_from_other_code_is_refused(research_panel, ledger, monkeypatch):
+    monkeypatch.setenv("AGB_VERSION", "one-build")
+    original = walkforward.run(research_panel, CONFIG, walkforward.Options(), ledger)
+    monkeypatch.setenv("AGB_VERSION", "another-build")
+
+    with pytest.raises(reproduce.ReproduceError, match="code version 'one-build'"):
+        reproduce.reproduce(ledger, original.trial_id, research_panel)
+    assert ledger.count() == 1, "a refused reproduction trains nothing"
+
+
+def test_a_ledger_written_before_the_reproduction_mark_still_reads_and_links(tmp_path):
+    ledger = Ledger(tmp_path / "trials.parquet")
+    for seed in (1, 2):
+        with ledger.trial(
+            "test", {"seed": seed}, features=("mom_12_1",), train_start=date(2024, 1, 31),
+            train_end=date(2025, 12, 31), partition_hash="abc",
+            cost_model_version=cost.CURRENT.version,
+        ):  # fmt: skip
+            pass
+    digest = ledger.digest()
+    old = pq.read_table(ledger.path)
+    pq.write_table(old.drop_columns(["reproduces"]), ledger.path)
+    assert "reproduces" not in pq.read_schema(ledger.path).names
+
+    ledger.verify()
+    assert ledger.digest() == digest, "an unmarked row hashes as it did before the column"
+    assert [row["reproduces"] for row in ledger.rows()] == [None, None]
+    with open_trial(ledger):
+        pass
+    ledger.verify()
+    assert ledger.count() == 3
+
+
+def test_lightgbm_scores_do_not_depend_on_the_thread_count(research_panel, ledger):
+    """The ranker trains with `deterministic` and row-wise histograms, so the scores a model
+    gives do not depend on how many threads built or ran it: a reproduction on a machine with
+    another core count agrees to nine figures."""
+    months = research_panel.months
+    rows, held = research_panel.select(months[:-6]), research_panel.select(months[-6:])
+    scores = []
+    for threads in (1, 4):
+        config = dataclasses.replace(CONFIG, num_threads=threads)
+        with open_trial(ledger, kind="threads") as trial:
+            booster = train.fit(rows, config, trial=trial)
+        scores.append(train.predict(booster, held, config))
+    one, four = scores
+    assert one.shape == four.shape and len(one) > 0
+    np.testing.assert_allclose(four, one, rtol=1e-9, atol=1e-12)
+
+
+def test_differences_name_the_two_sides():
+    assert recompute.differences({"a": 1.0}, {"a": 2.0}, labels=("original", "rerun")) == [
+        "a: original 1.0, rerun 2.0"
+    ]
+
+
 # The vectorbt scan ----------------------------------------------------------------------------
 
 
@@ -837,3 +911,82 @@ def test_the_fake_lake_is_deterministic(tmp_path):
 
     assert lake_module.partition_digest(first) == lake_module.partition_digest(second)
     assert PANEL_START < END
+
+
+# The command line -----------------------------------------------------------------------------
+
+
+@pytest.fixture
+def research_dir(research_panel, research_lake, tmp_path, monkeypatch):
+    """A research directory with the session's panel saved in it, and the lake it came from."""
+    research_panel.save(tmp_path / "panel.parquet")
+    monkeypatch.setenv("AGB_RESEARCH_DIR", str(tmp_path))
+    monkeypatch.setenv("AGB_LAKE_DIR", str(research_lake))
+    return tmp_path
+
+
+def usage_error(argv: list[str], capsys) -> str:
+    """The one line a refused command prints, after checking it exited 2 and printed nothing
+    else: no traceback, no trial."""
+    with pytest.raises(SystemExit) as exited:
+        cli.main(argv)
+    assert exited.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    [line] = captured.err.splitlines()
+    return line
+
+
+@pytest.mark.parametrize("test_groups", ["4", "0"])
+def test_a_split_the_panel_cannot_take_is_a_usage_error(research_dir, capsys, test_groups):
+    line = usage_error(["cpcv", "--groups", "4", "--test-groups", test_groups], capsys)
+    assert line == "cpcv: test_groups must be between 1 and groups - 1"
+    assert not (research_dir / trials.FILE).exists(), "nothing ran"
+
+
+def test_a_signal_that_is_not_a_feature_is_a_usage_error(research_dir, capsys):
+    line = usage_error(["scan", "--signal", "alpha"], capsys)
+    assert line.startswith("scan: 'alpha' is not a feature")
+
+
+def test_the_cli_has_no_default_research_directory(monkeypatch, capsys):
+    monkeypatch.delenv("AGB_RESEARCH_DIR", raising=False)
+    line = usage_error(["trials"], capsys)
+    assert line.startswith("research: AGB_RESEARCH_DIR is not set;")
+
+
+def test_the_cli_says_when_it_builds_a_panel(
+    research_panel, research_lake, tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("AGB_RESEARCH_DIR", str(tmp_path))
+    monkeypatch.setenv("AGB_LAKE_DIR", str(research_lake))
+    built = []
+    monkeypatch.setattr(
+        cli, "_build_panel", lambda start, end, out: built.append(out) or research_panel.save(out)
+    )
+    with pytest.raises(SystemExit):
+        cli.main(["scan", "--signal", "alpha"])
+    first = capsys.readouterr().err.splitlines()[0]
+    assert built == [tmp_path / "panel.parquet"]
+    assert first == (
+        f"panel: none saved at {tmp_path / 'panel.parquet'};"
+        f" building it from the lake at {research_lake}"
+    )
+
+
+def test_the_cli_reproduces_a_trial_and_lists_the_mark(research_dir, capsys):
+    cli.main(["scan", "--size", "3", "--hold-through", "5"])
+    original = capsys.readouterr().out.split("\n", 1)[0].removeprefix("trial ")
+
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["reproduce", original])
+    assert exited.value.code == 0
+    out = capsys.readouterr().out
+    assert out.startswith(f"trial {original} rerun as ")
+    assert out.endswith(": results match\n")
+
+    cli.main(["trials"])
+    listed = capsys.readouterr().out.splitlines()
+    assert len(listed) == 2
+    assert "reproduces=" not in listed[0]
+    assert listed[1].endswith(f" reproduces={original}")
