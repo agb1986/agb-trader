@@ -11,7 +11,7 @@ This document fixes which tables exist, what each holds, which are mutable, who 
 
 ## Job claims
 
-Scheduler work is a `job` row, unique on `(kind, period)`, so a second monthly rebalance for the same period fails on the constraint instead of producing a duplicate. Pollers claim with `SELECT … FOR UPDATE SKIP LOCKED` and a conditional update that sets `claimed_by` and `lease_until`, renewing the lease while they work. Two pollers cannot hold the same row, and a waiting poller skips rather than blocks.
+Scheduler work is a `job` row, unique on `(kind, period)`, so a second monthly rebalance for the same period fails on the constraint instead of producing a duplicate. Pollers claim with `SELECT … FOR UPDATE SKIP LOCKED` and a conditional update that sets `claimed_by` and `lease_until`, renewing the lease while they work. Each poller claims under a name of its own, its service plus its process id and a random suffix, and renewing, completing, failing or releasing a job is conditional on that name, so a worker that has lost its lease cannot finish the job its successor holds. Two pollers cannot hold the same row, and a waiting poller skips rather than blocks.
 
 What happens when a lease expires depends on the stage, because running twice has different consequences:
 

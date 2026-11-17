@@ -162,6 +162,78 @@ def expire(db, job_id):
     assert state(db, job_id)[2] is True
 
 
+def age(db, job_id, by):
+    """Let `by` pass for the job's lease. The database's clock is not ours to move, so the lease
+    is brought forward to meet it instead, which is the same to everything that reads it."""
+    db.connect("pipeline").execute(
+        "UPDATE agb.job SET lease_until = lease_until - %s WHERE id = %s", (by, job_id)
+    )
+
+
+def test_a_worker_name_is_the_service_and_never_repeats():
+    names = {jobs.worker_name("pipeline") for _ in range(100)}
+    assert len(names) == 100
+    assert all(name.startswith("pipeline-") for name in names)
+
+
+def test_a_job_that_runs_past_its_lease_is_kept_by_renewing_it(db):
+    job_id = add_job(db)
+    kept = add_job(db, period="2026-11")
+    worker, rival = db.connect("pipeline"), db.connect("pipeline")
+    name = jobs.worker_name("pipeline")
+    claim = jobs.claim(worker, ["rebalance"], name, LEASE, reclaim_expired=True)
+    other = jobs.claim(worker, ["rebalance"], name, LEASE, reclaim_expired=True)
+    assert {claim.job_id, other.job_id} == {job_id, kept}
+
+    # Eight minutes of work against a five-minute lease, in two steps of four. The first job
+    # renews between them; the second does not.
+    for held in (claim, other):
+        age(db, held.job_id, timedelta(minutes=4))
+    jobs.renew(worker, claim, LEASE)
+    for held in (claim, other):
+        age(db, held.job_id, timedelta(minutes=4))
+
+    taken = jobs.claim(
+        rival, ["rebalance"], jobs.worker_name("pipeline"), LEASE, reclaim_expired=True
+    )
+    assert taken.job_id == other.job_id and taken.reclaimed
+    assert jobs.claim(rival, ["rebalance"], "pipeline-late", LEASE, reclaim_expired=True) is None
+    assert state(db, claim.job_id) == ("claimed", name, False)
+    jobs.complete(worker, claim)
+    assert state(db, claim.job_id)[0] == "completed"
+
+
+def test_a_worker_that_lost_its_lease_cannot_complete_fail_or_release_the_job(db):
+    job_id = add_job(db)
+    stale, fresh = db.connect("pipeline"), db.connect("pipeline")
+    # Two workers of one service: only the name tells them apart.
+    lost = jobs.claim(stale, ["rebalance"], jobs.worker_name("pipeline"), LEASE)
+    age(db, job_id, LEASE + timedelta(minutes=1))
+    claim = jobs.claim(
+        fresh, ["rebalance"], jobs.worker_name("pipeline"), LEASE, reclaim_expired=True
+    )
+    assert claim.reclaimed and lost.worker != claim.worker
+
+    with pytest.raises(jobs.LeaseLost):
+        jobs.complete(stale, lost)
+    with pytest.raises(jobs.LeaseLost):
+        jobs.fail(stale, lost, "too late")
+    with pytest.raises(jobs.LeaseLost):
+        jobs.release(stale, lost, "too late")
+    with pytest.raises(jobs.LeaseLost):
+        jobs.renew(stale, lost, LEASE)
+
+    assert state(db, job_id) == ("claimed", claim.worker, False)
+    assert [event for event, _ in events(db, job_id)] == [
+        "created",
+        "claimed",
+        "lease_expired",
+        "reclaimed",
+    ]
+    jobs.complete(fresh, claim)
+    assert state(db, job_id)[0] == "completed"
+
+
 def test_an_expired_lease_cannot_be_released_by_its_worker(db):
     job_id = add_job(db, kind="submission")
     execution = db.connect("execution")

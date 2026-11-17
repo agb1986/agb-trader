@@ -30,6 +30,12 @@ Before taking a job it builds any rerun the operator asked for (`agb rerun`, agb
 a copy of the missed basket under its new reference, for the next session, gated like any
 other. A rerun has no job; the command is done once its basket has a gate run.
 
+The service claims under a name of its own, its role plus its process id and a random suffix
+(`jobs.worker_name`), so two workers never share one and the lease is conditional on it: only
+the holder can renew, complete, fail or release the job. A rebalance renews its lease between
+its steps, and the panel after every retrieval and model call, so a run longer than the lease
+keeps it; a renewal that finds the lease gone raises `jobs.LeaseLost` and the work stops.
+
 Both are safe to redo, so an expired lease is reclaimed: a partition that lands with the same
 bytes is left untouched and recorded nothing new, a reference already proposed is kept, and a
 basket already gated keeps its verdict. The same holds for a rerun interrupted between
@@ -49,13 +55,14 @@ Parquet file, or any of the errors each job names -- fails with the cause named 
 again, so the alert is raised once. Only a database connection that has gone away is left to
 stop the service, so it restarts with a new one. A job whose lease was lost -- it ran out and
 another worker reclaimed it -- is left to that worker: the cycle logs it and ends without
-failing the job. A rerun that fails is logged and raises a `pipeline_rerun_failed` alert, once
-per rerun; it has no job to fail, so it is tried again each cycle. That includes a gate that
-refuses to approve a basket past its cutoff (the `transition_timely` trigger's
-`CheckViolation`). A rerun that is `NotReady`, because execution has not yet read the account
-at its signal session's close, is not a failure: it is logged and tried again next cycle,
-with no alert. A rerun whose basket was built but never gated, and has since been retired
-as missed by the approval sweep, is skipped: the sweep has already alerted on it.
+completing, failing or releasing the job. A rerun that fails is logged and raises a
+`pipeline_rerun_failed` alert, once per rerun; it has no job to fail, so it is tried again each
+cycle. That includes a gate that refuses to approve a basket past its cutoff (the
+`transition_timely` trigger's `CheckViolation`). A rerun that is `NotReady`, because execution
+has not yet read the account at its signal session's close, is not a failure: it is logged and
+tried again next cycle, with no alert. A rerun whose basket was built but never gated, and has
+since been retired as missed by the approval sweep, is skipped: the sweep has already alerted
+on it.
 
     python -m agb.services.pipeline             run the service
     python -m agb.services.pipeline backfill    land the vendor's history from 1998, then exit
@@ -236,6 +243,7 @@ class Pipeline:
         capital: Decimal | None = None,
         lease: timedelta = LEASE,
         retry: timedelta = RETRY,
+        worker: str | None = None,
         sample: int = panel_audit.SAMPLE,
         limits: gate.Limits = gate.LIMITS,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -251,6 +259,7 @@ class Pipeline:
         self.capital = capital
         self.lease = lease
         self.retry = retry
+        self.worker = worker or jobs.worker_name(PIPELINE)
         self.sample = sample
         self.limits = limits
         self.clock = clock
@@ -269,10 +278,17 @@ class Pipeline:
     def client(self) -> Sharadar:
         return Sharadar(self.api_key, self.opener, sleep=self.sleep)
 
-    def stage2(self, conn: psycopg.Connection) -> basket.Stage2 | None:
+    def beat(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
+        """Show the service is alive and extend the job's lease by a full term, from the long
+        steps of a job. Raises `jobs.LeaseLost` if the lease is gone, which stops the work."""
+        heartbeat.progress(conn)
+        jobs.renew(conn, claim, self.lease)
+
+    def stage2(self, conn: psycopg.Connection, claim: jobs.Claim) -> basket.Stage2 | None:
         """The panel the month's basket is blended with: the newest `panel_config`, driven by
-        the real EDGAR client, model and store. None when no configuration has been made,
-        which leaves the rebalance stage-1 only. A configuration made for other prompts, rubric
+        the real EDGAR client, model and store, and renewing `claim`'s lease after each
+        retrieval and model call. None when no configuration has been made, which leaves the
+        rebalance stage-1 only. A configuration made for other prompts, rubric
         or scrubber raises, so the month fails loudly rather than blending with a stale panel."""
         if self.runner is not None:
             return self.runner
@@ -285,7 +301,7 @@ class Pipeline:
             edgar.Edgar.from_env(),
             analyst.AnthropicModel(),
             PanelStore(self.panel_dir),
-            beat=lambda: heartbeat.progress(conn),
+            beat=lambda: self.beat(conn, claim),
         )
 
     def __call__(self, conn: psycopg.Connection) -> None:
@@ -294,7 +310,7 @@ class Pipeline:
         claim = jobs.claim(
             conn,
             [schedule.DATA_PULL, schedule.REBALANCE, schedule.PANEL_AUDIT],
-            PIPELINE,
+            self.worker,
             self.lease,
             reclaim_expired=True,
         )
@@ -319,6 +335,7 @@ class Pipeline:
 
     def rebalance(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
         try:
+            jobs.renew(conn, claim, self.lease)
             ranker = self.ranker or registry.load_promoted(conn, self.models_dir)
             if isinstance(ranker, registry.CertifiedRanker) and ranker.waiver is not None:
                 log.warning("rebalance %s ranks under a waiver: %s", claim.period, ranker.waiver)
@@ -332,8 +349,9 @@ class Pipeline:
                     if self.capital is not None
                     else basket.account_capital(conn, self.clock())
                 ),
-                panel=self.stage2(conn),
+                panel=self.stage2(conn, claim),
             )
+            jobs.renew(conn, claim, self.lease)
             verdict = gate.run(
                 conn,
                 proposal.basket_id,
