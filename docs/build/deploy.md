@@ -79,8 +79,10 @@ make deploy
 
 That runs `scripts/deploy/deploy.sh`, which:
 
-1. Stops if the working tree has uncommitted changes, since the image is built from the
-   commit and not from the working tree.
+1. Stops if the working tree has uncommitted or untracked files, naming them, since the image
+   is built from the commit and not from the working tree. `--allow-dirty` (or
+   `AGB_DEPLOY_ALLOW_DIRTY=1 make deploy`) deploys the commit anyway and lists what it leaves
+   out.
 2. Checks that the deploy directory exists and that each server env file sets every variable
    its example does. The variable names are read on the server, so no value leaves it. A
    missing file or variable stops the deploy before anything is built.
@@ -92,7 +94,9 @@ That runs `scripts/deploy/deploy.sh`, which:
    default to `dev` when unset, and `certify` refuses to run under `dev`, so a research image
    built by hand without `AGB_VERSION` cannot certify a model.
 4. Ships the image with `docker save | gzip | ssh … docker load`, unless the server already
-   has it.
+   has that tag under the same image id as the one just built. A tag the server holds under a
+   different id is shipped again, and after every load the server's id for the tag is compared
+   with the built one: a mismatch stops the deploy before anything is activated.
 5. Installs the release: the commit's `compose.yaml` and `agb-stack` go into
    `releases/<tag>/`.
 6. Runs `agb-stack activate <tag>` on the server. That starts the new release with
