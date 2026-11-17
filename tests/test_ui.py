@@ -1038,13 +1038,14 @@ def commands(db):
     )
 
 
-def test_the_write_routes_are_the_two_telegram_has_and_nothing_else(conn, waiting):
-    """The acceptance criterion that a test enumerates the UI's write routes. The five are
-    answering a rebalance two ways and the three of the kill switch; a page is never one of
-    them, every form on every page posts to one of them, and the only things a form asks the
-    operator to type are a reference, a reason and a token. No route resizes a position, edits
-    the universe, overrides the ranker, moves the ladder or promotes a model."""
-    assert set(ui.WRITES) == {"/approve", "/reject", "/pause", "/resume", "/liquidate"}
+def test_the_write_routes_are_the_ones_telegram_has_and_nothing_else(conn, waiting):
+    """The acceptance criterion that a test enumerates the UI's write routes. The six are
+    answering a rebalance two ways, the three of the kill switch and acknowledging an alert; a
+    page is never one of them, every form on every page posts to one of them, and the only things
+    a form asks the operator to type are a reference, a reason, a token and an alert id. No route
+    resizes a position, edits the universe, overrides the ranker, moves the ladder or promotes a
+    model."""
+    assert set(ui.WRITES) == {"/approve", "/reject", "/pause", "/resume", "/liquidate", "/ack"}
     assert not set(ui.WRITES) & set(ui.ROUTES), "a page is read, a write path is posted to"
 
     for path, view in ui.ROUTES.items():
@@ -1054,7 +1055,7 @@ def test_the_write_routes_are_the_two_telegram_has_and_nothing_else(conn, waitin
             [action] = re.findall(r'action="([^"]+)"', attrs)
             assert action in ui.WRITES, f"{action} on {path} is not a declared write"
         typed = set(re.findall(r'<input type="text" name="([^"]+)"', page))
-        assert typed <= {"reference", "reason", "token"}, f"{path} asks for {typed}"
+        assert typed <= {"reference", "reason", "token", "alert"}, f"{path} asks for {typed}"
         assert 'value="' not in page, f"{path} prefills a field, which is a one-click answer"
 
 
@@ -1710,3 +1711,114 @@ def test_the_confirmation_pages_are_read_only_over_http_and_the_post_keeps_its_p
     _, _, page = get(served, response.getheader("Location"))
     assert "cleared: pause" in reply_in(page)
     assert killswitch.causes(db.connect("ui")) == []
+
+
+# -- issue #209: acknowledging an alert -----------------------------------------------------
+
+
+def acknowledgements(db):
+    """Every acknowledgement written, as (alert, channel, actor, chat) and oldest first."""
+    return rows(
+        db,
+        "SELECT alert_id, channel, actor, chat_id FROM agb.alert_event"
+        " WHERE event = 'acknowledged' ORDER BY id",
+    )
+
+
+def test_the_alerts_page_lists_each_id_and_a_form_to_acknowledge_one(conn, db):
+    first = alert(db, "partial_rebalance", f"live basket {PERIOD}", PERIOD, delivered=True)
+    second = alert(db, "halt_open", "pause", PERIOD)
+
+    page = ui.alerts(conn, LATER)
+
+    assert f"<td>{first}</td>" in page and f"<td>{second}</td>" in page
+    assert 'action="/ack"' in page
+    assert '<input type="text" name="alert"' in page
+
+
+def test_acknowledging_from_the_ui_writes_one_event_naming_the_operator(writer, conn, db):
+    ident = alert(db, "halt_open", "pause", PERIOD, delivered=True)
+
+    reply = reply_of(ui.ack(writer, {"alert": str(ident)}, LATER))
+
+    assert reply == f"Alert {ident} (halt_open, pause {PERIOD}) acknowledged by ui:operator."
+    assert acknowledgements(db) == [(ident, "ui", "ui:operator", None)]
+    assert commands(db) == [("ack", "accepted", None, "ui:operator", "ui")]
+    assert "acknowledged 2026-10-01" in ui.alerts(conn, LATER)
+    assert "by ui:operator" in ui.alerts(conn, LATER)
+
+
+def test_acknowledging_twice_is_refused_by_name_and_writes_nothing_more(writer, db):
+    ident = alert(db, "halt_open", "pause", PERIOD)
+    ui.ack(writer, {"alert": str(ident)}, LATER)
+
+    reply = reply_of(ui.ack(writer, {"alert": f" {ident} "}, LATER + timedelta(hours=1)))
+
+    assert reply.startswith(f"Alert {ident} (halt_open, pause {PERIOD}) was already acknowledged")
+    assert "by ui:operator from ui at 2026-10-01 17:30 ET" in reply
+    assert reply.endswith("Nothing changed.")
+    assert len(acknowledgements(db)) == 1, "the first acknowledgement stands"
+    assert [c[:3] for c in commands(db)] == [
+        ("ack", "accepted", None),
+        ("ack", "refused", reply),
+    ]
+
+
+@pytest.mark.parametrize("typed", ["", "   ", "x", "-3", "2.5", "1,000", "٣", "9" * 30])
+def test_a_missing_or_malformed_id_is_refused_and_recorded(writer, db, typed):
+    alert(db, "halt_open", "pause", PERIOD)
+
+    reply = reply_of(ui.ack(writer, {"alert": typed}, LATER))
+
+    assert reply.startswith("Usage: /ack <alert id>")
+    assert acknowledgements(db) == []
+    [(verb, outcome, reason, actor, surface)] = commands(db)
+    assert (verb, outcome, reason, actor, surface) == ("ack", "refused", reply, "ui:operator", "ui")
+
+
+def test_an_id_no_alert_has_is_refused_and_recorded(writer, db):
+    ident = alert(db, "halt_open", "pause", PERIOD)
+
+    reply = reply_of(ui.ack(writer, {"alert": str(ident + 1000)}, LATER))
+
+    assert reply == f"There is no alert {ident + 1000}; nothing was acknowledged."
+    assert acknowledgements(db) == []
+    assert [c[:2] for c in commands(db)] == [("ack", "refused")]
+
+
+def test_the_ack_post_is_a_redirect_to_the_outcome_page_like_the_other_writes(served, db):
+    ident = alert(db, "halt_open", "pause", PERIOD)
+
+    status, response, _ = post(served, "/ack", {"alert": str(ident)})
+
+    assert status == 303
+    where = response.getheader("Location")
+    assert re.fullmatch(r"/outcome\?id=[A-Za-z0-9_-]+", where)
+    assert len(acknowledgements(db)) == 1
+    for _ in range(2):
+        status, _, body = get(served, where)
+        assert status == 200
+        assert f"Alert {ident} (halt_open, pause {PERIOD}) acknowledged by ui:operator." in (
+            reply_in(body)
+        )
+        assert 'href="/alerts"' in body
+    assert len(acknowledgements(db)) == 1, "a reload does not acknowledge again"
+
+
+def test_the_ack_post_has_the_protections_the_other_writes_have(served, db):
+    ident = alert(db, "halt_open", "pause", PERIOD)
+    host, port, _ = served
+    forged = HTTPConnection(host, port)
+    forged.request(
+        "POST",
+        "/ack",
+        body=urlencode({"alert": str(ident)}),
+        headers=FORM | {"Origin": "http://elsewhere.example"},
+    )
+    response = forged.getresponse()
+    response.read()
+    assert response.status == 403
+
+    status, _, _ = get(served, "/ack")
+    assert status in (404, 405), "an acknowledgement is only ever posted"
+    assert acknowledgements(db) == []
