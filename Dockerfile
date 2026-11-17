@@ -7,9 +7,13 @@
 # Classic Dockerfile syntax only: the workstation builds with the legacy builder, so no
 # BuildKit-only features such as RUN --mount.
 
-FROM ghcr.io/astral-sh/uv:0.10.10 AS uv
+# Both base images are pinned by digest as well as tag, so a rebuild starts from the same bytes
+# however the tags move. To take a newer base, pull the tag and read its digest, for example
+# `docker pull python:3.12-slim && docker image inspect --format '{{index .RepoDigests 0}}'
+# python:3.12-slim`, then change it here.
+FROM ghcr.io/astral-sh/uv:0.10.10@sha256:cbe0a44ba994e327b8fe7ed72beef1aaa7d2c4c795fd406d1dbf328bacb2f1c5 AS uv
 
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a AS runtime
 COPY --from=uv /uv /usr/local/bin/uv
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

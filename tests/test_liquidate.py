@@ -16,6 +16,7 @@ from decimal import Decimal
 import pytest
 from psycopg import errors
 from psycopg.types.json import Jsonb
+from test_bot import CHAT, UPDATE_IDS
 from test_execution import (
     AFTER,
     CALENDAR,
@@ -30,7 +31,15 @@ from test_execution import (
     state,
     submitted,
 )
-from test_pause_resume import ACTOR, BEFORE_DEADLINE, Operator, commands, kinds, open_causes
+from test_pause_resume import (
+    ACTOR,
+    BEFORE_DEADLINE,
+    OPERATOR,
+    Operator,
+    commands,
+    kinds,
+    open_causes,
+)
 
 from agb import execution
 from agb.alpaca import Alpaca, AlpacaError, Closed
@@ -139,6 +148,40 @@ def test_step_one_says_so_when_nothing_has_been_observed(db, operator):
     assert "positions: no snapshot yet, so the count is unknown" in reply
     assert "equity: not read from the broker yet" in reply
     issued(reply)
+
+
+def test_a_token_reply_that_fails_to_send_is_retried_without_a_second_token(db, operator, clock):
+    """A reply Telegram would not take is queued and sent again as it was: the token is not
+    issued a second time, and its five minutes are not restarted by the retry."""
+    observed(db, holding())
+    operator.telegram.fail_once_on = 1
+    operator.bot.retry_after = timedelta(0)
+    operator.telegram.updates.append(
+        {
+            "update_id": next(UPDATE_IDS),
+            "message": {
+                "chat": {"id": int(CHAT)},
+                "from": {"id": OPERATOR},
+                "date": int(clock().timestamp()),
+                "text": "/liquidate",
+            },
+        }
+    )
+    operator.bot.poll(db.connect("bot"))
+    assert operator.telegram.sent == []
+    [(_, token, expires_at)] = rows(db, "SELECT kind, token, expires_at FROM agb.liquidation")
+    assert expires_at == NOW + TOKEN_VALID
+
+    # The retry comes two minutes later, inside the token's life.
+    clock.now = NOW + timedelta(minutes=2)
+    [reply] = [text for text in operator.cycle() if text.startswith("LIQUIDATE")]
+    assert issued(reply) == token
+    assert "within 5 minutes, by 2026-10-01 15:40 ET" in reply
+    # One token, the one first issued, with the expiry it was first given.
+    assert rows(db, "SELECT token, expires_at FROM agb.liquidation") == [(token, expires_at)]
+    # The command was recorded once, and a further cycle sends nothing.
+    assert len(commands(db)) == 1
+    assert not [text for text in operator.cycle() if text.startswith("LIQUIDATE")]
 
 
 def test_each_token_is_random(db, operator):

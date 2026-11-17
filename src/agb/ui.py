@@ -137,6 +137,7 @@ STATE_CLASS = {
     "approved": "ok",
     "submitted": "ok",
     "filled": "ok",
+    "unfilled": "bad",
     "rejected": "dim",
     "missed": "dim",
     "halted": "bad",

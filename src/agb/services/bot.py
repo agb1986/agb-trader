@@ -10,7 +10,10 @@ attempted.
 
 It holds no state beyond a cached Telegram update offset and which duties are failing. Every
 message it sends is computed from the database, every message it receives is a `command` row
-whatever became of it, and every delivery attempt is an `alert_event`. Alerts notify and never act.
+whatever became of it, every delivery attempt is an `alert_event`, and every part of a long
+alert Telegram accepted is an `alert_part`, so a delivery that fails part-way resumes at the first
+part not sent. A reply Telegram will not take is queued as an alert of kind `reply` and delivered
+like any other. Alerts notify and never act.
 Each update it handles is a `telegram_update` row written with its command, so a restart neither
 loses nor repeats one, and a command older than `STALE_COMMAND` is refused rather than acted on.
 
@@ -30,6 +33,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
+from functools import partial
 from time import sleep as wait
 from typing import Any
 
@@ -74,6 +78,8 @@ PERFORMANCE_FOOTER = (
 CYCLE_FAILURE = "cycle_failure"
 # How much of a failure's message the alert carries.
 FAILURE_MAX = 200
+# A reply Telegram would not take, queued as an alert so it is retried with the rest.
+REPLY = "reply"
 FILL_CONFIRMATION = "fill_confirmation"
 GATE_HALT = "gate_halt"
 # The unprompted rebalance messages look back over this many of the latest live baskets.
@@ -167,7 +173,8 @@ def parse(text: str) -> Parsed:
 
 
 def split(text: str, limit: int = MESSAGE_MAX) -> list[str]:
-    """Cut a message into parts Telegram accepts, between items where it can."""
+    """Cut a message into parts Telegram accepts, between items where it can. A blank message
+    has no parts."""
     parts: list[str] = []
     current = ""
     for block in text.split("\n\n"):
@@ -185,7 +192,8 @@ def split(text: str, limit: int = MESSAGE_MAX) -> list[str]:
             current = candidate
     if current:
         parts.append(current)
-    return parts
+    # Telegram refuses a message with nothing in it, so a part of only whitespace is not sent.
+    return [part for part in parts if part.strip()]
 
 
 def alert_text(finding: Finding) -> str:
@@ -243,6 +251,16 @@ _SETTLED = """
     ORDER BY id
 """
 _RAISED = "SELECT 1 FROM agb.alert WHERE kind = %s AND subject = %s AND period = %s"
+
+# The parts of an alert Telegram has accepted, by part number and the message each became.
+_SENT = """
+    SELECT part, telegram_message_id FROM agb.alert_part
+    WHERE alert_id = %s AND channel = %s
+"""
+_PART = """
+    INSERT INTO agb.alert_part (alert_id, part, channel, chat_id, telegram_message_id, actor)
+    VALUES (%(alert_id)s, %(part)s, %(channel)s, %(chat_id)s, %(message_id)s, %(actor)s)
+"""
 
 _RECORD = """
     INSERT INTO agb.alert_event (alert_id, event, channel, chat_id, telegram_message_id,
@@ -372,7 +390,7 @@ class Bot:
             self._offset = max(self._offset or 0, update["update_id"] + 1)
             reply = self.handle(conn, update, now)
             if reply is not None:
-                self._send(reply)
+                self._reply(conn, f"update {update['update_id']}", reply, now)
 
     def handle(self, conn: psycopg.Connection, update: dict[str, Any], now: datetime) -> str | None:
         """Handle one update, at most once, and return the reply it is owed, if any.
@@ -425,14 +443,55 @@ class Bot:
 
     def answer(self, conn: psycopg.Connection, message: dict[str, Any], now: datetime) -> None:
         """Record the command, then send its reply."""
-        self._send(self.reply_to(conn, message, now))
+        reply = self.reply_to(conn, message, now)
+        self._reply(conn, f"message {message.get('message_id', 'unknown')}", reply, now)
 
-    def _send(self, reply: str) -> None:
+    def _reply(self, conn: psycopg.Connection, subject: str, reply: str, now: datetime) -> None:
+        """Send a reply now. One Telegram will not take is not dropped: it is raised as an alert
+        of kind `reply`, which `deliver` sends on the backoff schedule like any other, resuming
+        from the first part Telegram has not accepted. The reply was computed when its command
+        ran and is kept as it was, so a retry says what the first attempt would have said. A
+        liquidation token is in a reply, and a retry neither reveals it twice nor lengthens
+        its life: only the parts the chat has not got are sent, and the expiry is the one the
+        kill switch recorded, which the reply states."""
+        parts = split(reply)
+        sent: dict[int, int] = {}
         try:
-            for part in split(reply):
-                self.telegram.send_message(self.chat_id, part)
+            self._transmit(parts, sent, lambda number, message_id: None)
         except TelegramError as exc:
-            log.warning("could not send the reply %r: %s", reply.splitlines()[0], exc)
+            log.warning("could not send the reply %r: %s; queued to try again", subject, exc)
+            with conn.transaction():
+                alert_id = self._raise(conn, REPLY, subject, f"{now:%Y-%m-%d}", reply)
+                if alert_id is None:
+                    return
+                for number, message_id in sent.items():
+                    self._part(conn, alert_id, number, message_id)
+                self._record(conn, alert_id, "failed", detail=self._why(parts, sent, exc))
+
+    def _transmit(
+        self,
+        parts: list[str],
+        sent: dict[int, int],
+        keep: Callable[[int, int], None],
+    ) -> None:
+        """Send each part not already in `sent`, in order, and add it to `sent` with the
+        Telegram message it became as soon as Telegram accepts it. `keep` records it. A part
+        Telegram refuses raises `TelegramError` with every part before it in `sent`."""
+        for number, text in enumerate(parts, 1):
+            if number in sent:
+                continue
+            message_id = self.telegram.send_message(self.chat_id, text)
+            sent[number] = message_id
+            keep(number, message_id)
+
+    @staticmethod
+    def _why(parts: list[str], sent: dict[int, int], exc: TelegramError) -> str:
+        """The failure as `alert_event` records it, naming the part that failed when there is
+        more than one."""
+        if len(parts) < 2:
+            return str(exc)
+        first_unsent = next(n for n in range(1, len(parts) + 1) if n not in sent)
+        return f"part {first_unsent} of {len(parts)}: {exc}"
 
     def reply_to(self, conn: psycopg.Connection, message: dict[str, Any], now: datetime) -> str:
         """Record the command and return its reply: the command's readout, or why it was
@@ -635,6 +694,12 @@ class Bot:
         self, conn: psycopg.Connection, kind: str, subject: str, period: str, body: str
     ) -> bool:
         """Raise an alert once: an alert with the same key already raised adds nothing."""
+        return self._raise(conn, kind, subject, period, body) is not None
+
+    def _raise(
+        self, conn: psycopg.Connection, kind: str, subject: str, period: str, body: str
+    ) -> int | None:
+        """Raise an alert and return its id, or `None` when one with its key was raised before."""
         raised = conn.execute(
             _RAISE,
             {
@@ -645,9 +710,10 @@ class Bot:
                 "actor": ACTOR,
             },
         ).fetchone()
-        if raised:
-            log.info("raised alert %s: %s %s %s", raised[0], kind, subject, period)
-        return raised is not None
+        if raised is None:
+            return None
+        log.info("raised alert %s: %s %s %s", raised[0], kind, subject, period)
+        return int(raised[0])
 
     def calendar(self, today: date) -> NyseCalendar:
         if self._calendar is None or not self._calendar.covers(today, today + timedelta(days=14)):
@@ -678,22 +744,49 @@ class Bot:
         self.raise_alert(conn, "preflight", "rebalance", period, preflight_text(period, findings))
 
     def deliver(self, conn: psycopg.Connection) -> None:
-        """Send each undelivered alert that is not backing off, and record the attempt."""
+        """Send each undelivered alert that is not backing off, and record the attempt.
+
+        A long alert goes out in parts, and each part Telegram accepts is recorded as it is
+        sent, so an attempt that fails part-way is resumed from the first part not sent and
+        repeats none. The delivery names the last part. An alert with nothing in it has
+        nothing to send and is recorded as delivered, without a message.
+        """
         due = conn.execute(_DUE, {"first": self.retry_after, "cap": self.retry_cap}).fetchall()
         for alert_id, kind, subject, period, body in due:
+            parts = split(body)
+            if not parts:
+                self._record(
+                    conn, alert_id, "delivered", detail="nothing to send: the body is blank"
+                )
+                log.warning(
+                    "alert %s (%s %s) has a blank body; nothing to send", alert_id, kind, subject
+                )
+                continue
+            sent = dict(conn.execute(_SENT, (alert_id, CHANNEL)).fetchall())
             try:
-                # A long alert goes out in parts; the delivery names the last part sent.
-                for part in split(body):
-                    message_id = self.telegram.send_message(self.chat_id, part)
+                self._transmit(parts, sent, partial(self._part, conn, alert_id))
             except TelegramError as exc:
-                self._record(conn, alert_id, "failed", detail=str(exc))
+                self._record(conn, alert_id, "failed", detail=self._why(parts, sent, exc))
                 log.warning("could not deliver alert %s (%s %s): %s", alert_id, kind, subject, exc)
                 continue
-            event_id = self._record(conn, alert_id, "delivered", message_id=message_id)
+            event_id = self._record(conn, alert_id, "delivered", message_id=sent[len(parts)])
             if kind == approval.APPROVAL_REQUEST:
                 # The request reaching the chat is what the month expects of the bot.
                 jobs.fulfil(conn, schedule.APPROVAL_REQUEST, period, "alert_event", event_id, ACTOR)
             log.info("delivered alert %s (%s %s %s)", alert_id, kind, subject, period)
+
+    def _part(self, conn: psycopg.Connection, alert_id: int, part: int, message_id: int) -> None:
+        conn.execute(
+            _PART,
+            {
+                "alert_id": alert_id,
+                "part": part,
+                "channel": CHANNEL,
+                "chat_id": self.chat_id,
+                "message_id": message_id,
+                "actor": ACTOR,
+            },
+        )
 
     def _record(
         self,

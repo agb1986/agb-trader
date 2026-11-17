@@ -1,0 +1,2471 @@
+{
+ "backtest_paths": {
+  "months": 30,
+  "paths": [
+   {
+    "after_tax": {
+     "annual_exempt_amount": 3000.0,
+     "approximate": true,
+     "basis": "approximate: UK capital gains tax at the higher rate on realised gains, in USD, as a diagnostic of what the turnover costs after tax; it certifies nothing and no gate reads it",
+     "benchmark": "SPY",
+     "buy_and_hold": {
+      "after_tax_final_value": 968123.1776,
+      "after_tax_return": -0.0318768224,
+      "disposals": 1,
+      "final_value": 968123.1776,
+      "loss_carried_forward": 31876.824832,
+      "realised_gains": 0.0,
+      "realised_losses": 31876.824832,
+      "shares": 47464,
+      "tax": 0.0,
+      "taxable_gains": 0.0,
+      "total_return": -0.0318768224,
+      "years": [
+       {
+        "carried": 31876.824832,
+        "disposals": 1,
+        "exempt": 0.0,
+        "gains": 0.0,
+        "losses": 31876.824832,
+        "net": -31876.824832,
+        "relieved": 0.0,
+        "tax": 0.0,
+        "taxable": 0.0,
+        "year": "2026/27"
+       }
+      ]
+     },
+     "rate": 0.24,
+     "simplifications": [
+      "the arithmetic is in USD: gains are not converted to GBP at each trade's date, so the allowance and the rate are applied to dollars as if they were pounds, and the currency gain the exchange rate adds or takes away is not taxed",
+      "each name's cost basis is one Section 104 average-cost pool; HMRC's same-day and thirty-day matching rules are not applied, so a name sold and bought back within a month is pooled here where HMRC would match the two",
+      "every gain above the allowance is taxed at 24%, with no basic-rate band and no other income, gains, losses or reliefs of the operator's in the calculation",
+      "the 24% rate and the GBP 3,000 allowance are held constant across every tax year, where both have changed repeatedly and will change again",
+      "the whole allowance is assumed free for this account and claimed in the year it falls; a carried-forward loss is assumed claimed in time and relieves only gains above the allowance, which is the order that wastes the least relief",
+      "positions still open at the end are treated as disposed of at the final session's close with no dealing cost, so the bill covers the whole run and the buy-and-hold comparison is like for like",
+      "dividends, the tax on them and the withholding on US dividends are outside this view, as they are outside the backtest"
+     ],
+     "strategy": {
+      "after_tax_final_value": 1150099.5688319998,
+      "after_tax_return": 0.1500995688319997,
+      "disposals": 82,
+      "final_value": 1195604.6988319997,
+      "loss_carried_forward": 0.0,
+      "realised_gains": 687477.364072,
+      "realised_losses": 491872.64476,
+      "tax": 45505.13,
+      "taxable_gains": 189604.719312,
+      "total_return": 0.1956046988319997,
+      "years": [
+       {
+        "carried": 11341.070347,
+        "disposals": 7,
+        "exempt": 0.0,
+        "gains": 25270.42974,
+        "losses": 36611.500087,
+        "net": -11341.070347,
+        "relieved": 0.0,
+        "tax": 0.0,
+        "taxable": 0.0,
+        "year": "2023/24"
+       },
+       {
+        "carried": 65340.473918,
+        "disposals": 30,
+        "exempt": 0.0,
+        "gains": 184034.280268,
+        "losses": 238033.683839,
+        "net": -53999.403571,
+        "relieved": 0.0,
+        "tax": 0.0,
+        "taxable": 0.0,
+        "year": "2024/25"
+       },
+       {
+        "carried": 0.0,
+        "disposals": 33,
+        "exempt": 3000.0,
+        "gains": 315419.205517,
+        "losses": 183737.014164,
+        "net": 131682.191353,
+        "relieved": 65340.473918,
+        "tax": 15202.01,
+        "taxable": 63341.717435,
+        "year": "2025/26"
+       },
+       {
+        "carried": 0.0,
+        "disposals": 12,
+        "exempt": 3000.0,
+        "gains": 162753.448547,
+        "losses": 33490.44667,
+        "net": 129263.001877,
+        "relieved": 0.0,
+        "tax": 30303.12,
+        "taxable": 126263.001877,
+        "year": "2026/27"
+       }
+      ]
+     }
+    },
+    "annual_return": 0.07407608112009667,
+    "annual_volatility": 0.09480080560914239,
+    "cash_acquisition_events": 0,
+    "cash_acquisition_exits": 0,
+    "delisting_events": 0,
+    "delisting_exits": 0,
+    "delisting_loss": 0.0,
+    "delisting_return": -0.3,
+    "fees_fraction": 0.05321849,
+    "fees_paid": 53218.49,
+    "final_value": 1195604.6988319997,
+    "gross_return": 0.2488231888319996,
+    "halt_events": 0,
+    "max_drawdown": -0.14805911930268123,
+    "monthly": [
+     {
+      "as_of": "2024-01-31",
+      "benchmark": 0.003554053480630426,
+      "fees": 4093.6999999999994,
+      "gross": 0.018465872678999906,
+      "net": 0.01437217267900004
+     },
+     {
+      "as_of": "2024-02-29",
+      "benchmark": 0.007161587906021616,
+      "fees": 1853.4199999999998,
+      "gross": -0.03206165395794225,
+      "net": -0.033888813702580234
+     },
+     {
+      "as_of": "2024-03-28",
+      "benchmark": 0.001725411118810083,
+      "fees": 1236.07,
+      "gross": -0.014987466876792088,
+      "net": -0.016248767553230792
+     },
+     {
+      "as_of": "2024-04-30",
+      "benchmark": -0.005107030830686643,
+      "fees": 1874.68,
+      "gross": 0.035314940183421184,
+      "net": 0.0333703977739952
+     },
+     {
+      "as_of": "2024-05-31",
+      "benchmark": -0.011781163492204039,
+      "fees": 2753.25,
+      "gross": -0.02758317466156457,
+      "net": -0.030346804700847385
+     },
+     {
+      "as_of": "2024-06-28",
+      "benchmark": -0.004666892868593231,
+      "fees": 1831.51,
+      "gross": -0.017414600486983067,
+      "net": -0.019310551526370734
+     },
+     {
+      "as_of": "2024-07-31",
+      "benchmark": 0.004301652501401909,
+      "fees": 1672.3,
+      "gross": -0.04702767104648842,
+      "net": -0.0487928978406208
+     },
+     {
+      "as_of": "2024-08-30",
+      "benchmark": -0.011182517581887041,
+      "fees": 1030.18,
+      "gross": -0.03985808633712451,
+      "net": -0.041001291957925234
+     },
+     {
+      "as_of": "2024-09-30",
+      "benchmark": 0.0007809493698882619,
+      "fees": 548.8,
+      "gross": 0.006171383797663577,
+      "net": 0.005536334679210109
+     },
+     {
+      "as_of": "2024-10-31",
+      "benchmark": 0.0011544828263028162,
+      "fees": 1735.0799999999997,
+      "gross": 0.012386742470194667,
+      "net": 0.010390032666552251
+     },
+     {
+      "as_of": "2024-11-29",
+      "benchmark": -0.008518906345713284,
+      "fees": 1617.71,
+      "gross": 0.05963580865220841,
+      "net": 0.057793310490140026
+     },
+     {
+      "as_of": "2024-12-31",
+      "benchmark": -0.0027670920243717534,
+      "fees": 1188.55,
+      "gross": -0.016232983668329926,
+      "net": -0.01751272746587973
+     },
+     {
+      "as_of": "2025-01-31",
+      "benchmark": -0.008131381805595472,
+      "fees": 915.72,
+      "gross": 0.006825833093546008,
+      "net": 0.005822277713565915
+     },
+     {
+      "as_of": "2025-02-28",
+      "benchmark": 0.005209599291162492,
+      "fees": 1248.71,
+      "gross": 0.035747591085020014,
+      "net": 0.0343870270612594
+     },
+     {
+      "as_of": "2025-03-31",
+      "benchmark": -0.0019092324369858193,
+      "fees": 1311.74,
+      "gross": -0.0003634432544797894,
+      "net": -0.0017451697652421938
+     },
+     {
+      "as_of": "2025-04-30",
+      "benchmark": -0.005558238165384588,
+      "fees": 2156.91,
+      "gross": -0.0016190044021316963,
+      "net": -0.00389496601045225
+     },
+     {
+      "as_of": "2025-05-30",
+      "benchmark": 0.021086907197679805,
+      "fees": 2848.4199999999996,
+      "gross": 0.013016432191280458,
+      "net": 0.009999039739412519
+     },
+     {
+      "as_of": "2025-06-30",
+      "benchmark": -0.005522887144842503,
+      "fees": 1210.91,
+      "gross": 0.020827185409809434,
+      "net": 0.019557141670519362
+     },
+     {
+      "as_of": "2025-07-31",
+      "benchmark": -0.004815594429616432,
+      "fees": 1872.5099999999998,
+      "gross": 0.05664998307555602,
+      "net": 0.05472370320262798
+     },
+     {
+      "as_of": "2025-08-29",
+      "benchmark": 0.014975858348200699,
+      "fees": 1474.27,
+      "gross": -0.021930427382786055,
+      "net": -0.023368343538060943
+     },
+     {
+      "as_of": "2025-09-30",
+      "benchmark": -0.01175474932909748,
+      "fees": 2122.87,
+      "gross": 0.028488071129365133,
+      "net": 0.02636800631985814
+     },
+     {
+      "as_of": "2025-10-31",
+      "benchmark": -0.014832528522198296,
+      "fees": 1236.08,
+      "gross": 0.02110561316529047,
+      "net": 0.019902880209104135
+     },
+     {
+      "as_of": "2025-11-28",
+      "benchmark": -0.009981860748575655,
+      "fees": 2189.36,
+      "gross": 0.022622361444691208,
+      "net": 0.0205336377535843
+     },
+     {
+      "as_of": "2025-12-31",
+      "benchmark": -0.005751127377549348,
+      "fees": 1713.9800000000002,
+      "gross": 0.006670128813271559,
+      "net": 0.005067834691522943
+     },
+     {
+      "as_of": "2026-01-30",
+      "benchmark": 0.011824094825838571,
+      "fees": 2577.2200000000003,
+      "gross": 0.008944701943151001,
+      "net": 0.006547566308384267
+     },
+     {
+      "as_of": "2026-02-27",
+      "benchmark": 0.0008126779742994028,
+      "fees": 2951.8000000000006,
+      "gross": -0.013129084023078774,
+      "net": -0.01585676603902375
+     },
+     {
+      "as_of": "2026-03-31",
+      "benchmark": 0.0034637568347488656,
+      "fees": 1951.06,
+      "gross": 0.021944772328507778,
+      "net": 0.020112799085987065
+     },
+     {
+      "as_of": "2026-04-30",
+      "benchmark": 0.005631203327940426,
+      "fees": 1583.71,
+      "gross": 0.03524866321368725,
+      "net": 0.0337909370009295
+     },
+     {
+      "as_of": "2026-05-29",
+      "benchmark": 0.001804439497267163,
+      "fees": 2417.97,
+      "gross": 0.04783745620065338,
+      "net": 0.04568458279954357
+     },
+     {
+      "as_of": "2026-06-30",
+      "benchmark": -0.00259576844217857,
+      "fees": 0.0,
+      "gross": 0.018015738031582185,
+      "net": 0.018015738031582185
+     }
+    ],
+    "months": 30,
+    "orders": 160,
+    "participation_max": 0.046437829146640665,
+    "participation_mean": 0.013209371559062062,
+    "path": "0",
+    "sharpe": 0.7813866205473778,
+    "stock_merger_events": 0,
+    "stock_merger_exits": 0,
+    "total_return": 0.1956046988319997,
+    "trimmed": 13,
+    "turnover": 1.3216040721996063,
+    "unfilled": 0
+   },
+   {
+    "after_tax": {
+     "annual_exempt_amount": 3000.0,
+     "approximate": true,
+     "basis": "approximate: UK capital gains tax at the higher rate on realised gains, in USD, as a diagnostic of what the turnover costs after tax; it certifies nothing and no gate reads it",
+     "benchmark": "SPY",
+     "buy_and_hold": {
+      "after_tax_final_value": 968123.1776,
+      "after_tax_return": -0.0318768224,
+      "disposals": 1,
+      "final_value": 968123.1776,
+      "loss_carried_forward": 31876.824832,
+      "realised_gains": 0.0,
+      "realised_losses": 31876.824832,
+      "shares": 47464,
+      "tax": 0.0,
+      "taxable_gains": 0.0,
+      "total_return": -0.0318768224,
+      "years": [
+       {
+        "carried": 31876.824832,
+        "disposals": 1,
+        "exempt": 0.0,
+        "gains": 0.0,
+        "losses": 31876.824832,
+        "net": -31876.824832,
+        "relieved": 0.0,
+        "tax": 0.0,
+        "taxable": 0.0,
+        "year": "2026/27"
+       }
+      ]
+     },
+     "rate": 0.24,
+     "simplifications": [
+      "the arithmetic is in USD: gains are not converted to GBP at each trade's date, so the allowance and the rate are applied to dollars as if they were pounds, and the currency gain the exchange rate adds or takes away is not taxed",
+      "each name's cost basis is one Section 104 average-cost pool; HMRC's same-day and thirty-day matching rules are not applied, so a name sold and bought back within a month is pooled here where HMRC would match the two",
+      "every gain above the allowance is taxed at 24%, with no basic-rate band and no other income, gains, losses or reliefs of the operator's in the calculation",
+      "the 24% rate and the GBP 3,000 allowance are held constant across every tax year, where both have changed repeatedly and will change again",
+      "the whole allowance is assumed free for this account and claimed in the year it falls; a carried-forward loss is assumed claimed in time and relieves only gains above the allowance, which is the order that wastes the least relief",
+      "positions still open at the end are treated as disposed of at the final session's close with no dealing cost, so the bill covers the whole run and the buy-and-hold comparison is like for like",
+      "dividends, the tax on them and the withholding on US dividends are outside this view, as they are outside the backtest"
+     ],
+     "strategy": {
+      "after_tax_final_value": 1118366.0214110008,
+      "after_tax_return": 0.1183660214110008,
+      "disposals": 85,
+      "final_value": 1151955.2814110008,
+      "loss_carried_forward": 0.0,
+      "realised_gains": 577921.717001,
+      "realised_losses": 425966.453891,
+      "tax": 33589.26,
+      "taxable_gains": 139955.26311,
+      "total_return": 0.1519552814110008,
+      "years": [
+       {
+        "carried": 0.0,
+        "disposals": 5,
+        "exempt": 3000.0,
+        "gains": 30884.427973,
+        "losses": 604.116768,
+        "net": 30280.311205,
+        "relieved": 0.0,
+        "tax": 6547.27,
+        "taxable": 27280.311205,
+        "year": "2023/24"
+       },
+       {
+        "carried": 0.0,
+        "disposals": 32,
+        "exempt": 3000.0,
+        "gains": 263590.126784,
+        "losses": 187056.701869,
+        "net": 76533.424915,
+        "relieved": 0.0,
+        "tax": 17648.02,
+        "taxable": 73533.424915,
+        "year": "2024/25"
+       },
+       {
+        "carried": 0.0,
+        "disposals": 35,
+        "exempt": 3000.0,
+        "gains": 214685.660782,
+        "losses": 190784.591617,
+        "net": 23901.069165,
+        "relieved": 0.0,
+        "tax": 5016.26,
+        "taxable": 20901.069165,
+        "year": "2025/26"
+       },
+       {
+        "carried": 0.0,
+        "disposals": 13,
+        "exempt": 3000.0,
+        "gains": 68761.501462,
+        "losses": 47521.043637,
+        "net": 21240.457825,
+        "relieved": 0.0,
+        "tax": 4377.71,
+        "taxable": 18240.457825,
+        "year": "2026/27"
+       }
+      ]
+     }
+    },
+    "annual_return": 0.058215815797993065,
+    "annual_volatility": 0.08457998888994979,
+    "cash_acquisition_events": 0,
+    "cash_acquisition_exits": 0,
+    "delisting_events": 0,
+    "delisting_exits": 0,
+    "delisting_loss": 0.0,
+    "delisting_return": -0.3,
+    "fees_fraction": 0.06303636,
+    "fees_paid": 63036.36,
+    "final_value": 1151955.2814110008,
+    "gross_return": 0.2149916414110009,
+    "halt_events": 0,
+    "max_drawdown": -0.055492581932159335,
+    "monthly": [
+     {
+      "as_of": "2024-01-31",
+      "benchmark": 0.003554053480630426,
+      "fees": 3326.94,
+      "gross": 0.03665195960000012,
+      "net": 0.033325019600000116
+     },
+     {
+      "as_of": "2024-02-29",
+      "benchmark": 0.007161587906021616,
+      "fees": 1397.49,
+      "gross": -0.005234214791483227,
+      "net": -0.006586635349867587
+     },
+     {
+      "as_of": "2024-03-28",
+      "benchmark": 0.001725411118810083,
+      "fees": 1282.73,
+      "gross": 0.00441506714727069,
+      "net": 0.003165474938718882
+     },
+     {
+      "as_of": "2024-04-30",
+      "benchmark": -0.005107030830686643,
+      "fees": 1430.18,
+      "gross": 0.04925502874787835,
+      "net": 0.04786619206099796
+     },
+     {
+      "as_of": "2024-05-31",
+      "benchmark": -0.011781163492204039,
+      "fees": 2983.2799999999997,
+      "gross": 0.01351588329496578,
+      "net": 0.01075117912496748
+     },
+     {
+      "as_of": "2024-06-28",
+      "benchmark": -0.004666892868593231,
+      "fees": 1292.81,
+      "gross": -0.022685612671493827,
+      "net": -0.02387095855843291
+     },
+     {
+      "as_of": "2024-07-31",
+      "benchmark": 0.004301652501401909,
+      "fees": 2224.66,
+      "gross": -0.02844687927319034,
+      "net": -0.030536496820418924
+     },
+     {
+      "as_of": "2024-08-30",
+      "benchmark": -0.011182517581887041,
+      "fees": 2127.01,
+      "gross": 0.005329783133356969,
+      "net": 0.003268957593169919
+     },
+     {
+      "as_of": "2024-09-30",
+      "benchmark": 0.0007809493698882619,
+      "fees": 2037.57,
+      "gross": -0.0032012858213845696,
+      "net": -0.005169021948178809
+     },
+     {
+      "as_of": "2024-10-31",
+      "benchmark": 0.0011544828263028162,
+      "fees": 2053.85,
+      "gross": 0.04850675577366936,
+      "net": 0.046512991803484116
+     },
+     {
+      "as_of": "2024-11-29",
+      "benchmark": -0.008518906345713284,
+      "fees": 1568.2400000000002,
+      "gross": 0.032268266595006034,
+      "net": 0.030813568319985718
+     },
+     {
+      "as_of": "2024-12-31",
+      "benchmark": -0.0027670920243717534,
+      "fees": 1639.2300000000002,
+      "gross": -0.0013226466140080495,
+      "net": -0.0027977422023279797
+     },
+     {
+      "as_of": "2025-01-31",
+      "benchmark": -0.008131381805595472,
+      "fees": 2380.58,
+      "gross": -0.013349082057761641,
+      "net": -0.015497307214268008
+     },
+     {
+      "as_of": "2025-02-28",
+      "benchmark": 0.005209599291162492,
+      "fees": 2414.2,
+      "gross": 0.016256844029531425,
+      "net": 0.014043987004437986
+     },
+     {
+      "as_of": "2025-03-31",
+      "benchmark": -0.0019092324369858193,
+      "fees": 1651.41,
+      "gross": 0.01634271268740739,
+      "net": 0.014849993122836969
+     },
+     {
+      "as_of": "2025-04-30",
+      "benchmark": -0.005558238165384588,
+      "fees": 2925.3199999999997,
+      "gross": -0.024106237073615366,
+      "net": -0.026711759659362344
+     },
+     {
+      "as_of": "2025-05-30",
+      "benchmark": 0.021086907197679805,
+      "fees": 628.05,
+      "gross": 0.02863175345077207,
+      "net": 0.0280570097690922
+     },
+     {
+      "as_of": "2025-06-30",
+      "benchmark": -0.005522887144842503,
+      "fees": 2365.33,
+      "gross": 0.01412939070123187,
+      "net": 0.012023894185217321
+     },
+     {
+      "as_of": "2025-07-31",
+      "benchmark": -0.004815594429616432,
+      "fees": 2892.58,
+      "gross": 0.016494377143748906,
+      "net": 0.013950141107253566
+     },
+     {
+      "as_of": "2025-08-29",
+      "benchmark": 0.014975858348200699,
+      "fees": 1458.85,
+      "gross": -0.02896485519909231,
+      "net": -0.03023036659500966
+     },
+     {
+      "as_of": "2025-09-30",
+      "benchmark": -0.01175474932909748,
+      "fees": 3817.0899999999997,
+      "gross": 0.030625918015020792,
+      "net": 0.027211479947546913
+     },
+     {
+      "as_of": "2025-10-31",
+      "benchmark": -0.014832528522198296,
+      "fees": 3871.44,
+      "gross": -0.015507483360165275,
+      "net": -0.0188787997221167
+     },
+     {
+      "as_of": "2025-11-28",
+      "benchmark": -0.009981860748575655,
+      "fees": 1695.19,
+      "gross": -0.024136432660682328,
+      "net": -0.025641038340950217
+     },
+     {
+      "as_of": "2025-12-31",
+      "benchmark": -0.005751127377549348,
+      "fees": 2228.5,
+      "gross": 0.008631657700630013,
+      "net": 0.006601648670667926
+     },
+     {
+      "as_of": "2026-01-30",
+      "benchmark": 0.011824094825838571,
+      "fees": 1986.7,
+      "gross": 0.007717660700312434,
+      "net": 0.005919783662371669
+     },
+     {
+      "as_of": "2026-02-27",
+      "benchmark": 0.0008126779742994028,
+      "fees": 2593.0099999999998,
+      "gross": -0.00034770971121644845,
+      "net": -0.002680461526196387
+     },
+     {
+      "as_of": "2026-03-31",
+      "benchmark": 0.0034637568347488656,
+      "fees": 1235.75,
+      "gross": 0.031103639688110807,
+      "net": 0.029988932924897682
+     },
+     {
+      "as_of": "2026-04-30",
+      "benchmark": 0.005631203327940426,
+      "fees": 2182.2,
+      "gross": -0.02224216645889543,
+      "net": -0.02415330429285767
+     },
+     {
+      "as_of": "2026-05-29",
+      "benchmark": 0.001804439497267163,
+      "fees": 3346.1699999999996,
+      "gross": -0.014767353591659482,
+      "net": -0.017770412586826545
+     },
+     {
+      "as_of": "2026-06-30",
+      "benchmark": -0.00259576844217857,
+      "fees": 0.0,
+      "gross": 0.05253966416175082,
+      "net": 0.05253966416175082
+     }
+    ],
+    "months": 30,
+    "orders": 166,
+    "participation_max": 0.04740777266681492,
+    "participation_mean": 0.014633580920267461,
+    "path": "1",
+    "sharpe": 0.6882930177933678,
+    "stock_merger_events": 0,
+    "stock_merger_exits": 0,
+    "total_return": 0.1519552814110008,
+    "trimmed": 16,
+    "turnover": 1.3787195908305983,
+    "unfilled": 0
+   },
+   {
+    "after_tax": {
+     "annual_exempt_amount": 3000.0,
+     "approximate": true,
+     "basis": "approximate: UK capital gains tax at the higher rate on realised gains, in USD, as a diagnostic of what the turnover costs after tax; it certifies nothing and no gate reads it",
+     "benchmark": "SPY",
+     "buy_and_hold": {
+      "after_tax_final_value": 968123.1776,
+      "after_tax_return": -0.0318768224,
+      "disposals": 1,
+      "final_value": 968123.1776,
+      "loss_carried_forward": 31876.824832,
+      "realised_gains": 0.0,
+      "realised_losses": 31876.824832,
+      "shares": 47464,
+      "tax": 0.0,
+      "taxable_gains": 0.0,
+      "total_return": -0.0318768224,
+      "years": [
+       {
+        "carried": 31876.824832,
+        "disposals": 1,
+        "exempt": 0.0,
+        "gains": 0.0,
+        "losses": 31876.824832,
+        "net": -31876.824832,
+        "relieved": 0.0,
+        "tax": 0.0,
+        "taxable": 0.0,
+        "year": "2026/27"
+       }
+      ]
+     },
+     "rate": 0.24,
+     "simplifications": [
+      "the arithmetic is in USD: gains are not converted to GBP at each trade's date, so the allowance and the rate are applied to dollars as if they were pounds, and the currency gain the exchange rate adds or takes away is not taxed",
+      "each name's cost basis is one Section 104 average-cost pool; HMRC's same-day and thirty-day matching rules are not applied, so a name sold and bought back within a month is pooled here where HMRC would match the two",
+      "every gain above the allowance is taxed at 24%, with no basic-rate band and no other income, gains, losses or reliefs of the operator's in the calculation",
+      "the 24% rate and the GBP 3,000 allowance are held constant across every tax year, where both have changed repeatedly and will change again",
+      "the whole allowance is assumed free for this account and claimed in the year it falls; a carried-forward loss is assumed claimed in time and relieves only gains above the allowance, which is the order that wastes the least relief",
+      "positions still open at the end are treated as disposed of at the final session's close with no dealing cost, so the bill covers the whole run and the buy-and-hold comparison is like for like",
+      "dividends, the tax on them and the withholding on US dividends are outside this view, as they are outside the backtest"
+     ],
+     "strategy": {
+      "after_tax_final_value": 1016398.28234,
+      "after_tax_return": 0.01639828234,
+      "disposals": 90,
+      "final_value": 1019681.95234,
+      "loss_carried_forward": 0.0,
+      "realised_gains": 477071.988544,
+      "realised_losses": 457390.042004,
+      "tax": 3283.67,
+      "taxable_gains": 13681.94654,
+      "total_return": 0.01968195234,
+      "years": [
+       {
+        "carried": 22349.956114,
+        "disposals": 6,
+        "exempt": 0.0,
+        "gains": 8382.709833,
+        "losses": 30732.665947,
+        "net": -22349.956114,
+        "relieved": 0.0,
+        "tax": 0.0,
+        "taxable": 0.0,
+        "year": "2023/24"
+       },
+       {
+        "carried": 116722.848222,
+        "disposals": 33,
+        "exempt": 0.0,
+        "gains": 130188.117382,
+        "losses": 224561.00949,
+        "net": -94372.892108,
+        "relieved": 0.0,
+        "tax": 0.0,
+        "taxable": 0.0,
+        "year": "2024/25"
+       },
+       {
+        "carried": 33941.973113,
+        "disposals": 39,
+        "exempt": 3000.0,
+        "gains": 244117.027011,
+        "losses": 158336.151902,
+        "net": 85780.875109,
+        "relieved": 82780.875109,
+        "tax": 0.0,
+        "taxable": 0.0,
+        "year": "2025/26"
+       },
+       {
+        "carried": 0.0,
+        "disposals": 12,
+        "exempt": 3000.0,
+        "gains": 94384.134318,
+        "losses": 43760.214665,
+        "net": 50623.919653,
+        "relieved": 33941.973113,
+        "tax": 3283.67,
+        "taxable": 13681.94654,
+        "year": "2026/27"
+       }
+      ]
+     }
+    },
+    "annual_return": 0.007826777231105808,
+    "annual_volatility": 0.07604902834309807,
+    "cash_acquisition_events": 0,
+    "cash_acquisition_exits": 0,
+    "delisting_events": 0,
+    "delisting_exits": 0,
+    "delisting_loss": 0.0,
+    "delisting_return": -0.3,
+    "fees_fraction": 0.0544774,
+    "fees_paid": 54477.4,
+    "final_value": 1019681.95234,
+    "gross_return": 0.07415935233999993,
+    "halt_events": 0,
+    "max_drawdown": -0.1200666912099998,
+    "monthly": [
+     {
+      "as_of": "2024-01-31",
+      "benchmark": 0.003554053480630426,
+      "fees": 3879.6000000000004,
+      "gross": -0.00787473619500001,
+      "net": -0.011754336194999992
+     },
+     {
+      "as_of": "2024-02-29",
+      "benchmark": 0.007161587906021616,
+      "fees": 1167.57,
+      "gross": -0.045803297420722755,
+      "net": -0.046984754666388295
+     },
+     {
+      "as_of": "2024-03-28",
+      "benchmark": 0.001725411118810083,
+      "fees": 1966.49,
+      "gross": 0.03278147692131972,
+      "net": 0.030693493833008123
+     },
+     {
+      "as_of": "2024-04-30",
+      "benchmark": -0.005107030830686643,
+      "fees": 1827.2300000000002,
+      "gross": -0.011987061736310367,
+      "net": -0.013869405401879198
+     },
+     {
+      "as_of": "2024-05-31",
+      "benchmark": -0.011781163492204039,
+      "fees": 1329.09,
+      "gross": 0.0169206268623332,
+      "net": 0.015532191528565997
+     },
+     {
+      "as_of": "2024-06-28",
+      "benchmark": -0.004666892868593231,
+      "fees": 2613.52,
+      "gross": -0.02619860288340814,
+      "net": -0.028887061774296896
+     },
+     {
+      "as_of": "2024-07-31",
+      "benchmark": 0.004301652501401909,
+      "fees": 1662.07,
+      "gross": -0.052240947679168204,
+      "net": -0.054001533267565294
+     },
+     {
+      "as_of": "2024-08-30",
+      "benchmark": -0.011182517581887041,
+      "fees": 1221.8100000000002,
+      "gross": 0.0010407823004303651,
+      "net": -0.0003273278803755941
+     },
+     {
+      "as_of": "2024-09-30",
+      "benchmark": 0.0007809493698882619,
+      "fees": 1187.54,
+      "gross": 0.007032852196950268,
+      "net": 0.005702680121809411
+     },
+     {
+      "as_of": "2024-10-31",
+      "benchmark": 0.0011544828263028162,
+      "fees": 1123.73,
+      "gross": -0.015275158537673361,
+      "net": -0.016526719323135874
+     },
+     {
+      "as_of": "2024-11-29",
+      "benchmark": -0.008518906345713284,
+      "fees": 1152.59,
+      "gross": 0.0009214527385481563,
+      "net": -0.00038382296397210247
+     },
+     {
+      "as_of": "2024-12-31",
+      "benchmark": -0.0027670920243717534,
+      "fees": 1760.74,
+      "gross": 0.023280966480967447,
+      "net": 0.02128621240473172
+     },
+     {
+      "as_of": "2025-01-31",
+      "benchmark": -0.008131381805595472,
+      "fees": 1796.07,
+      "gross": -0.021902895317287063,
+      "net": -0.023895264982022768
+     },
+     {
+      "as_of": "2025-02-28",
+      "benchmark": 0.005209599291162492,
+      "fees": 2491.6800000000003,
+      "gross": 0.005278781024197654,
+      "net": 0.002447111879377628
+     },
+     {
+      "as_of": "2025-03-31",
+      "benchmark": -0.0019092324369858193,
+      "fees": 610.02,
+      "gross": 0.010613238539266767,
+      "net": 0.009921673791311036
+     },
+     {
+      "as_of": "2025-04-30",
+      "benchmark": -0.005558238165384588,
+      "fees": 2451.9300000000003,
+      "gross": 0.010799665835561356,
+      "net": 0.008047281052650401
+     },
+     {
+      "as_of": "2025-05-30",
+      "benchmark": 0.021086907197679805,
+      "fees": 2476.69,
+      "gross": 0.008449077506228475,
+      "net": 0.005691092957377464
+     },
+     {
+      "as_of": "2025-06-30",
+      "benchmark": -0.005522887144842503,
+      "fees": 1750.02,
+      "gross": 0.021785730312263274,
+      "net": 0.019847976560457115
+     },
+     {
+      "as_of": "2025-07-31",
+      "benchmark": -0.004815594429616432,
+      "fees": 1845.37,
+      "gross": 0.0004121565983044029,
+      "net": -0.001591409118775089
+     },
+     {
+      "as_of": "2025-08-29",
+      "benchmark": 0.014975858348200699,
+      "fees": 1699.21,
+      "gross": 0.021352410774639008,
+      "net": 0.019504594100065997
+     },
+     {
+      "as_of": "2025-09-30",
+      "benchmark": -0.01175474932909748,
+      "fees": 1805.82,
+      "gross": 0.024102993127620875,
+      "net": 0.022176812112317812
+     },
+     {
+      "as_of": "2025-10-31",
+      "benchmark": -0.014832528522198296,
+      "fees": 2337.0499999999997,
+      "gross": -0.004279407742275088,
+      "net": -0.006718142783836645
+     },
+     {
+      "as_of": "2025-11-28",
+      "benchmark": -0.009981860748575655,
+      "fees": 2571.5099999999998,
+      "gross": 0.0426692449473105,
+      "net": 0.039967699181351346
+     },
+     {
+      "as_of": "2025-12-31",
+      "benchmark": -0.005751127377549348,
+      "fees": 1979.96,
+      "gross": -0.02103463098119973,
+      "net": -0.023034772281844362
+     },
+     {
+      "as_of": "2026-01-30",
+      "benchmark": 0.011824094825838571,
+      "fees": 1642.1699999999998,
+      "gross": -0.017710071720897336,
+      "net": -0.019408093547823912
+     },
+     {
+      "as_of": "2026-02-27",
+      "benchmark": 0.0008126779742994028,
+      "fees": 2353.37,
+      "gross": 0.022905766271859918,
+      "net": 0.02042419322727662
+     },
+     {
+      "as_of": "2026-03-31",
+      "benchmark": 0.0034637568347488656,
+      "fees": 1404.3899999999999,
+      "gross": 0.011791810114427426,
+      "net": 0.010340554770858823
+     },
+     {
+      "as_of": "2026-04-30",
+      "benchmark": 0.005631203327940426,
+      "fees": 2878.6,
+      "gross": 0.012075727424440297,
+      "net": 0.00913151162639858
+     },
+     {
+      "as_of": "2026-05-29",
+      "benchmark": 0.001804439497267163,
+      "fees": 1491.56,
+      "gross": 0.021183077362364244,
+      "net": 0.019671322834979632
+     },
+     {
+      "as_of": "2026-06-30",
+      "benchmark": -0.00259576844217857,
+      "fees": 0.0,
+      "gross": 0.013549764396002306,
+      "net": 0.013549764396002306
+     }
+    ],
+    "months": 30,
+    "orders": 176,
+    "participation_max": 0.0411392880668344,
+    "participation_mean": 0.01271808546757407,
+    "path": "2",
+    "sharpe": 0.10291751783855813,
+    "stock_merger_events": 0,
+    "stock_merger_exits": 0,
+    "total_return": 0.01968195234000003,
+    "trimmed": 14,
+    "turnover": 1.464587484629449,
+    "unfilled": 0
+   }
+  ],
+  "summary": {
+   "paths": 3,
+   "sharpe_mean": 0.524199052059768,
+   "total_return_max": 0.1956046988319997,
+   "total_return_mean": 0.12241397752766685,
+   "total_return_min": 0.01968195234000003
+  }
+ },
+ "backtest_single": {
+  "after_tax": {
+   "annual_exempt_amount": 3000.0,
+   "approximate": true,
+   "basis": "approximate: UK capital gains tax at the higher rate on realised gains, in USD, as a diagnostic of what the turnover costs after tax; it certifies nothing and no gate reads it",
+   "benchmark": "SPY",
+   "buy_and_hold": {
+    "after_tax_final_value": 968123.1776,
+    "after_tax_return": -0.0318768224,
+    "disposals": 1,
+    "final_value": 968123.1776,
+    "loss_carried_forward": 31876.824832,
+    "realised_gains": 0.0,
+    "realised_losses": 31876.824832,
+    "shares": 47464,
+    "tax": 0.0,
+    "taxable_gains": 0.0,
+    "total_return": -0.0318768224,
+    "years": [
+     {
+      "carried": 31876.824832,
+      "disposals": 1,
+      "exempt": 0.0,
+      "gains": 0.0,
+      "losses": 31876.824832,
+      "net": -31876.824832,
+      "relieved": 0.0,
+      "tax": 0.0,
+      "taxable": 0.0,
+      "year": "2026/27"
+     }
+    ]
+   },
+   "rate": 0.24,
+   "simplifications": [
+    "the arithmetic is in USD: gains are not converted to GBP at each trade's date, so the allowance and the rate are applied to dollars as if they were pounds, and the currency gain the exchange rate adds or takes away is not taxed",
+    "each name's cost basis is one Section 104 average-cost pool; HMRC's same-day and thirty-day matching rules are not applied, so a name sold and bought back within a month is pooled here where HMRC would match the two",
+    "every gain above the allowance is taxed at 24%, with no basic-rate band and no other income, gains, losses or reliefs of the operator's in the calculation",
+    "the 24% rate and the GBP 3,000 allowance are held constant across every tax year, where both have changed repeatedly and will change again",
+    "the whole allowance is assumed free for this account and claimed in the year it falls; a carried-forward loss is assumed claimed in time and relieves only gains above the allowance, which is the order that wastes the least relief",
+    "positions still open at the end are treated as disposed of at the final session's close with no dealing cost, so the bill covers the whole run and the buy-and-hold comparison is like for like",
+    "dividends, the tax on them and the withholding on US dividends are outside this view, as they are outside the backtest"
+   ],
+   "strategy": {
+    "after_tax_final_value": 1368754.2890030004,
+    "after_tax_return": 0.3687542890030004,
+    "disposals": 19,
+    "final_value": 1483308.2790030004,
+    "loss_carried_forward": 0.0,
+    "realised_gains": 560362.706862,
+    "realised_losses": 77054.423645,
+    "tax": 114553.99,
+    "taxable_gains": 477308.283217,
+    "total_return": 0.4833082790030004,
+    "years": [
+     {
+      "carried": 53301.642916,
+      "disposals": 3,
+      "exempt": 0.0,
+      "gains": 0.0,
+      "losses": 53301.642916,
+      "net": -53301.642916,
+      "relieved": 0.0,
+      "tax": 0.0,
+      "taxable": 0.0,
+      "year": "2024/25"
+     },
+     {
+      "carried": 0.0,
+      "disposals": 9,
+      "exempt": 3000.0,
+      "gains": 215557.72408,
+      "losses": 23752.780729,
+      "net": 191804.943351,
+      "relieved": 53301.642916,
+      "tax": 32520.79,
+      "taxable": 135503.300435,
+      "year": "2025/26"
+     },
+     {
+      "carried": 0.0,
+      "disposals": 7,
+      "exempt": 3000.0,
+      "gains": 344804.982782,
+      "losses": 0.0,
+      "net": 344804.982782,
+      "relieved": 0.0,
+      "tax": 82033.2,
+      "taxable": 341804.982782,
+      "year": "2026/27"
+     }
+    ]
+   }
+  },
+  "annual_return": 0.1708265667924409,
+  "annual_volatility": 0.0617929613691351,
+  "cash_acquisition_events": 0,
+  "cash_acquisition_exits": 0,
+  "delisting_events": 0,
+  "delisting_exits": 0,
+  "delisting_loss": 0.0,
+  "delisting_return": -0.3,
+  "fees_fraction": 0.00821462,
+  "fees_paid": 8214.62,
+  "final_value": 1483308.2790030004,
+  "gross_return": 0.4915228990030005,
+  "halt_events": 0,
+  "max_drawdown": -0.034820537837494614,
+  "monthly": [
+   {
+    "as_of": "2024-01-31",
+    "benchmark": 0.003554053480630426,
+    "fees": 1031.57,
+    "gross": 0.007220779735000127,
+    "net": 0.006189209735000256
+   },
+   {
+    "as_of": "2024-02-29",
+    "benchmark": 0.007161587906021616,
+    "fees": 0.0,
+    "gross": 0.00528469312884039,
+    "net": 0.00528469312884039
+   },
+   {
+    "as_of": "2024-03-28",
+    "benchmark": 0.001725411118810083,
+    "fees": 0.0,
+    "gross": 0.009722072825486094,
+    "net": 0.009722072825486094
+   },
+   {
+    "as_of": "2024-04-30",
+    "benchmark": -0.005107030830686643,
+    "fees": 330.33000000000004,
+    "gross": -0.017804031923194574,
+    "net": -0.01812745979394159
+   },
+   {
+    "as_of": "2024-05-31",
+    "benchmark": -0.011781163492204039,
+    "fees": 412.28999999999996,
+    "gross": 0.03234459250251187,
+    "net": 0.03193346444991563
+   },
+   {
+    "as_of": "2024-06-28",
+    "benchmark": -0.004666892868593231,
+    "fees": 0.0,
+    "gross": 0.006202562299904457,
+    "net": 0.006202562299904457
+   },
+   {
+    "as_of": "2024-07-31",
+    "benchmark": 0.004301652501401909,
+    "fees": 384.21000000000004,
+    "gross": -0.0142110864028836,
+    "net": -0.014580068979175298
+   },
+   {
+    "as_of": "2024-08-30",
+    "benchmark": -0.011182517581887041,
+    "fees": 0.0,
+    "gross": -0.02053994263882153,
+    "net": -0.02053994263882153
+   },
+   {
+    "as_of": "2024-09-30",
+    "benchmark": 0.0007809493698882619,
+    "fees": 0.0,
+    "gross": 0.02788098860005639,
+    "net": 0.02788098860005639
+   },
+   {
+    "as_of": "2024-10-31",
+    "benchmark": 0.0011544828263028162,
+    "fees": 0.0,
+    "gross": 0.038333861423148985,
+    "net": 0.038333861423148985
+   },
+   {
+    "as_of": "2024-11-29",
+    "benchmark": -0.008518906345713284,
+    "fees": 0.0,
+    "gross": 0.018999836034464312,
+    "net": 0.018999836034464312
+   },
+   {
+    "as_of": "2024-12-31",
+    "benchmark": -0.0027670920243717534,
+    "fees": 0.0,
+    "gross": 0.02893148561890535,
+    "net": 0.02893148561890535
+   },
+   {
+    "as_of": "2025-01-31",
+    "benchmark": -0.008131381805595472,
+    "fees": 0.0,
+    "gross": 0.018821076413883198,
+    "net": 0.018821076413883198
+   },
+   {
+    "as_of": "2025-02-28",
+    "benchmark": 0.005209599291162492,
+    "fees": 0.0,
+    "gross": -0.009736656185901249,
+    "net": -0.009736656185901249
+   },
+   {
+    "as_of": "2025-03-31",
+    "benchmark": -0.0019092324369858193,
+    "fees": 525.98,
+    "gross": 0.025442166402136923,
+    "net": 0.024978602822776752
+   },
+   {
+    "as_of": "2025-04-30",
+    "benchmark": -0.005558238165384588,
+    "fees": 1019.7900000000001,
+    "gross": 0.0422353665654871,
+    "net": 0.04135849492085164
+   },
+   {
+    "as_of": "2025-05-30",
+    "benchmark": 0.021086907197679805,
+    "fees": 644.85,
+    "gross": 0.0010384973402419728,
+    "net": 0.0005060413496700278
+   },
+   {
+    "as_of": "2025-06-30",
+    "benchmark": -0.005522887144842503,
+    "fees": 475.70000000000005,
+    "gross": 0.03335405274061087,
+    "net": 0.03296146344902784
+   },
+   {
+    "as_of": "2025-07-31",
+    "benchmark": -0.004815594429616432,
+    "fees": 0.0,
+    "gross": 0.021281048046618123,
+    "net": 0.021281048046618123
+   },
+   {
+    "as_of": "2025-08-29",
+    "benchmark": 0.014975858348200699,
+    "fees": 0.0,
+    "gross": -0.005787093472889415,
+    "net": -0.005787093472889415
+   },
+   {
+    "as_of": "2025-09-30",
+    "benchmark": -0.01175474932909748,
+    "fees": 655.3599999999999,
+    "gross": 0.02139017020489442,
+    "net": 0.020874494774740793
+   },
+   {
+    "as_of": "2025-10-31",
+    "benchmark": -0.014832528522198296,
+    "fees": 869.12,
+    "gross": -0.01593667307146418,
+    "net": -0.01660656369523683
+   },
+   {
+    "as_of": "2025-11-28",
+    "benchmark": -0.009981860748575655,
+    "fees": 0.0,
+    "gross": 0.004107786264971436,
+    "net": 0.004107786264971436
+   },
+   {
+    "as_of": "2025-12-31",
+    "benchmark": -0.005751127377549348,
+    "fees": 578.6800000000001,
+    "gross": 0.04309764355695789,
+    "net": 0.04264593846322473
+   },
+   {
+    "as_of": "2026-01-30",
+    "benchmark": 0.011824094825838571,
+    "fees": 0.0,
+    "gross": 0.018675601592660795,
+    "net": 0.018675601592660795
+   },
+   {
+    "as_of": "2026-02-27",
+    "benchmark": 0.0008126779742994028,
+    "fees": 0.0,
+    "gross": 0.024980563932604616,
+    "net": 0.024980563932604616
+   },
+   {
+    "as_of": "2026-03-31",
+    "benchmark": 0.0034637568347488656,
+    "fees": 634.9,
+    "gross": 0.012431385546112672,
+    "net": 0.011976152844739962
+   },
+   {
+    "as_of": "2026-04-30",
+    "benchmark": 0.005631203327940426,
+    "fees": 651.8399999999999,
+    "gross": 0.014806469971333946,
+    "net": 0.014344622198636525
+   },
+   {
+    "as_of": "2026-05-29",
+    "benchmark": 0.001804439497267163,
+    "fees": 0.0,
+    "gross": 0.025166711082524884,
+    "net": 0.025166711082524884
+   },
+   {
+    "as_of": "2026-06-30",
+    "benchmark": -0.00259576844217857,
+    "fees": 0.0,
+    "gross": 0.010669687820335172,
+    "net": 0.010669687820335172
+   }
+  ],
+  "months": 30,
+  "orders": 33,
+  "participation_max": 0.012863107602870107,
+  "participation_mean": 0.00800235356274203,
+  "sharpe": 2.7644987876850142,
+  "start_dates": [
+   {
+    "annual_return": 0.17569770642461457,
+    "annual_volatility": 0.06605773395718387,
+    "max_drawdown": -0.033723144686999995,
+    "months": 23,
+    "sharpe": 2.659759817654284,
+    "start": "2024-08-30",
+    "total_return": 0.3637456218799999
+   },
+   {
+    "annual_return": 0.2017822351081231,
+    "annual_volatility": 0.056464518308893145,
+    "max_drawdown": -0.015318471849490978,
+    "months": 15,
+    "sharpe": 3.5736112013611643,
+    "start": "2025-04-30",
+    "total_return": 0.25829428735000026
+   },
+   {
+    "annual_return": 0.2338009427850165,
+    "annual_volatility": 0.04558281742307004,
+    "max_drawdown": 0.0,
+    "months": 8,
+    "sharpe": 5.129146375815877,
+    "start": "2025-11-28",
+    "total_return": 0.150350181049
+   }
+  ],
+  "stock_merger_events": 0,
+  "stock_merger_exits": 0,
+  "total_return": 0.48330827900300033,
+  "trimmed": 11,
+  "turnover": 0.2047460252748967,
+  "unfilled": 0
+ },
+ "replay": [
+  {
+   "after_tax": {
+    "annual_exempt_amount": 3000.0,
+    "approximate": true,
+    "basis": "approximate: UK capital gains tax at the higher rate on realised gains, in USD, as a diagnostic of what the turnover costs after tax; it certifies nothing and no gate reads it",
+    "benchmark": "SPY",
+    "buy_and_hold": {
+     "after_tax_final_value": 968123.1776,
+     "after_tax_return": -0.0318768224,
+     "disposals": 1,
+     "final_value": 968123.1776,
+     "loss_carried_forward": 31876.824832,
+     "realised_gains": 0.0,
+     "realised_losses": 31876.824832,
+     "shares": 47464,
+     "tax": 0.0,
+     "taxable_gains": 0.0,
+     "total_return": -0.0318768224,
+     "years": [
+      {
+       "carried": 31876.824832,
+       "disposals": 1,
+       "exempt": 0.0,
+       "gains": 0.0,
+       "losses": 31876.824832,
+       "net": -31876.824832,
+       "relieved": 0.0,
+       "tax": 0.0,
+       "taxable": 0.0,
+       "year": "2026/27"
+      }
+     ]
+    },
+    "rate": 0.24,
+    "simplifications": [
+     "the arithmetic is in USD: gains are not converted to GBP at each trade's date, so the allowance and the rate are applied to dollars as if they were pounds, and the currency gain the exchange rate adds or takes away is not taxed",
+     "each name's cost basis is one Section 104 average-cost pool; HMRC's same-day and thirty-day matching rules are not applied, so a name sold and bought back within a month is pooled here where HMRC would match the two",
+     "every gain above the allowance is taxed at 24%, with no basic-rate band and no other income, gains, losses or reliefs of the operator's in the calculation",
+     "the 24% rate and the GBP 3,000 allowance are held constant across every tax year, where both have changed repeatedly and will change again",
+     "the whole allowance is assumed free for this account and claimed in the year it falls; a carried-forward loss is assumed claimed in time and relieves only gains above the allowance, which is the order that wastes the least relief",
+     "positions still open at the end are treated as disposed of at the final session's close with no dealing cost, so the bill covers the whole run and the buy-and-hold comparison is like for like",
+     "dividends, the tax on them and the withholding on US dividends are outside this view, as they are outside the backtest"
+    ],
+    "strategy": {
+     "after_tax_final_value": 1103099.774913,
+     "after_tax_return": 0.103099774913,
+     "disposals": 82,
+     "final_value": 1133762.854913,
+     "loss_carried_forward": 0.0,
+     "realised_gains": 641151.196,
+     "realised_losses": 507388.350446,
+     "tax": 30663.08,
+     "taxable_gains": 127762.845554,
+     "total_return": 0.133762854913,
+     "years": [
+      {
+       "carried": 15805.253972,
+       "disposals": 7,
+       "exempt": 0.0,
+       "gains": 23167.024132,
+       "losses": 38972.278104,
+       "net": -15805.253972,
+       "relieved": 0.0,
+       "tax": 0.0,
+       "taxable": 0.0,
+       "year": "2023/24"
+      },
+      {
+       "carried": 87250.803863,
+       "disposals": 30,
+       "exempt": 0.0,
+       "gains": 173918.828807,
+       "losses": 245364.378698,
+       "net": -71445.549891,
+       "relieved": 0.0,
+       "tax": 0.0,
+       "taxable": 0.0,
+       "year": "2024/25"
+      },
+      {
+       "carried": 0.0,
+       "disposals": 33,
+       "exempt": 3000.0,
+       "gains": 293473.916524,
+       "losses": 188860.86859,
+       "net": 104613.047934,
+       "relieved": 87250.803863,
+       "tax": 3446.94,
+       "taxable": 14362.244071,
+       "year": "2025/26"
+      },
+      {
+       "carried": 0.0,
+       "disposals": 12,
+       "exempt": 3000.0,
+       "gains": 150591.426537,
+       "losses": 34190.825054,
+       "net": 116400.601483,
+       "relieved": 0.0,
+       "tax": 27216.14,
+       "taxable": 113400.601483,
+       "year": "2026/27"
+      }
+     ]
+    }
+   },
+   "annual_return": 0.05149906222357137,
+   "annual_volatility": 0.09496823785873704,
+   "cash_acquisition_events": 0,
+   "cash_acquisition_exits": 0,
+   "delisting_events": 0,
+   "delisting_exits": 0,
+   "delisting_loss": 0.0,
+   "delisting_return": -0.3,
+   "fees_fraction": 0.10261445,
+   "fees_paid": 102614.45,
+   "final_value": 1133762.854913,
+   "gross_return": 0.23637730491300002,
+   "halt_events": 0,
+   "max_drawdown": -0.15918238620445158,
+   "monthly": [
+    {
+     "as_of": "2024-01-31",
+     "benchmark": 0.003554053480630426,
+     "fees": 8162.77,
+     "gross": 0.018440921832999946,
+     "net": 0.01027815183299996
+    },
+    {
+     "as_of": "2024-02-29",
+     "benchmark": 0.007161587906021616,
+     "fees": 3684.09,
+     "gross": -0.032031395090833636,
+     "net": -0.03567800468376181
+    },
+    {
+     "as_of": "2024-03-28",
+     "benchmark": 0.001725411118810083,
+     "fees": 2446.45,
+     "gross": -0.015050422762986626,
+     "net": -0.017561576549664615
+    },
+    {
+     "as_of": "2024-04-30",
+     "benchmark": -0.005107030830686643,
+     "fees": 3707.2200000000003,
+     "gross": 0.03543780549911313,
+     "net": 0.031564515753384814
+    },
+    {
+     "as_of": "2024-05-31",
+     "benchmark": -0.011781163492204039,
+     "fees": 5450.33,
+     "gross": -0.027773477485938836,
+     "net": -0.03329371838244921
+    },
+    {
+     "as_of": "2024-06-28",
+     "benchmark": -0.004666892868593231,
+     "fees": 3603.1,
+     "gross": -0.017463694626008275,
+     "net": -0.02123869506982967
+    },
+    {
+     "as_of": "2024-07-31",
+     "benchmark": 0.004301652501401909,
+     "fees": 3287.7999999999997,
+     "gross": -0.04717260007348445,
+     "net": -0.05069200543411834
+    },
+    {
+     "as_of": "2024-08-30",
+     "benchmark": -0.011182517581887041,
+     "fees": 2019.49,
+     "gross": -0.03986835857063453,
+     "net": -0.04214554438006468
+    },
+    {
+     "as_of": "2024-09-30",
+     "benchmark": 0.0007809493698882619,
+     "fees": 1074.3,
+     "gross": 0.006085769915449957,
+     "net": 0.00482108361614908
+    },
+    {
+     "as_of": "2024-10-31",
+     "benchmark": 0.0011544828263028162,
+     "fees": 3386.0,
+     "gross": 0.012411370040859238,
+     "net": 0.008444431676603026
+    },
+    {
+     "as_of": "2024-11-29",
+     "benchmark": -0.008518906345713284,
+     "fees": 3139.81,
+     "gross": 0.05977933784395639,
+     "net": 0.05613163127732479
+    },
+    {
+     "as_of": "2024-12-31",
+     "benchmark": -0.0027670920243717534,
+     "fees": 2308.44,
+     "gross": -0.016371723653162085,
+     "net": -0.01891104151604006
+    },
+    {
+     "as_of": "2025-01-31",
+     "benchmark": -0.008131381805595472,
+     "fees": 1762.08,
+     "gross": 0.006746899839453979,
+     "net": 0.004771223901534505
+    },
+    {
+     "as_of": "2025-02-28",
+     "benchmark": 0.005209599291162492,
+     "fees": 2421.3,
+     "gross": 0.03588615084059277,
+     "net": 0.03318423696221995
+    },
+    {
+     "as_of": "2025-03-31",
+     "benchmark": -0.0019092324369858193,
+     "fees": 2534.6499999999996,
+     "gross": -0.0005509583476784874,
+     "net": -0.0032885150677055552
+    },
+    {
+     "as_of": "2025-04-30",
+     "benchmark": -0.005558238165384588,
+     "fees": 4149.0,
+     "gross": -0.001797185083289965,
+     "net": -0.006293110526736201
+    },
+    {
+     "as_of": "2025-05-30",
+     "benchmark": 0.021086907197679805,
+     "fees": 5476.45,
+     "gross": 0.013014249165809844,
+     "net": 0.007042294642412017
+    },
+    {
+     "as_of": "2025-06-30",
+     "benchmark": -0.005522887144842503,
+     "fees": 2321.24,
+     "gross": 0.020696341700696674,
+     "net": 0.018182779134214178
+    },
+    {
+     "as_of": "2025-07-31",
+     "benchmark": -0.004815594429616432,
+     "fees": 3578.8000000000006,
+     "gross": 0.05647173404865513,
+     "net": 0.05266562405029074
+    },
+    {
+     "as_of": "2025-08-29",
+     "benchmark": 0.014975858348200699,
+     "fees": 2803.69,
+     "gross": -0.02187494864687234,
+     "net": -0.02470753695752481
+    },
+    {
+     "as_of": "2025-09-30",
+     "benchmark": -0.01175474932909748,
+     "fees": 4038.88,
+     "gross": 0.028567479932723128,
+     "net": 0.024383596772307836
+    },
+    {
+     "as_of": "2025-10-31",
+     "benchmark": -0.014832528522198296,
+     "fees": 2345.66,
+     "gross": 0.021118951988051693,
+     "net": 0.018746917253202433
+    },
+    {
+     "as_of": "2025-11-28",
+     "benchmark": -0.009981860748575655,
+     "fees": 4147.13,
+     "gross": 0.02265576992097018,
+     "net": 0.01853918267513821
+    },
+    {
+     "as_of": "2025-12-31",
+     "benchmark": -0.005751127377549348,
+     "fees": 3244.0699999999997,
+     "gross": 0.0066522809127396165,
+     "net": 0.003490715652796794
+    },
+    {
+     "as_of": "2026-01-30",
+     "benchmark": 0.011824094825838571,
+     "fees": 4860.16,
+     "gross": 0.008944028381498548,
+     "net": 0.0042239507443906366
+    },
+    {
+     "as_of": "2026-02-27",
+     "benchmark": 0.0008126779742994028,
+     "fees": 5548.860000000001,
+     "gross": -0.013176233543480853,
+     "net": -0.018542494247080876
+    },
+    {
+     "as_of": "2026-03-31",
+     "benchmark": 0.0034637568347488656,
+     "fees": 3654.77,
+     "gross": 0.022004670560318296,
+     "net": 0.018403393364891274
+    },
+    {
+     "as_of": "2026-04-30",
+     "benchmark": 0.005631203327940426,
+     "fees": 2948.28,
+     "gross": 0.03535573770040856,
+     "net": 0.03250310807494139
+    },
+    {
+     "as_of": "2026-05-29",
+     "benchmark": 0.001804439497267163,
+     "fees": 4509.63,
+     "gross": 0.04787123775709334,
+     "net": 0.04364526974792393
+    },
+    {
+     "as_of": "2026-06-30",
+     "benchmark": -0.00259576844217857,
+     "fees": 0.0,
+     "gross": 0.018016013056298963,
+     "net": 0.018016013056298963
+    }
+   ],
+   "months": 30,
+   "orders": 160,
+   "participation_max": 0.04463219814412986,
+   "participation_mean": 0.012867742152130726,
+   "path": "0",
+   "sharpe": 0.5422766957114122,
+   "stock_merger_events": 0,
+   "stock_merger_exits": 0,
+   "total_return": 0.1337628549130001,
+   "trimmed": 14,
+   "turnover": 1.3245158239077948,
+   "unfilled": 0
+  },
+  {
+   "after_tax": {
+    "annual_exempt_amount": 3000.0,
+    "approximate": true,
+    "basis": "approximate: UK capital gains tax at the higher rate on realised gains, in USD, as a diagnostic of what the turnover costs after tax; it certifies nothing and no gate reads it",
+    "benchmark": "SPY",
+    "buy_and_hold": {
+     "after_tax_final_value": 968123.1776,
+     "after_tax_return": -0.0318768224,
+     "disposals": 1,
+     "final_value": 968123.1776,
+     "loss_carried_forward": 31876.824832,
+     "realised_gains": 0.0,
+     "realised_losses": 31876.824832,
+     "shares": 47464,
+     "tax": 0.0,
+     "taxable_gains": 0.0,
+     "total_return": -0.0318768224,
+     "years": [
+      {
+       "carried": 31876.824832,
+       "disposals": 1,
+       "exempt": 0.0,
+       "gains": 0.0,
+       "losses": 31876.824832,
+       "net": -31876.824832,
+       "relieved": 0.0,
+       "tax": 0.0,
+       "taxable": 0.0,
+       "year": "2026/27"
+      }
+     ]
+    },
+    "rate": 0.24,
+    "simplifications": [
+     "the arithmetic is in USD: gains are not converted to GBP at each trade's date, so the allowance and the rate are applied to dollars as if they were pounds, and the currency gain the exchange rate adds or takes away is not taxed",
+     "each name's cost basis is one Section 104 average-cost pool; HMRC's same-day and thirty-day matching rules are not applied, so a name sold and bought back within a month is pooled here where HMRC would match the two",
+     "every gain above the allowance is taxed at 24%, with no basic-rate band and no other income, gains, losses or reliefs of the operator's in the calculation",
+     "the 24% rate and the GBP 3,000 allowance are held constant across every tax year, where both have changed repeatedly and will change again",
+     "the whole allowance is assumed free for this account and claimed in the year it falls; a carried-forward loss is assumed claimed in time and relieves only gains above the allowance, which is the order that wastes the least relief",
+     "positions still open at the end are treated as disposed of at the final session's close with no dealing cost, so the bill covers the whole run and the buy-and-hold comparison is like for like",
+     "dividends, the tax on them and the withholding on US dividends are outside this view, as they are outside the backtest"
+    ],
+    "strategy": {
+     "after_tax_final_value": 1069921.2786070001,
+     "after_tax_return": 0.0699212786070002,
+     "disposals": 85,
+     "final_value": 1089159.5786070002,
+     "loss_carried_forward": 0.0,
+     "realised_gains": 534907.633368,
+     "realised_losses": 445748.05101,
+     "tax": 19238.3,
+     "taxable_gains": 80159.582358,
+     "total_return": 0.0891595786070002,
+     "years": [
+      {
+       "carried": 0.0,
+       "disposals": 5,
+       "exempt": 3000.0,
+       "gains": 28212.759539,
+       "losses": 1299.313836,
+       "net": 26913.445703,
+       "relieved": 0.0,
+       "tax": 5739.23,
+       "taxable": 23913.445703,
+       "year": "2023/24"
+      },
+      {
+       "carried": 0.0,
+       "disposals": 32,
+       "exempt": 3000.0,
+       "gains": 249210.830398,
+       "losses": 196786.280163,
+       "net": 52424.550235,
+       "relieved": 0.0,
+       "tax": 11861.89,
+       "taxable": 49424.550235,
+       "year": "2024/25"
+      },
+      {
+       "carried": 2387.576513,
+       "disposals": 35,
+       "exempt": 0.0,
+       "gains": 196554.122833,
+       "losses": 198941.699346,
+       "net": -2387.576513,
+       "relieved": 0.0,
+       "tax": 0.0,
+       "taxable": 0.0,
+       "year": "2025/26"
+      },
+      {
+       "carried": 0.0,
+       "disposals": 13,
+       "exempt": 3000.0,
+       "gains": 60929.920598,
+       "losses": 48720.757665,
+       "net": 12209.162933,
+       "relieved": 2387.576513,
+       "tax": 1637.18,
+       "taxable": 6821.58642,
+       "year": "2026/27"
+      }
+     ]
+    }
+   },
+   "annual_return": 0.034752790073773854,
+   "annual_volatility": 0.08507534367502897,
+   "cash_acquisition_events": 0,
+   "cash_acquisition_exits": 0,
+   "delisting_events": 0,
+   "delisting_exits": 0,
+   "delisting_loss": 0.0,
+   "delisting_return": -0.3,
+   "fees_fraction": 0.12115530000000001,
+   "fees_paid": 121155.3,
+   "final_value": 1089159.5786070002,
+   "gross_return": 0.21031487860700016,
+   "halt_events": 0,
+   "max_drawdown": -0.07007718962650289,
+   "monthly": [
+    {
+     "as_of": "2024-01-31",
+     "benchmark": 0.003554053480630426,
+     "fees": 6641.76,
+     "gross": 0.036631157413999915,
+     "net": 0.029989397413999974
+    },
+    {
+     "as_of": "2024-02-29",
+     "benchmark": 0.007161587906021616,
+     "fees": 2786.23,
+     "gross": -0.0052580221928471005,
+     "net": -0.007963127708491613
+    },
+    {
+     "as_of": "2024-03-28",
+     "benchmark": 0.001725411118810083,
+     "fees": 2547.62,
+     "gross": 0.004391311255341757,
+     "net": 0.0018980138730837481
+    },
+    {
+     "as_of": "2024-04-30",
+     "benchmark": -0.005107030830686643,
+     "fees": 2840.2799999999997,
+     "gross": 0.04917418065778123,
+     "net": 0.04639972957877192
+    },
+    {
+     "as_of": "2024-05-31",
+     "benchmark": -0.011781163492204039,
+     "fees": 5896.870000000001,
+     "gross": 0.013564141874494062,
+     "net": 0.00805936334937174
+    },
+    {
+     "as_of": "2024-06-28",
+     "benchmark": -0.004666892868593231,
+     "fees": 2536.7,
+     "gross": -0.02262074407461323,
+     "net": -0.024969842955576138
+    },
+    {
+     "as_of": "2024-07-31",
+     "benchmark": 0.004301652501401909,
+     "fees": 4389.209999999999,
+     "gross": -0.02840575105386023,
+     "net": -0.03257444969482515
+    },
+    {
+     "as_of": "2024-08-30",
+     "benchmark": -0.011182517581887041,
+     "fees": 4164.43,
+     "gross": 0.005169999180418605,
+     "net": 0.001081610718632442
+    },
+    {
+     "as_of": "2024-09-30",
+     "benchmark": 0.0007809493698882619,
+     "fees": 3973.7200000000003,
+     "gross": -0.0032496890138511425,
+     "net": -0.007146634818215758
+    },
+    {
+     "as_of": "2024-10-31",
+     "benchmark": 0.0011544828263028162,
+     "fees": 4006.67,
+     "gross": 0.048382525164042844,
+     "net": 0.044424982860017836
+    },
+    {
+     "as_of": "2024-11-29",
+     "benchmark": -0.008518906345713284,
+     "fees": 3056.13,
+     "gross": 0.032318152660115285,
+     "net": 0.029427894978766966
+    },
+    {
+     "as_of": "2024-12-31",
+     "benchmark": -0.0027670920243717534,
+     "fees": 3189.81,
+     "gross": -0.0013393812071592626,
+     "net": -0.004269826531516863
+    },
+    {
+     "as_of": "2025-01-31",
+     "benchmark": -0.008131381805595472,
+     "fees": 4625.57,
+     "gross": -0.013399376265464391,
+     "net": -0.017667061669411233
+    },
+    {
+     "as_of": "2025-02-28",
+     "benchmark": 0.005209599291162492,
+     "fees": 4659.5,
+     "gross": 0.016305977625206136,
+     "net": 0.011929670936342562
+    },
+    {
+     "as_of": "2025-03-31",
+     "benchmark": -0.0019092324369858193,
+     "fees": 3165.2,
+     "gross": 0.016531056325448823,
+     "net": 0.013593276389901376
+    },
+    {
+     "as_of": "2025-04-30",
+     "benchmark": -0.005558238165384588,
+     "fees": 5615.799999999999,
+     "gross": -0.024048980468032277,
+     "net": -0.029191382359255225
+    },
+    {
+     "as_of": "2025-05-30",
+     "benchmark": 0.021086907197679805,
+     "fees": 1206.6,
+     "gross": 0.028775565091886834,
+     "net": 0.02763745550811003
+    },
+    {
+     "as_of": "2025-06-30",
+     "benchmark": -0.005522887144842503,
+     "fees": 4522.150000000001,
+     "gross": 0.01418621834842515,
+     "net": 0.010035475787915304
+    },
+    {
+     "as_of": "2025-07-31",
+     "benchmark": -0.004815594429616432,
+     "fees": 5520.54,
+     "gross": 0.016475143252490998,
+     "net": 0.01145835503906345
+    },
+    {
+     "as_of": "2025-08-29",
+     "benchmark": 0.014975858348200699,
+     "fees": 2774.78,
+     "gross": -0.02896118742348086,
+     "net": -0.03145420164403678
+    },
+    {
+     "as_of": "2025-09-30",
+     "benchmark": -0.01175474932909748,
+     "fees": 7239.759999999999,
+     "gross": 0.030703978181355396,
+     "net": 0.023988140231564037
+    },
+    {
+     "as_of": "2025-10-31",
+     "benchmark": -0.014832528522198296,
+     "fees": 7298.969999999999,
+     "gross": -0.0155609596204348,
+     "net": -0.02217310952196272
+    },
+    {
+     "as_of": "2025-11-28",
+     "benchmark": -0.009981860748575655,
+     "fees": 3173.13,
+     "gross": -0.024006249125079537,
+     "net": -0.026945976123011417
+    },
+    {
+     "as_of": "2025-12-31",
+     "benchmark": -0.005751127377549348,
+     "fees": 4173.93,
+     "gross": 0.00874066086334424,
+     "net": 0.004766665608372467
+    },
+    {
+     "as_of": "2026-01-30",
+     "benchmark": 0.011824094825838571,
+     "fees": 3723.74,
+     "gross": 0.0075938863004858526,
+     "net": 0.004065335986653595
+    },
+    {
+     "as_of": "2026-02-27",
+     "benchmark": 0.0008126779742994028,
+     "fees": 4854.42,
+     "gross": -0.00026873417687656165,
+     "net": -0.004850072227964075
+    },
+    {
+     "as_of": "2026-03-31",
+     "benchmark": 0.0034637568347488656,
+     "fees": 2307.87,
+     "gross": 0.03115260057959479,
+     "net": 0.028963943019873373
+    },
+    {
+     "as_of": "2026-04-30",
+     "benchmark": 0.005631203327940426,
+     "fees": 4061.32,
+     "gross": -0.02233018664488584,
+     "net": -0.026073304730061087
+    },
+    {
+     "as_of": "2026-05-29",
+     "benchmark": 0.001804439497267163,
+     "fees": 6202.59,
+     "gross": -0.014661216588386039,
+     "net": -0.020530878987321644
+    },
+    {
+     "as_of": "2026-06-30",
+     "benchmark": -0.00259576844217857,
+     "fees": 0.0,
+     "gross": 0.05230301494980227,
+     "net": 0.05230301494980227
+    }
+   ],
+   "months": 30,
+   "orders": 166,
+   "participation_max": 0.04519583353334064,
+   "participation_mean": 0.014210898220612457,
+   "path": "1",
+   "sharpe": 0.408494266053425,
+   "stock_merger_events": 0,
+   "stock_merger_exits": 0,
+   "total_return": 0.08915957860700008,
+   "trimmed": 19,
+   "turnover": 1.3803603845239063,
+   "unfilled": 0
+  },
+  {
+   "after_tax": {
+    "annual_exempt_amount": 3000.0,
+    "approximate": true,
+    "basis": "approximate: UK capital gains tax at the higher rate on realised gains, in USD, as a diagnostic of what the turnover costs after tax; it certifies nothing and no gate reads it",
+    "benchmark": "SPY",
+    "buy_and_hold": {
+     "after_tax_final_value": 968123.1776,
+     "after_tax_return": -0.0318768224,
+     "disposals": 1,
+     "final_value": 968123.1776,
+     "loss_carried_forward": 31876.824832,
+     "realised_gains": 0.0,
+     "realised_losses": 31876.824832,
+     "shares": 47464,
+     "tax": 0.0,
+     "taxable_gains": 0.0,
+     "total_return": -0.0318768224,
+     "years": [
+      {
+       "carried": 31876.824832,
+       "disposals": 1,
+       "exempt": 0.0,
+       "gains": 0.0,
+       "losses": 31876.824832,
+       "net": -31876.824832,
+       "relieved": 0.0,
+       "tax": 0.0,
+       "taxable": 0.0,
+       "year": "2026/27"
+      }
+     ]
+    },
+    "rate": 0.24,
+    "simplifications": [
+     "the arithmetic is in USD: gains are not converted to GBP at each trade's date, so the allowance and the rate are applied to dollars as if they were pounds, and the currency gain the exchange rate adds or takes away is not taxed",
+     "each name's cost basis is one Section 104 average-cost pool; HMRC's same-day and thirty-day matching rules are not applied, so a name sold and bought back within a month is pooled here where HMRC would match the two",
+     "every gain above the allowance is taxed at 24%, with no basic-rate band and no other income, gains, losses or reliefs of the operator's in the calculation",
+     "the 24% rate and the GBP 3,000 allowance are held constant across every tax year, where both have changed repeatedly and will change again",
+     "the whole allowance is assumed free for this account and claimed in the year it falls; a carried-forward loss is assumed claimed in time and relieves only gains above the allowance, which is the order that wastes the least relief",
+     "positions still open at the end are treated as disposed of at the final session's close with no dealing cost, so the bill covers the whole run and the buy-and-hold comparison is like for like",
+     "dividends, the tax on them and the withholding on US dividends are outside this view, as they are outside the backtest"
+    ],
+    "strategy": {
+     "after_tax_final_value": 963708.7265229995,
+     "after_tax_return": -0.0362912734770005,
+     "disposals": 90,
+     "final_value": 963708.7265229995,
+     "loss_carried_forward": 42291.291388,
+     "realised_gains": 437472.376414,
+     "realised_losses": 473763.667802,
+     "tax": 0.0,
+     "taxable_gains": 0.0,
+     "total_return": -0.0362912734770005,
+     "years": [
+      {
+       "carried": 26179.067307,
+       "disposals": 6,
+       "exempt": 0.0,
+       "gains": 7122.579833,
+       "losses": 33301.64714,
+       "net": -26179.067307,
+       "relieved": 0.0,
+       "tax": 0.0,
+       "taxable": 0.0,
+       "year": "2023/24"
+      },
+      {
+       "carried": 138768.763119,
+       "disposals": 33,
+       "exempt": 0.0,
+       "gains": 119381.646371,
+       "losses": 231971.342183,
+       "net": -112589.695812,
+       "relieved": 0.0,
+       "tax": 0.0,
+       "taxable": 0.0,
+       "year": "2024/25"
+      },
+      {
+       "carried": 80644.995285,
+       "disposals": 39,
+       "exempt": 3000.0,
+       "gains": 225572.966564,
+       "losses": 164449.19873,
+       "net": 61123.767834,
+       "relieved": 58123.767834,
+       "tax": 0.0,
+       "taxable": 0.0,
+       "year": "2025/26"
+      },
+      {
+       "carried": 42291.291388,
+       "disposals": 12,
+       "exempt": 3000.0,
+       "gains": 85395.183646,
+       "losses": 44041.479749,
+       "net": 41353.703897,
+       "relieved": 38353.703897,
+       "tax": 0.0,
+       "taxable": 0.0,
+       "year": "2026/27"
+      }
+     ]
+    }
+   },
+   "annual_return": -0.01467768932514324,
+   "annual_volatility": 0.07600380876267948,
+   "cash_acquisition_events": 0,
+   "cash_acquisition_exits": 0,
+   "delisting_events": 0,
+   "delisting_exits": 0,
+   "delisting_loss": 0.0,
+   "delisting_return": -0.3,
+   "fees_fraction": 0.10483696,
+   "fees_paid": 104836.96,
+   "final_value": 963708.7265229995,
+   "gross_return": 0.06854568652299964,
+   "halt_events": 0,
+   "max_drawdown": -0.1410702939830003,
+   "monthly": [
+    {
+     "as_of": "2024-01-31",
+     "benchmark": 0.003554053480630426,
+     "fees": 7732.950000000001,
+     "gross": -0.007807142750000162,
+     "net": -0.015540092750000123
+    },
+    {
+     "as_of": "2024-02-29",
+     "benchmark": 0.007161587906021616,
+     "fees": 2327.85,
+     "gross": -0.045624777973404695,
+     "net": -0.04798937401521064
+    },
+    {
+     "as_of": "2024-03-28",
+     "benchmark": 0.001725411118810083,
+     "fees": 3896.4700000000003,
+     "gross": 0.03277372489669883,
+     "net": 0.02861623208427111
+    },
+    {
+     "as_of": "2024-04-30",
+     "benchmark": -0.005107030830686643,
+     "fees": 3619.0,
+     "gross": -0.011868176544972409,
+     "net": -0.01562218615386024
+    },
+    {
+     "as_of": "2024-05-31",
+     "benchmark": -0.011781163492204039,
+     "fees": 2630.33,
+     "gross": 0.016949732000823836,
+     "net": 0.014177974584680175
+    },
+    {
+     "as_of": "2024-06-28",
+     "benchmark": -0.004666892868593231,
+     "fees": 5151.990000000001,
+     "gross": -0.02627431817550885,
+     "net": -0.03162742384994677
+    },
+    {
+     "as_of": "2024-07-31",
+     "benchmark": 0.004301652501401909,
+     "fees": 3261.03,
+     "gross": -0.0521017606731774,
+     "net": -0.05560075402726594
+    },
+    {
+     "as_of": "2024-08-30",
+     "benchmark": -0.011182517581887041,
+     "fees": 2393.77,
+     "gross": 0.0010119095769809405,
+     "net": -0.0017077535405980449
+    },
+    {
+     "as_of": "2024-09-30",
+     "benchmark": 0.0007809493698882619,
+     "fees": 2326.81,
+     "gross": 0.007073864717420664,
+     "net": 0.004425755363526074
+    },
+    {
+     "as_of": "2024-10-31",
+     "benchmark": 0.0011544828263028162,
+     "fees": 2182.21,
+     "gross": -0.015192774223229177,
+     "net": -0.017665373256138595
+    },
+    {
+     "as_of": "2024-11-29",
+     "benchmark": -0.008518906345713284,
+     "fees": 2249.21,
+     "gross": 0.0009018030656366971,
+     "net": -0.0016925417997718517
+    },
+    {
+     "as_of": "2024-12-31",
+     "benchmark": -0.0027670920243717534,
+     "fees": 3422.7,
+     "gross": 0.023270324964553835,
+     "net": 0.019315728081962913
+    },
+    {
+     "as_of": "2025-01-31",
+     "benchmark": -0.008131381805595472,
+     "fees": 3489.54,
+     "gross": -0.02209666650093578,
+     "net": -0.02605208864265307
+    },
+    {
+     "as_of": "2025-02-28",
+     "benchmark": 0.005209599291162492,
+     "fees": 4834.21,
+     "gross": 0.005272925562950448,
+     "net": -0.0003532650423421213
+    },
+    {
+     "as_of": "2025-03-31",
+     "benchmark": -0.0019092324369858193,
+     "fees": 1177.28,
+     "gross": 0.010642434742871965,
+     "net": 0.009271798715554613
+    },
+    {
+     "as_of": "2025-04-30",
+     "benchmark": -0.005558238165384588,
+     "fees": 4720.56,
+     "gross": 0.010787610739097842,
+     "net": 0.005342236145664092
+    },
+    {
+     "as_of": "2025-05-30",
+     "benchmark": 0.021086907197679805,
+     "fees": 4747.110000000001,
+     "gross": 0.00856868122302723,
+     "net": 0.003121778670865716
+    },
+    {
+     "as_of": "2025-06-30",
+     "benchmark": -0.005522887144842503,
+     "fees": 3335.9900000000002,
+     "gross": 0.021665101196138847,
+     "net": 0.017849250347336643
+    },
+    {
+     "as_of": "2025-07-31",
+     "benchmark": -0.004815594429616432,
+     "fees": 3523.12,
+     "gross": 0.00037001731173114116,
+     "net": -0.0035892117218475628
+    },
+    {
+     "as_of": "2025-08-29",
+     "benchmark": 0.014975858348200699,
+     "fees": 3234.3,
+     "gross": 0.021250830325546977,
+     "net": 0.017603080297717177
+    },
+    {
+     "as_of": "2025-09-30",
+     "benchmark": -0.01175474932909748,
+     "fees": 3421.09,
+     "gross": 0.02422830131584308,
+     "net": 0.020436628497129572
+    },
+    {
+     "as_of": "2025-10-31",
+     "benchmark": -0.014832528522198296,
+     "fees": 4425.13,
+     "gross": -0.004257587085287451,
+     "net": -0.009063837010170439
+    },
+    {
+     "as_of": "2025-11-28",
+     "benchmark": -0.009981860748575655,
+     "fees": 4851.16,
+     "gross": 0.04277156966384443,
+     "net": 0.03745440343769113
+    },
+    {
+     "as_of": "2025-12-31",
+     "benchmark": -0.005751127377549348,
+     "fees": 3725.17,
+     "gross": -0.021062026780260812,
+     "net": -0.02499763371586783
+    },
+    {
+     "as_of": "2026-01-30",
+     "benchmark": 0.011824094825838571,
+     "fees": 3074.99,
+     "gross": -0.017746211090379438,
+     "net": -0.021078200854002804
+    },
+    {
+     "as_of": "2026-02-27",
+     "benchmark": 0.0008126779742994028,
+     "fees": 4384.66,
+     "gross": 0.023040437627648735,
+     "net": 0.0181870176492287
+    },
+    {
+     "as_of": "2026-03-31",
+     "benchmark": 0.0034637568347488656,
+     "fees": 2614.44,
+     "gross": 0.011682676619937604,
+     "net": 0.008840421383981667
+    },
+    {
+     "as_of": "2026-04-30",
+     "benchmark": 0.005631203327940426,
+     "fees": 5340.290000000001,
+     "gross": 0.012136347865384645,
+     "net": 0.006381593877378355
+    },
+    {
+     "as_of": "2026-05-29",
+     "benchmark": 0.001804439497267163,
+     "fees": 2743.6,
+     "gross": 0.021188773867989896,
+     "net": 0.01825098872697062
+    },
+    {
+     "as_of": "2026-06-30",
+     "benchmark": -0.00259576844217857,
+     "fees": 0.0,
+     "gross": 0.013421670624935711,
+     "net": 0.013421670624935711
+    }
+   ],
+   "months": 30,
+   "orders": 176,
+   "participation_max": 0.038832040963515634,
+   "participation_mean": 0.0123627442429688,
+   "path": "2",
+   "sharpe": -0.19311781296348002,
+   "stock_merger_events": 0,
+   "stock_merger_exits": 0,
+   "total_return": -0.03629127347700056,
+   "trimmed": 16,
+   "turnover": 1.467322722534021,
+   "unfilled": 0
+  }
+ ],
+ "scan": {
+  "annual_return": 0.1689392301459398,
+  "annual_volatility": 0.06199805505334396,
+  "fees_fraction": 0.007724386307314082,
+  "fees_paid": 7724.386307314082,
+  "final_value": 1477337.8848217456,
+  "max_drawdown": -0.03458119664324433,
+  "months": 30,
+  "orders": 33,
+  "sharpe": 2.724911773451316,
+  "total_return": 0.47733788482174555
+ },
+ "scan_scores": {
+  "annual_return": 0.08306332674344041,
+  "annual_volatility": 0.09395135018241874,
+  "fees_fraction": 0.053806858040009044,
+  "fees_paid": 53806.85804000904,
+  "final_value": 1220772.187860276,
+  "max_drawdown": -0.1493988328893635,
+  "months": 30,
+  "orders": 160,
+  "sharpe": 0.8841099843925839,
+  "total_return": 0.2207721878602762
+ }
+}

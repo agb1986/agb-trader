@@ -6,9 +6,12 @@ be a second implementation of the strategy. The strategy here ranks each month's
 signal, exactly as `scan.ranking` does, and hands the ranking to `agb.rebalance.select`,
 `agb.rebalance.weights` and `agb.rebalance.orders`, the code the live basket runs, unchanged:
 the 20-buy, 30-hold buffer, the tie-breaks, the equal weights and the whole-share sizing all
-come from there. NautilusTrader has no cross-sectional abstraction of its own, so what the
-strategy adds is only the clock: it decides at the close of each month's signal session and
-trades at the close of the next session, as the live pipeline does.
+come from there. The one switch it sets is `top_up=False`: live buys a kept name back to its
+weight once it sits more than a point under it, and the backtest does not, because its results
+are the ones the promoted model was certified on and a top-up would change them.
+NautilusTrader has no cross-sectional abstraction of its own, so what the strategy adds is only
+the clock: it decides at the close of each month's signal session and trades at the close of
+the next session, as the live pipeline does.
 
     signal session L   `month.snapshot_date`: the ranking, the held names, the prints and the
                        liquidity are read from the bars through this session, and the plan is
@@ -85,7 +88,7 @@ Each backtest is a trial, like a scan: its options and its results append a row.
 import warnings
 from bisect import bisect_left, bisect_right
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
@@ -126,10 +129,11 @@ BENCHMARK = "SPY"
 # show, so an acquisition the corporate record does not hold is charged as a failure: a
 # conservative choice, made on purpose (issue #168).
 DELISTING_RETURN = -0.30
-MONTHS_PER_YEAR = 12
 LIQUIDITY_BARS = scan.LIQUIDITY_BARS
 # Decimal places of the adjusted prices the engine trades; split-adjusted closes run small.
 PRECISION = 6
+_EPOCH = date(1970, 1, 1)
+_NANOS_PER_DAY = 86_400 * 10**9
 # The session's bars are stamped at this UTC hour, after the New York close all year round.
 CLOSE_HOUR_UTC = 21
 # Calendar days of bars loaded before the first signal session, so the cost model has its
@@ -232,74 +236,44 @@ def run(
     reuses wrote; see `agb.research.cache`. The single-signal case is not cached: it is not
     what a certification runs, and its start-date sensitivity runs are not paths.
     """
-    frame = panel.frame
-    months = panel.months
-    if not months:
-        raise BacktestError("the panel has no months")
-    if scores is None and options.signal not in features.FEATURES:
-        raise BacktestError(f"{options.signal!r} is not a feature; pass scores for a model signal")
-    paths_of = isinstance(scores, Mapping)
-    if paths_of and not scores:
-        raise BacktestError("no paths to run")
-    # Checked before the lake is opened and before a ranking is built. A whole-run hit is the
-    # only hit that skips `_feed`, whose bar load is most of what a cached certification saves;
-    # a run that misses on one path still pays for the bars of every name any path ranks.
-    entry = (
-        backtest_key(
-            cache, panel, stage="run", options=asdict(options), scores=scores, forced=forced
-        )
-        if cache is not None and paths_of
-        else None
+    setup = _setup(
+        panel,
+        options,
+        scores,
+        stage="run",
+        cache=cache,
+        forced=forced,
+        usable=lambda held: standing(ledger, held.get("trial_id")),
     )
-    if entry is not None:
-        held = entry.read()
-        if held is not None and standing(ledger, held.get("trial_id")):
-            return Run(str(held["trial_id"]), held["results"])
-    keys = None
-    if paths_of:
-        runs = {str(label): rankings(frame, options, series) for label, series in scores.items()}
-        if cache is not None:
-            keys = path_keys(cache, panel, options=asdict(options), scores=scores, forced=forced)
-    else:
-        runs = {"": rankings(frame, options, scores)}
+    if setup.held is not None:
+        return Run(str(setup.held["trial_id"]), setup.held["results"])
     with ledger.trial(
         KIND,
         {KIND: asdict(options)},
         features=(options.signal,),
-        train_start=months[0].as_of,
-        train_end=months[-1].as_of,
+        train_start=panel.months[0].as_of,
+        train_end=panel.months[-1].as_of,
         partition_hash=panel.partition_hash,
         cost_model_version=panel.cost_model_version,
     ) as trial:
-        conn = db if db is not None else lake.connect(lake_dir)
-        try:
-            _require(conn)
-            months = _priced(conn, months)
-            feed = _feed(runs, months, options, conn, forced=forced)
-            if paths_of:
-                paths = _paths(feed, months, runs, options, forced, keys=keys)
-                trial.results = {
-                    "months": len(months),
-                    "paths": paths,
-                    "summary": _summary(paths),
-                }
-            else:
-                ranked = runs[""]
-                outcome = simulate(feed, months, ranked, options, forced)
-                results = _report(outcome, feed, months, options, forced)
-                results["start_dates"] = [
-                    _sensitivity(feed, months[i:], ranked, options, forced)
-                    for i in _starts(months, options)
-                ]
-                trial.results = results
-        finally:
-            if db is None:
-                conn.close()
+        months, feed = setup.load(lake_dir, db)
+        if isinstance(scores, Mapping):
+            paths = _paths(feed, months, setup.runs, options, forced, keys=setup.keys)
+            trial.results = {"months": len(months), "paths": paths, "summary": _summary(paths)}
+        else:
+            ranked = setup.runs[""]
+            outcome = simulate(feed, months, ranked, options, forced)
+            results = _report(outcome, feed, months, options, forced)
+            results["start_dates"] = [
+                _sensitivity(feed, months[i:], ranked, options, forced)
+                for i in _starts(months, options)
+            ]
+            trial.results = results
         trial_id, results = trial.trial_id, trial.results
     # Written after the trial's row says `succeeded`, so an entry never names a row that is
     # still open or that failed.
-    if entry is not None:
-        entry.write({"trial_id": trial_id, "results": results})
+    if setup.entry is not None:
+        setup.entry.write({"trial_id": trial_id, "results": results})
     return Run(trial_id, results)
 
 
@@ -318,40 +292,103 @@ def replay(
     the specification says, adds no trial.
 
     `cache` checkpoints it as it does `run`, minus the ledger row there is none of."""
-    months = panel.months
-    if not months:
+    if not isinstance(scores, Mapping):
+        raise BacktestError("replay runs paths; pass a mapping of scores")
+    setup = _setup(
+        panel,
+        options,
+        scores,
+        stage="replay",
+        cache=cache,
+        forced=forced,
+        usable=lambda held: isinstance(held.get("paths"), list),
+    )
+    if setup.held is not None:
+        return list(setup.held["paths"])
+    months, feed = setup.load(lake_dir, db)
+    paths = _paths(feed, months, setup.runs, options, forced, keys=setup.keys)
+    if setup.entry is not None:
+        setup.entry.write({"paths": paths})
+    return paths
+
+
+@dataclass(frozen=True)
+class _Setup:
+    """What `run` and `replay` both start from: the whole-run cache entry and what it holds,
+    when that is usable, and otherwise the rankings each path trades, the per-path cache
+    entries, and the means to load the bars they need."""
+
+    panel: Panel
+    options: Options
+    forced: Sequence[corporate.Event]
+    entry: Key | None
+    held: dict[str, Any] | None
+    runs: dict[str, dict[date, list[str]]]
+    keys: Mapping[str, Key] | None
+
+    def load(
+        self, lake_dir: Path, db: duckdb.DuckDBPyConnection | None
+    ) -> tuple[list[Month], "Feed"]:
+        """The months the lake can price and the feed of every name the rankings could
+        trade, read once for every path. The connection is closed again before any path is
+        simulated, unless the caller passed it in."""
+        conn = db if db is not None else lake.connect(lake_dir)
+        try:
+            _require(conn)
+            months = _priced(conn, self.panel.months)
+            return months, _feed(self.runs, months, self.options, conn, forced=self.forced)
+        finally:
+            if db is None:
+                conn.close()
+
+
+def _setup(
+    panel: Panel,
+    options: Options,
+    scores: pd.Series | Mapping[str, pd.Series] | None,
+    *,
+    stage: str,
+    cache: Cache | None,
+    forced: Sequence[corporate.Event],
+    usable: Callable[[dict[str, Any]], bool],
+) -> _Setup:
+    """The checks, cache lookups and rankings `run` and `replay` share.
+
+    The whole-run entry is checked before the lake is opened and before a ranking is built. A
+    whole-run hit is the only hit that skips `_feed`, whose bar load is most of what a cached
+    certification saves; a run that misses on one path still pays for the bars of every name
+    any path ranks. `usable` says whether what the entry holds can be served: `run` needs the
+    ledger row it names to stand, `replay` needs a list of paths."""
+    if not panel.months:
         raise BacktestError("the panel has no months")
+    if scores is None and options.signal not in features.FEATURES:
+        raise BacktestError(f"{options.signal!r} is not a feature; pass scores for a model signal")
+
+    def made(entry, held, runs, keys) -> _Setup:
+        return _Setup(panel, options, forced, entry, held, runs, keys)
+
+    if not isinstance(scores, Mapping):
+        # The single-signal case is not cached; see `run`.
+        return made(None, None, {"": rankings(panel.frame, options, scores)}, None)
     if not scores:
         raise BacktestError("no paths to run")
     entry = (
         None
         if cache is None
         else backtest_key(
-            cache, panel, stage="replay", options=asdict(options), scores=scores, forced=forced
+            cache, panel, stage=stage, options=asdict(options), scores=scores, forced=forced
         )
     )
-    if entry is not None:
-        held = entry.read()
-        if held is not None and isinstance(held.get("paths"), list):
-            return held["paths"]
+    held = None if entry is None else entry.read()
+    if held is not None and usable(held):
+        return made(entry, held, {}, None)
     runs = {str(label): rankings(panel.frame, options, series) for label, series in scores.items()}
     keys = (
         None
         if cache is None
         else path_keys(cache, panel, options=asdict(options), scores=scores, forced=forced)
     )
-    conn = db if db is not None else lake.connect(lake_dir)
-    try:
-        _require(conn)
-        months = _priced(conn, months)
-        feed = _feed(runs, months, options, conn, forced=forced)
-        paths = _paths(feed, months, runs, options, forced, keys=keys)
-    finally:
-        if db is None:
-            conn.close()
-    if entry is not None:
-        entry.write({"paths": paths})
-    return paths
+    return made(entry, None, runs, keys)
 
 
 def _feed(
@@ -680,10 +717,24 @@ def load(
         [np.datetime64(max(wanted.get(name, start), start)) for name in names],
         dtype="datetime64[ns]",
     )
-    streamed = frame[fed & (stamps >= opens[codes])]
+    streamed = frame[fed & (stamps >= opens[codes])].sort_values(["date", "ticker"])
+    # Read by position, column by column, rather than looked up by label row by row; one
+    # BarType per name and one stamp per session serve every bar that shares them.
+    quotes = adjusted.loc[streamed.index]
+    types = {ticker: _bar_type(ticker) for ticker in streamed["ticker"].unique()}
+    stamped = {day: _stamp(day) for day in streamed["date"].unique()}
     bars = [
-        _bar(row.ticker, row.date, *adjusted.loc[row.Index], row.volume)
-        for row in streamed.sort_values(["date", "ticker"]).itertuples()
+        _bar(types[ticker], stamped[day], open_, high, low, close, volume)
+        for ticker, day, open_, high, low, close, volume in zip(
+            streamed["ticker"].tolist(),
+            streamed["date"].tolist(),
+            quotes["open"].tolist(),
+            quotes["high"].tolist(),
+            quotes["low"].tolist(),
+            quotes["close"].tolist(),
+            streamed["volume"].tolist(),
+            strict=True,
+        )
     ]
     return Feed(
         {ticker: s for ticker, s in series.items() if ticker in wanted},
@@ -693,12 +744,11 @@ def load(
     )
 
 
-def _bar(ticker: str, day: date, open_, high, low, close, volume) -> Bar:
+def _bar(bar_type: BarType, stamp: int, open_, high, low, close, volume) -> Bar:
     top = max(open_, high, low, close)
     bottom = min(open_, high, low, close)
-    stamp = _stamp(day)
     return Bar(
-        _bar_type(ticker),
+        bar_type,
         Price(float(open_), PRECISION),
         Price(float(top), PRECISION),
         Price(float(bottom), PRECISION),
@@ -733,7 +783,10 @@ def _stamp(day: date, nanos: int = 0) -> int:
 
 
 def _day(stamp: int) -> date:
-    return pd.Timestamp(stamp, unit="ns", tz="UTC").date()
+    """The UTC session a stamp falls in. Whole days counted from the epoch, which is what a
+    UTC timestamp's date is, without building one: the engine's strategy asks this of every
+    bar and every fill."""
+    return _EPOCH + timedelta(days=stamp // _NANOS_PER_DAY)
 
 
 def _off_close(price: float, expected: float | None) -> bool:
@@ -979,8 +1032,15 @@ class _Rebalancer(Strategy):
         if equity <= 0:
             raise BacktestError(f"{month.as_of}: the account is worth {equity:.2f}")
         weight = rebalance.weights(selection.names, options.size)
+        # Live tops up a kept name that has fallen more than a point under its weight; the
+        # backtest does not, so its numbers stay those the promoted model was certified on.
         plan = rebalance.orders(
-            selection, weight, prints, self.positions, Decimal(str(round(equity, 2)))
+            selection,
+            weight,
+            prints,
+            self.positions,
+            Decimal(str(round(equity, 2))),
+            top_up=False,
         )
         for order in plan:
             self.book.liquidity[order.symbol] = feed.liquidity(order.symbol, day)
@@ -1135,8 +1195,12 @@ def simulate(
         raise BacktestError(f"no bars to replay between {start} and {end}")
     book = _Book(multiple=options.cost_multiple)
     strategy = _Rebalancer(feed, months, rankings, book, options, forced)
+    # The engine's own post-run statistics are never read: the report is built from the
+    # strategy's fills, so the analysis is switched off rather than computed and discarded.
     config = BacktestEngineConfig(
-        logging=LoggingConfig(bypass_logging=True), risk_engine=RiskEngineConfig(bypass=True)
+        logging=LoggingConfig(bypass_logging=True),
+        risk_engine=RiskEngineConfig(bypass=True),
+        run_analysis=False,
     )
     engine = BacktestEngine(config)
     try:
@@ -1151,7 +1215,8 @@ def simulate(
         )
         for instrument in feed.instruments():
             engine.add_instrument(instrument)
-        engine.add_data(list(bars))
+        # A fresh slice of the run's bars, already in session order; the engine copies it.
+        engine.add_data(bars)
         engine.add_strategy(strategy)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -1193,7 +1258,7 @@ def _report(
     delisting_loss = sum(fill.delisting for fill in outcome.fills)
     takes = [fill.participation for fill in outcome.fills]
     return {
-        **_metrics(net, marks, options),
+        **scan.metrics(marks, options.init_cash),
         "gross_return": (marks[-1] + fees_paid) / options.init_cash - 1.0,
         "fees_paid": fees_paid,
         "fees_fraction": fees_paid / options.init_cash,
@@ -1356,24 +1421,6 @@ def _mark(series: Series, day: date, *, missing: bool = False) -> Decimal | None
     return Decimal(str(float(series.adjusted[n - 1])))
 
 
-def _metrics(returns: list[float], marks: list[float], options: Options) -> dict[str, Any]:
-    """The scan's summary of an equity curve, from the marks and the monthly returns between
-    them."""
-    months = len(returns)
-    total = marks[-1] / options.init_cash - 1.0
-    annual = (1.0 + total) ** (MONTHS_PER_YEAR / months) - 1.0 if months else 0.0
-    vol = float(np.std(returns, ddof=1) * np.sqrt(MONTHS_PER_YEAR)) if months > 1 else None
-    peaks = np.maximum.accumulate(marks)
-    return {
-        "months": months,
-        "total_return": total,
-        "annual_return": float(annual),
-        "annual_volatility": vol,
-        "sharpe": None if not vol else float(annual / vol),
-        "max_drawdown": float((np.asarray(marks) / peaks - 1.0).min()),
-    }
-
-
 def _marks(
     fills: Sequence[Fill], feed: Feed, months: Sequence[Month], options: Options
 ) -> tuple[list[float], list[float], list[float]]:
@@ -1423,8 +1470,7 @@ def _sensitivity(
 ) -> dict[str, Any]:
     outcome = simulate(feed, months, rankings, options, forced)
     marks, _, _ = _marks(outcome.fills, feed, months, options)
-    net = [marks[i + 1] / marks[i] - 1.0 for i in range(len(months))]
-    return {"start": months[0].as_of.isoformat(), **_metrics(net, marks, options)}
+    return {"start": months[0].as_of.isoformat(), **scan.metrics(marks, options.init_cash)}
 
 
 def _summary(paths: list[dict[str, Any]]) -> dict[str, Any]:

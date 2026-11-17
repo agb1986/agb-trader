@@ -1,4 +1,6 @@
+import secrets
 import shutil
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -97,6 +99,47 @@ def test_main_bootstraps_and_migrates_a_blank_database(cluster, blank_db, monkey
     with cluster.connect(blank_db, "scheduler") as conn:
         assert conn.execute("SELECT count(*) FROM agb.heartbeat").fetchone() == (0,)
         assert conn.execute("SHOW timezone").fetchone() == ("UTC",)
+
+
+def server_log_between(cluster, start, end):
+    """The Postgres server log from the line naming `start` to the one naming `end`."""
+    deadline = time.monotonic() + 10
+    while True:
+        out = subprocess.run(
+            ["docker", "logs", cluster.container], capture_output=True, text=True, check=True
+        )
+        log = out.stdout + out.stderr
+        if end in log:
+            return log[log.index(start) : log.index(end)]
+        assert time.monotonic() < deadline, f"{end} never reached the server log"
+        time.sleep(0.1)
+
+
+def test_no_role_password_reaches_the_statement_log(cluster, blank_db):
+    marker = f"bootstrap-{secrets.token_hex(8)}"
+    with cluster.connect(blank_db, "postgres") as admin:
+        admin.execute("SET log_statement = 'all'")
+        admin.execute(f"SELECT '{marker}'")
+        migrate.bootstrap(admin, cluster.passwords)
+        admin.execute(f"SELECT '{marker}-done'")
+        stored = dict(
+            admin.execute(
+                "SELECT rolname, rolpassword FROM pg_authid WHERE rolname = ANY(%s)",
+                (list(PASSWORD_VARS),),
+            ).fetchall()
+        )
+    log = server_log_between(cluster, marker, f"{marker}-done")
+
+    # The log did record the role statements, so a password's absence is not an empty log's.
+    assert "ALTER ROLE" in log
+    for password in cluster.passwords.values():
+        assert password not in log
+    assert "SCRAM-SHA-256$" in log
+    assert sorted(stored) == sorted(PASSWORD_VARS)
+    assert all(secret.startswith("SCRAM-SHA-256$4096:") for secret in stored.values())
+    # The verifier logs in as the password did.
+    with cluster.connect(blank_db, "scheduler") as conn:
+        assert conn.execute("SELECT current_user").fetchone() == ("scheduler",)
 
 
 def add(directory, version, name="extra"):

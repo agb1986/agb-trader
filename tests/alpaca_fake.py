@@ -210,7 +210,8 @@ class FakeBroker:
                 continue
             fill_price = price if price is not None else self.quotes[order.symbol].mid
             wanted = short.get(order.symbol, order.qty)
-            parts = pieces.get(order.symbol) or [wanted]
+            # A symbol short at zero fills nothing: no FILL activity, and the order expires.
+            parts = pieces.get(order.symbol) or ([wanted] if wanted else [])
             assert sum(parts) == wanted, f"{order.symbol}: pieces do not add up to {wanted}"
             filled = Decimal(0)
             for part in parts:

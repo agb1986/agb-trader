@@ -169,7 +169,14 @@ def _run(args):
         options = cpcv.Options(
             groups=args.groups, test_groups=args.test_groups, embargo_months=args.embargo_months
         )
-        return cpcv.run(panel, config, options, ledger)
+        # The cache keys on the code version, so a run with no version (`dev`) neither reads
+        # nor fills it. A versioned run fills the entry a certification of the same
+        # configuration over the same panel reads, which then refits only the shipped model.
+        from agb.research.cache import Cache
+        from agb.research.trials import UNVERSIONED, code_version
+
+        cache = Cache.under(_research_dir()) if code_version() != UNVERSIONED else None
+        return cpcv.run(panel, config, options, ledger, cache=cache)
     if args.command == "certify":
         from agb.research import certify
 

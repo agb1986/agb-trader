@@ -16,8 +16,17 @@ The basket is sized on the capital the caller states, which the pipeline takes f
 account's own equity (`account_capital`, over `agb.broker_state_now`) rather than from a
 figure carried in the code. Equity, not cash: the weights describe the whole portfolio, the
 order plan trades only the difference from what is held, and the gate derives cash from
-capital less the book's value. Every basket row records the `capital_usd` it was sized on, so
-the audit trail says what each month assumed.
+capital less the book's value and the orders' modelled cost. Every basket row records the
+`capital_usd` it was sized on, so the audit trail says what each month assumed.
+
+Whole shares of a twentieth each can spend the whole of the capital on shares, and leave
+nothing to pay the modelled cost of trading, which the gate's cash check refuses. So once the
+plan is costed, `propose` trims it to fit (`_fit`): while the cash after modelled costs is
+negative, it takes one share off each buy in turn, lowest-ranked first, re-costing each order
+it trims, and stops at the first share that leaves the cash at zero or above. An entering
+name keeps at least one share, so it stays in the basket; a top-up may be trimmed away. What
+was trimmed is written on the basket as its `sizing_note`. If the plan still does not fit, it
+is written as it stands and the gate halts it.
 
 Proposing is safe to redo. A job whose lease expired mid-proposal is reclaimed and proposed
 again; the second attempt finds the reference taken, writes nothing and completes the job with
@@ -61,7 +70,7 @@ the backtest and the live path identical through a merger or a halt.
 """
 
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -143,8 +152,8 @@ _INSERT_BASKET = """
     INSERT INTO agb.basket
         (reference, period, job_id, session_date, signal_date, snapshot_date, partition_hash,
          universe_size, ranker, model_certification_id, model_sha256, cost_model_version,
-         capital_usd, actor, panel_config_id, panel_run_id, panel_w)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+         capital_usd, actor, panel_config_id, panel_run_id, panel_w, sizing_note)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (reference) DO NOTHING
     RETURNING id
 """
@@ -213,10 +222,12 @@ _INSERT_RERUN = """
     INSERT INTO agb.basket
         (reference, period, deviation_of, job_id, session_date, signal_date, snapshot_date,
          partition_hash, universe_size, ranker, model_certification_id, model_sha256,
-         cost_model_version, capital_usd, actor, panel_config_id, panel_run_id, panel_w)
+         cost_model_version, capital_usd, actor, panel_config_id, panel_run_id, panel_w,
+         sizing_note)
     SELECT %(reference)s, period, id, NULL, %(session)s, signal_date, snapshot_date,
            partition_hash, universe_size, ranker, model_certification_id, model_sha256,
-           cost_model_version, capital_usd, %(actor)s, panel_config_id, panel_run_id, panel_w
+           cost_model_version, capital_usd, %(actor)s, panel_config_id, panel_run_id, panel_w,
+           sizing_note
     FROM agb.basket WHERE id = %(original)s
     ON CONFLICT (reference) DO NOTHING
     RETURNING id
@@ -320,6 +331,7 @@ class Proposal:
     members: frozenset[str] = frozenset()
     marks: dict[str, Decimal] = field(default_factory=dict)
     shadow_id: int | None = None  # the counterfactual written beside it, when a panel ran
+    sizing_note: str | None = None  # what `_fit` trimmed to pay the modelled cost, if anything
 
 
 class Stage2(Protocol):
@@ -494,6 +506,16 @@ def propose(
         weight = rebalance.weights(selection.names)
         plan = rebalance.orders(selection, weight, quotes, held, capital)
         costs = [_cost(lake_db, order, signal, forced=order.symbol in divest) for order in plan]
+        plan, costs, sizing_note = _fit(
+            plan,
+            costs,
+            selection,
+            held,
+            marks,
+            capital,
+            ranked_order,
+            lambda order: _cost(lake_db, order, signal),
+        )
     finally:
         lake_db.close()
 
@@ -520,6 +542,7 @@ def propose(
                 panel.config_id if panel is not None else None,
                 run_id,
                 panel.w if panel is not None else None,
+                sizing_note,
             ),
         ).fetchone()
         if row is None:
@@ -551,9 +574,7 @@ def propose(
                         _bps(modelled.floor_bps),
                         _bps(modelled.impact_bps),
                         modelled.fees.total,
-                        _bps(modelled.floor_bps)
-                        + _bps(modelled.impact_bps)
-                        + _bps(modelled.fees_bps),
+                        _modelled_bps(modelled),
                     )
                     for order, modelled in zip(plan, costs, strict=True)
                 ],
@@ -570,6 +591,7 @@ def propose(
         members,
         marks,
         shadow_id,
+        sizing_note,
     )
 
 
@@ -660,6 +682,113 @@ def _bps(value: float) -> Decimal:
     return Decimal(repr(value)).quantize(Decimal("0.0001"))
 
 
+def _modelled_bps(modelled: cost.TradeCost) -> Decimal:
+    """An order's recorded modelled cost in basis points: the sum of its frozen parts."""
+    return _bps(modelled.floor_bps) + _bps(modelled.impact_bps) + _bps(modelled.fees_bps)
+
+
+def _shares_after(
+    symbol: str,
+    selection: rebalance.Selection,
+    held: Mapping[str, Decimal],
+    plan: Sequence[rebalance.Order],
+) -> Decimal:
+    """What `symbol` holds once the plan fills: an entering name what it buys, and a kept or
+    carried one its position plus any top-up."""
+    bought = next((o.qty for o in plan if o.symbol == symbol and o.side is rebalance.Side.BUY), 0)
+    return Decimal(bought) if symbol in selection.buy else Decimal(held[symbol]) + bought
+
+
+def _cash_after(
+    plan: Sequence[rebalance.Order],
+    costs: Sequence[cost.TradeCost],
+    selection: rebalance.Selection,
+    held: Mapping[str, Decimal],
+    marks: Mapping[str, Decimal],
+    capital: Decimal,
+) -> Decimal | None:
+    """The cash the gate will measure (agb.gate `_cash`): capital less the targets' value at
+    their marks and every order's modelled cost, at the basis points the order row records.
+    None when a target has no mark, which the gate refuses on its own."""
+    if any(symbol not in marks for symbol in selection.names):
+        return None
+    value = sum(
+        (_shares_after(s, selection, held, plan) * marks[s] for s in selection.names), Decimal(0)
+    )
+    spent = sum(
+        (o.notional * _modelled_bps(c) / 10000 for o, c in zip(plan, costs, strict=True)),
+        Decimal(0),
+    )
+    return capital - value - spent
+
+
+def _fit(
+    plan: list[rebalance.Order],
+    costs: list[cost.TradeCost],
+    selection: rebalance.Selection,
+    held: Mapping[str, Decimal],
+    marks: Mapping[str, Decimal],
+    capital: Decimal,
+    ranked_order: Sequence[str],
+    price: Callable[[rebalance.Order], cost.TradeCost],
+) -> tuple[list[rebalance.Order], list[cost.TradeCost], str | None]:
+    """Trim the plan's buys until the cash after modelled costs is not negative.
+
+    Each pass takes one share off every buy in turn, from the lowest-ranked up, and re-costs
+    the order it trimmed; trimming stops at the first share that leaves the cash at zero or
+    above. Taking shares round the buys keeps each name within a share or so of its
+    twentieth, where trimming one name to fit would push it out of the gate's weight band.
+    An entering name keeps one share, so it stays the name the basket holds; a top-up of a
+    kept name may go to nothing, which leaves the position as it was. Sells are never
+    touched. Returns the plan, its costs and a note of what was trimmed, or None when nothing
+    was. A plan that cannot be made to fit is returned as trimmed as it can be, for the gate
+    to refuse."""
+    cash = _cash_after(plan, costs, selection, held, marks, capital)
+    if cash is None or cash >= 0:
+        return plan, costs, None
+    short = cash
+    plan, costs = list(plan), list(costs)
+    rank = {symbol: i for i, symbol in enumerate(ranked_order)}
+    buys = sorted(
+        (o.symbol for o in plan if o.side is rebalance.Side.BUY),
+        key=lambda s: rank.get(s, len(rank)),
+        reverse=True,
+    )
+    trimmed: dict[str, int] = {}
+    while cash < 0:
+        moved = False
+        for symbol in buys:
+            i = next((j for j, o in enumerate(plan) if o.symbol == symbol), None)
+            if i is None:
+                continue
+            order = plan[i]
+            floor = 1 if symbol in selection.buy else 0
+            if order.qty <= floor:
+                continue
+            trimmed[symbol] = trimmed.get(symbol, 0) + 1
+            moved = True
+            if order.qty - 1 == 0:
+                del plan[i], costs[i]
+            else:
+                plan[i] = rebalance.Order(symbol, order.side, order.qty - 1, order.price)
+                costs[i] = price(plan[i])
+            cash = _cash_after(plan, costs, selection, held, marks, capital)
+            assert cash is not None
+            if cash >= 0:
+                break
+        if not moved:
+            break
+    parts = ", ".join(
+        f"{symbol} by {n} share{'' if n == 1 else 's'}" for symbol, n in trimmed.items()
+    )
+    outcome = "leaving" if cash >= 0 else "still short of cash, leaving"
+    note = (
+        f"Trimmed buys to pay the modelled cost: cash after modelled costs was {short:.2f};"
+        f" trimmed {parts}, {outcome} {cash:.2f}."
+    )
+    return plan, costs, note
+
+
 def _target(
     symbol: str,
     selection: rebalance.Selection,
@@ -668,10 +797,7 @@ def _target(
     plan: list[rebalance.Order],
     rank_of: dict[str, Ranked],
 ) -> tuple:
-    if symbol in selection.buy:
-        shares = next(o.qty for o in plan if o.symbol == symbol)
-    else:
-        shares = held[symbol]
+    shares = _shares_after(symbol, selection, held, plan)
     ranked = rank_of.get(symbol)
     return (
         symbol,

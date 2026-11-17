@@ -24,11 +24,11 @@ Rejected: a session-scoped advisory lock. It releases when the connection dies, 
 
 ## Baskets
 
-**Content is frozen once the gate has run.** A basket's content is insert-only: the target weights, the order plan, the gate result check by check (what each measured, not pass/fail alone), the stage-1 ranks and panel scores it was built from, the Sharadar snapshot date, and a hash of the lake partition it read. Each basket references the `model_certification` and the `panel_config` it was built with.
+**Content is frozen once the gate has run.** A basket's content is insert-only: the target weights, the order plan, the gate result check by check (what each measured, not pass/fail alone), the stage-1 ranks and panel scores it was built from, the Sharadar snapshot date, and a hash of the lake partition it read. Where buys were trimmed to leave cash for their modelled costs, the basket's `sizing_note` says which names lost how many shares and the cash left, and a rerun copies it. Each basket references the `model_certification` and the `panel_config` it was built with.
 
 **State is a sequence of events.** `basket_event` rows carry `seq`, `from_state`, `to_state`, actor (a human identity or `system`), surface (`telegram`, `ui`, `cli`, `scheduler`, `pipeline`, `execution`), timestamp and reason. `unique(basket_id, seq)` makes every transition a compare-and-swap: a writer inserts `seq = last + 1`, and a concurrent writer hits the constraint. That settles the Telegram-versus-UI race inside the database: the first answer wins, and the loser replies "already approved by X at T". Current state is a view over the latest event. A trigger checks every insert against a `basket_transition` table of permitted `(from, to, role)` triples. Another binds the actor to the writing role: the bot writes from `telegram` as the Telegram user who answered (`telegram:<id>`), or as `bot` when it puts a basket to the human; the UI writes from `ui` as `ui:operator`; and only the pipeline, scheduler and execution roles may write as `system`.
 
-The state set is the one the risk and Telegram documents already use (proposed, halted at the gate, pending, approved, rejected, missed, submitted, filled). The exact enumeration is left to the build.
+The state set is the one the risk and Telegram documents already use (proposed, halted at the gate, pending, approved, rejected, missed, submitted, filled), plus unfilled for a submitted basket whose orders all ended at the close with nothing filled. A settled basket's `basket_outcome` row, written with the event that settled it, counts its orders filled in full, filled in part and unfilled, and says whether the basket filled in full, in part or not at all. The exact enumeration is left to the build.
 
 **References people can type.** Each basket has an internal key and a unique human reference, `2026-10` for that month's rebalance. A deliberate next-session rerun after a missed approval is a new basket, `2026-10r1`, with `deviation_of` pointing at the original, which keeps its missed outcome. Shadow baskets (`kind = 'shadow'`) have no typeable reference.
 
@@ -116,7 +116,7 @@ Rejected: stored counters. Rejected: the shadow as extra columns on the traded b
 
 **Expected events are what tell a dead system from a quiet month.** The scheduler writes `expected_event` rows ahead of time: the data pull due at T, the rebalance proposal due at T, the approval request due at T, submission due by T. Each is completed by a reference to the row that fulfilled it. An overdue view flags any expected event past its time with no completion. The same view also flags when no rebalance is expected within the next cycle's horizon, which is how a dead scheduler shows up: it simply stops writing future rows. A month without a rebalance is quiet only if nothing was expected. This view drives `/status`, the pre-flight message and the UI banner.
 
-`alert` rows are append-only with a dedupe key `(kind, subject, period)`, so a stale heartbeat produces one alert rather than one per cycle. `alert_event` records delivery (with the Telegram message id) and acknowledgement, so an alert the bot never delivered is visible in the UI.
+`alert` rows are append-only with a dedupe key `(kind, subject, period)`, so a stale heartbeat produces one alert rather than one per cycle. `alert_event` records delivery (with the Telegram message id) and acknowledgement, so an alert the bot never delivered is visible in the UI. `alert_part` records each part of a long alert Telegram accepted, with its message id, so a delivery that fails part-way resumes where it stopped. A `delivered` event carries a message id unless it says in `detail` why there was nothing to send.
 
 The bot evaluates the health of every other service and alerts. The UI evaluates everything, including the bot, and shows a banner. The bot's pre-flight message on the session before each rebalance is how a dead bot is noticed with a session to spare.
 
@@ -147,7 +147,7 @@ Rejected: everything in Postgres, which grows the dump by hundreds of megabytes 
 | `liquidation` | bot, ui (token, confirm), execution (result) | no |
 | `liquidation_order`, `liquidation_fill` | execution | no |
 | `halt_event`, `broker_state` | pipeline (gate_breach), execution (lease, broker_state), bot / ui (pause, resume, liquidation) | no |
-| `order`, `order_event`, `fill`, position snapshots | execution | no |
+| `order`, `order_event`, `fill`, `basket_outcome`, position snapshots | execution | no |
 | `reconcile_run` | execution (the operator's `agb reconcile`) | no |
 | `model_certification`, `certification_event`, `promotion_event` | research (certification, via artifact import), cli (promotion, voiding) | no |
 | `ladder_event`, `mode_event` | cli (up), scheduler or execution as `system` (down) | no |
@@ -157,6 +157,7 @@ Rejected: everything in Postgres, which grows the dump by hundreds of megabytes 
 | `heartbeat` | every service | upsert |
 | `expected_event` | scheduler (create), fulfilling service (completion reference) | completion by append or reference, never rewrite |
 | `alert`, `alert_event` | bot, ui, execution, scheduler, pipeline (`alert` only, for a job that failed) | no |
+| `alert_part` | bot | no |
 | `dividend` | cli, ui (the operator, from a broker statement) | no |
 
 Views: current basket state, open halt causes, audit log, shortfall, eligibility (ladder and mode), overdue expected events, reconcile state (each planned order beside what the broker last said about it), per-fill and live cost shortfall, equity by New York month, and the promoted certification's alert thresholds.

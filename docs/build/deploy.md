@@ -22,11 +22,12 @@ Everything on the server lives in one directory, `/mnt/data/AppData/agb-trader` 
 | `releases/<tag>/`  | `compose.yaml` and `agb-stack` as of commit `<tag>`.                   |
 | `current`          | A link to the release that is running.                                 |
 | `previous`         | A link to the release it replaced.                                     |
+| `healthy`          | A link to the last release that came up healthy. Pruning keeps it.     |
 | `agb-stack`        | A link to `current/agb-stack`, the command for everything below.       |
 
 A tag is the commit's 12-character short hash, and the image is `agb-trader-app:<tag>`. The
-server keeps only the current and previous releases and their images. Each deploy removes the
-rest. The database lives on the `agb-trader_pgdata` Docker volume, not in this directory.
+server keeps only the current, previous and last healthy releases and their images. Each
+successful deploy removes the rest; a failed one removes nothing. The database lives on the `agb-trader_pgdata` Docker volume, not in this directory.
 
 Run `agb-stack` from the deploy directory as `./agb-stack`, or by its full path.
 
@@ -55,6 +56,13 @@ Run `agb-stack` from the deploy directory as `./agb-stack`, or by its full path.
 - `env/vpn.env` sets every variable `env/vpn.env.example` does, with the WireGuard private
   key generated for this stack alone (see
   [Operator setup](operator-setup.md#4-protonvpn-wireguard-key)).
+
+- The `agb-trader_pgdata` volume, if it already exists, is owned by uid 70. `db` runs as the
+  image's `postgres` user, not as root, so it cannot take ownership of a volume that root
+  owns. The image's own entrypoint gave the volume to uid 70 when it first initialised it, so
+  a volume made by this stack already is. To check, on the server:
+  `docker run --rm -v agb-trader_pgdata:/data --entrypoint stat postgres:17-alpine -c %u /data`
+  prints `70`.
 
 The other env files join the list as the services that read them are deployed.
 
@@ -87,16 +95,17 @@ That runs `scripts/deploy/deploy.sh`, which:
    has it.
 5. Installs the release: the commit's `compose.yaml` and `agb-stack` go into
    `releases/<tag>/`.
-6. Runs `agb-stack activate <tag>` on the server. That moves `previous` to the release that
-   was running and `current` to the new one, then runs `docker compose up --wait`. `migrate`
-   applies any new migrations before the services start, and refuses one that is older than
-   the newest already applied, naming both versions. If that migration is safe to run after
-   the newer one, run the activation again with the flag, on the server in the deploy
-   directory: `AGB_MIGRATE_ALLOW_OUT_OF_ORDER=1 ./agb-stack activate <tag>` (see
-   [migrations/README.md](../../migrations/README.md)). `--wait` returns only once every
+6. Runs `agb-stack activate <tag>` on the server. That starts the new release with
+   `docker compose up --wait`. `migrate` applies any new migrations before the services start,
+   and refuses one that is older than the newest already applied, naming both versions. If that
+   migration is safe to run after the newer one, run the activation again with the flag, on the
+   server in the deploy directory: `AGB_MIGRATE_ALLOW_OUT_OF_ORDER=1 ./agb-stack activate <tag>`
+   (see [migrations/README.md](../../migrations/README.md)). `--wait` returns only once every
    service reports healthy, and each app service is healthy only while its own heartbeat is
    younger than five minutes, so a service that crash-loops or never beats fails the deploy
-   instead of passing it. Once the stack is up, it prunes old releases and images.
+   instead of passing it. Then it runs `agb void-stale`, which must succeed too. Only once both
+   have passed does `current` move to the new release, `previous` to the one that was running,
+   and `healthy` to the new release. Last, it prunes old releases and images.
 7. Prints `agb-stack status`: each service's last heartbeat and the version it runs. It exits
    1, and so fails the deploy, if any service has never beaten or last beat more than five
    minutes ago.
@@ -110,9 +119,32 @@ AGB_DEPLOY_HOST=other.local make deploy
 
 Deploying the commit that is already running restarts nothing that has not changed.
 
-If the stack does not come up, the deploy stops with an error. `current` already points at the
-new release, so `make rollback` returns to the one that was running. A rollback ends with the
-same `status`, so it too fails while a service is stale.
+If the new release does not come up healthy, or `agb void-stale` fails, `agb-stack activate`
+brings the release that was running back up, leaves `current`, `previous` and `healthy` as they
+were, prunes nothing, and exits non-zero, so the deploy fails and the stack is on the release it
+was on before. The failed release stays in `releases/` until a later successful deploy prunes it.
+The exceptions: on the very first deploy there is nothing to return to, so the stack is stopped
+and `current` is not set; and if the release that was running will not come back up either, the
+error says so and the stack is down. Either way, fix the cause and run `make deploy` again, or
+`./agb-stack activate <tag>` for a release already on the server. A rollback ends with the same
+`status`, so it too fails while a service is stale.
+
+## Pinned images
+
+`compose.yaml` pins `db` and `vpn` by digest, and the Dockerfile pins its `python` and `uv`
+bases by digest, so every deploy of a commit runs the same images. The server pulls the
+Postgres and gluetun digests itself the first time a release names them. To take a newer
+image, pull its tag on the workstation, read the digest, and put it in place of the old one
+in a commit of its own:
+
+```sh
+docker pull postgres:17-alpine
+docker image inspect --format '{{index .RepoDigests 0}}' postgres:17-alpine
+```
+
+The same two commands, with `qmcgaw/gluetun:v3`, `python:3.12-slim` or
+`ghcr.io/astral-sh/uv:0.10.10`, give the others. `tests/test_compose.py` fails on an image
+that is not pinned.
 
 ## Rolling back
 
@@ -120,8 +152,9 @@ same `status`, so it too fails while a service is stale.
 make rollback
 ```
 
-This runs `agb-stack rollback` on the server, which activates the `previous` release. The
-release it leaves becomes `previous`, so running `make rollback` again returns to it. To go back
+This runs `agb-stack rollback` on the server, which activates the `previous` release under the
+rules above: if it does not come up, the stack returns to the release it was on. The release it
+leaves becomes `previous`, so running `make rollback` again returns to it. To go back
 further, deploy an older commit: check it out and run `make deploy`.
 
 A rollback does not undo migrations. It does not need to: migrations only ever widen: they add tables
@@ -402,8 +435,8 @@ To take a certification out of service for good:
 
 A voided model cannot be promoted. If it is the live one, rebalances fail until another is
 promoted. A release that changes the cost model voids every certification made under the old
-one: `agb-stack activate` runs `agb void-stale` once the stack is up, and `agb promote` runs it
-too. Each voiding is an `agb.certification_event`. A certification made under a cost model the
+one: `agb-stack activate` runs `agb void-stale` once the stack is up and fails the deploy,
+returning to the release that was running, if it cannot; `agb promote` runs it too. Each voiding is an `agb.certification_event`. A certification made under a cost model the
 running release does not know yet, by research code ahead of the deploy, is refused but not
 voided, so it can be promoted once that release is live; for the same reason a rollback voids
 nothing.

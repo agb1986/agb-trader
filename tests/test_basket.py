@@ -18,9 +18,9 @@ from psycopg import errors
 from registry_fake import ARTIFACT, MODEL_ID
 from test_gate import actor_for, go_live
 
-from agb import approval, basket, corporate, gate, jobs, lake, schedule
+from agb import approval, basket, corporate, cost, gate, jobs, lake, schedule
 from agb.corporate import Event, Kind
-from agb.rebalance import SIZE
+from agb.rebalance import SIZE, Order, Selection, Side
 from agb.schedule import Expected, Planned
 from agb.services.pipeline import RETRY, Pipeline, capital_from_env
 
@@ -140,17 +140,27 @@ def test_the_rebalance_job_proposes_a_twenty_name_equal_weight_basket(db, tmp_pa
     assert [s for s, _ in ranked] == [f"N{i:02d}" for i in range(1, 26)]
     assert all(score is not None for _, score in ranked)
 
+    # Twenty names at $20 and 250 shares spend the whole $100,000 on shares, which leaves
+    # nothing for the modelled cost, so the lowest-ranked buy, N20, gives up one share to pay
+    # it, and the basket passes the gate's cash check rather than halting.
+    bought = {f"N{i:02d}": 250 for i in range(1, SIZE + 1)} | {"N20": 249}
     held = targets(db)
     assert [t[0] for t in held] == [f"N{i:02d}" for i in range(1, SIZE + 1)]
-    assert {t[1:] for t in held} == {(Decimal("0.05"), 250, False, False, None)} - {None} or all(
-        (weight, shares, was_held, carried) == (Decimal("0.05"), 250, False, False)
-        and rank == int(symbol[1:])
+    assert all(
+        (weight, shares, was_held, carried, rank)
+        == (Decimal("0.05"), bought[symbol], False, False, int(symbol[1:]))
         for symbol, weight, shares, was_held, carried, rank in held
     )
+    [(note,)] = rows(db, "SELECT sizing_note FROM agb.basket")
+    assert note == (
+        "Trimmed buys to pay the modelled cost: cash after modelled costs was -20.00;"
+        " trimmed N20 by 1 share, leaving 0.00."
+    )
+    assert gate_check(db, "cash") == ("0.00", True)
 
     plan = orders(db)
     assert [(o[0], o[1], o[2], o[3]) for o in plan] == [
-        (f"N{i:02d}", "buy", 250, f"2026-10-N{i:02d}") for i in range(1, SIZE + 1)
+        (f"N{i:02d}", "buy", bought[f"N{i:02d}"], f"2026-10-N{i:02d}") for i in range(1, SIZE + 1)
     ]
     for _, _, qty, _, price, notional, version, floor, impact, fees, total in plan:
         assert price == 20 and notional == qty * price and version == "1"
@@ -161,7 +171,9 @@ def test_the_rebalance_job_proposes_a_twenty_name_equal_weight_basket(db, tmp_pa
 def test_the_basket_is_the_book_and_the_order_plan_moves_it(db, tmp_path):
     """From a filled book of N01, N04 (rank 22) and N30 (rank 25), both inside the buffer, OLD
     (ranked below the buffer) and HALT, which has no print on the signal session, the plan keeps
-    the three, carries HALT, sells OLD and buys the sixteen open slots from the top."""
+    the three, carries HALT, sells OLD and buys the sixteen open slots from the top. N01, a
+    partial fill at 2% of the book, is topped back up to its twentieth; N04 at 4% is within a
+    point of it and N30 over it, so neither trades."""
     market = Market(tmp_path).names(40)
     for ticker, growth in (
         ("N04", 0.01 - 22 * 0.0002 - 0.00001),
@@ -182,7 +194,7 @@ def test_the_basket_is_the_book_and_the_order_plan_moves_it(db, tmp_path):
     held = targets(db)
     assert len(held) == SIZE
     by_symbol = {t[0]: t[1:] for t in held}
-    assert by_symbol["N01"] == (Decimal("0.05"), 100, True, False, 1)
+    assert by_symbol["N01"] == (Decimal("0.05"), 250, True, False, 1)
     assert by_symbol["N04"] == (Decimal("0.05"), 200, True, False, 22)
     assert by_symbol["N30"] == (Decimal("0.05"), 300, True, False, 25)
     assert by_symbol["HALT"] == (Decimal("0.05"), 50, True, True, None)
@@ -191,6 +203,7 @@ def test_the_basket_is_the_book_and_the_order_plan_moves_it(db, tmp_path):
     assert bought == [f"N{i:02d}" for i in range(2, 19) if i != 4]
     plan = orders(db)
     assert [(o[0], o[1], o[2]) for o in plan] == [
+        ("N01", "buy", 150),
         *((f"N{i:02d}", "buy", 250) for i in range(2, 19) if i != 4),
         ("OLD", "sell", 400),
     ]
@@ -227,9 +240,13 @@ def test_a_cash_acquisition_terminates_the_position_and_its_cash_waits_for_the_r
     assert job_state(db) == "completed"
     by_symbol = {t[0]: t[1:] for t in targets(db)}
     assert len(by_symbol) == SIZE and "GONE" not in by_symbol
-    # Nineteen buys fill the slots N01 did not already hold, and nothing sells GONE.
+    # Nineteen buys fill the slots N01 did not already hold, N01 is topped up from its 2%,
+    # and nothing sells GONE. That spends all the capital on shares, so the lowest-ranked buy
+    # gives up a share to pay the modelled cost.
     assert [(o[0], o[1], o[2]) for o in orders(db)] == [
-        (f"N{i:02d}", "buy", 250) for i in range(2, SIZE + 1)
+        ("N01", "buy", 150),
+        *((f"N{i:02d}", "buy", 250) for i in range(2, SIZE)),
+        ("N20", "buy", 249),
     ]
     assert gate_check(db, "positions") == ("20", True)
 
@@ -294,7 +311,8 @@ def test_a_halt_across_the_rebalance_carries_the_position_and_skips_its_replacem
     plan = [(o[0], o[1], o[2]) for o in orders(db)]
     assert plan == [(f"N{i:02d}", "buy", 250) for i in range(1, SIZE)]
     assert gate_check(db, "positions") == ("20", True)
-    assert gate_check(db, "weight_sum") == ("1.00", True)
+    # Nineteen twentieths, and STUCK's 50 shares at their last close.
+    assert gate_check(db, "weight_sum") == ("0.9599", True)
 
 
 def test_an_unrecorded_carry_halts_the_rebalance(db, tmp_path):
@@ -498,6 +516,85 @@ def test_a_rebalance_with_no_account_reading_keeps_the_job_and_tries_again(db, t
     assert timedelta(0) < left <= RETRY
     assert rows(db, "SELECT count(*) FROM agb.basket") == [(0,)]
     assert late_proposals(db, due + MINUTE) == [(PERIOD,)]
+
+
+# Fitting the plan to the cash. `_fit` is called with the plan already costed; these cost
+# every order at a flat 10 bps of its notional, so the arithmetic can be followed by hand.
+
+
+def flat_cost(order):
+    return cost.TradeCost(
+        "1",
+        cost.Side(str(order.side)),
+        float(order.notional),
+        10.0,
+        0.0,
+        cost.Fees(*[Decimal(0)] * 4),
+    )
+
+
+def fit(selection, plan, marks, capital, held=None):
+    return basket._fit(
+        plan,
+        [flat_cost(o) for o in plan],
+        selection,
+        held or {},
+        marks,
+        Decimal(capital),
+        ["A", "B", "C", "K"],
+        flat_cost,
+    )
+
+
+THREE = Selection(keep=(), buy=("A", "B", "C"), sell=(), carry=())
+TEN = {"A": Decimal(10), "B": Decimal(10), "C": Decimal(10)}
+
+
+def buys(*legs):
+    return [Order(symbol, Side.BUY, qty, Decimal(10)) for symbol, qty in legs]
+
+
+def test_a_plan_that_leaves_cash_for_its_costs_is_not_trimmed():
+    """$15,000 of shares and $15 of modelled cost fit $15,015 exactly."""
+    plan = buys(("A", 500), ("B", 500), ("C", 500))
+    assert fit(THREE, plan, TEN, 15015)[::2] == (plan, None)
+
+
+def test_an_over_cash_plan_is_trimmed_a_share_at_a_time_from_the_lowest_rank():
+    """The same plan on $15,000 is $15 short. A share off C, the lowest-ranked buy, leaves it
+    $4.99 short; a share off B, the next one up, leaves $5.02, and trimming stops there."""
+    plan = buys(("A", 500), ("B", 500), ("C", 500))
+
+    fitted, costs, note = fit(THREE, plan, TEN, 15000)
+
+    assert fitted == buys(("A", 500), ("B", 499), ("C", 499))
+    assert [c.order_usd for c in costs] == [5000.0, 4990.0, 4990.0]  # re-costed as trimmed
+    assert note == (
+        "Trimmed buys to pay the modelled cost: cash after modelled costs was -15.00;"
+        " trimmed C by 1 share, B by 1 share, leaving 5.02."
+    )
+
+
+def test_trimming_keeps_an_entering_name_and_may_drop_a_top_up():
+    """A enters with one $1,000 share and K, held at 400, is topped up by 100 at $10, on
+    $5,000 of capital. K's top-up goes a share at a time to nothing, A keeps its one share,
+    and the plan is still a dollar short, which is left for the gate to refuse."""
+    selection = Selection(keep=("K",), buy=("A",), sell=(), carry=())
+    plan = [Order("A", Side.BUY, 1, Decimal(1000)), Order("K", Side.BUY, 100, Decimal(10))]
+    marks = {"A": Decimal(1000), "K": Decimal(10)}
+
+    fitted, _, note = fit(selection, plan, marks, 5000, held={"K": Decimal(400)})
+
+    assert fitted == plan[:1]
+    assert note == (
+        "Trimmed buys to pay the modelled cost: cash after modelled costs was -1002.00;"
+        " trimmed K by 100 shares, still short of cash, leaving -1.00."
+    )
+
+
+def test_a_plan_with_an_unmarked_name_is_left_for_the_gate():
+    plan = buys(("A", 500), ("B", 500), ("C", 500))
+    assert fit(THREE, plan, {"A": Decimal(10)}, 1000)[::2] == (plan, None)
 
 
 # The state machine. A basket is inserted directly, as the pipeline does, so these need no lake.

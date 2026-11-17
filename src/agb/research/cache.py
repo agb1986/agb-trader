@@ -44,8 +44,11 @@ An entry whose trial id is not in the ledger the asking run writes to, or is not
 there, is not reused at all, because a manifest has to name trials its own shipped ledger
 holds.
 
-Nothing here is consulted unless a cache is handed in. `reproduce` hands in none, so a
-reproduction still recomputes the run it is checking, which is the whole point of it."""
+Nothing here is consulted unless a cache is handed in. `certify` hands one in, and so does the
+`cpcv` command when the build has a version: a cross-validation the operator runs by hand
+writes the same `cpcv` entry, scores included, that the certification of that configuration
+over that panel then reads instead of refitting. `reproduce` hands in none, so a reproduction
+still recomputes the run it is checking, which is the whole point of it."""
 
 import hashlib
 import json

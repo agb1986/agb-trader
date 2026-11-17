@@ -131,8 +131,10 @@ def run(
     aligned to `panel.frame`, for the certification backtest to trade.
 
     `cache`, when given, is consulted for a cross-validation of this configuration over this
-    panel and filled with this one. A hit does no refit, so it writes no ledger row and hands
-    back the row the run it reuses wrote; see `agb.research.cache`."""
+    panel and filled with this one, scores included whether or not the caller asked for them,
+    so a `cpcv` run the operator starts by hand leaves an entry the certification of the same
+    configuration reuses rather than refitting. A hit does no refit, so it writes no ledger row
+    and hands back the row the run it reuses wrote; see `agb.research.cache`."""
     months = panel.months
     split_list = splits(months, options)
     grouped = group_months(months, options.groups)
@@ -145,6 +147,9 @@ def run(
         held = _held(entry, panel, ledger, scores_out)
         if held is not None:
             return held
+    # The entry holds every path's scores, so a run that fills the cache collects them even
+    # when its caller has no use for them.
+    collected = {} if scores_out is None and entry is not None else scores_out
     with ledger.trial(
         KIND,
         {"model": config.to_dict(), KIND: asdict(options)},
@@ -179,8 +184,8 @@ def run(
                 "splits": [index for _, index in members],
                 "metrics": train.evaluate(frame, np.concatenate(scores)),
             })  # fmt: skip
-            if scores_out is not None:
-                scores_out[p] = _aligned(panel.frame, frame, np.concatenate(scores))
+            if collected is not None:
+                collected[p] = _aligned(panel.frame, frame, np.concatenate(scores))
         trial.results = {
             "groups": [len(group) for group in grouped],
             "splits": per_split,
@@ -191,10 +196,10 @@ def run(
         trial_id = trial.trial_id
     # Written after the trial's row says `succeeded`, so an entry never names a row that is
     # still open or that failed.
-    if entry is not None and scores_out is not None:
+    if entry is not None and collected is not None:
         entry.write(
             {"trial_id": trial_id, "results": results},
-            table=scores_table(panel, scores_out),
+            table=scores_table(panel, collected),
         )
     return Run(trial_id, results)
 
@@ -204,12 +209,10 @@ def _held(
 ) -> Run | None:
     """The cross-validation this key holds, if the cache holds one this run may use.
 
-    The scores are part of the entry, so an entry is only a hit for a run that wants them: a
-    `cpcv` run that passes no `scores_out` is cheap to serve but there is nothing to serve it
-    from, and filling the cache without them would leave an entry the certification cannot
-    use."""
-    if scores_out is None:
-        return None
+    An entry is only a hit when its scores read back whole over this panel, even for a caller
+    that passes no `scores_out`: every run that fills the cache writes them, so an entry
+    without them is damaged, and serving its results alone would leave it in place for the
+    certification that does need them."""
     payload = entry.read()
     if payload is None or not standing(ledger, payload.get("trial_id")):
         return None
@@ -219,7 +222,8 @@ def _held(
     paths = scores_from(table, panel)
     if paths is None:
         return None
-    scores_out.update(paths)
+    if scores_out is not None:
+        scores_out.update(paths)
     return Run(str(payload["trial_id"]), payload["results"])
 
 

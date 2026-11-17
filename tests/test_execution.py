@@ -719,6 +719,7 @@ def test_each_partial_fill_is_its_own_row_with_the_schedules_fees(db):
     # Reconciling again finds nothing new: the fills are keyed by the broker's execution id.
     assert execution.ingest_fills(conn, fake, CLOSE_AT - timedelta(hours=1)) == 0
     assert alerts(db) == []
+    assert outcomes(db) == [(target.id, "filled", 12, 12, 0, 0, "execution", True)]
 
 
 def test_a_fill_the_broker_stamps_before_its_own_order_row_is_still_recorded(db):
@@ -808,6 +809,132 @@ def test_a_basket_that_alerted_at_submission_and_then_filled_short_raises_both_a
             "buy 240 N05 filled 200",
         ),
     ]
+
+
+def outcomes(db):
+    return rows(
+        db,
+        "SELECT o.basket_id, o.outcome, o.orders, o.in_full, o.in_part, o.unfilled, o.actor,"
+        " o.event_id = e.id FROM agb.basket_outcome o"
+        " JOIN agb.basket_state s ON s.id = o.basket_id"
+        " JOIN agb.basket_event e ON e.basket_id = s.id AND e.seq = s.seq ORDER BY o.id",
+    )
+
+
+def test_a_basket_whose_orders_all_expire_unfilled_ends_unfilled_with_one_alert(db):
+    """Twenty orders that expire at the close with nothing filled do not leave the basket
+    reading as filled: it ends in its own state, its outcome row counts twenty unfilled, and
+    exactly one alert names the orders."""
+    conn = db.connect("execution")
+    fake = broker()
+    target = submitted(db, conn, fake, SOUND)
+
+    fake.close(CLOSE_AT, short={s: Decimal(0) for s in NAMES})
+    outcome = execution.reconcile(conn, fake, target, AFTER)
+
+    assert outcome == execution.Outcome(
+        target.id, "unfilled", 20, "0 of 20 orders filled in full at 2026-10-01T20:05:00Z"
+    )
+    assert state(db, target.id) == ("unfilled", 4, "execution", "execution")
+    assert rows(db, "SELECT DISTINCT status, filled_qty FROM agb.order_state") == [("expired", 0)]
+    assert rows(db, "SELECT count(*) FROM agb.fill") == [(0,)]
+    assert outcomes(db) == [(target.id, "unfilled", 20, 0, 0, 20, "execution", True)]
+    names = ", ".join(f"buy 240 {s} (expired, 0 filled)" for s in NAMES)
+    assert alerts(db) == [
+        (
+            "basket_unfilled",
+            PERIOD,
+            PERIOD,
+            f"basket {PERIOD} filled nothing: all 20 orders ended with no shares filled: {names}",
+        )
+    ]
+    # The basket is settled: a second reconcile has nothing to move and raises nothing more.
+    with pytest.raises(ExecutionError, match="no longer submitted"):
+        execution.reconcile(conn, fake, target, AFTER)
+    assert len(alerts(db)) == 1
+    # An unfilled basket ends a run of clean rebalances, as a halt does.
+    assert rows(db, "SELECT state FROM agb.ladder_rebalance WHERE basket_id = %s", target.id) == [
+        ("unfilled",)
+    ]
+
+
+def test_each_settled_basket_records_whether_it_filled_in_full_or_in_part(db):
+    """The outcome row counts every order once: filled in full, filled in part, or unfilled.
+    A basket that filled some of its orders still ends filled, and its row says in part."""
+    conn = db.connect("execution")
+    fake = broker()
+    target = submitted(db, conn, fake, SOUND)
+
+    fake.close(CLOSE_AT, short={"N01": Decimal(0), "N02": Decimal(100)})
+    assert execution.reconcile(conn, fake, target, AFTER).state == "filled"
+
+    assert outcomes(db) == [(target.id, "partly_filled", 20, 18, 1, 1, "execution", True)]
+    assert [kind for kind, *_ in alerts(db)] == ["partial_rebalance_short_fill"]
+
+
+def test_a_failure_between_the_move_and_its_alert_rolls_both_back(db, monkeypatch):
+    """The move to unfilled, the outcome row and the alert are one transaction: a process
+    that dies after the move and before the alert leaves the basket submitted, with no
+    outcome and no alert, and the next reconcile settles it and raises the alert once."""
+    conn = db.connect("execution")
+    fake = broker()
+    target = submitted(db, conn, fake, SOUND)
+    fake.close(CLOSE_AT, short={s: Decimal(0) for s in NAMES})
+
+    def die(*args):
+        raise RuntimeError("killed between the move and the alert")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(execution, "raise_alert", die)
+        with pytest.raises(RuntimeError, match="killed"):
+            execution.reconcile(conn, fake, target, AFTER)
+
+    assert state(db, target.id)[:2] == ("submitted", 3)
+    assert outcomes(db) == []
+    assert alerts(db) == []
+
+    assert execution.reconcile(conn, fake, target, AFTER).state == "unfilled"
+    assert state(db, target.id)[:2] == ("unfilled", 4)
+    assert [o[1] for o in outcomes(db)] == ["unfilled"]
+    assert [kind for kind, *_ in alerts(db)] == ["basket_unfilled"]
+
+
+def test_a_basket_still_waiting_past_the_reconcile_deadline_raises_one_alert(db):
+    """The deadline is a fixed time after the session's close. Before it a waiting basket is
+    only logged; at it, one alert names each order still open; later cycles raise no second
+    one, and the basket keeps waiting until the broker is done."""
+    conn = db.connect("execution")
+    fake = broker()
+    target = submitted(db, conn, fake, SOUND)
+    deadline = execution.reconcile_deadline(CALENDAR, target.session_date)
+    assert deadline == CLOSE_AT + execution.RECONCILE_DEADLINE == CLOSE_AT + timedelta(hours=1)
+
+    early = execution.reconcile(conn, fake, target, deadline - timedelta(minutes=1), deadline)
+    assert early.state == "submitted"
+    assert early.reason == f"waiting on {', '.join(NAMES)}"
+    assert alerts(db) == []
+
+    late = execution.reconcile(conn, fake, target, deadline, deadline)
+    assert late.state == "submitted"
+    assert late.reason == f"waiting on {', '.join(NAMES)} past the reconcile deadline"
+    names = ", ".join(f"buy 240 {s} (accepted, 0 filled)" for s in NAMES)
+    overdue = (
+        "reconcile_overdue",
+        PERIOD,
+        PERIOD,
+        f"basket {PERIOD} is still waiting on the broker at 2026-10-01T21:00:00Z, past the "
+        f"17:00 ET reconcile deadline, with 20 of 20 orders still open: {names}",
+    )
+    assert alerts(db) == [overdue]
+
+    for later in (deadline + timedelta(minutes=5), deadline + timedelta(hours=3)):
+        assert execution.reconcile(conn, fake, target, later, deadline).state == "submitted"
+    assert alerts(db) == [overdue]
+    assert state(db, target.id)[0] == "submitted"
+
+    fake.close(CLOSE_AT)
+    assert execution.reconcile(conn, fake, target, deadline + timedelta(hours=4)).state == "filled"
+    assert alerts(db) == [overdue]
 
 
 def test_the_daily_snapshot_records_positions_and_flags_a_discrepancy(db):
@@ -959,6 +1086,31 @@ def test_the_service_submits_in_the_window_and_reconciles_after_the_close(db, ca
     # The next cycle has nothing to do, and does not snapshot the session twice.
     service(conn)
     assert rows(db, snapshots) == [(date(2026, 9, 30), 0), (TRADE, 20)]
+    assert "ERROR" not in caplog.text
+
+
+def test_the_service_alerts_once_on_a_basket_still_waiting_an_hour_after_the_close(db, caplog):
+    """The service passes each basket its session's reconcile deadline: a cycle before it
+    only logs the wait, the first cycle at or past it raises the alert, and the next does not."""
+    conn = db.connect("execution")
+    target = approved(db)
+    fake = broker()
+    clock = Clock(NOW)
+    service = Execution(fake, clock=clock)
+    service(conn)
+    assert state(db, target.id)[0] == "submitted"
+
+    clock.now = CLOSE_AT + execution.RECONCILE_DEADLINE - timedelta(minutes=1)
+    with caplog.at_level(logging.INFO):
+        service(conn)
+    assert f"basket {PERIOD}: waiting on N01" in caplog.text
+    assert alerts(db) == []
+
+    for minutes in (0, 5):
+        clock.now = CLOSE_AT + execution.RECONCILE_DEADLINE + timedelta(minutes=minutes)
+        service(conn)
+    assert [kind for kind, *_ in alerts(db)] == ["reconcile_overdue"]
+    assert state(db, target.id)[0] == "submitted"
     assert "ERROR" not in caplog.text
 
 
