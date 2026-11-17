@@ -25,7 +25,8 @@ answer the approval request. Neither is written here: the kill switch lives in
 functions with a source of its own, so the two surfaces cannot drift apart. This service only
 turns a message into that source — who sent it, which surface it came from, and the text as
 typed — and sends back the reply it is given, which is why every one of these is a `command`
-row whatever became of it. The other commands only read.
+row whatever became of it. `/ack` acknowledges an alert the same way, through `agb.alerts`.
+The other commands only read.
 """
 
 import logging
@@ -42,7 +43,7 @@ from typing import Any
 import psycopg
 from psycopg.types.json import Jsonb
 
-from agb import approval, health, jobs, killswitch, ladder, readout, schedule
+from agb import alerts, approval, health, jobs, killswitch, ladder, readout, schedule
 from agb.cli import format_age
 from agb.health import Finding
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
@@ -121,6 +122,7 @@ COMMANDS = {
     "pause": ("/pause", "open the pause halt cause and suspend trading at the broker"),
     "resume": ("/resume", "clear every open halt cause and lift the broker suspension"),
     "liquidate": ("/liquidate [token]", "close every position at market, in two steps"),
+    "ack": ("/ack <alert id>", "acknowledge an alert by the id it is listed under"),
     "help": ("/help", "this list"),
 }
 # Commands the spec names that later tickets bring. They are refused, and recorded.
@@ -182,6 +184,9 @@ def parse(text: str) -> Parsed:
             return Parsed(verb, args, f"usage: {usage}")
     elif verb == "liquidate":
         if len(args) > 1:
+            return Parsed(verb, args, f"usage: {usage}")
+    elif verb == "ack":
+        if len(args) != 1 or alerts.alert_id(args[0]) is None:
             return Parsed(verb, args, f"usage: {usage}")
     elif args and verb not in DECISIONS:
         return Parsed(verb, args, f"usage: {usage}, no arguments")
@@ -582,6 +587,8 @@ class Bot:
             return self.resume(conn, message)
         if parsed.verb == "liquidate":
             return self.liquidate(conn, message, parsed.args, now)
+        if parsed.verb == "ack":
+            return alerts.acknowledge(conn, self.source(message), parsed.args[0], now)
         if parsed.verb in DECISIONS:
             return self.decide(conn, message, parsed, now)
         self._command(conn, message, parsed.verb, {"args": parsed.args})

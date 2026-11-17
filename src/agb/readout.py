@@ -9,7 +9,7 @@ adds no prose of its own and never recommends.
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import psycopg
@@ -25,6 +25,8 @@ LOG_DEFAULT = 10
 DETAIL_MAX = 120
 # A halt's reason is cut to this in /status.
 HALT_MAX = 240
+# /status says whether the alerts raised in this long have been acknowledged.
+ALERT_WINDOW = timedelta(days=7)
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,35 @@ _NEXT_SUBMISSION = """
     ORDER BY due_at
     LIMIT 1
 """
+
+
+_RECENT_ALERTS = """
+    SELECT a.id, a.kind, a.subject, a.period,
+           EXISTS (SELECT 1 FROM agb.alert_event e
+                   WHERE e.alert_id = a.id AND e.event = 'acknowledged')
+    FROM agb.alert a
+    WHERE a.raised_at > %s
+    ORDER BY a.id DESC
+"""
+
+
+def _alerts_item(conn: psycopg.Connection, now: datetime) -> Item | None:
+    """Whether the alerts of the last `ALERT_WINDOW` have been acknowledged, or None when none
+    was raised. The newest one still waiting is named with the command that acknowledges it."""
+    rows = conn.execute(_RECENT_ALERTS, (now - ALERT_WINDOW,)).fetchall()
+    if not rows:
+        return None
+    waiting = [row for row in rows if not row[4]]
+    days = ALERT_WINDOW.days
+    if not waiting:
+        return Item(
+            f"all {len(rows)} alerts of the last {days} days acknowledged", "nothing awaits you"
+        )
+    ident, kind, subject, period, _ = waiting[0]
+    return Item(
+        f"{len(waiting)} of {len(rows)} alerts of the last {days} days unacknowledged",
+        f"newest is {ident}, {kind} for {subject} {period}: /ack {ident}",
+    )
 
 
 def status(conn: psycopg.Connection, now: datetime) -> str:
@@ -178,6 +209,9 @@ def status(conn: psycopg.Connection, now: datetime) -> str:
     else:
         period, due_at = upcoming
         items.append(Item(f"next rebalance {period}", f"orders due by {et(due_at)}"))
+    alert_item = _alerts_item(conn, now)
+    if alert_item is not None:
+        items.append(alert_item)
     return message(header, items)
 
 

@@ -16,7 +16,7 @@ The bot is the only service holding the Telegram token, and the only one whose t
 
 ## The command set
 
-Fifteen commands.
+Sixteen commands.
 
 ```
 /status        — what the system is doing right now
@@ -33,10 +33,11 @@ Fifteen commands.
 /resume        — clear the halt and the pause
 /liquidate     — close every position at market (two steps)
 /log [n]       — recent audit lines
+/ack <id>      — acknowledge an alert, by the id it is listed under
 /help          — this list
 ```
 
-The set divides in three. `/status`, `/positions`, `/pnl` and `/log` are read-only monitoring. `/pending`, `/approve`, `/reject`, `/basket`, `/why` and `/gate` are the approval loop and its drill-downs. `/pause`, `/resume` and `/liquidate` are the kill-switch. `/level` sits across the first two, because the autonomy ladder is both a fact about current state and the thing the approval loop is working toward. `/help` lists the commands and touches nothing.
+The set divides in three. `/status`, `/positions`, `/pnl` and `/log` are read-only monitoring. `/pending`, `/approve`, `/reject`, `/basket`, `/why` and `/gate` are the approval loop and its drill-downs. `/pause`, `/resume` and `/liquidate` are the kill-switch. `/level` sits across the first two, because the autonomy ladder is both a fact about current state and the thing the approval loop is working toward. `/ack` acknowledges an alert and is described below. `/help` lists the commands and touches nothing.
 
 **There is no command that changes a position outside the approval loop and `/liquidate`.** That is the standing constraint expressed as an interface: the bot offers no way to trim a name, add one, or override a weight. If the human wants a different book, the mechanism is to reject the rebalance or to liquidate, both recorded as deliberate divergences. There is no `/promote` and no way to move the ladder up: those are server CLI acts ([04 — Risk limits and approval workflow](04-risk-and-approval.md)), and `/level` is read-only.
 
@@ -140,6 +141,16 @@ The performance alert opens by stating that nothing has been done and nothing wi
 As built, a performance alert carries the one header `PERFORMANCE ALERT — nothing has been done and nothing will be.`, then the reading as a two-line item, then the footer `/pause stops the next rebalance and /liquidate closes every position. Both are yours to choose; nothing in this message chooses for you, and no part of the system will act on it.` The reading's own second line ends with `live is outside the range validation explored`. A health alert keeps its own `HEALTH ALERT` header and carries no footer, because a stale heartbeat is a thing to fix rather than a thing to decide about. A test asserts the footer verbatim and that the words "should", "consider", "recommend", "advise" and "suggest" appear nowhere in the message.
 
 This wording is doing real work. An alert that reads as a recommendation converts a monitoring system into an advisory one, and an operator who acts on it at the bottom of a drawdown has overlaid an unbacktested exit rule on a certified strategy by hand, the exact outcome the standing constraint forbids the software from doing automatically. Saying outright that no action was taken and none will be taken removes the ambiguity about whether the system is asking for something.
+
+## `/ack` acknowledges an alert
+
+`/ack <alert id>` says the operator has seen an alert. It is the one write on this surface that touches neither a basket nor the kill switch: it changes no order flow and halts nothing. The id is the number an alert is listed under on the UI's Alerts page ([06 — Local UI](06-local-ui.md)), and `/status` names the newest alert still waiting, with the command that acknowledges it.
+
+Acknowledging writes one `alert_event` with event `acknowledged`, naming the operator (`telegram:<user id>`), the channel and the chat the command came in from. The UI's Acknowledge form calls the same function (`agb.alerts.acknowledge`), so the two surfaces give the same reply and write the same row, differing only in the actor and the channel. It is the same chat check as every other command: a message from any chat but the configured one is refused and acknowledges nothing.
+
+An alert is acknowledged once, and the first acknowledgement stands. A second `/ack` for the same alert, from either surface, writes no second event: it is refused, and the reply says who acknowledged the alert, from where and when. A unique index on `alert_event` settles a race between the two surfaces in the database, and a trigger binds the actor to the role that writes it, as it does for a basket. A missing or malformed id and an id no alert has are refused with a reply that says which. Every attempt, refused ones included, is one `command` row.
+
+`/status` also says whether the alerts raised in the last seven days have been acknowledged: how many are waiting out of how many were raised, or that all of them are acknowledged. It says nothing when none was raised in that time.
 
 ## The audit log carries an actor, and `system` is one
 

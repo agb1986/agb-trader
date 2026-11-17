@@ -1,6 +1,6 @@
 """The local UI's pages, rendered from the database by the server beside it
 (docs/architecture/06-local-ui.md). Every page is a read, and a page renders on a connection
-the database itself holds read-only, so a mistake on a page cannot become a write. The two
+the database itself holds read-only, so a mistake on a page cannot become a write. The
 write paths are forms that post to their own routes, each of which takes a connection of its
 own, and `WRITES` is the whole list of them.
 
@@ -32,14 +32,16 @@ Panel is the safety panel's own record, name by name, with the Judge's reason on
 and the note that the panel never learns which company it is reading about. None of the four has
 a write path: nothing on them appears in `WRITES`.
 
-The writes are exactly Telegram's two: answering the rebalance, and the kill switch. Neither
-is written here. Answering goes through `agb.approval` and the switch through
-`agb.killswitch`, the same functions the bot calls, with a source naming this surface, so the
-semantics cannot drift between the two surfaces and the race between them is settled in one
-place. Approving is never one click: the operator types the rebalance's reference, which is
-the friction Telegram's typed command has and the whole reason the landing page is the log
-rather than a basket with a green button. Every write is a `command` row with the actor and
-the surface on it, refused ones included.
+The writes are Telegram's: answering the rebalance, the kill switch, and acknowledging an
+alert. None is written here. Answering goes through `agb.approval`, the switch through
+`agb.killswitch` and acknowledging through `agb.alerts`, the same functions the bot calls,
+with a source naming this surface, so the semantics cannot drift between the two surfaces and
+the race between them is settled in one place. Approving is never one click: the operator
+types the rebalance's reference, which is the friction Telegram's typed command has and the
+whole reason the landing page is the log rather than a basket with a green button.
+Acknowledging is typed too: the Alerts page lists each alert's id, and the operator types the
+one they have seen. Every write is a `command` row with the actor and the surface on it,
+refused ones included.
 
 Pause, Resume and Ask to liquidate are not one click either. Each is a link from the kill switch
 page to a confirmation page (`/confirm/...`, a GET that reads and writes nothing) which says what
@@ -65,6 +67,7 @@ from decimal import Decimal, DivisionByZero, InvalidOperation
 import psycopg
 
 from agb import analyst, approval, debate, health, killswitch, ladder, readout
+from agb.alerts import acknowledge
 from agb.health import et
 from agb.nyse import NyseCalendar, trading_date
 
@@ -247,7 +250,8 @@ def page(title: str, path: str, blocks: Iterable[object]) -> str:
         f"<title>{esc(title)} — agb-trader</title><style>{STYLE}</style></head><body>"
         f"<header><b>agb-trader</b>{nav}</header><main>{join(blocks)}</main>"
         "<footer>Read-mostly: the pages read, and the only writes are answering a "
-        "rebalance and the kill switch, both recorded against this surface. Nothing here "
+        "rebalance, the kill switch and acknowledging an alert, all recorded against this "
+        "surface. Nothing here "
         "resizes a position, edits the universe, overrides the ranker, moves the ladder or "
         "promotes a model.</footer>"
         "</body></html>\n"
@@ -1395,9 +1399,10 @@ def panel(conn: psycopg.Connection, now: datetime) -> str:
 # The Alerts view.
 
 _ALERTS = """
-    SELECT a.kind, a.subject, a.period, a.body, a.raised_at, a.raised_by,
+    SELECT a.id, a.kind, a.subject, a.period, a.body, a.raised_at, a.raised_by,
            max(e.at) FILTER (WHERE e.event = 'delivered'),
            max(e.at) FILTER (WHERE e.event = 'acknowledged'),
+           max(e.actor) FILTER (WHERE e.event = 'acknowledged'),
            count(e.id) FILTER (WHERE e.event = 'failed')
     FROM agb.alert a
     LEFT JOIN agb.alert_event e ON e.alert_id = a.id
@@ -1407,9 +1412,15 @@ _ALERTS = """
 """
 
 
-def _delivery(delivered: datetime | None, acknowledged: datetime | None, failures: int) -> Html:
+def _delivery(
+    delivered: datetime | None,
+    acknowledged: datetime | None,
+    failures: int,
+    acknowledged_by: str | None = None,
+) -> Html:
     if acknowledged:
-        return tag("span", f"acknowledged {et(acknowledged)}", class_="ok")
+        who = f" by {acknowledged_by}" if acknowledged_by else ""
+        return tag("span", f"acknowledged {et(acknowledged)}{who}", class_="ok")
     if delivered:
         return tag("span", f"delivered {et(delivered)}", class_="ok")
     if failures:
@@ -1425,18 +1436,40 @@ def alerts(conn: psycopg.Connection, now: datetime) -> str:
         blocks: list[object] = [note("Nothing has been raised.")]
         return page("Alerts", "/alerts", [banner(conn, now), section("Alerts", blocks)])
     listed = []
-    for kind, subject, period, body, raised_at, by, delivered, acknowledged, failures in rows:
+    for row in rows:
+        (
+            ident,
+            kind,
+            subject,
+            period,
+            body,
+            raised_at,
+            by,
+            delivered,
+            acknowledged,
+            who,
+            failures,
+        ) = row
         listed.append(
             (
+                ident,
                 et(raised_at),
                 kind,
                 f"{subject} {period}",
                 by,
-                _delivery(delivered, acknowledged, failures),
+                _delivery(delivered, acknowledged, failures, who),
                 Html(f"<details><summary>body</summary><pre>{esc(body)}</pre></details>"),
             )
         )
-    blocks = [table(["Raised", "Kind", "Subject", "By", "Delivery", ""], listed)]
+    blocks = [
+        table(["Id", "Raised", "Kind", "Subject", "By", "Delivery", ""], listed),
+        tag("h3", "Acknowledge"),
+        note(
+            "Type the id of an alert you have seen. An alert is acknowledged once, by whoever "
+            "does it first, here or with /ack in Telegram."
+        ),
+        write_form("/ack", "Acknowledge", [("alert", "Alert id")]),
+    ]
     return page("Alerts", "/alerts", [banner(conn, now), section("Alerts", blocks)])
 
 
@@ -1672,6 +1705,14 @@ def liquidate(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime
     return Outcome("/killswitch", "Kill switch", reply)
 
 
+def ack(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
+    """Acknowledge the alert whose id was typed. `agb.alerts` checks it, refuses and records a
+    missing, malformed or repeated one, and settles a race with the bot on the alert itself."""
+    word = fields.get("alert", "").strip()
+    reply = acknowledge(conn, _source(f"/ack {word}".strip()), word or None, now)
+    return Outcome("/alerts", "Acknowledge alert", reply)
+
+
 def outcome(conn: psycopg.Connection, now: datetime, held: Outcome | None) -> str:
     """The page a write redirects to: the reply it produced, above the banner as it reads now.
     An outcome the server no longer holds, because it expired or the server restarted, says so
@@ -1716,7 +1757,7 @@ def failed(path: str, cause: str, wrote: bool) -> str:
     return page(heading, path, [section(heading, blocks)])
 
 
-# What the server routes: the pages, which only read, and the writes, which are these five and
+# What the server routes: the pages, which only read, and the writes, which are these six and
 # no others. A page's form posts to one of these and nowhere else, and the server answers a
 # POST to a page with 405.
 ROUTES = {
@@ -1740,6 +1781,7 @@ WRITES = {
     "/pause": pause,
     "/resume": resume,
     "/liquidate": liquidate,
+    "/ack": ack,
 }
 
 
