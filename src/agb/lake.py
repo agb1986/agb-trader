@@ -759,13 +759,13 @@ def land_bulk(
     return partitions
 
 
-# The lake keeps every day's version of an SF1 row; the view shows the latest.
+# The lake keeps every day's version of an SF1 row; the `sf1` view shows the latest. The versions
+# are read from the parquet files once per connection, into a temporary table that also marks each
+# row's latest version, so no query decodes the files again or ranks the versions again for the
+# view.
 _SF1_PERIOD = ", ".join(SF1.primary_key)
-_VIEW_FILTER = {
-    SF1.name: (
-        f"QUALIFY row_number() OVER (PARTITION BY {_SF1_PERIOD} ORDER BY lastupdated DESC) = 1"
-    ),
-}
+_SF1_VERSIONS = "sf1_versions"
+_SF1_LATEST = "_latest"
 # `sf1_as_of(d)` is SF1 as it was known on day `d`: the rows filed by then, each in the latest
 # version the vendor had stamped by then. A row the lake first saw after `d` is served in the
 # earliest version it has, since nothing older was ever landed: the backfill holds each row only
@@ -773,7 +773,7 @@ _VIEW_FILTER = {
 # earlier version to fall back to.
 _SF1_AS_OF = f"""
 CREATE MACRO sf1_as_of(as_of) AS TABLE
-SELECT * FROM {{source}}
+SELECT * EXCLUDE ({_SF1_LATEST}) FROM {_SF1_VERSIONS}
 WHERE datekey <= as_of
 QUALIFY row_number() OVER (
     PARTITION BY {_SF1_PERIOD}
@@ -788,6 +788,10 @@ def connect(lake: Path = DEFAULT_DIR) -> duckdb.DuckDBPyConnection:
     `tickers`, the newest snapshot as of this call. A query that stands on a past day reads
     `sf1_as_of(day)` instead of `sf1`, the fundamentals as they were known that day.
 
+    `sep` is read with its `date` partitions, so a query that filters on `date` opens only the
+    sessions it asks for. The SF1 versions are read once, into a temporary table the view and the
+    macro both read.
+
     A query that runs out of memory spills to DuckDB's temp directory, which defaults to `.tmp`
     under the working directory. The service image's working directory is not writable, so spill
     beside the lake, which the service owns and which has the room for it."""
@@ -799,14 +803,31 @@ def connect(lake: Path = DEFAULT_DIR) -> duckdb.DuckDBPyConnection:
         if not files:
             continue
         if dataset.key is None:
-            source = f"read_parquet('{_sql(files[-1])}')"
-        else:
-            pattern = lake / dataset.name / f"{dataset.partition}=*" / FILE
-            source = f"read_parquet('{_sql(pattern)}', hive_partitioning = false)"
-        view_filter = _VIEW_FILTER.get(dataset.name, "")
-        conn.execute(f"CREATE VIEW {dataset.name} AS SELECT * FROM {source} {view_filter}")
+            conn.execute(
+                f"CREATE VIEW {dataset.name} AS SELECT * FROM read_parquet('{_sql(files[-1])}')"
+            )
+            continue
+        pattern = lake / dataset.name / f"{dataset.partition}=*" / FILE
         if dataset is SF1:
-            conn.execute(_SF1_AS_OF.format(source=source))
+            conn.execute(f"""
+                CREATE TEMP TABLE {_SF1_VERSIONS} AS
+                SELECT *,
+                    row_number() OVER (
+                        PARTITION BY {_SF1_PERIOD} ORDER BY lastupdated DESC
+                    ) = 1 AS {_SF1_LATEST}
+                FROM read_parquet('{_sql(pattern)}', hive_partitioning = false)
+            """)
+            conn.execute(
+                f"CREATE VIEW {dataset.name} AS SELECT * EXCLUDE ({_SF1_LATEST}) "
+                f"FROM {_SF1_VERSIONS} WHERE {_SF1_LATEST}"
+            )
+            conn.execute(_SF1_AS_OF)
+        else:
+            # The partition directory names the file's date, so a filter on `date` prunes the
+            # files it excludes. The column is typed here, not guessed, to match the files' own.
+            hive = f"hive_partitioning = true, hive_types = {{'{dataset.partition}': DATE}}"
+            source = f"read_parquet('{_sql(pattern)}', {hive})"
+            conn.execute(f"CREATE VIEW {dataset.name} AS SELECT * FROM {source}")
     return conn
 
 
