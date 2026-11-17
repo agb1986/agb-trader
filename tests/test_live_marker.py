@@ -44,18 +44,18 @@ def test_there_are_live_modules_to_guard():
 
 def test_a_default_run_collects_no_live_module():
     """`make test`, and a plain `uv run pytest`: the default options deselect the live tests."""
-    assert recipe("test") == 'uv run pytest -m "not live"'
+    assert recipe("test") == 'uv run --frozen pytest -m "not live"'
     assert collected_files("-m", "not live", *LIVE_MODULES) == set()
     assert collected_files(*LIVE_MODULES) == set()
 
 
 def test_the_fast_run_collects_no_live_module():
     """What `make test-fast` runs: its own -m replaces the default one, so it keeps "not live"."""
-    assert recipe("test-fast") == 'uv run pytest -m "not stack and not live"'
+    assert recipe("test-fast") == 'uv run --frozen pytest -m "not stack and not live"'
     assert collected_files("-m", "not stack and not live", *LIVE_MODULES) == set()
 
 
 def test_asking_for_live_collects_every_live_module():
     """What `make test-live` runs. Every *_live.py module carries the marker."""
-    assert recipe("test-live") == "uv run pytest -m live"
+    assert recipe("test-live") == "uv run --frozen pytest -m live"
     assert collected_files("-m", "live", *LIVE_MODULES) == set(LIVE_MODULES)

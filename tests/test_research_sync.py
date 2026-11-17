@@ -114,7 +114,7 @@ def test_the_research_container_has_no_network_and_no_sync():
     """The container cannot rsync: the sync is a host command, run by make before it."""
     makefile = (ROOT / "Makefile").read_text()
     [line] = [line for line in makefile.splitlines() if "agb.research sync" in line]
-    assert line.startswith("\tuv run python -m agb.research sync"), "the host runs the sync"
+    assert line.startswith("\tuv run --frozen python -m agb.research sync"), "the host runs the sync"
     assert "research: sync-lake" in makefile, "a research run syncs the lake first"
 
 
