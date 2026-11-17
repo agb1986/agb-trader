@@ -30,10 +30,14 @@ MODEL_ID = "ranker-cache.1"
 MODEL = train.Config(num_boost_round=20, min_data_in_leaf=5)
 OTHER = train.Config(num_boost_round=21, min_data_in_leaf=5)
 VALIDATION = cpcv.Options(groups=6, test_groups=2, embargo_months=1)
-SIZE, HOLD_THROUGH = 6, 10
+# The fake market's passing configuration: a six-name book held to the eighth session, ranked
+# against three plain-signal priors. Since issue #187 the verdict also fails a Sharpe above 2.0
+# on any basis, and the ten-session hold this used before cleared the deflated Sharpe only with a
+# gross Sharpe above 2.0.
+SIZE, HOLD_THROUGH = 6, 8
 # Plain-signal backtests the first certification is ranked against: with no other candidate
 # the overfitting gate has nothing to measure and fails (issue #166).
-PRIORS = ("mom_12_1", "mom_6_1", "rev_1m", "vol_12m", "log_mktcap")
+PRIORS = ("mom_12_1", "mom_6_1", "rev_1m")
 # The manifest fields a rerun is entitled to differ on: when it ran, where it ran, its own
 # trial row, and everything downstream of the ledger that row was appended to. Every other
 # field -- every gate value and diagnostic, the paths, the nested trial ids, the declared

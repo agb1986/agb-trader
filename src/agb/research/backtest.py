@@ -87,7 +87,7 @@ Each backtest is a trial, like a scan: its options and its results append a row.
 
 import warnings
 from bisect import bisect_left, bisect_right
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -845,6 +845,26 @@ class _Book:
     free: set = field(default_factory=set)  # the client order ids a corporate action forced
     delisting: dict = field(default_factory=dict)  # client order id: the delisting return
     as_traded: dict = field(default_factory=dict)  # client order id: `Feed.as_traded`
+    # client order id: the charges made on its fills that no fill event has claimed yet
+    unclaimed: dict = field(default_factory=dict)
+
+    def charge(self, coid, ticker: str, fee: float, take: float, loss: float) -> None:
+        """Record the fee model's charge for one fill of the order `coid`."""
+        self.charges.append((ticker, fee, take, loss))
+        self.unclaimed.setdefault(coid, deque()).append((fee, take, loss))
+
+    def claim(self, coid, ticker: str) -> tuple[float, float, float]:
+        """The charge for the next fill of the order `coid`: the fee, participation and
+        delisting loss, paired by order rather than by the fills' position in the run, so a
+        charge can never be read against another order's fill (issue #187). One order filled
+        in parts is charged and claims once per part, in the order they happened."""
+        queue = self.unclaimed.get(coid)
+        if not queue:
+            raise BacktestError(f"{ticker}: a fill of order {coid} that was never charged")
+        charge = queue.popleft()
+        if not queue:
+            del self.unclaimed[coid]
+        return charge
 
 
 class _Fees(FeeModel):
@@ -865,7 +885,7 @@ class _Fees(FeeModel):
         if order.client_order_id in self.book.free:
             # A cash acquisition or a merger conversion: the position changes without a trade
             # of ours behind it, so there is no commission and no participation to report.
-            self.book.charges.append((ticker, 0.0, 0.0, 0.0))
+            self.book.charge(order.client_order_id, ticker, 0.0, 0.0, 0.0)
             return Money(0, USD)
         liq = self.book.liquidity.get(ticker)
         if liq is None:
@@ -877,7 +897,7 @@ class _Fees(FeeModel):
         priced = cost.trade_cost(side, notional, shares * self.book.as_traded.get(coid, 1.0), liq)
         fee = Money(priced.total_usd * self.book.multiple, USD).as_double()
         loss = Money(notional * -self.book.delisting.get(coid, 0.0), USD).as_double()
-        self.book.charges.append((ticker, fee, notional / liq.adv_usd, loss))
+        self.book.charge(coid, ticker, fee, notional / liq.adv_usd, loss)
         return Money(fee + loss, USD)
 
 
@@ -1135,7 +1155,7 @@ class _Rebalancer(Strategy):
         expected = self.feed.close_at(ticker, day)
         if _off_close(close, expected):
             raise BacktestError(f"{ticker} filled at {close} on {day}, whose close is {expected}")
-        charged, take, loss = self.book.charges[len(self.fills)][1:]
+        charged, take, loss = self.book.claim(event.client_order_id, ticker)
         if abs(charged + loss - commission) > 0.005:
             raise BacktestError(
                 f"{ticker}: charged {commission}, the cost model priced {charged + loss}"
@@ -1236,7 +1256,7 @@ def simulate(
             f"the account holds {strategy.account_final}, not the {strategy.cash:.2f} the fills"
             " add up to"
         )
-    if len(book.charges) != len(strategy.fills):
+    if len(book.charges) != len(strategy.fills) or book.unclaimed:
         raise BacktestError(f"{len(book.charges)} charges for {len(strategy.fills)} fills")
     return Simulation(strategy.fills, strategy.counts, dict(strategy.positions))
 
@@ -1475,11 +1495,18 @@ def _sensitivity(
 
 def _summary(paths: list[dict[str, Any]]) -> dict[str, Any]:
     totals = [path["total_return"] for path in paths]
-    sharpes = [path["sharpe"] for path in paths if path["sharpe"] is not None]
+    ratios = [
+        path["return_over_volatility"]
+        for path in paths
+        if path["return_over_volatility"] is not None
+    ]
+    mean = float(np.mean(ratios)) if ratios else None
     return {
         "paths": len(paths),
         "total_return_mean": float(np.mean(totals)),
         "total_return_min": min(totals),
         "total_return_max": max(totals),
-        "sharpe_mean": float(np.mean(sharpes)) if sharpes else None,
+        "return_over_volatility_mean": mean,
+        # The same number under its old, misleading name, kept for readers of older reports.
+        "sharpe_mean": mean,
     }

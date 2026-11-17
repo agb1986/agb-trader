@@ -45,8 +45,12 @@ pytestmark = pytest.mark.usefixtures("certifiable")
 MODEL_ID = "ranker-2026.1"
 MODEL = train.Config(num_boost_round=20, min_data_in_leaf=5)
 VALIDATION = cpcv.Options(groups=6, test_groups=2, embargo_months=1)
-OPTIONS = certify.Options(model_id=MODEL_ID, size=6, hold_through=10)
-PRIORS = ("mom_12_1", "mom_6_1", "rev_1m", "vol_12m", "log_mktcap")
+# The fake market's passing configuration: a six-name book held to the eighth session, ranked
+# against three plain-signal priors. Since issue #187 the verdict also fails a Sharpe above 2.0
+# on any basis, and the ten-session hold this used before cleared the deflated Sharpe only with a
+# gross Sharpe above 2.0.
+OPTIONS = certify.Options(model_id=MODEL_ID, size=6, hold_through=8)
+PRIORS = ("mom_12_1", "mom_6_1", "rev_1m")
 
 # The research lake's last session, and the rebalance it signals.
 SIGNAL = date(2026, 8, 31)
@@ -63,7 +67,7 @@ NEXT = "next"
 # which is the failure the paper-only measurement waiver covers.
 FAILED_ID = "ranker-2026.1-failed"
 FAILED = certify.Options(
-    model_id=FAILED_ID, size=6, hold_through=10, thresholds=gates.Thresholds(dsr=1.0)
+    model_id=FAILED_ID, size=6, hold_through=8, thresholds=gates.Thresholds(dsr=1.0)
 )
 WAIVER = "measuring the live limits, issue #45"
 

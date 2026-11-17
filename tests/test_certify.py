@@ -32,8 +32,12 @@ pytestmark = pytest.mark.usefixtures("certifiable")
 
 MODEL = train.Config(num_boost_round=20, min_data_in_leaf=5)
 VALIDATION = cpcv.Options(groups=6, test_groups=2, embargo_months=1)
-OPTIONS = certify.Options(model_id="ranker-2024.1", size=6, hold_through=10)
-PRIORS = ("mom_12_1", "mom_6_1", "rev_1m", "vol_12m", "log_mktcap")
+# The fake market's passing configuration: a six-name book held to the eighth session, ranked
+# against three plain-signal priors. Since issue #187 the verdict also fails a Sharpe above 2.0
+# on any basis, and the ten-session hold this used before cleared the deflated Sharpe only with a
+# gross Sharpe above 2.0.
+OPTIONS = certify.Options(model_id="ranker-2024.1", size=6, hold_through=8)
+PRIORS = ("mom_12_1", "mom_6_1", "rev_1m")
 STAGE_1 = "stage 1 (classical ranker) only"
 # The ledger of a workstation that has tried many things: enough declared trials that no
 # thirty-month edge survives the deflated Sharpe. Each row is a different configuration, so
@@ -231,15 +235,15 @@ def test_the_artifact_carries_every_field_the_row_needs(certified, panel):
     )  # fmt: skip
     assert manifest["cost_model_version"] == panel.cost_model_version
     assert manifest["certified_capital"] == 100_000.0
-    assert set(manifest["gates"]) >= {"dsr", "pbo", "sharpe_net", "dsr_2x", "thresholds"}
-    assert all(manifest["gates"][g]["passed"] for g in ("dsr", "pbo", "sharpe_net", "dsr_2x"))
+    assert set(manifest["gates"]) >= {*certify.REPORTED_GATES, "thresholds"}
+    assert all(manifest["gates"][g]["passed"] for g in certify.REPORTED_GATES)
     for name in ("max_drawdown", "longest_losing_run", "tracking_dispersion", "monthly_return"):
         assert set(manifest["path_quantiles"][name]) == {
             "min", "max", "q05", "q25", "q50", "q75", "q95",
         }  # fmt: skip
     assert manifest["participation_max"] >= manifest["participation_mean"] > 0.0
     assert manifest["break_even_multiple"] > 1.0
-    assert manifest["gross_sharpe_flag"] is (manifest["sharpe_gross"] > 2.0)
+    assert manifest["gross_sharpe_flag"] is False and manifest["gates"]["start_date_stable"] is True
     assert datetime.fromisoformat(manifest["certified_at"]).tzinfo is not None
 
 
@@ -488,6 +492,28 @@ def test_the_report_says_what_the_gates_certify(certified):
     assert "break-even cost multiple" in report
     assert f"{len(PRIORS) + 1} trials declared from the {len(PRIORS) + 3} rows of the" in report
     assert f"counted as {trials.RULE}" in report
+
+
+def test_the_report_lists_the_binding_suspicion_and_start_date_gates(certified):
+    """Issue #187: the gross-Sharpe suspicion check and the start-date check are gates, so the
+    report lists them with the rest; a manifest written before them still renders, and a gate
+    with no value to read says so rather than failing to format."""
+    report = (certified.directory / certify.REPORT).read_text()
+    assert "- gross_sharpe: " in report and "at most 2.0000: pass" in report
+    assert "- start_date: " in report
+    older = {**certified.manifest}
+    older["gates"] = {
+        key: gate
+        for key, gate in certified.manifest["gates"].items()
+        if key not in ("gross_sharpe", "start_date")
+    }
+    assert "- gross_sharpe: " not in certify.report(older)
+    empty = {**certified.manifest}
+    empty["gates"] = {
+        **certified.manifest["gates"],
+        "start_date": {**certified.manifest["gates"]["start_date"], "value": None},
+    }
+    assert "- start_date: none, above " in certify.report(empty)
 
 
 def test_the_report_names_the_excess_return_definition(certified):
@@ -828,7 +854,8 @@ def test_a_ledger_with_the_wrong_number_of_rows_is_refused(db, certified, tmp_pa
     copy.drop_last_trial()
     copy.rewrite()
     with pytest.raises(
-        artifact.CertificationError, match="holds 7 rows; the certification shipped 8"
+        artifact.CertificationError,
+        match=f"holds {len(PRIORS) + 2} rows; the certification shipped {len(PRIORS) + 3}",
     ):
         artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
@@ -841,7 +868,8 @@ def test_a_ledger_that_disagrees_with_the_declared_count_is_refused(db, certifie
     copy.rewrite(ledger_rows=len(PRIORS) + 2)
     with pytest.raises(
         artifact.CertificationError,
-        match=f"holds 5 trials counted as {trials.RULE}; the certification declared 6",
+        match=f"holds {len(PRIORS)} trials counted as {trials.RULE};"
+        f" the certification declared {len(PRIORS) + 1}",
     ):
         artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
@@ -865,7 +893,8 @@ def test_a_declared_count_the_trial_row_disagrees_with_is_refused(db, certified,
     copy.rewrite(declared_trials=7)
     with pytest.raises(
         artifact.CertificationError,
-        match=f"holds 6 trials counted as {trials.RULE}; the certification declared 7",
+        match=f"holds {len(PRIORS) + 1} trials counted as {trials.RULE};"
+        " the certification declared 7",
     ):
         artifact.import_artifact(db.connect(RESEARCH), copy.directory)
     # Dropping a configuration and lowering the declared count to match leaves the recount and
@@ -1014,14 +1043,19 @@ def test_the_cli_certifies_and_imports(
     research_dir = tmp_path / "research"
     research_dir.mkdir()
     # The prior backtests give the overfitting gate something to rank the model against; an
-    # empty ledger leaves one candidate and fails it.
-    shutil.copy(prior[0].path, research_dir / trials.FILE)
+    # empty ledger leaves one candidate and fails it. Only the priors are copied: the module's
+    # own certification also sits in that ledger, and counting it would declare one more trial
+    # than the certified run did.
+    ledger, prior_ids = prior
+    Ledger(research_dir / trials.FILE)._write(
+        [row for row in ledger.rows() if row["trial_id"] in prior_ids]
+    )
     panel.save(research_dir / "panel.parquet")
     monkeypatch.setenv("AGB_RESEARCH_DIR", str(research_dir))
     monkeypatch.setenv("AGB_LAKE_DIR", str(research_lake))
     cli.main([
         "certify", "--model-id", "cli-ranker", "--rounds", "20", "--min-leaf", "5",
-        "--groups", "6", "--size", "6", "--hold-through", "10",
+        "--groups", "6", "--size", "6", "--hold-through", "8",
     ])  # fmt: skip
     out = capsys.readouterr().out
     assert f"certification PASSED: {STAGE_1}; artifact " in out
@@ -1052,7 +1086,7 @@ def test_the_cli_exits_1_on_a_failed_certification_after_writing_it(
     with pytest.raises(SystemExit) as exited:
         cli.main([
             "certify", "--model-id", "cli-failed", "--rounds", "20", "--min-leaf", "5",
-            "--groups", "6", "--size", "6", "--hold-through", "10",
+            "--groups", "6", "--size", "6", "--hold-through", "8",
         ])  # fmt: skip
     assert exited.value.code == 1
     out = capsys.readouterr().out
