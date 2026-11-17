@@ -1,7 +1,6 @@
 """Job leases: one winner per job, skip-don't-block, visible expiry, and a logged lifecycle."""
 
 import threading
-import time
 from datetime import timedelta
 
 import pytest
@@ -11,6 +10,7 @@ from agb import jobs
 from agb.roles import OWNER
 
 LEASE = timedelta(minutes=5)
+LAPSED = timedelta(seconds=-1)  # a lease that is already over when it is taken
 
 
 def add_job(db, kind="rebalance", period="2026-10", due="now() - interval '1 minute'"):
@@ -148,17 +148,15 @@ def test_a_locked_job_is_skipped_not_waited_for(db):
     with holder.transaction():
         held = jobs.claim(holder, ["rebalance"], "holder", LEASE)
         assert held.job_id == first
-        # The holder's transaction is still open, so its row lock on the first job is live.
-        started = time.monotonic()
+        # The holder's transaction is still open, so its row lock on the first job is live. A claim
+        # that waited for it would fail on the connection's lock timeout.
         taken = jobs.claim(other, ["rebalance"], "other", LEASE)
-        assert time.monotonic() - started < 1
         assert taken.job_id == second
         assert jobs.claim(other, ["rebalance"], "other", LEASE) is None
 
 
 def expire(db, job_id):
-    """Wait out a zero-length lease."""
-    time.sleep(0.05)
+    """Check that the lease taken with `LAPSED` shows as expired."""
     assert state(db, job_id)[2] is True
 
 
@@ -237,7 +235,7 @@ def test_a_worker_that_lost_its_lease_cannot_complete_fail_or_release_the_job(db
 def test_an_expired_lease_cannot_be_released_by_its_worker(db):
     job_id = add_job(db, kind="submission")
     execution = db.connect("execution")
-    claim = jobs.claim(execution, ["submission"], "execution", timedelta(0))
+    claim = jobs.claim(execution, ["submission"], "execution", LAPSED)
     expire(db, job_id)
 
     with pytest.raises(jobs.LeaseLost):
@@ -249,7 +247,7 @@ def test_an_expired_lease_cannot_be_released_by_its_worker(db):
 def test_an_expired_lease_is_visible_and_not_reclaimed_by_default(db):
     job_id = add_job(db, kind="submission")
     execution = db.connect("execution")
-    claim = jobs.claim(execution, ["submission"], "execution", timedelta(0))
+    claim = jobs.claim(execution, ["submission"], "execution", LAPSED)
     expire(db, job_id)
 
     assert state(db, job_id) == ("lease_expired", "execution", True)
@@ -267,7 +265,7 @@ def test_an_expired_lease_is_visible_and_not_reclaimed_by_default(db):
 def test_a_pipeline_stage_with_an_expired_lease_is_reclaimed(db):
     job_id = add_job(db, kind="features")
     stale, fresh = db.connect("pipeline"), db.connect("pipeline")
-    lost = jobs.claim(stale, ["features"], "pipeline-a", timedelta(0))
+    lost = jobs.claim(stale, ["features"], "pipeline-a", LAPSED)
     expire(db, job_id)
 
     claim = jobs.claim(fresh, ["features"], "pipeline-b", LEASE, reclaim_expired=True)
@@ -292,7 +290,7 @@ def test_a_pipeline_stage_with_an_expired_lease_is_reclaimed(db):
 
 def test_an_expiry_already_recorded_is_not_recorded_again_on_reclaim(db):
     job_id = add_job(db, kind="features")
-    jobs.claim(db.connect("pipeline"), ["features"], "pipeline-a", timedelta(0))
+    jobs.claim(db.connect("pipeline"), ["features"], "pipeline-a", LAPSED)
     expire(db, job_id)
     jobs.record_expiries(db.connect("scheduler"), "scheduler")
     jobs.claim(db.connect("pipeline"), ["features"], "pipeline-b", LEASE, reclaim_expired=True)

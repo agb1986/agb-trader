@@ -6,7 +6,6 @@ basket's state machine: the CAS on `basket_event`, the transition trigger and th
 import os
 import re
 import threading
-import time
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -31,10 +30,11 @@ LIMITS = gate.Limits(universe_min=20)
 # The evening of the signal session, well before the trade session's MOC cutoff.
 EVENING = datetime(2026, 9, 30, 22, 0, tzinfo=UTC)
 ZERO_HASH = "0" * 64
+LEASE = timedelta(minutes=5)
 
 
 def plan_rebalance(db, period=PERIOD, session_date=TRADE):
-    start = datetime.now(UTC) - timedelta(hours=1)
+    start = EVENING - timedelta(hours=1)
     due = start + timedelta(hours=15)
     job = Planned(
         schedule.REBALANCE,
@@ -376,10 +376,11 @@ def test_a_lease_that_expired_mid_proposal_is_reclaimed_and_completed(db, tmp_pa
     plan_rebalance(db)
     root = Market(tmp_path).names(25).land()
     conn = db.connect("pipeline")
-    claim = jobs.claim(conn, [schedule.REBALANCE], "pipeline", timedelta(milliseconds=1))
+    claim = jobs.claim(conn, [schedule.REBALANCE], "pipeline", LEASE)
     read_book(db, SIGNAL)
     basket.propose(conn, claim, root, registry_fake.ranker(db), capital=CAPITAL)
-    time.sleep(0.05)
+    # The lease ran out while the proposal was being made.
+    conn.execute("UPDATE agb.job SET lease_until = now() - interval '1 second'")
 
     run(db, root)
 
@@ -745,6 +746,18 @@ def test_an_account_that_holds_nothing_reads_as_an_empty_book(db):
     assert basket.book(db.connect("pipeline"), SIGNAL) == {}
 
 
+def waiting_on_the_first_insert(db, patience=5):
+    """Block until some session is waiting on a lock, so the release comes after the second
+    insert has reached the first's uncommitted row."""
+    pause = threading.Event()
+    for _ in range(int(patience / 0.01)):
+        [(blocked,)] = rows(db, "SELECT count(*) FROM pg_locks WHERE NOT granted")
+        if blocked:
+            return
+        pause.wait(0.01)
+    raise AssertionError("the second transition never waited on the first")
+
+
 def test_two_transitions_from_the_same_state_let_exactly_one_through(db):
     """Two bots race to put the same proposal to the human. The second insert waits on the
     first's uncommitted row, then fails the unique index when the first commits."""
@@ -776,7 +789,7 @@ def test_two_transitions_from_the_same_state_let_exactly_one_through(db):
     for t in threads:
         t.start()
     first_in.wait(5)
-    time.sleep(0.2)
+    waiting_on_the_first_insert(db)
     release.set()
     for t in threads:
         t.join(10)
