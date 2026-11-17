@@ -20,9 +20,14 @@ set -euo pipefail
 host=${AGB_DEPLOY_HOST:-casaos.local}
 dir=${AGB_DEPLOY_DIR:-/mnt/data/AppData/agb-trader}
 interval=${AGB_SIZING_INTERVAL:-5}
-# The compose project the sampler watches. agb-stack runs compose with --project-directory,
-# so the project is that directory's name, and the household stack's containers are not it.
-project=$(basename "$dir")
+# The compose project the sampler watches: the `name:` compose.yaml sets, which Compose uses
+# whatever the directory is called. Read from the file rather than repeated here, so the two
+# cannot drift. agb-stack runs compose with --project-directory, which does not change it.
+project=$(sed -n 's/^name:[[:space:]]*\([A-Za-z0-9_.-]*\)[[:space:]]*\(#.*\)\{0,1\}$/\1/p' "$(dirname "${BASH_SOURCE[0]}")/../../compose.yaml")
+[ -n "$project" ] || {
+    echo "sizing: compose.yaml sets no project name" >&2
+    exit 1
+}
 remote_script="$dir/measure.py"
 # The pattern `pgrep` and `pkill` are given below travels to the server inside the command line
 # of the shell that runs them, and that shell is a process like any other, so a plain path
