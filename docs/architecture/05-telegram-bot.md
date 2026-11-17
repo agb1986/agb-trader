@@ -123,7 +123,7 @@ Lists the pre-trade checks from the last run one by one, each with what it actua
 
 `/pause` sets the `pause` halt cause and Alpaca's `suspend_trade`, and confirms both. If a submission is in flight, it also cancels that basket's already-sent orders and reports what was cancelled and, if anything did not cancel or filled first, what remains live or filled.
 
-`/resume` clears every open halt cause and unsets `suspend_trade`. It records one clear per cause, and its reply lists what it cleared (for example `cleared: pause, gate_breach`), so an unexplained gate breach cleared alongside a pause remains visible. Resume clears the latch and nothing more: a rebalance that halted at 15:31 and is resumed at 15:47 is not automatically retried, because it would submit MOC orders past the cutoff into an unknown state. If the human still wants it and there is time, `/pending` is still there.
+`/resume` clears every open halt cause and unsets `suspend_trade`. It records one clear per cause, and its reply lists what it cleared (for example `cleared: pause, gate_breach`), so an unexplained gate breach cleared alongside a pause remains visible. (The local UI's resume is the same code but clears only the causes the operator ticks; Telegram's takes no choice and clears all.) Resume clears the latch and nothing more: a rebalance that halted at 15:31 and is resumed at 15:47 is not automatically retried, because it would submit MOC orders past the cutoff into an unknown state. If the human still wants it and there is time, `/pending` is still there.
 
 ## `/liquidate` reports the broker's actual result
 

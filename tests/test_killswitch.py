@@ -70,6 +70,78 @@ def test_resume_with_nothing_open_says_nothing_was_open(conn):
     assert rows(conn, "SELECT count(*) FROM agb.halt_event") == [(0,)]
 
 
+def two_open_causes(conn):
+    killswitch.pause(conn, WHO)
+    typed = issued_token(killswitch.liquidate(conn, WHO, None, NOW))
+    killswitch.liquidate(conn, WHO, typed, NOW)
+    assert [cause for cause, *_ in killswitch.causes(conn)] == ["pause", "liquidation"]
+
+
+def test_resume_can_clear_only_the_causes_it_is_told_to(conn):
+    two_open_causes(conn)
+
+    reply = killswitch.resume(conn, WHO, ["liquidation"])
+
+    assert "cleared: liquidation" in reply
+    assert "still open: pause" in reply
+    assert "broker suspend_trade: stays on while pause is open." in reply
+    assert [cause for cause, *_ in killswitch.causes(conn)] == ["pause"]
+    assert rows(conn, "SELECT cause, action FROM agb.halt_event ORDER BY id")[-1] == (
+        "liquidation",
+        "clear",
+    )
+    [(args,)] = rows(conn, "SELECT args FROM agb.command WHERE verb = 'resume'")
+    assert args == {"cleared": ["liquidation"], "left_open": ["pause"]}
+
+
+def test_resume_of_the_pause_alone_asks_the_broker_off_and_leaves_the_rest(conn):
+    two_open_causes(conn)
+
+    reply = killswitch.resume(conn, WHO, ["pause"])
+
+    assert "still open: liquidation" in reply
+    assert "broker suspend_trade: asked off." in reply
+    assert [cause for cause, *_ in killswitch.causes(conn)] == ["liquidation"]
+
+
+def test_resume_choosing_no_cause_is_refused_and_recorded_and_clears_nothing(conn):
+    two_open_causes(conn)
+    events = rows(conn, "SELECT count(*) FROM agb.halt_event")
+
+    reply = killswitch.resume(conn, WHO, [])
+
+    assert reply == "RESUME refused\nno cause was chosen to clear\nNothing has been done."
+    assert rows(conn, "SELECT count(*) FROM agb.halt_event") == events
+    assert len(killswitch.causes(conn)) == 2
+    assert rows(conn, "SELECT verb, outcome, reason FROM agb.command ORDER BY id")[-1] == (
+        "resume",
+        "refused",
+        "no cause was chosen to clear",
+    )
+
+
+def test_resume_says_so_when_a_chosen_cause_is_not_open_any_more(conn):
+    killswitch.pause(conn, WHO)
+
+    reply = killswitch.resume(conn, WHO, ["pause", "liquidation"])
+
+    assert "cleared: pause" in reply
+    assert "not open any more, so not cleared: liquidation" in reply
+    assert "still open" not in reply
+    assert killswitch.causes(conn) == []
+
+
+def test_resume_without_a_choice_replies_as_it_always_did(conn):
+    killswitch.pause(conn, WHO)
+
+    assert killswitch.resume(conn, WHO) == (
+        "RESUMED\ncleared: pause\nbroker suspend_trade: asked off. Execution confirms it "
+        "here.\nA halted rebalance is not resubmitted."
+    )
+    [(args,)] = rows(conn, "SELECT args FROM agb.command WHERE verb = 'resume'")
+    assert args == {"cleared": ["pause"]}
+
+
 def test_causes_list_the_oldest_first_with_who_and_why(conn):
     killswitch.pause(conn, WHO)
     [(cause, at, actor, reason)] = killswitch.causes(conn)

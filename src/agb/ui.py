@@ -41,6 +41,13 @@ the friction Telegram's typed command has and the whole reason the landing page 
 rather than a basket with a green button. Every write is a `command` row with the actor and
 the surface on it, refused ones included.
 
+Pause, Resume and Ask to liquidate are not one click either. Each is a link from the kill switch
+page to a confirmation page (`/confirm/...`, a GET that reads and writes nothing) which says what
+will change, and the write is the form on that page, posted to the same route as before so the
+server's host, origin and redirect protections apply to it unchanged. Resume's page lists the
+open causes with a tick box each, unticked; only the ticked ones are cleared, and a form with none
+ticked is refused and recorded.
+
 A write returns an `Outcome` rather than a page: the server stores it and answers the POST with
 a 303 to `/outcome?id=<token>`, which `outcome` renders, so reloading the page the operator ends
 on is a GET and cannot write twice. A write that raises is `failed`: a 500 page that names the
@@ -1454,23 +1461,26 @@ def kill_switch(conn: psycopg.Connection, now: datetime) -> str:
         tag("h3", "Pause"),
         note(
             "Opens the pause cause, so no further order goes out, and asks execution to suspend "
-            "trading at the broker. Execution confirms that as an alert."
+            "trading at the broker. Execution confirms that as an alert. The next page says "
+            "what will change and writes nothing until it is confirmed."
         ),
-        write_form("/pause", "Pause"),
+        tag("p", tag("a", "Pause…", href=CONFIRM_PAUSE)),
         tag("h3", "Resume"),
         note(
-            f"Clears every open cause, one clear each: {', '.join(c for c, *_ in latched)}."
+            f"Clears the causes you tick on the next page, one clear each. Open now: "
+            f"{', '.join(c for c, *_ in latched)}."
             if latched
-            else "Clears every open cause, one clear each. Nothing is open to clear."
+            else "Clears the causes you tick, one clear each. Nothing is open to clear."
         ),
-        write_form("/resume", "Resume"),
+        tag("p", tag("a", "Resume…", href=CONFIRM_RESUME)),
         tag("h3", "Liquidate"),
         note(
             "Two steps. The first says what closing every position would mean and issues a "
             f"token good for {minutes} minutes; the second is that token typed back. A wrong or "
-            "late token is refused, spends the token, and you start again."
+            "late token is refused, spends the token, and you start again. Asking for the token "
+            "is a write too, so it has its own confirmation page first."
         ),
-        write_form("/liquidate", "Ask to liquidate"),
+        tag("p", tag("a", "Ask to liquidate…", href=CONFIRM_LIQUIDATE)),
         note(
             f"A token is outstanding until {et(expires)}. Type it back to go ahead."
             if expires
@@ -1479,6 +1489,110 @@ def kill_switch(conn: psycopg.Connection, now: datetime) -> str:
         write_form("/liquidate", "Liquidate", [("token", "Token")]),
     ]
     return page("Kill switch", "/killswitch", [banner(conn, now), section("Kill switch", blocks)])
+
+
+# Where each kill-switch write is confirmed. The kill switch page links here, and these pages
+# only read: the first click on Pause, Resume or Ask to liquidate writes nothing, and the write is
+# the form on the page it lands on, posted to the same route as before.
+CONFIRM_PAUSE = "/confirm/pause"
+CONFIRM_RESUME = "/confirm/resume"
+CONFIRM_LIQUIDATE = "/confirm/liquidate"
+# What a ticked cause is called in the form the resume confirmation posts: `cause.<name>`.
+CAUSE_FIELD = "cause."
+
+
+def confirm_form(action: str, button: str, ticks: Sequence[str] = ()) -> Html:
+    """The confirmed write as a plain form posting to one of `WRITES`, with a way back. The ticks
+    are unticked and carry no value: nothing here is chosen for the operator, and an untouched
+    form clears nothing."""
+    body: list[object] = [
+        Html(
+            f'<label><input type="checkbox" name="{esc(CAUSE_FIELD + cause)}"> {esc(cause)}</label>'
+        )
+        for cause in ticks
+    ]
+    body.append(tag("button", button, type="submit"))
+    body.append(Html(' <a href="/killswitch">Cancel</a>'))
+    return Html(f'<form class="write" method="post" action="{esc(action)}">{join(body)}</form>')
+
+
+def confirm_pause(conn: psycopg.Connection, now: datetime) -> str:
+    already = next(
+        ((at, actor) for cause, at, actor, _ in killswitch.causes(conn) if cause == "pause"), None
+    )
+    blocks: list[object] = [
+        note("Nothing has been written yet. Confirming does these things:"),
+        Html(
+            "<ul><li>opens the <b>pause</b> halt cause, so no further order goes out, whatever "
+            "else is open;</li><li>asks execution to set the broker's suspend_trade, and to "
+            "cancel the sent orders of a basket still being submitted, which halts that "
+            "basket;</li><li>records the command against this surface.</li></ul>"
+        ),
+        note(
+            f"The pause cause is open already, since {et(already[0])} by {already[1]}: "
+            "confirming records the command and changes nothing else."
+            if already
+            else "The pause cause is not open."
+        ),
+        confirm_form("/pause", "Confirm pause"),
+    ]
+    return page("Confirm pause", "/killswitch", [banner(conn, now), section("Pause?", blocks)])
+
+
+def confirm_resume(conn: psycopg.Connection, now: datetime) -> str:
+    latched = killswitch.causes(conn)
+    if latched:
+        blocks: list[object] = [
+            note(
+                "Nothing has been written yet. Tick each cause to clear; only those are "
+                "cleared, one clear each, and an unticked cause stays open and keeps trading "
+                "halted. Nothing is ticked for you, and ticking none clears nothing."
+            ),
+            table(
+                ["Open cause", "Since", "By", "Reason"],
+                [(cause, et(at), actor, reason or "") for cause, at, actor, reason in latched],
+            ),
+            note(
+                "The broker's suspend_trade is asked off once the pause cause is cleared, and "
+                "stays on while it is open. A halted rebalance is not resubmitted."
+            ),
+            confirm_form("/resume", "Confirm resume", [cause for cause, *_ in latched]),
+        ]
+    else:
+        blocks = [
+            note("No halt cause is open, so there is nothing to clear."),
+            tag("p", tag("a", "Back", href="/killswitch")),
+        ]
+    return page("Confirm resume", "/killswitch", [banner(conn, now), section("Resume?", blocks)])
+
+
+def confirm_liquidate(conn: psycopg.Connection, now: datetime) -> str:
+    minutes = int(killswitch.TOKEN_VALID.total_seconds() // 60)
+    expires = killswitch.outstanding(conn, now)
+    blocks: list[object] = [
+        note("Nothing has been written yet. Confirming is step one of two, and does only this:"),
+        Html(
+            f"<ul><li>issues a token good for {minutes} minutes, and records the request;</li>"
+            "<li>answers with what closing every position would mean: the positions held and "
+            "their value, and the account's equity.</li></ul>"
+        ),
+        note(
+            "It closes nothing and opens no halt cause. Step two is that token typed back on "
+            "the kill switch page, which opens the liquidation cause and has execution cancel "
+            "open orders and close every position at market."
+        ),
+        note(
+            f"A token is outstanding until {et(expires)}; a new one supersedes it."
+            if expires
+            else "No token is outstanding."
+        ),
+        confirm_form("/liquidate", "Confirm: issue a token"),
+    ]
+    return page(
+        "Confirm liquidate",
+        "/killswitch",
+        [banner(conn, now), section("Ask to liquidate?", blocks)],
+    )
 
 
 # The write paths. Each takes the fields the form posted and returns the `Outcome`: the reply
@@ -1543,7 +1657,12 @@ def pause(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) ->
 
 
 def resume(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
-    return Outcome("/killswitch", "Kill switch", killswitch.resume(conn, _source("/resume")))
+    """Clear the causes the confirmation page ticked, and no others. A form that ticks none is
+    refused and recorded, and a cause that opened after the page was drawn is not on it, so it
+    stays open."""
+    ticked = sorted(name[len(CAUSE_FIELD) :] for name in fields if name.startswith(CAUSE_FIELD))
+    source = _source(" ".join(["/resume", *ticked]))
+    return Outcome("/killswitch", "Kill switch", killswitch.resume(conn, source, ticked))
 
 
 def liquidate(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
@@ -1611,6 +1730,9 @@ ROUTES = {
     "/panel": panel,
     "/alerts": alerts,
     "/killswitch": kill_switch,
+    CONFIRM_PAUSE: confirm_pause,
+    CONFIRM_RESUME: confirm_resume,
+    CONFIRM_LIQUIDATE: confirm_liquidate,
 }
 WRITES = {
     "/approve": approve,

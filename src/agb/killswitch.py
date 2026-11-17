@@ -8,7 +8,9 @@ is on it. The functions here take the command's source — who threw the switch,
 surface, and the text they typed — and return the reply, which both surfaces show verbatim.
 
 `pause` opens the `pause` halt cause unless it is open already; `resume` clears every open
-cause, one clear each, and says what it cleared. Neither touches the broker: `suspend_trade` is
+cause, one clear each, and says what it cleared, or clears only the causes it is told to when a
+surface lets the operator choose (the local UI does; the bot's `/resume` takes none and clears
+all). Neither touches the broker: `suspend_trade` is
 execution's to set, since only execution holds the broker's keys, and its confirmation arrives
 as an alert.
 
@@ -22,7 +24,9 @@ spends the token, and is not retried. Every step is a `command` row, refused one
 import logging
 import secrets
 import string
+from collections.abc import Collection
 from datetime import datetime, timedelta
+from typing import Any
 
 import psycopg
 
@@ -104,20 +108,51 @@ def pause(conn: psycopg.Connection, source: approval.Source) -> str:
     )
 
 
-def resume(conn: psycopg.Connection, source: approval.Source) -> str:
-    """Clear every open halt cause, one clear each, and ask execution to unset the broker's
-    `suspend_trade`. Returns the reply, which lists what was cleared."""
+def resume(
+    conn: psycopg.Connection, source: approval.Source, only: Collection[str] | None = None
+) -> str:
+    """Clear the open halt causes, one clear each, and ask execution to unset the broker's
+    `suspend_trade`. Returns the reply, which lists what was cleared.
+
+    Without `only` every open cause is cleared. With it, only the open causes it names are: a
+    named cause that is not open any more is left out and said so, and an empty `only` is
+    refused and recorded, since a resume that names nothing to clear is not one. The broker's
+    `suspend_trade` stays on while the `pause` cause is."""
     with conn.transaction():
-        cleared = [cause for (cause,) in conn.execute(_OPEN_CAUSES).fetchall()]
-        for cause in cleared:
-            conn.execute(_HALT, (cause, "clear", source.actor, "/resume"))
-        approval.record(conn, source, "resume", {"cleared": cleared})
+        open_causes = [cause for (cause,) in conn.execute(_OPEN_CAUSES).fetchall()]
+        if only is None:
+            cleared, gone = open_causes, []
+        else:
+            cleared = [cause for cause in open_causes if cause in only]
+            gone = sorted(set(only) - set(open_causes))
+        if only is not None and not only:
+            refusal = "no cause was chosen to clear"
+            approval.record(conn, source, "resume", {"cleared": []}, refusal)
+        else:
+            refusal = None
+            for cause in cleared:
+                conn.execute(_HALT, (cause, "clear", source.actor, "/resume"))
+            args: dict[str, Any] = {"cleared": cleared}
+            if only is not None:
+                args["left_open"] = [cause for cause in open_causes if cause not in cleared]
+            approval.record(conn, source, "resume", args)
+    if refusal is not None:
+        log.warning("resume refused for %s: %s", source.actor, refusal)
+        return f"RESUME refused\n{refusal}\nNothing has been done."
     log.info("resume by %s, cleared: %s", source.actor, ", ".join(cleared) or "nothing")
     what = f"cleared: {', '.join(cleared)}" if cleared else "cleared: nothing was open"
-    return (
-        f"RESUMED\n{what}\nbroker suspend_trade: asked off. Execution confirms it "
-        "here.\nA halted rebalance is not resubmitted."
-    )
+    lines = ["RESUMED", what]
+    if gone:
+        lines.append(f"not open any more, so not cleared: {', '.join(gone)}")
+    left = [cause for cause in open_causes if cause not in cleared]
+    if only is not None and left:
+        lines.append(f"still open: {', '.join(left)}")
+    if "pause" in left:
+        lines.append("broker suspend_trade: stays on while pause is open.")
+    else:
+        lines.append("broker suspend_trade: asked off. Execution confirms it here.")
+    lines.append("A halted rebalance is not resubmitted.")
+    return "\n".join(lines)
 
 
 def liquidate(
