@@ -9,6 +9,12 @@
 #   make panel-check CMD=restore     put the body back from the backup
 #   make panel-check CMD=status      what is broken right now, and the last audits
 #
+# The database is reached as the `cli` role, never as the `postgres` superuser. Reads run in a
+# read-only session; the one write, `run`'s audit job, goes through agb.request_panel_audit,
+# which `cli` may execute and which enqueues a panel_audit and nothing else. `run`'s period is
+# checked against the pattern agb.panel_audit admits before anything is sent, and reaches SQL
+# only as a psql variable, never as text in a statement.
+#
 # AGB_DEPLOY_HOST (default casaos.local) and AGB_DEPLOY_DIR (default
 # /mnt/data/AppData/agb-trader) say where, as they do for deploy.sh. AGB_PANEL_PATH is the
 # store's path on the server when it is not <dir>/panel.
@@ -30,6 +36,10 @@ marker="$keep_dir/broken"
 wait_seconds=300
 # The default period of `run`: the day, then the time, so each drill is its own period.
 drill_format=%Y-%m-%d-drill-%H%M%S
+# What agb.panel_audit's period check admits: a day, then an optional lowercase suffix. A bare
+# day is the nightly job's; the suffix is a drill's. bash's =~ anchors at the end of the string,
+# where a `$` in a Python or Postgres pattern also accepts a trailing newline.
+period_pattern='^[0-9]{4}-[0-9]{2}-[0-9]{2}(-[a-z0-9][a-z0-9-]*)?$'
 # The nightly cap on bodies read (panel_audit.SAMPLE), when the server does not ask for another.
 default_sample=100000
 
@@ -39,10 +49,32 @@ die() {
 }
 remote() { ssh -o BatchMode=yes -- "$host" "$@"; }
 q() { printf '%q' "$1"; }
-# One psql query against the server's database, as a single unaligned line per row.
-query() {
-    remote "$(q "$dir/agb-stack") exec -T db psql -U postgres -d agb -tA -c $(q "$1")"
+# Whether $1 is a period panel_audit takes: the right shape, and a day that exists.
+valid_period() {
+    [[ $1 =~ $period_pattern ]] && [ "$(date -d "${1:0:10}" +%F 2>/dev/null)" = "${1:0:10}" ]
 }
+
+# One statement against the server's database as `cli`, run by psql on the server.
+#
+#   db <read|write> <psql flags> <statement> [name=value ...]
+#
+# The statement goes in on stdin, because psql substitutes its variables there and not in a
+# -c string; each name=value becomes -v, which the statement reads as :'name', a quoted
+# literal. `read` opens the session read-only, so a read cannot write whatever it is sent.
+db() {
+    local mode=$1 flags=$2 statement=$3 session="" vars="" pair
+    shift 3
+    if [ "$mode" = read ]; then
+        session="-e $(q 'PGOPTIONS=-c default_transaction_read_only=on')"
+    fi
+    for pair in "$@"; do vars="$vars -v $(q "$pair")"; done
+    printf '%s\n' "$statement" |
+        remote "$(q "$dir/agb-stack") exec -T $session db psql -U cli -d agb $flags -v ON_ERROR_STOP=1$vars -f -"
+}
+# A read, as a single unaligned line per row.
+query() { db read -tA "$@"; }
+# The one write: the statement, as a single unaligned line per row.
+write() { db write -tA "$@"; }
 
 deployed() {
     remote "test -d $(q "$dir")" || die "$host:$dir does not exist"
@@ -94,9 +126,8 @@ EOF
 
 latest_audits() {
     echo "--- the last 3 audits"
-    remote "$(q "$dir/agb-stack") exec -T db psql -U postgres -d agb -c \
-        $(q "SELECT period, bodies, checked, sound, missing, corrupt
-             FROM agb.panel_audit ORDER BY id DESC LIMIT 3")" || true
+    db read "" "SELECT period, bodies, checked, sound, missing, corrupt
+              FROM agb.panel_audit ORDER BY id DESC LIMIT 3" || true
 }
 
 check() {
@@ -164,42 +195,41 @@ corrupt() {
 }
 
 run() {
-    deployed
     local period=${1:-}
+    # Refused here, before anything reaches the server, and again where the SQL is.
+    if [ -n "$period" ]; then
+        valid_period "$period" ||
+            die "'$period' is not a period; use a day with an optional suffix of lowercase letters, digits and hyphens, e.g. 2026-11-15-again"
+    fi
+    deployed
     if [ -z "$period" ]; then
         # A date plus a suffix, which the scheduler never plans. It plans a panel_audit for
         # every night 45 days ahead, so every bare date is taken ((kind, period) is unique),
         # tomorrow's included. The audit's own check admits the suffix.
         period=$(remote "date -u +$drill_format")
+        valid_period "$period" || die "the server's clock gave '$period', which is not a period"
     fi
     case $period in
     [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-[a-z0-9]*) ;;
     *) echo "panel-check: $period is a bare date, which the scheduler has probably planned" >&2 ;;
     esac
-    # The job's session date is the day the period starts with.
-    local day=${period:0:10}
     local taken
     taken=$(query "SELECT state FROM agb.job_state
-                   WHERE kind = 'panel_audit' AND period = '$period'")
+                   WHERE kind = 'panel_audit' AND period = :'period'" "period=$period")
     [ -z "$taken" ] ||
         die "panel_audit $period already exists on $host and is $taken; pass a period that has none"
 
     remote "test -f $(q "$marker")" ||
         echo "panel-check: no body is broken, so this audit should come back sound" >&2
 
-    query "WITH j AS (
-               INSERT INTO agb.job (kind, period, session_date, not_before, created_by)
-               VALUES ('panel_audit', '$period', '$day', now(), 'operator')
-               RETURNING id)
-           INSERT INTO agb.job_event (job_id, event, actor)
-           SELECT id, 'created', 'operator' FROM j" > /dev/null
+    write "SELECT agb.request_panel_audit(:'period')" "period=$period" > /dev/null
     echo "inserted panel_audit $period; waiting up to ${wait_seconds}s for the pipeline"
 
     local waited=0 row=""
     while [ "$waited" -lt "$wait_seconds" ]; do
         row=$(query "SELECT checked, sound, coalesce(array_length(missing, 1), 0),
                             coalesce(array_length(corrupt, 1), 0)
-                     FROM agb.panel_audit WHERE period = '$period'")
+                     FROM agb.panel_audit WHERE period = :'period'" "period=$period")
         [ -z "$row" ] || break
         sleep 10
         waited=$((waited + 10))
@@ -208,7 +238,7 @@ run() {
         echo "--- the job, as it stands, and everything that happened to it"
         query "SELECT s.state, e.event, e.actor, e.at, coalesce(e.detail, '')
                FROM agb.job_state s JOIN agb.job_event e ON e.job_id = s.id
-               WHERE s.kind = 'panel_audit' AND s.period = '$period' ORDER BY e.id"
+               WHERE s.kind = 'panel_audit' AND s.period = :'period' ORDER BY e.id" "period=$period"
         die "no audit was recorded for $period within ${wait_seconds}s; see \`agb-stack logs pipeline\`"
     fi
     echo "audit $period recorded: checked/sound/missing/corrupt = ${row//|/ }"

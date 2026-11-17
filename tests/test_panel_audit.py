@@ -319,13 +319,9 @@ DRILL = f"{PERIOD}-drill-143012"
 
 
 def drill_audit(db, store, period=DRILL):
-    """What `panel-check.sh run` does: insert a job for `period`, as the operator, and let the
-    pipeline claim it."""
-    db.connect("scheduler").execute(
-        "INSERT INTO agb.job (kind, period, session_date, not_before, created_by)"
-        " VALUES ('panel_audit', %s, %s, now(), 'operator')",
-        (period, period[:10]),
-    )
+    """What `panel-check.sh run` does: ask for a job for `period` as `cli`, through the one
+    function it may call, and let the pipeline claim it."""
+    db.connect("cli").execute("SELECT agb.request_panel_audit(%s)", (period,))
 
 
 def drill_default_period(now):
@@ -401,4 +397,54 @@ def test_a_period_that_is_not_a_day_with_a_suffix_is_refused(db, period):
             "INSERT INTO agb.panel_audit (period, job_id, bodies, checked, sound, actor)"
             " VALUES (%s, 1, 0, 0, 0, 'pipeline')",
             (period,),
+        )
+
+
+def test_cli_can_request_an_audit_and_the_job_and_its_event_follow(db):
+    job = db.connect("cli").execute("SELECT agb.request_panel_audit(%s)", (DRILL,)).fetchone()[0]
+    reader = db.connect("cli")
+    row = reader.execute(
+        "SELECT kind, period, session_date, created_by FROM agb.job WHERE id = %s", (job,)
+    ).fetchone()
+    assert row == ("panel_audit", DRILL, date(2026, 9, 14), "operator")
+    events = reader.execute(
+        "SELECT event, actor FROM agb.job_event WHERE job_id = %s", (job,)
+    ).fetchall()
+    assert events == [("created", "operator")]
+
+
+def test_a_period_already_asked_for_is_refused(db):
+    cli = db.connect("cli")
+    cli.execute("SELECT agb.request_panel_audit(%s)", (DRILL,))
+    with pytest.raises(errors.UniqueViolation):
+        cli.execute("SELECT agb.request_panel_audit(%s)", (DRILL,))
+
+
+@pytest.mark.parametrize(
+    "period", ["2026-10'; --", "2026-11-15-", "2026-11-15-Drill", "2026-11", "2026-11-15\n", "x"]
+)
+def test_a_request_for_a_period_that_is_not_a_day_with_a_suffix_is_refused(db, period):
+    cli = db.connect("cli")
+    with pytest.raises(errors.CheckViolation):
+        cli.execute("SELECT agb.request_panel_audit(%s)", (period,))
+    assert cli.execute("SELECT count(*) FROM agb.job WHERE kind = 'panel_audit'").fetchone() == (0,)
+
+
+def test_a_request_with_no_period_is_refused(db):
+    with pytest.raises(errors.CheckViolation):
+        db.connect("cli").execute("SELECT agb.request_panel_audit(NULL)")
+
+
+@pytest.mark.parametrize("role", ["scheduler", "pipeline", "execution", "bot", "ui", "research"])
+def test_only_cli_may_request_an_audit(db, role):
+    with pytest.raises(errors.InsufficientPrivilege):
+        db.connect(role).execute("SELECT agb.request_panel_audit(%s)", (DRILL,))
+
+
+def test_cli_still_cannot_insert_a_job_itself(db):
+    with pytest.raises(errors.InsufficientPrivilege):
+        db.connect("cli").execute(
+            "INSERT INTO agb.job (kind, period, session_date, not_before, created_by)"
+            " VALUES ('panel_audit', %s, %s, now(), 'operator')",
+            (DRILL, DRILL[:10]),
         )

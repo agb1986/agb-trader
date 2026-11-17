@@ -152,9 +152,16 @@ db_psql() {
     compose exec -T db psql --username=postgres --no-psqlrc --set=ON_ERROR_STOP=1 --quiet "$@"
 }
 
+# Read-only, as `backup`, which holds pg_read_all_data: a count needs no superuser, and the
+# session cannot write.
+read_psql() {
+    compose exec -T -e PGOPTIONS='-c default_transaction_read_only=on' db \
+        psql --username=backup --no-psqlrc --set=ON_ERROR_STOP=1 --quiet "$@"
+}
+
 # Rows in every table of database $1, one "schema.table count" line each.
 counts() {
-    db_psql --dbname="$1" --no-align --tuples-only --field-separator=' ' --command="
+    read_psql --dbname="$1" --no-align --tuples-only --field-separator=' ' --command="
         SELECT table_schema || '.' || table_name,
                (xpath('/row/n/text()', query_to_xml(
                    format('SELECT count(*) AS n FROM %I.%I', table_schema, table_name),

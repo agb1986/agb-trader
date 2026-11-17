@@ -41,9 +41,15 @@ die() {
 }
 remote() { ssh -o BatchMode=yes -- "$host" "$@"; }
 q() { printf '%q' "$1"; }
-# One psql query against the server's database, as a single unaligned line per row.
+# One read against the server's database as `cli`, in a read-only session, as a single
+# unaligned line per row. The statement goes in on stdin, where psql substitutes its variables;
+# each further name=value is a -v, which the statement reads as :'name', a quoted literal.
 query() {
-    remote "$(q "$dir/agb-stack") exec -T db psql -U postgres -d agb -tA -c $(q "$1")"
+    local statement=$1 vars="" pair
+    shift
+    for pair in "$@"; do vars="$vars -v $(q "$pair")"; done
+    printf '%s\n' "$statement" |
+        remote "$(q "$dir/agb-stack") exec -T -e $(q 'PGOPTIONS=-c default_transaction_read_only=on') db psql -U cli -d agb -tA -v ON_ERROR_STOP=1$vars -f -"
 }
 
 usage() {
@@ -61,8 +67,8 @@ cd "$(git rev-parse --show-toplevel)"
 
 model=${1:-}
 [ -n "$model" ] || usage
-# The id becomes a path component on the server and a SQL literal below, so it is checked
-# rather than quoted. This is certify.MODEL_ID, the one pattern for a model id: a letter or
+# The id becomes a path component on the server, so it is checked as well as passed to SQL as a
+# psql variable. This is certify.MODEL_ID, the one pattern for a model id: a letter or
 # digit first, so an id cannot start with a dash (an option to the tools it reaches) or a dot
 # (a hidden directory), then letters, digits, dot, dash and underscore. bash's =~ anchors at
 # the end of the string, where Python's `$` also accepts a trailing newline, so certify matches
@@ -74,7 +80,7 @@ model_id='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 artifact="$research/certifications/$model"
 
 # The certification's own row on the server, and the model that is live there.
-certified() { query "SELECT id FROM agb.model_certification WHERE model_id = '$model'"; }
+certified() { query "SELECT id FROM agb.model_certification WHERE model_id = :'model'" "model=$model"; }
 live() { query "SELECT model_id FROM agb.promoted_model"; }
 
 written() {
@@ -198,7 +204,7 @@ check() {
     id=$(certified)
     if [ -n "$id" ]; then
         voided=$(query "SELECT coalesce(voided_at::text, '') FROM agb.model_certification
-                        WHERE model_id = '$model'")
+                        WHERE model_id = :'model'" "model=$model")
         echo "certified: model_certification $id${voided:+, voided $voided}"
     else
         echo "not certified yet on $host"

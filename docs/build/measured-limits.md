@@ -331,6 +331,14 @@ admits that form, and `health.panel_bodies` reads the row recorded last rather t
 highest period, so the drill's audit is the one it alerts on. `run` takes a period explicitly
 too, `make panel-check CMD="run 2026-11-15-again"`; a bare date will be refused as taken.
 
+A period is checked before anything is sent to the server: a real day, then an optional
+suffix of lowercase letters, digits and hyphens, the form `agb.panel_audit` admits. Anything
+else, such as `2026-10'; --`, is refused with no ssh and no SQL. The period reaches psql only
+as a variable (`-v period=...`, read as `:'period'`), never as text in a statement. The script
+connects as the `cli` role, not `postgres`: its reads run in a read-only session, and the one
+write calls `agb.request_panel_audit(period)`, which `cli` may execute and which enqueues a
+`panel_audit` job and its `created` event and does nothing else.
+
 ### Making the check certain
 
 While the store holds fewer bodies than the cap, one audit reads all of them, so a single

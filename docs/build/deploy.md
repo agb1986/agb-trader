@@ -244,10 +244,13 @@ The partial dump is deleted, and nothing is pruned. The job's expected event sta
 unfulfilled, so from 05:00 New York time the night shows in the overdue view, as a night whose
 backup never ran does. To check:
 
+Reads on the server go in as the `cli` role, in a read-only session (`PGOPTIONS` below), not as
+the `postgres` superuser; `postgres` is for `createdb`, `dropdb` and the restore load only.
+
 ```sh
 ls -l backups/
-./agb-stack exec -T db psql -U postgres -d agb -c "SELECT * FROM agb.overdue"
-./agb-stack exec -T db psql -U postgres -d agb -c \
+./agb-stack exec -T -e PGOPTIONS='-c default_transaction_read_only=on' db psql -U cli -d agb -c "SELECT * FROM agb.overdue"
+./agb-stack exec -T -e PGOPTIONS='-c default_transaction_read_only=on' db psql -U cli -d agb -c \
   "SELECT period, state, claimed_by FROM agb.job_state WHERE kind = 'backup' ORDER BY period DESC LIMIT 5"
 ```
 
@@ -340,9 +343,9 @@ To query the lake with DuckDB, and to see the latest snapshots:
 ```sh
 ./agb-stack exec pipeline python -m agb.lake "SELECT max(date), count(*) FROM sep"
 ./agb-stack exec pipeline python -m agb.lake --check
-./agb-stack exec -T db psql -U postgres -d agb -c \
+./agb-stack exec -T -e PGOPTIONS='-c default_transaction_read_only=on' db psql -U cli -d agb -c \
   "SELECT snapshot_date, partition, sha256 FROM agb.lake_snapshot ORDER BY id DESC LIMIT 5"
-./agb-stack exec -T db psql -U postgres -d agb -c \
+./agb-stack exec -T -e PGOPTIONS='-c default_transaction_read_only=on' db psql -U cli -d agb -c \
   "SELECT period, state FROM agb.job_state WHERE kind = 'data_pull' ORDER BY period DESC LIMIT 5"
 ```
 
@@ -524,7 +527,7 @@ database. A table can differ where rows were written after the dump, most often
 
 ```sh
 ./agb-stack restore backups/agb-2026-09-16.sql.gz agb_scratch --keep
-./agb-stack exec -T db psql -U postgres -d agb_scratch
+./agb-stack exec -T -e PGOPTIONS='-c default_transaction_read_only=on' db psql -U backup -d agb_scratch
 ./agb-stack exec -T db dropdb -U postgres agb_scratch
 ```
 
