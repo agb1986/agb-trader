@@ -3,9 +3,13 @@ the same each time they land, the bulk backfill from 1998, and DuckDB over the r
 
 import http.client
 import io
+import os
+import subprocess
+import sys
 import urllib.error
 import zipfile
 from datetime import date
+from pathlib import Path
 
 import duckdb
 import pyarrow as pa
@@ -54,11 +58,11 @@ def landed(root):
     return sorted(str(p.parent.relative_to(root)) for p in root.rglob(lake.FILE))
 
 
-def bulk(tmp_path, vendor, dataset, root):
+def bulk(tmp_path, vendor, dataset, root, record=lake._nothing):
     work = tmp_path / "work"
     work.mkdir(exist_ok=True)
     archive = client(vendor).bulk(dataset, work / f"{dataset.name}.zip")
-    return lake.land_bulk(root, dataset, archive, lake.SINCE, work)
+    return lake.land_bulk(root, dataset, archive, lake.SINCE, work, record)
 
 
 def test_parse_gives_the_lake_types_and_keeps_the_filing_date_as_datekey():
@@ -416,6 +420,126 @@ def test_a_crashed_write_leaves_no_partial_behind(tmp_path):
     (directory / ".tmpab12.partial").write_bytes(b"half a file")
     lake.pull(tmp_path, client(sample()), SESSION)
     assert sorted(p.name for p in directory.iterdir()) == [lake.FILE]
+
+
+class Ledger:
+    """Stands in for agb.lake_snapshot: the partitions `record` was handed, by path and hash."""
+
+    def __init__(self, path=None):
+        self.path = path
+        self.rows = set()
+
+    def __call__(self, partition):
+        self.rows.add((partition.path, partition.sha256))
+        if self.path is not None:
+            with open(self.path, "a") as f:
+                f.write(f"{partition.path} {partition.sha256}\n")
+
+    def read(self):
+        self.rows = {tuple(line.split()) for line in self.path.read_text().splitlines()}
+        return self.rows
+
+
+def on_disk(root):
+    """Every partition file in the lake, by path and hash, and any file under another name."""
+    files = {(str(p.parent.relative_to(root)), lake.file_hash(p)) for p in root.rglob(lake.FILE)}
+    others = sorted(p.name for p in root.rglob("*") if p.is_file() and p.name != lake.FILE)
+    return files, others
+
+
+def test_record_sees_each_partition_before_it_is_in_place(tmp_path):
+    seen = []
+
+    def record(partition):
+        final = tmp_path / partition.path / lake.FILE
+        [partial] = (tmp_path / partition.path).glob(".*.partial")
+        seen.append((partition.path, final.exists(), lake.file_hash(partial) == partition.sha256))
+
+    lake.pull(tmp_path, client(sample()), SESSION, record)
+    assert seen and all(not exists and same for _, exists, same in seen)
+    assert {path for path, _, _ in seen} == set(landed(tmp_path))
+
+
+def test_a_partition_landing_again_is_recorded_again(tmp_path):
+    # A file whose record was lost, kept as it is or rewritten with the same bytes, is handed to
+    # `record` the next time it lands, so the ledger catches up with the lake.
+    lake.pull(tmp_path, client(sample()), SESSION)
+    ledger = Ledger()
+    files = mtimes(tmp_path)
+    lake.pull(tmp_path, client(sample()), SESSION, ledger)
+    assert mtimes(tmp_path) == files
+    assert ledger.rows == on_disk(tmp_path)[0]
+
+
+def test_a_record_that_fails_lands_nothing(tmp_path):
+    def refuse(partition):
+        raise OSError("the ledger is down")
+
+    with pytest.raises(OSError, match="the ledger is down"):
+        lake.pull(tmp_path, client(sample()), SESSION, refuse)
+    assert on_disk(tmp_path) == (set(), [])
+
+
+CRASH = Path(__file__).with_name("lake_crash.py")
+CRASHED = 86
+
+
+def crash(point, root, ledger, *, revised=False):
+    """Land the sample's SEP export in a process that dies at `point` of the third partition's
+    landing; see lake_crash.py."""
+    args = [sys.executable, str(CRASH), point, str(root), str(ledger)]
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    done = subprocess.run([*args, *(["revised"] if revised else [])], env=env, timeout=120)
+    assert done.returncode == CRASHED, f"it did not die at {point}"
+
+
+@pytest.mark.parametrize("revised", [False, True], ids=["fresh", "revised"])
+@pytest.mark.parametrize("point", ["write", "record", "rename", "sync"])
+def test_a_backfill_killed_part_way_leaves_the_lake_readable_and_lands_again(
+    tmp_path, point, revised
+):
+    # A backfill killed at any point of a partition's landing: half the bytes written, the bytes
+    # written but not recorded, recorded but not renamed into place, renamed but the directory
+    # not synced. Each file under a partition's name is one the ledger has, the lake reads as it
+    # did with the dead write left out, and the backfill run again lands what a clean one does.
+    root, ledger = tmp_path / "lake", Ledger(tmp_path / "ledger")
+    clean = tmp_path / "clean"
+    bulk(tmp_path, sample(), SEP, clean)
+    if revised:
+        bulk(tmp_path, sample(), SEP, root, ledger)
+        vendor = sample()
+        for row in vendor.rows["stocks"]:
+            if row["ticker"] == "AAPL":
+                row["volume"] = "1250001"
+        clean = tmp_path / "clean-revised"
+        bulk(tmp_path, vendor, SEP, clean)
+    else:
+        vendor = sample()
+    before = on_disk(root)[0] if root.exists() else set()
+
+    crash(point, root, ledger.path, revised=revised)
+
+    files, others = on_disk(root)
+    assert files <= ledger.read(), "a file in place that the ledger lacks"
+    assert all(name.endswith(".partial") and name.startswith(".") for name in others), others
+    assert len(others) == (0 if point == "sync" else 1)  # the dead write, left where it died
+    assert len(files) == 4 if revised else len(files) in (2, 3)
+    if point in ("write", "record"):
+        assert {path for path, _ in files} == {path for path, _ in before} | {
+            "sep/date=1998-01-02",
+            "sep/date=2008-09-12",
+        }
+        assert files - before <= {(p, h) for p, h in on_disk(clean)[0]}
+    rows = lake.connect(root).sql("SELECT count(*) FROM sep").fetchone()
+    assert rows[0] == sum(pq.read_table(root / path / lake.FILE).num_rows for path, _ in files)
+    assert lake.inconsistent(root) == []
+
+    archive = client(vendor).bulk(SEP, tmp_path / "again.zip")
+    lake.land_bulk(root, SEP, archive, lake.SINCE, tmp_path / "work", ledger)
+
+    assert on_disk(root) == (on_disk(clean)[0], [])
+    assert on_disk(root)[0] <= ledger.rows
+    assert lake.inconsistent(root) == []
 
 
 def test_the_backfill_lands_history_from_1998_with_delisted_tickers(tmp_path):

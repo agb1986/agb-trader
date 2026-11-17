@@ -1,9 +1,10 @@
 """The pipeline service. It takes the scheduler's jobs in turn, one per cycle:
 
   * `data_pull`: pulls Sharadar's SEP, SF1 and TICKERS for the session into the Parquet lake
-    (agb.lake), records each partition's date and hash in `agb.lake_snapshot`, and completes
-    the job, which fulfils the pull's expected event. A pull that fails, or never runs, leaves
-    that event unfulfilled, so it shows in the overdue view like any other missed work.
+    (agb.lake), records each partition's date and hash in `agb.lake_snapshot` before its file
+    is renamed into place, and completes the job, which fulfils the pull's expected event. A
+    pull that fails, or never runs, leaves that event unfulfilled, so it shows in the overdue
+    view like any other missed work.
   * `rebalance`: proposes the month's basket (agb.basket) from the universe as of the signal
     session, ranked by the promoted certification's model (agb.registry, loaded from
     AGB_MODELS_DIR and checked against its certified digest on every rebalance), blended with
@@ -37,15 +38,16 @@ its steps, and the panel after every retrieval and model call, so a run longer t
 keeps it; a renewal that finds the lease gone raises `jobs.LeaseLost` and the work stops.
 
 Both are safe to redo, so an expired lease is reclaimed: a partition that lands with the same
-bytes is left untouched and recorded nothing new, a reference already proposed is kept, and a
-basket already gated keeps its verdict. The same holds for a rerun interrupted between
-building and gating.
+bytes is left untouched and recorded nothing new, a pull or backfill stopped part way leaves
+every file it renamed into place recorded (agb.lake lands a partition only after its
+record), a reference already proposed is kept, and a basket already gated keeps its verdict.
+The same holds for a rerun interrupted between building and gating.
 
 Data the vendor has not yet published is not a failure: the service keeps the job and shortens
 its lease to RETRY, so the work is tried again once the lease runs out, until it lands. That
 holds for a session the vendor is still publishing, one short of the row floor (agb.lake): it
 is deferred quietly, with no alert of its own. The earlier sessions a deferred pull did land
-are recorded all the same. A rebalance waiting for execution to read the account (`NotReady`)
+were recorded as they landed. A rebalance waiting for execution to read the account (`NotReady`)
 is kept the same way. Neither waits for ever: each job has a deadline past which its work is
 of no use -- for a pull, the time the next session's pull is due, which lands its session too;
 for a rebalance, its trade session's MOC cutoff -- and a job still waiting then is failed
@@ -177,6 +179,20 @@ def record(
     with conn.transaction(), conn.cursor() as cur:
         cur.executemany(_RECORD, rows)
         return cur.rowcount
+
+
+class Ledger:
+    """Records each partition in `agb.lake_snapshot` as agb.lake hands it over, before its file
+    is renamed into place, and counts the rows it added."""
+
+    def __init__(self, conn: psycopg.Connection, snapshot: date, job_id: int | None) -> None:
+        self.conn = conn
+        self.snapshot = snapshot
+        self.job_id = job_id
+        self.added = 0
+
+    def __call__(self, partition: Partition) -> None:
+        self.added += record(self.conn, self.snapshot, [partition], self.job_id)
 
 
 def cause(exc: BaseException) -> str:
@@ -635,12 +651,12 @@ class Pipeline:
 
     def pull(self, conn: psycopg.Connection, claim: jobs.Claim) -> None:
         session = date.fromisoformat(claim.period)
+        ledger = Ledger(conn, session, claim.job_id)
         try:
-            partitions = lake.pull(self.lake_dir, self.client(), session)
+            partitions = lake.pull(self.lake_dir, self.client(), session, ledger)
         except NotYet as exc:
-            # The sessions before this one that the pull did land are the lake's now; record
-            # them, so the lake and its ledger agree while this session waits.
-            added = record(conn, session, exc.landed, claim.job_id)
+            # The sessions before this one that the pull did land were recorded as they landed,
+            # so the lake and its ledger agree while this session waits.
             if not self.wait(conn, claim, "data pull", f"not yet published: {exc}"):
                 return
             log.info(
@@ -649,28 +665,28 @@ class Pipeline:
                 claim.period,
                 exc,
                 len(exc.landed),
-                added,
+                ledger.added,
                 self.retry,
             )
             return
         except (LakeError, OSError, pa.ArrowException, psycopg.Error) as exc:
             self.stop(conn, claim, "data pull", exc)
             return
-        added = record(conn, session, partitions, claim.job_id)
         jobs.complete(conn, claim)
         log.info(
             "data pull %s landed %d partitions, %d of them new or changed",
             claim.period,
             len(partitions),
-            added,
+            ledger.added,
         )
 
     def backfill(
         self, conn: psycopg.Connection, since: date = lake.SINCE, snapshot: date | None = None
     ) -> list[Partition]:
         """Land the vendor's full SEP and SF1 from `since` on, and its tickers table as it
-        stands, recording each partition under `snapshot` (today's trading date by default).
-        Safe to run again: unchanged partitions are left as they are."""
+        stands, recording each partition under `snapshot` (today's trading date by default)
+        before its file is renamed into place. Safe to run again, including after a crash part
+        way: unchanged partitions are left as they are, and every file in place is recorded."""
         snapshot = snapshot or nyse.trading_date(datetime.now(UTC))
         client = self.client()
         work = self.lake_dir / ".backfill"
@@ -681,15 +697,17 @@ class Pipeline:
                 work.mkdir(parents=True)
                 log.info("downloading the vendor's %s export", dataset.name)
                 archive = client.bulk(dataset, work / f"{dataset.name}.zip")
-                partitions = lake.land_bulk(self.lake_dir, dataset, archive, since, work)
-                added = record(conn, snapshot, partitions, None)
+                ledger = Ledger(conn, snapshot, None)
+                partitions = lake.land_bulk(self.lake_dir, dataset, archive, since, work, ledger)
                 log.info(
-                    "%s: %d partitions, %d new or changed", dataset.name, len(partitions), added
+                    "%s: %d partitions, %d new or changed",
+                    dataset.name,
+                    len(partitions),
+                    ledger.added,
                 )
                 landed += partitions
-            partitions = lake.land(self.lake_dir, lake.TICKERS, client.tickers(), snapshot)
-            record(conn, snapshot, partitions, None)
-            landed += partitions
+            ledger = Ledger(conn, snapshot, None)
+            landed += lake.land(self.lake_dir, lake.TICKERS, client.tickers(), snapshot, ledger)
         finally:
             shutil.rmtree(work, ignore_errors=True)
         return landed

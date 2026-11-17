@@ -558,6 +558,37 @@ def test_the_backfill_lands_history_from_1998_and_records_it(db, tmp_path):
     assert mtimes(tmp_path) == files
 
 
+def test_a_backfill_stopped_between_a_write_and_its_record_lands_again(db, tmp_path, monkeypatch):
+    # The ledger fails on the third partition, its bytes written but not yet recorded: that
+    # partition does not land, every file that did is recorded, the lake reads, and the backfill
+    # run again lands and records the rest.
+    conn = db.connect("pipeline")
+    pipeline = Pipeline(tmp_path, KEY, opener=sample())
+    real, calls = pipeline_module.record, 0
+
+    def fails_on_the_third(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise psycopg.OperationalError("the server closed the connection")
+        return real(*args)
+
+    monkeypatch.setattr(pipeline_module, "record", fails_on_the_third)
+    with pytest.raises(psycopg.OperationalError):
+        pipeline.backfill(conn, snapshot=SESSION)
+
+    assert landed(tmp_path) == ["sep/date=1998-01-02", "sep/date=2008-09-12"]
+    assert sorted(r[2] for r in snapshots(db)) == landed(tmp_path)
+    recorded_rows = sum(r[4] for r in snapshots(db))
+    assert lake.connect(tmp_path).sql("SELECT count(*) FROM sep").fetchone() == (recorded_rows,)
+    assert not (tmp_path / ".backfill").exists()
+
+    pipeline.backfill(conn, snapshot=SESSION)
+
+    assert len(landed(tmp_path)) == 9
+    assert sorted(r[2] for r in snapshots(db)) == landed(tmp_path)
+
+
 def test_snapshots_are_append_only(db, tmp_path):
     plan_pull(db)
     Pipeline(tmp_path, KEY, opener=sample())(db.connect("pipeline"))
