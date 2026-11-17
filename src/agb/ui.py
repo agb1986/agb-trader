@@ -97,39 +97,54 @@ ACTOR = "ui:operator"
 SURFACE = "ui"
 
 STYLE = """
-:root { color-scheme: light dark; --line: #d6d6d6; --dim: #666; --bad: #a40000;
-        --warn: #8a5300; --ok: #14612c; }
+:root { color-scheme: light dark; --bg: #ffffff; --fg: #1a1a1a; --dim: #595959; --line: #d0d0d0;
+        --link: #0b57d0; --bad: #a40000; --warn: #8a5300; --ok: #14612c; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #121212; --fg: #ececec; --dim: #ababab; --line: #3d3d3d; --link: #8ab4f8;
+          --bad: #ff8f8f; --warn: #f2b25c; --ok: #6fcf8a; }
+}
 * { box-sizing: border-box; }
-body { margin: 0; font: 14px/1.5 system-ui, sans-serif; }
+html { background: var(--bg); }
+body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--fg);
+       overflow-wrap: anywhere; }
+a { color: var(--link); }
+.skip { position: absolute; left: -999px; top: 0; background: var(--bg); padding: 6px 10px; }
+.skip:focus { left: 0; z-index: 1; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%);
+      white-space: nowrap; }
 header { border-bottom: 1px solid var(--line); padding: 10px 20px; display: flex;
-         gap: 18px; align-items: baseline; flex-wrap: wrap; }
-header b { font-size: 15px; }
-header a { color: inherit; text-decoration: none; padding: 2px 0; }
-header a.on { border-bottom: 2px solid currentColor; }
+         gap: 6px 18px; align-items: baseline; flex-wrap: wrap; }
+header .brand { font-size: 15px; font-weight: 700; margin: 0; }
+header nav { display: flex; gap: 4px 18px; flex-wrap: wrap; }
+header nav a { color: inherit; text-decoration: none; padding: 2px 0; }
+header nav a[aria-current] { border-bottom: 2px solid currentColor; font-weight: 600; }
 main { padding: 20px; max-width: 1100px; }
-h2 { font-size: 15px; margin: 24px 0 8px; }
-h3 { font-size: 13px; margin: 14px 0 4px; color: var(--dim); text-transform: uppercase;
+h1 { font-size: 18px; margin: 24px 0 8px; }
+.banner + h1 { margin-top: 8px; }
+h2 { font-size: 13px; margin: 14px 0 4px; color: var(--dim); text-transform: uppercase;
      letter-spacing: .04em; }
 p.note { color: var(--dim); margin: 6px 0; }
-table { border-collapse: collapse; width: 100%; margin: 4px 0 10px; }
+.scroll { position: relative; overflow-x: auto; max-width: 100%; margin: 4px 0 10px; }
+.scroll:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line);
          white-space: nowrap; }
 th { color: var(--dim); font-weight: 600; }
+tbody th { color: var(--fg); font-weight: 400; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.text, th.text { white-space: normal; min-width: 22em; }
+td.empty { color: var(--dim); white-space: normal; }
 .pair { display: flex; gap: 32px; flex-wrap: wrap; }
-.pair > div { flex: 1 1 260px; }
+.pair > div { flex: 1 1 260px; min-width: 0; }
 .banner { border: 1px solid var(--line); border-left-width: 4px; padding: 8px 12px;
           margin-bottom: 16px; }
 .banner.clear { border-left-color: var(--ok); }
 .banner.unwell { border-left-color: var(--bad); }
 .banner div { padding: 2px 0; }
 .banner span { color: var(--dim); }
-.row { display: grid; grid-template-columns: 7em 6em 1fr 6em 6em 6em;
-       gap: 12px; align-items: baseline; }
-.row .num { text-align: right; font-variant-numeric: tabular-nums; }
-.head { color: var(--dim); padding: 4px 0; border-bottom: 1px solid var(--line); }
-details.cycle { border-bottom: 1px solid var(--line); }
+table.log td.expand { padding: 0; max-width: 0; white-space: normal; }
+table.log tbody.cycle th, table.log tbody.cycle td { border-bottom: 0; }
+table.log tbody.cycle { border-bottom: 1px solid var(--line); }
 details.cycle > summary { padding: 6px 0; cursor: pointer; }
 details.cycle[open] > summary { font-weight: 600; }
 .detail { padding: 4px 0 14px 1.5em; }
@@ -140,10 +155,12 @@ footer { color: var(--dim); padding: 0 20px 24px; max-width: 1100px; }
 form.write { border: 1px solid var(--line); padding: 10px 12px; margin: 8px 0;
              max-width: 620px; }
 form.write label { display: block; margin: 0 0 8px; }
-form.write input { font: inherit; padding: 4px 6px; width: 14em; margin-top: 4px; }
+form.write input[type=text] { font: inherit; padding: 4px 6px; width: 14em; max-width: 100%;
+                              margin-top: 4px; }
 form.write button { font: inherit; padding: 4px 14px; }
+pre { white-space: pre-wrap; max-width: 100%; overflow-x: auto; }
 pre.reply { border: 1px solid var(--line); border-left-width: 4px; padding: 10px 12px;
-            white-space: pre-wrap; max-width: 620px; }
+            max-width: 620px; }
 """
 
 # A basket's state, coloured by what it means for the month: it traded, it is waiting, it
@@ -181,7 +198,9 @@ def esc(value: object) -> Html:
 
 
 def tag(name: str, body: object, **attrs: str) -> Html:
-    rendered = "".join(f' {key.rstrip("_")}="{esc(value)}"' for key, value in attrs.items())
+    rendered = "".join(
+        f' {key.rstrip("_").replace("_", "-")}="{esc(value)}"' for key, value in attrs.items()
+    )
     return Html(f"<{name}{rendered}>{esc(body)}</{name}>")
 
 
@@ -194,7 +213,9 @@ def note(text: str) -> Html:
 
 
 def section(heading: str, body: Iterable[object]) -> Html:
-    return join([tag("h2", heading), *body])
+    """A page's heading and what is under it. The heading is the page's one `h1`: every page
+    builds exactly one section, and the headings inside it are `h2`."""
+    return join([tag("h1", heading), *body])
 
 
 def table(
@@ -202,24 +223,38 @@ def table(
     rows: Iterable[Sequence[object]],
     numeric: Sequence[int] = (),
     wrap: Sequence[int] = (),
+    *,
+    caption: str,
+    empty: str = "Nothing to show.",
 ) -> Html:
     """One table. `numeric` is the columns that read as figures, right-aligned on a tabular
     figure; `wrap` is the columns that carry a sentence, which are the only ones allowed to
-    wrap, since a reason the Judge wrote is prose and not a cell."""
+    wrap, since a reason the Judge wrote is prose and not a cell.
+
+    The `caption` names the table for a screen reader and is hidden from the eye, since a
+    heading sits above most of them. Every header scopes its column. With no rows the table
+    says `empty` in a row of its own, so it is never a header with nothing under it. The table
+    sits in a box that scrolls sideways, so a wide one never widens the page; the box takes
+    focus (`tabindex`) so a keyboard can scroll it."""
 
     def cell(kind: str, index: int, value: object) -> str:
+        scope = ' scope="col"' if kind == "th" else ""
         if index in numeric:
-            return f'<{kind} class="num">{esc(value)}</{kind}>'
+            return f'<{kind} class="num"{scope}>{esc(value)}</{kind}>'
         if index in wrap:
-            return f'<{kind} class="text">{esc(value)}</{kind}>'
-        return f"<{kind}>{esc(value)}</{kind}>"
+            return f'<{kind} class="text"{scope}>{esc(value)}</{kind}>'
+        return f"<{kind}{scope}>{esc(value)}</{kind}>"
 
     head = "".join(cell("th", i, header) for i, header in enumerate(headers))
     body = "".join(
         "<tr>" + "".join(cell("td", i, value) for i, value in enumerate(row)) + "</tr>"
         for row in rows
+    ) or (f'<tr><td class="empty" colspan="{len(headers)}">{esc(empty)}</td></tr>')
+    return Html(
+        '<div class="scroll" tabindex="0"><table>'
+        f'<caption class="sr">{esc(caption)}</caption>'
+        f"<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
     )
-    return Html(f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
 
 
 def write_form(action: str, button: str, fields: Sequence[tuple[str, str]] = ()) -> Html:
@@ -240,15 +275,23 @@ def write_form(action: str, button: str, fields: Sequence[tuple[str, str]] = ())
 
 
 def page(title: str, path: str, blocks: Iterable[object]) -> str:
+    """The shell: a skip link, the header with the views' navigation (the page being read is
+    marked `aria-current`), the page's own content in `main` and the footer. The content's
+    first heading is the page's `h1`; see `section`."""
     nav = join(
-        tag("a", label, href=href, class_="on" if href == path else "") for href, label in VIEWS
+        tag("a", label, href=href, aria_current="page")
+        if href == path
+        else tag("a", label, href=href)
+        for href, label in VIEWS
     )
     return (
         "<!doctype html>\n"
         f'<html lang="en"><head><meta charset="utf-8">'
         f'<meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>{esc(title)} — agb-trader</title><style>{STYLE}</style></head><body>"
-        f"<header><b>agb-trader</b>{nav}</header><main>{join(blocks)}</main>"
+        '<a class="skip" href="#main">Skip to the page</a>'
+        f'<header><p class="brand">agb-trader</p><nav aria-label="Views">{nav}</nav></header>'
+        f'<main id="main">{join(blocks)}</main>'
         "<footer>Read-mostly: the pages read, and the only writes are answering a "
         "rebalance, the kill switch and acknowledging an alert, all recorded against this "
         "surface. Nothing here "
@@ -295,11 +338,11 @@ def banner(conn: psycopg.Connection, now: datetime) -> Html:
             else "no rebalance is scheduled"
         )
         body = tag("div", join([tag("b", "Healthy"), esc(f" — {next_cycle}")]))
-        return tag("div", body, class_="banner clear")
+        return tag("section", body, class_="banner clear", aria_label="Health")
     body = join(
         tag("div", join([tag("b", what), tag("span", f" — {facts}")])) for what, facts in lines
     )
-    return tag("div", body, class_="banner unwell")
+    return tag("section", body, class_="banner unwell", aria_label="Health")
 
 
 # The decision log.
@@ -384,9 +427,14 @@ def _diff_blocks(diff: readout.Diff, capital: Decimal) -> Html:
             (symbol, readout.rank_text(rank), was if was is not None else "—")
             for symbol, rank, was in diff.sold
         ],
+        caption="Names sold",
+        empty="None sold.",
     )
     bought = table(
-        ["In", "Rank"], [(symbol, readout.rank_text(rank)) for symbol, rank in diff.bought]
+        ["In", "Rank"],
+        [(symbol, readout.rank_text(rank)) for symbol, rank in diff.bought],
+        caption="Names bought",
+        empty="None bought.",
     )
     numbers = (
         f"{readout.turnover_text(diff.measured.get('turnover'))}  ·  "
@@ -414,6 +462,7 @@ def _gate_block(rows: list[readout.CheckRow]) -> Html:
             table(
                 ["Failed", "Measured", "Needs", "Level"],
                 [(c.label, c.measured, c.threshold, c.level) for c in fails],
+                caption="Failed gate checks",
             ),
         ]
     )
@@ -425,6 +474,7 @@ def _flags_block(rows: list[tuple]) -> Html:
     return table(
         ["Flag", "Subject", "Raised", "By"],
         [(kind, subject, et(at), by) for kind, subject, at, by in rows],
+        caption="Flags raised for the month",
     )
 
 
@@ -433,43 +483,56 @@ def _cycle(reads: _CycleReads, row: Sequence) -> Html:
     diff = reads.diffs[basket_id]
     returned, window = period_return(reads.windows[period])
     turnover = readout.turnover_text(diff.measured.get("turnover")).removeprefix("turnover ")
-    summary = Html(
-        f'<summary><span class="row">'
-        f"<span>{esc(reference)}</span>"
-        f'<span class="state {STATE_CLASS.get(state, "")}">{esc(state)}</span>'
-        f'<span class="dim">{esc(f"{et(since)} · {actor} · {surface}")}</span>'
-        f'<span class="num">{esc(returned)}</span>'
-        f'<span class="num">{esc(turnover)}</span>'
-        f'<span class="num">{esc(f"{names} names")}</span>'
-        f"</span></summary>"
+    cells = (
+        f'<th scope="row">{esc(reference)}</th>'
+        f'<td class="state {STATE_CLASS.get(state, "")}">{esc(state)}</td>'
+        f'<td class="dim">{esc(f"{et(since)} · {actor} · {surface}")}</td>'
+        f'<td class="num">{esc(returned)}</td>'
+        f'<td class="num">{esc(turnover)}</td>'
+        f'<td class="num">{esc(f"{names} names")}</td>'
     )
     events = reads.events.get(f"live basket {reference}", [])
     detail = join(
         [
-            tag("h3", "What it changed"),
+            tag("h2", "What it changed"),
             _diff_blocks(diff, capital),
-            tag("h3", "Return"),
+            tag("h2", "Return"),
             note(f"{returned} over {period}: {window}"),
-            tag("h3", "Gate"),
+            tag("h2", "Gate"),
             _gate_block(reads.checks[basket_id]),
-            tag("h3", "Flags"),
+            tag("h2", "Flags"),
             _flags_block(reads.flags.get(period, [])),
-            tag("h3", "Events"),
+            tag("h2", "Events"),
             table(
                 ["When", "Event", "Actor", "Detail"],
                 [(et(at), event, by, detail or "") for at, by, event, detail in events],
+                caption="Audit log lines naming this rebalance",
+                empty="No audit log line names it.",
             ),
             note(f"model {ranker} · capital {readout.dollars(capital)} · basket {basket_id}"),
         ]
     )
-    return Html(f'<details class="cycle">{summary}<div class="detail">{detail}</div></details>')
+    summary = tag("summary", f"Detail of {reference}")
+    return Html(
+        f'<tbody class="cycle"><tr>{cells}</tr><tr><td class="expand" colspan="6">'
+        f'<details class="cycle">{summary}<div class="detail">{detail}</div></details>'
+        "</td></tr></tbody>"
+    )
 
 
-_LOG_HEAD = Html(
-    '<div class="row head"><span>Rebalance</span><span>State</span><span>Decided</span>'
-    '<span class="num">Return</span><span class="num">Turnover</span>'
-    '<span class="num">Names</span></div>'
-)
+def _log_table(cycles: Iterable[Html]) -> Html:
+    """The log as a table: a header row, then one body per cycle, which is the cycle's row and
+    the row under it that expands. A body holds a cycle together so that the rows read as one."""
+    columns = ("Rebalance", "State", "Decided", "Return", "Turnover", "Names")
+    head = "".join(
+        '<th scope="col"' + (' class="num"' if index >= 3 else "") + f">{label}</th>"
+        for index, label in enumerate(columns)
+    )
+    return Html(
+        '<div class="scroll" tabindex="0"><table class="log">'
+        '<caption class="sr">Rebalance cycles, newest first</caption>'
+        f"<thead><tr>{head}</tr></thead>{join(cycles)}</table></div>"
+    )
 
 
 def log(conn: psycopg.Connection, now: datetime) -> str:
@@ -479,7 +542,7 @@ def log(conn: psycopg.Connection, now: datetime) -> str:
     body: list[object] = [note("No rebalance has been proposed yet.")]
     if cycles:
         reads = _CycleReads.of(conn, cycles)
-        body = [_LOG_HEAD, *(_cycle(reads, row) for row in cycles)]
+        body = [_log_table(_cycle(reads, row) for row in cycles)]
     return page("Decision log", "/", [banner(conn, now), section("Decision log", body)])
 
 
@@ -519,7 +582,7 @@ def rebalance(conn: psycopg.Connection, now: datetime) -> str:
     if waiting:
         blocks += [
             note("No answer by the session's cutoff means no trades this month."),
-            tag("h3", "Your answer"),
+            tag("h2", "Your answer"),
             note(
                 f"Type the reference, {reference}, into the box to answer. There is no button "
                 "that answers on its own: typing it is the deliberation."
@@ -532,9 +595,9 @@ def rebalance(conn: psycopg.Connection, now: datetime) -> str:
             ),
         ]
     blocks += [
-        tag("h3", "Diff"),
+        tag("h2", "Diff"),
         _diff_blocks(diff, capital),
-        tag("h3", "Targets"),
+        tag("h2", "Targets"),
         table(
             ["Symbol", "Rank", "Weight", "Shares", "Standing"],
             [
@@ -542,8 +605,10 @@ def rebalance(conn: psycopg.Connection, now: datetime) -> str:
                 for symbol, rank, weight, qty, h, c in conn.execute(_TARGETS, (basket_id,))
             ],
             numeric=(1, 2, 3),
+            caption="Basket targets",
+            empty="The basket holds nothing.",
         ),
-        tag("h3", "Orders"),
+        tag("h2", "Orders"),
         table(
             ["Side", "Symbol", "Qty", "Reference", "Notional", "Cost bps", "Client order id"],
             [
@@ -561,6 +626,8 @@ def rebalance(conn: psycopg.Connection, now: datetime) -> str:
                 )
             ],
             numeric=(2, 3, 4, 5),
+            caption="Basket orders",
+            empty="The basket trades nothing.",
         ),
     ]
     return page(
@@ -651,6 +718,8 @@ def positions(conn: psycopg.Connection, now: datetime) -> str:
             ["Symbol", "Shares", "Value", "Weight", "Since entry", "Held since", "Panel", "Rank"],
             rows,
             numeric=(1, 2, 3, 4, 6, 7),
+            caption="Positions held",
+            empty="No position is held.",
         ),
     ]
     return page("Positions", "/positions", [banner(conn, now), section("Positions", blocks)])
@@ -694,6 +763,7 @@ def gate(conn: psycopg.Connection, now: datetime) -> str:
                 )
                 for c in sorted(rows, key=lambda c: (c.passed, c.source, c.name, c.symbol or ""))
             ],
+            caption="Gate checks, failures first",
         ),
     ]
     return page(heading, "/gate", [banner(conn, now), section(heading, blocks)])
@@ -821,7 +891,12 @@ def _path_table(quantiles: Mapping[str, object], live: Mapping[str, float | None
             )
         )
     headers = ["Measure", "Live", *(label for _, label in QUANTILES)]
-    return table(headers, rows, numeric=range(1, len(headers)))
+    return table(
+        headers,
+        rows,
+        numeric=range(1, len(headers)),
+        caption="Path distribution beside the live account",
+    )
 
 
 def validation(conn: psycopg.Connection, now: datetime) -> str:
@@ -917,8 +992,13 @@ def validation(conn: psycopg.Connection, now: datetime) -> str:
             f"{readout.dollars(capital)} under cost model {cost_model}."
         ),
         note(standing),
-        tag("h3", "Gates"),
-        table(["Gate", "Measured", "Needs", "Result"], gate_rows, numeric=(1, 2)),
+        tag("h2", "Gates"),
+        table(
+            ["Gate", "Measured", "Needs", "Result"],
+            gate_rows,
+            numeric=(1, 2),
+            caption="Validation gates, each beside what it needs",
+        ),
         note(
             f"Declared trials {trials:,}, which is what the deflated Sharpe is deflated by: the"
             " figure answers how much of the Sharpe survives having tried that many times."
@@ -931,7 +1011,7 @@ def validation(conn: psycopg.Connection, now: datetime) -> str:
                 else ", unflagged."
             )
         ),
-        tag("h3", "Path distribution"),
+        tag("h2", "Path distribution"),
         note(
             f"{counted} Each measure below is the distribution across those paths, with what the"
             " live account has measured so far beside it."
@@ -998,12 +1078,13 @@ def _criteria_block(heading: str, criteria: Sequence[ladder.Criterion], standing
     A criterion nothing has measured reads as unmet, which is the honest answer."""
     return join(
         [
-            tag("h3", heading),
+            tag("h2", heading),
             note(standing),
             table(
                 ["Criterion", "Measured", "Needs", "Result"],
                 [(c.name, c.measured, c.threshold, "met" if c.met else "unmet") for c in criteria],
                 numeric=(1, 2),
+                caption=f"{heading} criteria",
             ),
         ]
     )
@@ -1025,7 +1106,7 @@ def promotion(conn: psycopg.Connection, now: datetime) -> str:
     ]
     if level.attestation:
         blocks.append(note(f"Attested: {level.attestation}"))
-    blocks.append(tag("h3", "The live model"))
+    blocks.append(tag("h2", "The live model"))
     if promoted is None:
         blocks.append(
             note(
@@ -1074,7 +1155,7 @@ def promotion(conn: psycopg.Connection, now: datetime) -> str:
         )
     criteria = ladder.status(conn)
     if not criteria:
-        blocks.append(join([tag("h3", "The level above"), note("L2 is the top of the ladder.")]))
+        blocks.append(join([tag("h2", "The level above"), note("L2 is the top of the ladder.")]))
     else:
         eligible = ladder.ready(conn)
         target = (
@@ -1105,7 +1186,7 @@ def promotion(conn: psycopg.Connection, now: datetime) -> str:
         )
     blocks.append(_criteria_block("Towards live", ladder.live_status(conn), standing))
     history = conn.execute(_PROMOTION_HISTORY, (LADDER_MAX,)).fetchall()
-    blocks.append(tag("h3", "Every transition"))
+    blocks.append(tag("h2", "Every transition"))
     if not history:
         blocks.append(note("Nothing has been certified, promoted or moved yet."))
     else:
@@ -1117,6 +1198,7 @@ def promotion(conn: psycopg.Connection, now: datetime) -> str:
                     for at, what, detail, who, evidence in history
                 ],
                 wrap=(2,),
+                caption="Every certification, promotion and move",
             )
         )
     return page("Promotion", "/promotion", [banner(conn, now), section("Promotion", blocks)])
@@ -1165,9 +1247,13 @@ def performance(conn: psycopg.Connection, now: datetime) -> str:
         )
     expected = limits.monthly_return if limits else None
     blocks.append(
-        table(["What", "Facts"], [(item.what, item.facts) for item in readout.comparison(conn)])
+        table(
+            ["What", "Facts"],
+            [(item.what, item.facts) for item in readout.comparison(conn)],
+            caption="Live figures beside the backtest",
+        )
     )
-    blocks.append(tag("h3", "Beside the backtest"))
+    blocks.append(tag("h2", "Beside the backtest"))
     blocks.append(_path_table(quantiles, _live_paths(months, expected)))
     worst = min(months, key=lambda month: month.total_return)
     average = quantiles.get("monthly_return") or {}
@@ -1181,7 +1267,7 @@ def performance(conn: psycopg.Connection, now: datetime) -> str:
             " single month is a rough reference against them and nothing more."
         )
     )
-    blocks.append(tag("h3", "Every month"))
+    blocks.append(tag("h2", "Every month"))
     blocks.append(
         table(
             ["Period", "Mode", "Return", "Dividends added back", "vs certified average month"],
@@ -1198,6 +1284,7 @@ def performance(conn: psycopg.Connection, now: datetime) -> str:
                 for month in months
             ],
             numeric=(2, 3, 4),
+            caption="Every month's return",
         )
     )
     paper = [month for month in months if month.mode == "paper"]
@@ -1348,6 +1435,7 @@ def _panel_name(
                 ],
                 numeric=(0, 2),
                 wrap=(3,),
+                caption="Rubric dimensions with the Judge's reason",
             )
         )
     if filings:
@@ -1366,6 +1454,7 @@ def _panel_name(
                     )
                     for document, form, filed, part, sent, chars in filings
                 ],
+                caption="Filings the analyst read",
             )
         )
     elif outcome == "retrieved":
@@ -1493,8 +1582,12 @@ def alerts(conn: psycopg.Connection, now: datetime) -> str:
             )
         )
     blocks = [
-        table(["Id", "Raised", "Kind", "Subject", "By", "Delivery", ""], listed),
-        tag("h3", "Acknowledge"),
+        table(
+            ["Id", "Raised", "Kind", "Subject", "By", "Delivery", "Body"],
+            listed,
+            caption="Alerts, newest first",
+        ),
+        tag("h2", "Acknowledge"),
         note(
             "Type the id of an alert you have seen. An alert is acknowledged once, by whoever "
             "does it first, here or with /ack in Telegram."
@@ -1519,17 +1612,18 @@ def kill_switch(conn: psycopg.Connection, now: datetime) -> str:
         table(
             ["Open cause", "Since", "By", "Reason"],
             [(cause, et(at), actor, reason or "") for cause, at, actor, reason in latched],
+            caption="Open halt causes",
         )
         if latched
         else note("No halt cause is open."),
-        tag("h3", "Pause"),
+        tag("h2", "Pause"),
         note(
             "Opens the pause cause, so no further order goes out, and asks execution to suspend "
             "trading at the broker. Execution confirms that as an alert. The next page says "
             "what will change and writes nothing until it is confirmed."
         ),
         tag("p", tag("a", "Pause…", href=CONFIRM_PAUSE)),
-        tag("h3", "Resume"),
+        tag("h2", "Resume"),
         note(
             f"Clears the causes you tick on the next page, one clear each. Open now: "
             f"{', '.join(c for c, *_ in latched)}."
@@ -1537,7 +1631,7 @@ def kill_switch(conn: psycopg.Connection, now: datetime) -> str:
             else "Clears the causes you tick, one clear each. Nothing is open to clear."
         ),
         tag("p", tag("a", "Resume…", href=CONFIRM_RESUME)),
-        tag("h3", "Liquidate"),
+        tag("h2", "Liquidate"),
         note(
             "Two steps. The first says what closing every position would mean and issues a "
             f"token good for {minutes} minutes; the second is that token typed back. A wrong or "
@@ -1615,6 +1709,7 @@ def confirm_resume(conn: psycopg.Connection, now: datetime) -> str:
             table(
                 ["Open cause", "Since", "By", "Reason"],
                 [(cause, et(at), actor, reason or "") for cause, at, actor, reason in latched],
+                caption="Open halt causes",
             ),
             note(
                 "The broker's suspend_trade is asked off once the pause cause is cleared, and "
@@ -1817,18 +1912,14 @@ WRITES = {
 
 
 def not_found(path: str) -> str:
-    return page(
-        "Not found", path, [note(f"There is no {path} here."), tag("p", tag("a", "Log", href="/"))]
-    )
+    blocks = [note(f"There is no {path} here."), tag("p", tag("a", "Log", href="/"))]
+    return page("Not found", path, [section("Not found", blocks)])
 
 
 def not_allowed(path: str) -> str:
     """A POST to a page. The pages read; the writes are the routes in `WRITES`."""
-    return page(
-        "Not allowed",
-        path,
-        [
-            note(f"{path} is a page, and pages are read with GET."),
-            tag("p", tag("a", "Log", href="/")),
-        ],
-    )
+    blocks = [
+        note(f"{path} is a page, and pages are read with GET."),
+        tag("p", tag("a", "Log", href="/")),
+    ]
+    return page("Not allowed", path, [section("Not allowed", blocks)])

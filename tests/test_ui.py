@@ -29,6 +29,7 @@ import subprocess
 import threading
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from html.parser import HTMLParser
 from http.client import HTTPConnection
 from pathlib import Path
 from urllib.parse import urlencode
@@ -895,6 +896,160 @@ def test_the_pages_carry_no_javascript_and_nothing_builds_any(conn, traded):
     built = {"package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"}
     assert not [p for p in tracked if Path(p).name in built]
     assert "node" not in (ROOT / "Dockerfile").read_text().lower()
+
+
+# -- issue #202: landmarks, table semantics, contrast and overflow -------------------------
+
+
+class Structure(HTMLParser):
+    """What a screen reader builds a page from: the landmarks, the headings, and for each table
+    its caption, its header cells and the rows under them."""
+
+    def __init__(self, source):
+        super().__init__()
+        self.h1 = 0
+        self.navs = []
+        self.mains = 0
+        self.links = []
+        self.tables = []
+        self.bare_headers = 0
+        self.unscoped = 0
+        self._cell = None
+        self._in_body = False
+        self.feed(source)
+
+    def handle_starttag(self, name, attrs):
+        attrs = dict(attrs)
+        if name == "h1":
+            self.h1 += 1
+        elif name == "nav":
+            self.navs.append(attrs)
+        elif name == "main":
+            self.mains += 1
+        elif name == "a" and "aria-current" in attrs:
+            self.links.append(attrs)
+        elif name == "table":
+            self.tables.append({"caption": 0, "head": 0, "rows": 0})
+        elif name == "caption":
+            self.tables[-1]["caption"] += 1
+        elif name == "th":
+            self.tables[-1]["head"] += 1
+            self.unscoped += "scope" not in attrs
+            self._cell = [""]
+        elif name == "tr" and self._in_body:
+            self.tables[-1]["rows"] += 1
+        elif name in ("thead", "tbody"):
+            self._in_body = name == "tbody"
+
+    def handle_endtag(self, name):
+        if name == "th" and self._cell is not None:
+            self.bare_headers += not self._cell[0].strip()
+            self._cell = None
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell[0] += data
+
+
+def landmarks(page, path):
+    """The checks every page must pass, whatever it shows."""
+    found = Structure(page)
+    assert found.h1 == 1, f"{path}: {found.h1} h1 elements"
+    assert found.mains == 1, f"{path}: {found.mains} main elements"
+    assert [nav.get("aria-label") for nav in found.navs] == ["Views"], path
+    assert 'href="#main"' in page and 'id="main"' in page, f"{path}: no skip link"
+    assert found.unscoped == 0, f"{path}: a th with no scope"
+    assert found.bare_headers == 0, f"{path}: an empty th"
+    for number, table in enumerate(found.tables):
+        assert table["caption"] == 1, f"{path}: table {number} has no caption"
+        assert table["head"], f"{path}: table {number} has no header cells"
+        assert table["rows"], f"{path}: table {number} is a header with nothing under it"
+    return found
+
+
+def test_every_page_has_one_h1_a_nav_a_main_and_marks_where_the_reader_is(
+    conn, traded, certified, blended
+):
+    """The shell is the same on every page: a skip link, one named `nav` with the view being
+    read marked `aria-current`, one `main` and one `h1`. Every table on the page has a caption,
+    scoped headers and a row, which is the structure a screen reader reads a table by."""
+    views = dict(ui.VIEWS)
+    for path, view in ui.ROUTES.items():
+        found = landmarks(view(conn, LATER), path)
+        here = [link["href"] for link in found.links]
+        # A confirmation page is a step inside the Kill switch view, so that is the link marked.
+        assert here == ([path] if path in views else ["/killswitch"]), path
+        assert all(link["aria-current"] == "page" for link in found.links)
+
+
+def test_a_database_with_nothing_in_it_still_gives_every_table_a_row(conn):
+    for path, view in ui.ROUTES.items():
+        landmarks(view(conn, LATER), path)
+
+
+def test_the_error_pages_have_the_same_shell():
+    for path, page in (
+        ("/nope", ui.not_found("/nope")),
+        ("/", ui.not_allowed("/")),
+        ("/", ui.failed("/", "ValueError", wrote=False)),
+        ("/pause", ui.failed("/pause", "ValueError", wrote=True)),
+    ):
+        landmarks(page, path)
+
+
+def test_an_empty_table_says_so_in_one_row_across_all_its_columns():
+    page = ui.table(["A", "B", "C"], [], caption="Nothing yet", empty="No rows today.")
+    assert 'colspan="3"' in page and "No rows today." in page
+    [only] = Structure(page).tables
+    assert only["rows"] == 1
+    assert "empty" not in ui.table(["A"], [["x"]], caption="One")
+
+
+def test_a_wide_table_scrolls_inside_its_own_box(conn, traded):
+    """The page never scrolls sideways at 360px because every table sits in a `.scroll` box
+    that does, and the decision log's expansions live inside the same box."""
+    assert '<div class="scroll" tabindex="0"><table' in ui.table(["A"], [["x"]], caption="One")
+    assert '<div class="scroll" tabindex="0"><table class="log">' in ui.log(conn, LATER)
+    assert re.search(r"\.scroll \{[^}]*overflow-x: auto", ui.STYLE)
+
+
+def test_the_decision_log_is_a_table_with_a_row_for_each_cycle(conn, traded):
+    page = ui.log(conn, LATER)
+    log_table = Structure(page).tables[0]
+    assert log_table["rows"] >= 2, "a cycle is its summary row and the row it expands in"
+    assert "<details" in page
+    headers = re.findall(r'<th[^>]*scope="col"[^>]*>([^<]+)</th>', page.split("</thead>")[0])
+    assert headers == ["Rebalance", "State", "Decided", "Return", "Turnover", "Names"]
+
+
+def luminance(colour):
+    """WCAG 2.x relative luminance of a `#rrggbb` colour."""
+    channels = [int(colour[i : i + 2], 16) / 255 for i in (1, 3, 5)]
+    red, green, blue = (
+        c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels
+    )
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def contrast(front, back):
+    lighter, darker = sorted((luminance(front), luminance(back)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def palette(block):
+    return dict(re.findall(r"--(\w+): (#[0-9a-f]{6})", block))
+
+
+def test_both_colour_schemes_meet_wcag_aa_for_text():
+    """Every colour the page prints text in is at least 4.5:1 against the background, in the
+    light scheme and again in the dark one, computed from the stylesheet itself."""
+    light, dark = ui.STYLE.split("@media (prefers-color-scheme: dark)")
+    for name, scheme in (("light", palette(light)), ("dark", palette(dark))):
+        assert {"bg", "fg", "dim", "link", "bad", "warn", "ok"} <= set(scheme), name
+        for text in ("fg", "dim", "link", "bad", "warn", "ok"):
+            ratio = contrast(scheme[text], scheme["bg"])
+            assert ratio >= 4.5, f"{name} --{text} {scheme[text]} on {scheme['bg']}: {ratio:.2f}"
+    assert contrast("#000000", "#ffffff") == pytest.approx(21)
 
 
 # -- the server ----------------------------------------------------------------------------
