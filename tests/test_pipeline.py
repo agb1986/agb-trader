@@ -3,6 +3,7 @@ snapshot, a failed or missed pull is overdue, a re-run changes nothing, and the 
 what any job does when it breaks: it fails once, naming its cause, with an alert, and the
 service carries on; a job whose lease was lost is left alone."""
 
+import errno
 import logging
 import re
 import threading
@@ -10,6 +11,7 @@ import time
 import urllib.error
 from datetime import UTC, date, datetime, timedelta
 
+import duckdb
 import psycopg
 import pyarrow as pa
 import pytest
@@ -28,16 +30,34 @@ from test_gate import LATE
 from test_jobs import age
 
 from agb import analyst, approval, edgar, heartbeat, jobs, lake, schedule
+from agb.errors import NotConfigured
+from agb.lake import KeyNotSet, LakeError
 from agb.panel_store import PanelStore
 from agb.schedule import Expected, Planned
 from agb.services import pipeline as pipeline_module
-from agb.services.pipeline import JOB_FAILED, RERUN_FAILED, RETRY, Pipeline, record
+from agb.services.pipeline import (
+    CONFIGURATION,
+    JOB_FAILED,
+    JOB_HELD,
+    PERMANENT,
+    RERUN_FAILED,
+    RETRY,
+    TRANSIENT,
+    TRANSIENT_RETRIES,
+    Pipeline,
+    classify,
+    record,
+)
 from agb.services.scheduler import Scheduler
 
 PERIOD = "2026-09-14"
 SESSION = date(2026, 9, 14)
 KEY = "k3y-not-a-real-one"
 MINUTE = timedelta(minutes=1)
+# The day after PERIOD, while its pull is still worth doing: the job expires when the next
+# session's pull is due, at 2026-09-15's close plus schedule.PULL_DELAY.
+DAY_AFTER = datetime(2026, 9, 15, 12, tzinfo=UTC)
+PULL_EXPIRES = datetime(2026, 9, 15, 22, tzinfo=UTC)
 
 
 def plan_pull(db, period=PERIOD, *, start=None):
@@ -182,7 +202,9 @@ def test_a_failed_pull_lands_nothing_and_is_overdue(db, tmp_path, setup, detail)
     key = setup(vendor)
     due = plan_pull(db)
 
-    Pipeline(tmp_path, key, opener=vendor, sleep=no_wait)(db.connect("pipeline"))
+    # Past the pull's deadline, so a held job (no key) fails as well.
+    run = Pipeline(tmp_path, key, opener=vendor, sleep=no_wait, clock=lambda: PULL_EXPIRES)
+    run(db.connect("pipeline"))
 
     assert pull_state(db) == "failed"
     [(failure,)] = (
@@ -241,7 +263,7 @@ def test_a_deferred_pull_records_the_missed_sessions_it_landed(db, tmp_path):
     lake.pull(tmp_path, lake.Sharadar(KEY, vendor), date(2026, 9, 10))
     due = plan_pull(db)
 
-    Pipeline(tmp_path, KEY, opener=vendor)(db.connect("pipeline"))
+    Pipeline(tmp_path, KEY, opener=vendor, clock=lambda: DAY_AFTER)(db.connect("pipeline"))
 
     assert pull_state(db) == "claimed"
     assert [(r[0], r[2], r[4]) for r in snapshots(db)] == [(SESSION, "sep/date=2026-09-11", 2)]
@@ -263,7 +285,7 @@ def test_a_session_not_yet_published_is_kept_and_tried_again(db, tmp_path):
     due = plan_pull(db)
     conn = db.connect("pipeline")
 
-    Pipeline(tmp_path, KEY, opener=vendor)(conn)
+    Pipeline(tmp_path, KEY, opener=vendor, clock=lambda: DAY_AFTER)(conn)
 
     assert pull_state(db) == "claimed"
     [(left,)] = db.connect("cli").execute("SELECT lease_until - now() FROM agb.job").fetchall()
@@ -274,7 +296,7 @@ def test_a_session_not_yet_published_is_kept_and_tried_again(db, tmp_path):
     ).fetchone() == (0,)
     assert late_pulls(db, due + MINUTE) == [(PERIOD,)]  # until it lands
     vendor.rows["stocks"] += published
-    Pipeline(tmp_path, KEY, opener=vendor)(conn)
+    Pipeline(tmp_path, KEY, opener=vendor, clock=lambda: DAY_AFTER)(conn)
     assert len(vendor.urls) == 1  # not before the retry is due
 
 
@@ -284,7 +306,9 @@ def test_a_session_not_yet_published_lands_once_the_vendor_has_it(db, tmp_path):
     del vendor.rows["stocks"][-2:]
     due = plan_pull(db)
     conn = db.connect("pipeline")
-    run = Pipeline(tmp_path, KEY, opener=vendor, retry=timedelta(milliseconds=1))
+    run = Pipeline(
+        tmp_path, KEY, opener=vendor, retry=timedelta(milliseconds=1), clock=lambda: DAY_AFTER
+    )
 
     run(conn)
     time.sleep(0.05)
@@ -298,6 +322,166 @@ def test_a_session_not_yet_published_lands_once_the_vendor_has_it(db, tmp_path):
     assert pull_state(db) == "completed"
     assert "sep/date=2026-09-14" in landed(tmp_path)
     assert late_pulls(db, due + MINUTE) == []
+
+
+def failed_details(db):
+    return [
+        detail
+        for (detail,) in cli_rows(db, "SELECT detail FROM agb.job_event WHERE event = 'failed'")
+    ]
+
+
+def job_id(db):
+    [(found,)] = cli_rows(db, "SELECT id FROM agb.job")
+    return found
+
+
+def test_a_pull_past_its_deadline_and_not_yet_published_fails_once_with_an_alert(db, tmp_path):
+    vendor = sample()
+    del vendor.rows["stocks"][-2:]
+    plan_pull(db)
+    conn = db.connect("pipeline")
+
+    Pipeline(tmp_path, KEY, opener=vendor, clock=lambda: DAY_AFTER)(conn)
+    assert pull_state(db) == "claimed"  # held, while its data can still be used
+    age(db, job_id(db), RETRY)
+    Pipeline(tmp_path, KEY, opener=vendor, clock=lambda: PULL_EXPIRES)(conn)
+
+    assert pull_state(db) == "failed"
+    [detail] = failed_details(db)
+    assert detail.startswith(
+        "expired: its work could be used only until 2026-09-15 22:00 UTC; not yet published: "
+    )
+    [(kind, subject, period, body, raised_by)] = alerts(db)
+    assert (kind, subject, period, raised_by) == (JOB_FAILED, "data_pull", PERIOD, "pipeline")
+    assert detail in body
+
+    # Never renewed again: the next cycle takes nothing and asks the vendor nothing.
+    asked = len(vendor.urls)
+    Pipeline(tmp_path, KEY, opener=vendor, clock=lambda: PULL_EXPIRES)(conn)
+    assert len(vendor.urls) == asked
+    assert len(failed_details(db)) == 1
+    assert len(alerts(db)) == 1
+
+
+def raises_first(monkeypatch, failures):
+    """Make lake.pull raise each of `failures` in turn, then pull as it would."""
+    real = lake.pull
+
+    def pull(*args, **kwargs):
+        if failures:
+            raise failures.pop(0)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(lake, "pull", pull)
+
+
+def disk_error():
+    return OSError(errno.EIO, "Input/output error")
+
+
+def test_the_retries_for_a_transient_error_are_bounded():
+    assert TRANSIENT_RETRIES == 3
+
+
+def test_a_transient_error_releases_the_pull_and_a_later_cycle_lands_it(
+    db, tmp_path, monkeypatch, caplog
+):
+    raises_first(monkeypatch, [disk_error()])
+    due = plan_pull(db)
+    run = Pipeline(tmp_path, KEY, opener=sample(), clock=lambda: DAY_AFTER)
+    conn = db.connect("pipeline")
+
+    with caplog.at_level(logging.WARNING, logger=pipeline_module.__name__):
+        run(conn)
+
+    assert pull_state(db) == "pending"
+    assert cli_rows(db, "SELECT event, detail FROM agb.job_event WHERE event = 'released'") == [
+        ("released", "transient: OSError: [Errno 5] Input/output error")
+    ]
+    assert "released to be tried again (1 of 3)" in caplog.text
+    run(conn)
+
+    assert pull_state(db) == "completed"
+    assert "sep/date=2026-09-14" in landed(tmp_path)
+    assert late_pulls(db, due + MINUTE) == []
+    assert alerts(db) == []
+
+
+def test_a_transient_error_past_every_retry_fails_the_pull_with_an_alert(db, tmp_path, monkeypatch):
+    raises_first(monkeypatch, [disk_error() for _ in range(TRANSIENT_RETRIES + 1)])
+    plan_pull(db)
+    run = Pipeline(tmp_path, KEY, opener=sample(), clock=lambda: DAY_AFTER)
+    conn = db.connect("pipeline")
+
+    for _ in range(TRANSIENT_RETRIES):
+        run(conn)
+        assert pull_state(db) == "pending"
+    run(conn)
+
+    assert pull_state(db) == "failed"
+    assert failed_details(db) == [
+        "transient, still after 3 retries: OSError: [Errno 5] Input/output error"
+    ]
+    [(kind, subject, period, _, _)] = alerts(db)
+    assert (kind, subject, period) == (JOB_FAILED, "data_pull", PERIOD)
+    run(conn)
+    assert len(alerts(db)) == 1
+
+
+def test_an_os_error_that_trying_again_does_not_mend_fails_at_once(db, tmp_path, monkeypatch):
+    raises_first(monkeypatch, [PermissionError(errno.EACCES, "Permission denied")])
+    plan_pull(db)
+
+    Pipeline(tmp_path, KEY, opener=sample(), clock=lambda: DAY_AFTER)(db.connect("pipeline"))
+
+    assert pull_state(db) == "failed"
+    assert failed_details(db) == ["permanent: PermissionError: [Errno 13] Permission denied"]
+
+
+def test_a_pull_with_no_key_is_held_with_one_alert_until_its_deadline(db, tmp_path):
+    plan_pull(db)
+    conn = db.connect("pipeline")
+
+    for _ in range(2):
+        Pipeline(tmp_path, "", opener=sample(), clock=lambda: DAY_AFTER)(conn)
+        assert pull_state(db) == "claimed"
+        age(db, job_id(db), RETRY)
+    [(kind, subject, period, body, _)] = alerts(db)
+    assert (kind, subject, period) == (JOB_HELD, "data_pull", PERIOD)
+    assert "KeyNotSet: SHARADAR_API_KEY is not set" in body
+    assert failed_details(db) == []
+
+    Pipeline(tmp_path, "", opener=sample(), clock=lambda: PULL_EXPIRES)(conn)
+
+    assert pull_state(db) == "failed"
+    [detail] = failed_details(db)
+    assert detail.startswith("expired: ")
+    assert "held for missing configuration: KeyNotSet: SHARADAR_API_KEY is not set" in detail
+    assert [a[0] for a in alerts(db)] == [JOB_HELD, JOB_FAILED]
+
+
+@pytest.mark.parametrize(
+    ("exc", "failure"),
+    [
+        (OSError(errno.EIO, "Input/output error"), TRANSIENT),
+        (ConnectionResetError(), TRANSIENT),
+        (TimeoutError(), TRANSIENT),
+        (psycopg.OperationalError("could not obtain lock"), TRANSIENT),
+        (duckdb.IOException("could not set lock on file"), TRANSIENT),
+        (KeyNotSet("SHARADAR_API_KEY is not set"), CONFIGURATION),
+        (NotConfigured("EDGAR_USER_AGENT is not set"), CONFIGURATION),
+        (FileNotFoundError(errno.ENOENT, "No such file"), PERMANENT),
+        (PermissionError(errno.EACCES, "Permission denied"), PERMANENT),
+        (LakeError("GET SEP failed after 3 attempts"), PERMANENT),
+        (errors.CheckViolation("basket_cutoff"), PERMANENT),
+        (pa.ArrowInvalid("bad cast"), PERMANENT),
+        (ValueError("bad data"), PERMANENT),
+    ],
+    ids=lambda v: type(v).__name__ if isinstance(v, BaseException) else v,
+)
+def test_each_error_is_classified_by_its_type(exc, failure):
+    assert classify(exc) == failure
 
 
 def test_nothing_is_pulled_before_the_job_is_due(db, tmp_path):
@@ -427,9 +611,9 @@ def alerts(db):
 @pytest.mark.parametrize(
     ("breaking", "cause"),
     [
-        (corrupt_body, "StoreError: body .* does not decompress"),
-        (database_error, "DivisionByZero: division by zero"),
-        (unreadable_parquet, "ArrowInvalid: "),
+        (corrupt_body, "permanent: StoreError: body .* does not decompress"),
+        (database_error, "permanent: DivisionByZero: division by zero"),
+        (unreadable_parquet, "permanent: ArrowInvalid: "),
     ],
     ids=["corrupt-body", "database", "arrow"],
 )
@@ -625,7 +809,9 @@ def test_a_rebalance_gated_past_its_cutoff_fails_once_with_an_alert(db, tmp_path
 
     assert job_state(db) == "failed"
     [(detail,)] = cli_rows(db, "SELECT detail FROM agb.job_event WHERE event = 'failed'")
-    assert detail.startswith("CheckViolation: basket_cutoff: pipeline may not approve basket")
+    assert detail.startswith(
+        "permanent: CheckViolation: basket_cutoff: pipeline may not approve basket"
+    )
     [(kind, subject, period, body, _)] = alerts(db)
     assert (kind, subject, period) == (JOB_FAILED, "rebalance", "2026-10")
     assert detail in body

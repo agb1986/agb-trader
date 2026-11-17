@@ -8,12 +8,14 @@ configured chat. Each of those duties runs under its own handler: one that raise
 raises one alert for its run of failures, and leaves the rest to run, so delivery is always
 attempted.
 
-It holds no state beyond a cached Telegram update offset and which duties are failing. Every
+It holds no state beyond a cached Telegram update offset, which duties are failing and how many
+refusals each chat has had this hour. Every
 message it sends is computed from the database, every message it receives is a `command` row
-whatever became of it, every delivery attempt is an `alert_event`, and every part of a long
-alert Telegram accepted is an `alert_part`, so a delivery that fails part-way resumes at the first
-part not sent. A reply Telegram will not take is queued as an alert of kind `reply` and delivered
-like any other. Alerts notify and never act.
+whatever became of it (a chat refused more than `REFUSAL_LIMIT` times in an hour gets one row
+saying so and no more until the hour is out), every delivery attempt is an `alert_event`, and
+every part of a long alert Telegram accepted is an `alert_part`, so a delivery that fails
+part-way resumes at the first part not sent. A reply Telegram will not take is queued as an
+alert of kind `reply` and delivered like any other. Alerts notify and never act.
 Each update it handles is a `telegram_update` row written with its command, so a restart neither
 loses nor repeats one, and a command older than `STALE_COMMAND` is refused rather than acted on.
 
@@ -94,6 +96,14 @@ TOKEN_VALID = killswitch.TOKEN_VALID
 # raised since. Five minutes is several poll cycles and a retried poll, and far less than the
 # time it takes for the state a command was meant for to change.
 STALE_COMMAND = timedelta(minutes=5)
+# A chat gets this many refused-message rows an hour, then one row saying so, then none until
+# the hour is out. The `command` table is append-only, so every row a stranger could make is a
+# row kept for good; a real operator refused twenty times in an hour has long since read the
+# reply. The hour begins with the chat's first refusal and is measured by the bot's clock.
+REFUSAL_LIMIT = 20
+REFUSAL_WINDOW = timedelta(hours=1)
+# Chats the limiter remembers before it forgets those whose hour is out.
+REFUSAL_TRACKED = 1024
 
 # The commands this bot answers, and what each shows, in the order /help lists them.
 COMMANDS = {
@@ -122,6 +132,12 @@ VERB = re.compile(r"^[a-z][a-z_]*$")
 TICKER = re.compile(r"^[A-Za-z][A-Za-z0-9.\-]{0,9}$")
 
 Check = Callable[[psycopg.Connection], list[Finding]]
+
+
+def refusal_reply(reason: str) -> str:
+    """What a refused message is answered with: why, and where the list of commands is. One
+    line, because the reply to a message that is not a command should not be a page."""
+    return f"{_cut(reason)} — /help lists the commands"
 
 
 def help_text(reason: str | None = None) -> str:
@@ -282,6 +298,45 @@ _CLAIM = """
 _OFFSET = "SELECT max(update_id) + 1 FROM agb.telegram_update"
 
 
+class RefusalLimit:
+    """How many refused messages a chat has had in its current hour, in memory.
+
+    `admit` says what to do with one more: record it, record the one summary row that says the
+    limit was reached, or record nothing. A restart forgets the count, which lets at most
+    `REFUSAL_LIMIT` more rows in; the limit is a bound on the table's growth, not a ledger.
+    """
+
+    RECORD = "record"
+    SUMMARISE = "summarise"
+    DROP = "drop"
+
+    def __init__(self, limit: int = REFUSAL_LIMIT, window: timedelta = REFUSAL_WINDOW) -> None:
+        self.limit = limit
+        self.window = window
+        # By chat: when its hour began and how many refusals it has had since.
+        self._seen: dict[str, tuple[datetime, int]] = {}
+
+    def exhausted(self, chat: str, now: datetime) -> bool:
+        """Whether the chat has used its rows and its summary row this hour."""
+        began, count = self._seen.get(chat, (now, 0))
+        return now - began < self.window and count > self.limit
+
+    def admit(self, chat: str, now: datetime) -> str:
+        began, count = self._seen.get(chat, (now, 0))
+        if now - began >= self.window:
+            began, count = now, 0
+        if chat not in self._seen and len(self._seen) >= REFUSAL_TRACKED:
+            self._seen = {c: v for c, v in self._seen.items() if now - v[0] < self.window}
+        count = min(count + 1, self.limit + 2)
+        self._seen[chat] = (began, count)
+        if count <= self.limit:
+            return self.RECORD
+        return self.SUMMARISE if count == self.limit + 1 else self.DROP
+
+    def began(self, chat: str, now: datetime) -> datetime:
+        return self._seen.get(chat, (now, 0))[0]
+
+
 class Bot:
     """One bot cycle, run by `serve`. Telegram and the clock are injectable for tests.
 
@@ -320,6 +375,7 @@ class Bot:
         self._calendar: NyseCalendar | None = None
         # Each duty that is failing, with the cycle its run of failures began in.
         self._failing: dict[str, datetime] = {}
+        self._refusals = RefusalLimit()
 
     def __call__(self, conn: psycopg.Connection) -> None:
         now = self.clock()
@@ -402,6 +458,16 @@ class Bot:
         """
         message = update.get("message")
         chat = message.get("chat", {}).get("id") if message is not None else None
+        if (
+            message is not None
+            and str(chat) != self.chat_id
+            and self._refusals.exhausted(str(chat), now)
+        ):
+            # A chat past its limit gets nothing on record, not even the update's own row: the
+            # update is not acted on either way, and one read again after a restart is only
+            # refused again.
+            log.debug("update %s from chat %s is over its refusal limit", update["update_id"], chat)
+            return None
         with conn.transaction():
             claimed = conn.execute(
                 _CLAIM,
@@ -418,7 +484,7 @@ class Bot:
             if message is None:
                 return None
             if str(chat) != self.chat_id:
-                self.refuse(conn, message)
+                self.refuse(conn, message, now)
                 return None
             return self.reply_to(conn, message, now)
 
@@ -494,8 +560,8 @@ class Bot:
         return f"part {first_unsent} of {len(parts)}: {exc}"
 
     def reply_to(self, conn: psycopg.Connection, message: dict[str, Any], now: datetime) -> str:
-        """Record the command and return its reply: the command's readout, or why it was
-        refused and what is available. A message older than `STALE_COMMAND` is refused
+        """Record the command and return its reply: the command's readout, or one line saying
+        why it was refused and where /help is. A message older than `STALE_COMMAND` is refused
         whatever it says."""
         parsed = parse(message.get("text") or "")
         stale = self.stale(message, now)
@@ -508,8 +574,8 @@ class Bot:
                 "Nothing has been done. Send it again if you still mean it."
             )
         if parsed.refusal is not None:
-            self._command(conn, message, parsed.verb, {"args": parsed.args}, parsed.refusal)
-            return help_text(parsed.refusal)
+            self._refused(conn, message, parsed, parsed.refusal, now)
+            return refusal_reply(parsed.refusal)
         if parsed.verb == "pause":
             return self.pause(conn, message)
         if parsed.verb == "resume":
@@ -595,14 +661,39 @@ class Bot:
         log.info("/%s by %s: %s", parsed.verb, source.actor, reply.splitlines()[0])
         return reply
 
-    def refuse(self, conn: psycopg.Connection, message: dict[str, Any]) -> None:
+    def refuse(self, conn: psycopg.Connection, message: dict[str, Any], now: datetime) -> None:
         """A message from any other chat is never answered, only recorded and logged."""
         chat = message.get("chat", {}).get("id")
-        parsed = parse(message.get("text") or "")
-        self._command(conn, message, parsed.verb, {"args": parsed.args}, "not the configured chat")
+        self._refused(
+            conn, message, parse(message.get("text") or ""), "not the configured chat", now
+        )
         log.warning(
             "refused a message from chat %s, user %s", chat, message.get("from", {}).get("id")
         )
+
+    def _refused(
+        self,
+        conn: psycopg.Connection,
+        message: dict[str, Any],
+        parsed: Parsed,
+        reason: str,
+        now: datetime,
+    ) -> None:
+        """Record a refused message, within the chat's hourly limit. The message that crosses
+        the limit is recorded as one summary row, without its text; later ones in the hour are
+        not recorded."""
+        chat = str(message.get("chat", {}).get("id"))
+        verdict = self._refusals.admit(chat, now)
+        if verdict == RefusalLimit.RECORD:
+            self._command(conn, message, parsed.verb, {"args": parsed.args}, reason)
+        elif verdict == RefusalLimit.SUMMARISE:
+            ends = self._refusals.began(chat, now) + self._refusals.window
+            summary = (
+                f"refusal limit: {self._refusals.limit} refused messages from chat {chat} "
+                f"recorded this hour; later ones are not recorded until {ends:%Y-%m-%d %H:%M} UTC"
+            )
+            log.warning(summary)
+            self._command(conn, message, None, {}, summary, text="")
 
     def _command(
         self,
@@ -611,13 +702,14 @@ class Bot:
         verb: str | None,
         args: dict[str, Any],
         refusal: str | None = None,
+        text: str | None = None,
     ) -> int:
         chat = message.get("chat", {}).get("id")
         (command_id,) = conn.execute(
             _COMMAND,
             {
                 "actor": operator(message),
-                "text": message.get("text") or "",
+                "text": (message.get("text") or "") if text is None else text,
                 "verb": verb,
                 "args": Jsonb(args),
                 "outcome": "accepted" if refusal is None else "refused",

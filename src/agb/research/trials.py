@@ -26,7 +26,16 @@ the same configuration rerun after a crash or rechecked by `reproduce` writes an
 every time; none of that is another configuration searched. `declared` therefore counts the
 distinct configurations the ledger holds, by the rule `RULE`, and `count` stays the row
 count. What each rule means, and what none of them can see, is
-docs/architecture/01-data-broker-backtesting.md and `agb.research.certify`."""
+docs/architecture/01-data-broker-backtesting.md and `agb.research.certify`.
+
+A row written by `agb.research.reproduce` says so in `reproduces`, which names the trial the
+reproduction was asked for; every row the rerun writes carries it, the nested ones too. It is a
+label for whoever reads the ledger and nothing counts by it: a reproduction runs under the same
+code version as the trial it repeats, so its rows are the same configuration again and already
+add none under `configurations` or `started`, and `rows` counts it like any other row. It is
+left out of the link and out of `digest` when null, so a ledger written before the column
+existed chains and digests as it did, and code that predates it still reads and verifies a
+ledger that has it."""
 
 import contextvars
 import fcntl
@@ -92,6 +101,7 @@ SCHEMA = pa.schema([
     ("error", pa.string()),
     ("parent", pa.string()),  # the trial this one ran inside, if any
     ("previous", pa.string()),  # `link` of the row before; null on rows from before the chain
+    ("reproduces", pa.string()),  # the trial a reproduction wrote this row for, if any
 ])  # fmt: skip
 # The trials open in this context, innermost last, as (ledger path, trial id): a trial opened
 # while another on the same ledger is open names that one as its parent. A context variable
@@ -99,6 +109,11 @@ SCHEMA = pa.schema([
 # new parameter, and a run in another thread or process is nobody's child.
 _OPEN: contextvars.ContextVar[tuple[tuple[str, str], ...]] = contextvars.ContextVar(
     "open_trials", default=()
+)
+# The reproductions running in this context, as (ledger path, trial id reproduced): every row
+# opened on that ledger meanwhile is marked as written for it. See `Ledger.reproducing`.
+_REPRODUCING: contextvars.ContextVar[tuple[tuple[str, str], ...]] = contextvars.ContextVar(
+    "reproducing", default=()
 )
 
 
@@ -369,7 +384,7 @@ class Ledger:
         """A SHA-256 over every row, in the order they were appended."""
         hasher = hashlib.sha256()
         for row in self.rows():
-            hasher.update(encode(row).encode())
+            hasher.update(encode(_unmarked(row)).encode())
             hasher.update(b"\n")
         return hasher.hexdigest()
 
@@ -390,6 +405,7 @@ class Ledger:
         the same ledger, in the same thread, names it as its parent."""
         key = str(self.path.resolve())
         parent = next((t for p, t in reversed(_OPEN.get()) if p == key), None)
+        reproduces = next((t for p, t in reversed(_REPRODUCING.get()) if p == key), None)
         started = datetime.now(UTC)
         row: dict[str, object] = {
             "trial_id": None,
@@ -409,6 +425,7 @@ class Ledger:
             "error": None,
             "parent": parent,
             "previous": None,
+            "reproduces": reproduces,
         }
         self._append(row)
         token = _OPEN.set((*_OPEN.get(), (key, str(row["trial_id"]))))
@@ -432,6 +449,16 @@ class Ledger:
                 self._replace(row)
             finally:
                 _OPEN.reset(token)
+
+    @contextmanager
+    def reproducing(self, trial_id: str) -> Iterator[None]:
+        """Mark every trial opened on this ledger inside the block, in this thread, as written to
+        reproduce `trial_id`. The mark is a label and changes no count; see the module."""
+        token = _REPRODUCING.set((*_REPRODUCING.get(), (str(self.path.resolve()), trial_id)))
+        try:
+            yield
+        finally:
+            _REPRODUCING.reset(token)
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
@@ -474,5 +501,14 @@ class Ledger:
 def _trial_id(row: dict[str, object]) -> str:
     """Sixteen hex digits over what the trial is and when it started: the same configuration
     tried twice gets two rows with two ids."""
-    keyed = {k: v for k, v in row.items() if k not in {"trial_id", "finished_at", "results"}}
+    keyed = {
+        k: v for k, v in _unmarked(row).items() if k not in {"trial_id", "finished_at", "results"}
+    }
     return hashlib.sha256(encode(keyed).encode()).hexdigest()[:16]
+
+
+def _unmarked(row: dict[str, object]) -> dict[str, object]:
+    """`row` without a null `reproduces`, so a row hashes as it did before the column existed."""
+    if row.get("reproduces") is None:
+        return {k: v for k, v in row.items() if k != "reproduces"}
+    return row

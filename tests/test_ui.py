@@ -45,7 +45,8 @@ from test_gate import EVENING, HELD, NAMES, SOUND, TURNOVER, hold, insert, rows,
 from test_health import dividend, mode, months
 from test_ladder import at_level
 
-from agb import analyst, approval, cost, debate, execution, panel, ui
+from agb import analyst, approval, cost, debate, execution, killswitch, panel, ui
+from agb.roles import OWNER
 from agb.services import ui as service
 from agb.services.bot import Bot
 
@@ -1145,7 +1146,8 @@ def test_the_kill_switch_page_shows_what_is_latched_and_what_resume_would_clear(
     page = ui.kill_switch(conn, LATER)
 
     assert "Open cause" in page and "ui:operator" in page
-    assert "Clears every open cause, one clear each: pause." in page
+    assert "Open now: pause." in page
+    assert f'href="{ui.CONFIRM_RESUME}"' in page, "Resume is a link to its confirmation"
 
 
 def test_pause_resume_and_their_rows_read_the_same_from_either_surface(writer, db):
@@ -1153,7 +1155,7 @@ def test_pause_resume_and_their_rows_read_the_same_from_either_surface(writer, d
     call `agb.killswitch`, so the reply is the same text and the rows differ only in who threw
     the switch and from where."""
     from_ui = reply_of(ui.pause(writer, {}, LATER))
-    cleared = reply_of(ui.resume(writer, {}, LATER))
+    cleared = reply_of(ui.resume(writer, {"cause.pause": "on"}, LATER))
     message = {"message_id": 11, "chat": {"id": int(CHAT)}, "from": {"id": 7}, "text": "/pause"}
     from_bot = Bot(FakeTelegram(), CHAT, lambda: LATER).pause(db.connect("bot"), message)
 
@@ -1169,6 +1171,140 @@ def test_pause_resume_and_their_rows_read_the_same_from_either_surface(writer, d
         ("pause", "clear", "ui:operator"),
         ("pause", "set", "telegram:7"),
     ]
+
+
+# -- issue #195: a confirmation step for Pause, Resume and Liquidate ------------------------
+
+CONFIRMS = {
+    ui.CONFIRM_PAUSE: ("/pause", "Confirm pause"),
+    ui.CONFIRM_RESUME: ("/resume", "Confirm resume"),
+    ui.CONFIRM_LIQUIDATE: ("/liquidate", "Confirm: issue a token"),
+}
+
+
+def open_gate_breach(db):
+    db.connect(OWNER).execute(
+        "INSERT INTO agb.halt_event (cause, action, actor, reason)"
+        " VALUES ('gate_breach', 'set', 'pipeline', 'a check failed')"
+    )
+
+
+def written(db):
+    """Everything a click on the kill switch could leave behind."""
+    return (
+        rows(db, "SELECT count(*) FROM agb.command"),
+        rows(db, "SELECT count(*) FROM agb.halt_event"),
+        rows(db, "SELECT count(*) FROM agb.liquidation"),
+    )
+
+
+def test_the_kill_switch_buttons_are_links_to_pages_that_write_nothing(conn, writer, db):
+    """Acceptance: the first click on Pause, Resume or Ask to liquidate writes nothing. The kill
+    switch page has no form for them, only links, and each page linked to is read only."""
+    ui.pause(writer, {}, LATER)
+    before = written(db)
+    page = ui.kill_switch(conn, LATER)
+
+    assert not re.findall(r'<form[^>]*action="/(?:pause|resume)"', page)
+    assert 'action="/liquidate"' in page, "the typed token's form is the second step"
+    for path in CONFIRMS:
+        assert f'href="{path}"' in page
+        assert path in ui.ROUTES and path not in ui.WRITES
+        ui.ROUTES[path](conn, LATER)
+    assert written(db) == before
+
+
+def test_each_confirmation_says_what_will_change_and_posts_to_its_own_write(conn, writer, db):
+    ui.pause(writer, {}, LATER)
+    open_gate_breach(db)
+
+    for path, (action, button) in CONFIRMS.items():
+        page = ui.ROUTES[path](conn, LATER)
+        assert "Nothing has been written yet." in page, path
+        [form] = re.findall(r"<form([^>]*)>", page)
+        assert 'method="post"' in form and f'action="{action}"' in form, path
+        assert button in page and 'href="/killswitch">Cancel' in page, path
+
+    assert "suspend_trade" in ui.confirm_pause(conn, LATER)
+    assert "already, since" in ui.confirm_pause(conn, LATER)
+    assert "step one of two" in ui.confirm_liquidate(conn, LATER)
+    assert "closes nothing" in ui.confirm_liquidate(conn, LATER)
+
+
+def test_the_resume_confirmation_lists_every_open_cause_unticked(conn, writer, db):
+    assert "nothing to clear" in ui.confirm_resume(conn, LATER)
+    assert "<form" not in ui.confirm_resume(conn, LATER)
+
+    ui.pause(writer, {}, LATER)
+    open_gate_breach(db)
+    page = ui.confirm_resume(conn, LATER)
+
+    assert re.findall(r'<input type="checkbox" name="([^"]+)"', page) == [
+        "cause.pause",
+        "cause.gate_breach",
+    ]
+    assert "checked" not in page and 'value="' not in page
+
+
+def test_resume_with_one_of_two_causes_ticked_leaves_the_other_open(conn, writer, db):
+    """Acceptance: only the ticked cause is cleared, through the shared kill switch module."""
+    ui.pause(writer, {}, LATER)
+    open_gate_breach(db)
+
+    reply = reply_of(ui.resume(writer, {"cause.gate_breach": "on"}, LATER))
+
+    assert "cleared: gate_breach" in reply and "still open: pause" in reply
+    assert [cause for cause, *_ in killswitch.causes(conn)] == ["pause"]
+    assert rows(db, "SELECT cause, action, actor FROM agb.halt_event ORDER BY id")[-1] == (
+        "gate_breach",
+        "clear",
+        "ui:operator",
+    )
+    assert commands(db)[-1] == ("resume", "accepted", None, "ui:operator", "ui")
+
+
+def test_resume_with_none_ticked_is_refused_recorded_and_clears_nothing(conn, writer, db):
+    ui.pause(writer, {}, LATER)
+    events = rows(db, "SELECT count(*) FROM agb.halt_event")
+
+    for fields in ({}, {"reason": "unrelated"}):
+        reply = reply_of(ui.resume(writer, fields, LATER))
+        assert reply.startswith("RESUME refused\nno cause was chosen to clear")
+
+    assert rows(db, "SELECT count(*) FROM agb.halt_event") == events
+    assert [cause for cause, *_ in killswitch.causes(conn)] == ["pause"]
+    assert [row[:3] for row in commands(db)[-2:]] == [
+        ("resume", "refused", "no cause was chosen to clear")
+    ] * 2
+
+
+def test_resume_reports_a_ticked_cause_that_someone_else_cleared(conn, writer, db):
+    ui.pause(writer, {}, LATER)
+    open_gate_breach(db)
+    killswitch.resume(writer, _bot_source(), ["gate_breach"])
+
+    reply = reply_of(ui.resume(writer, {"cause.gate_breach": "on", "cause.pause": "on"}, LATER))
+
+    assert "cleared: pause" in reply
+    assert "not open any more, so not cleared: gate_breach" in reply
+    assert killswitch.causes(conn) == []
+
+
+def test_a_cause_opened_after_the_page_was_drawn_stays_open(conn, writer, db):
+    """The page lists what was open when it was drawn; a later cause has no tick, so a resume
+    posted from it cannot clear that one."""
+    ui.pause(writer, {}, LATER)
+    page = ui.confirm_resume(conn, LATER)
+    open_gate_breach(db)
+    ticks = re.findall(r'name="(cause\.[^"]+)"', page)
+
+    ui.resume(writer, dict.fromkeys(ticks, "on"), LATER)
+
+    assert [cause for cause, *_ in killswitch.causes(conn)] == ["gate_breach"]
+
+
+def _bot_source():
+    return approval.Source("telegram:7", "telegram", "/resume")
 
 
 def test_liquidating_from_the_ui_is_two_steps_with_the_token_typed_back(conn, writer, db, traded):
@@ -1539,3 +1675,38 @@ def test_a_write_that_read_its_body_keeps_the_connection_alive(served, db):
     client.request("GET", response.getheader("Location"))
     assert client.getresponse().status == 200
     client.close()
+
+
+def test_the_confirmation_pages_are_read_only_over_http_and_the_post_keeps_its_protections(
+    served, db
+):
+    """Issue #195: a GET of each confirmation page is a 200 that writes nothing, and the form
+    on it posts to a route that still wants the Origin, redirects with a 303, and answers a
+    refused resume (none ticked) as an outcome page rather than an error."""
+    host, port, _ = served
+    status, _, _ = post(served, "/pause", {})
+    assert status == 303
+    before = written(db)
+    for path in CONFIRMS:
+        status, _, body = get(served, path)
+        assert status == 200 and "Nothing has been written yet." in body, path
+        status, _, _ = get(served, path, method="HEAD")
+        assert status == 200
+    assert written(db) == before
+
+    client = HTTPConnection(host, port)
+    client.request("POST", "/resume", body="cause.pause=on", headers=FORM)
+    assert client.getresponse().status == 403, "no Origin, no write"
+    client.close()
+    assert [cause for cause, *_ in killswitch.causes(db.connect("ui"))] == ["pause"]
+
+    status, response, _ = post(served, "/resume", {})
+    assert status == 303
+    _, _, page = get(served, response.getheader("Location"))
+    assert "RESUME refused" in reply_in(page)
+
+    status, response, _ = post(served, "/resume", {"cause.pause": "on"})
+    assert status == 303
+    _, _, page = get(served, response.getheader("Location"))
+    assert "cleared: pause" in reply_in(page)
+    assert killswitch.causes(db.connect("ui")) == []

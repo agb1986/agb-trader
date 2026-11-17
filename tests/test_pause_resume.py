@@ -27,10 +27,11 @@ from test_execution import (
     submitted,
 )
 
-from agb import execution, health
+from agb import execution, health, killswitch
 from agb.alpaca import AlpacaError
+from agb.approval import Source
 from agb.roles import OWNER
-from agb.services.bot import STALE_COMMAND, Bot, help_text
+from agb.services.bot import STALE_COMMAND, Bot, refusal_reply
 from agb.services.execution import Execution
 
 CHAT = "4242"
@@ -387,6 +388,47 @@ def test_resume_clears_every_open_cause_once_unsets_suspend_trade_and_lists_them
     assert confirmation(db, "resume") in operator.cycle()
 
 
+def test_a_resume_that_leaves_the_pause_open_keeps_suspend_trade_on(db, operator):
+    """The UI's resume clears the causes the operator ticked. Clearing `gate_breach` while the
+    pause stays open must not unset the broker's `suspend_trade`, or the pause would stop
+    holding the broker and health would alert on the mismatch."""
+    fake = broker()
+    conn = db.connect("execution")
+    service = Execution(fake, clock=Clock(NOW))
+    operator.says("/pause")
+    service(conn)
+    db.connect(OWNER).execute(
+        "INSERT INTO agb.halt_event (cause, action, actor, reason)"
+        " VALUES ('gate_breach', 'set', 'pipeline', 'a check failed')"
+    )
+    source = Source(ACTOR, "ui", "/resume gate_breach")
+
+    reply = killswitch.resume(db.connect("bot"), source, ["gate_breach"])
+
+    assert "still open: pause" in reply
+    assert "broker suspend_trade: stays on while pause is open." in reply
+    assert open_causes(db) == [("pause", ACTOR)]
+
+    service.clock.now += timedelta(minutes=1)
+    service(conn)
+
+    assert fake.suspend_trade is True
+    assert latches(db)[-1] == ("resume", True, True, "execution")
+    assert confirmation(db, "resume").splitlines()[1:] == [
+        "cleared: gate_breach",
+        "broker suspend_trade: on",
+        "a halted rebalance is not resubmitted",
+    ]
+    assert health.broker_mismatch(db.connect("bot")) == []
+
+    killswitch.resume(db.connect("bot"), source, ["pause"])
+    service.clock.now += timedelta(minutes=1)
+    service(conn)
+
+    assert fake.suspend_trade is False
+    assert latches(db)[-1] == ("resume", False, False, "execution")
+
+
 def test_resume_with_nothing_open_says_so(db, operator):
     fake = broker()
     assert "cleared: nothing was open" in operator.says("/resume")
@@ -491,12 +533,12 @@ def test_a_suspend_trade_mismatch_alerts_once_per_episode_in_both_directions(db,
 
 def test_only_pause_and_resume_reach_the_latches(db, operator):
     assert operator.says("/status").startswith("agb-trader")
-    assert operator.says("hello") == help_text("not a command")
+    assert operator.says("hello") == refusal_reply("not a command")
     assert operator.says("/approve@agb_bot 2026-10 yes") == (
         "usage: /approve <reference>, nothing after it\n\n"
         "Nothing is waiting for an answer.  /status"
     )
-    assert operator.says("/pause now") == help_text("usage: /pause, no arguments")
+    assert operator.says("/pause now") == refusal_reply("usage: /pause, no arguments")
 
     assert commands(db) == [
         (ACTOR, "telegram", "/status", "status", {"args": []}, "accepted", None),

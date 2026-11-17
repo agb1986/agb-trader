@@ -281,6 +281,22 @@ def _where(conn: psycopg.Connection) -> str:
     return f"database {info.dbname} on {info.host or 'a local socket'} as {info.user}"
 
 
+def _acknowledge(args: argparse.Namespace) -> int:
+    from agb import jobs
+
+    with psycopg.connect(application_name="agb-cli") as conn:
+        try:
+            added = jobs.acknowledge(conn, args.job_id, args.actor, args.reason)
+        except jobs.NotAcknowledged as exc:
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+    if added:
+        print(f"job {args.job_id} acknowledged; it no longer shows in agb.overdue")
+    else:
+        print(f"job {args.job_id} was already acknowledged; the first acknowledgement stands")
+    return 0
+
+
 def _void(args: argparse.Namespace) -> int:
     from agb import registry
 
@@ -566,6 +582,46 @@ def _corporate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _dividend(args: argparse.Namespace) -> int:
+    from datetime import date
+    from decimal import Decimal, InvalidOperation
+
+    from agb import approval, corporate
+
+    text = " ".join(
+        shlex.quote(part)
+        for part in [
+            "agb",
+            "dividend",
+            args.symbol,
+            args.amount,
+            "--ex-date",
+            args.ex_date,
+            *(["--detail", args.detail] if args.detail else []),
+        ]
+    )
+    source = approval.Source(args.actor, "cli", text)
+    try:
+        dividend = corporate.Dividend(
+            symbol=args.symbol.strip().upper(),
+            amount_usd=Decimal(args.amount),
+            ex_date=date.fromisoformat(args.ex_date),
+            detail=args.detail or "recorded with agb dividend",
+        )
+    except (corporate.CorporateError, InvalidOperation, ValueError) as exc:
+        print(f"agb: refused: {exc}", file=sys.stderr)
+        return 1
+    with psycopg.connect(application_name="agb-cli") as conn:
+        try:
+            row_id = corporate.record_dividend(conn, dividend, source)
+        except corporate.CorporateError as exc:
+            # A refusal that reached the database is recorded; leaving the block commits it.
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+    print(f"dividend {row_id}: {corporate.dividend_line(dividend)}")
+    return 0
+
+
 def _lake_dir() -> Path:
     from agb import lake
 
@@ -694,6 +750,16 @@ def main(argv: list[str] | None = None) -> int:
     promote.add_argument("--reason", help="why the waiver is being taken, for the audit log")
     promote.add_argument("--actor", **actor)
     promote.set_defaults(run=_promote)
+    acknowledge = commands.add_parser(
+        "acknowledge",
+        help="acknowledge a failed job, which takes it out of the overdue view",
+        description="Refuses a job that has not failed. A failed job also leaves the overdue "
+        "view on its own once it is older than agb.failed_overdue_age() (default 14 days).",
+    )
+    acknowledge.add_argument("job_id", type=int, help="the failed job, as agb.job_state shows it")
+    acknowledge.add_argument("--reason", required=True, help="what was decided, kept with it")
+    acknowledge.add_argument("--actor", **actor)
+    acknowledge.set_defaults(run=_acknowledge)
     void = commands.add_parser(
         "void",
         help="void a model's certification for good",
@@ -854,6 +920,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     corporate_show.add_argument("period", metavar="YYYY-MM", help="the rebalance to read")
     corporate_show.set_defaults(run=_corporate)
+    dividend = commands.add_parser(
+        "dividend",
+        help="record a dividend the paper broker did not credit",
+        description="Alpaca paper credits no dividends while the backtest assumes them, so a "
+        "paper month is compared with the backtest only once the dividends it was owed are "
+        "recorded. AMOUNT is the total cash the statement shows, not per share, and must be "
+        "positive. The month the ex-date falls in is the period it is added back to. A second "
+        "dividend for the same name on the same date is refused as a duplicate, with a "
+        "nonzero exit. Example: agb dividend AAPL 12.40 --ex-date 2026-11-07 "
+        "--detail 'Alpaca statement, November'",
+    )
+    dividend.add_argument("symbol", help="the name that paid it")
+    dividend.add_argument("amount", help="the total cash in dollars, e.g. 12.40")
+    dividend.add_argument("--ex-date", required=True, metavar="DATE", help="YYYY-MM-DD")
+    dividend.add_argument(
+        "--detail", help="where the figure came from, kept for the audit (default says so)"
+    )
+    dividend.add_argument("--actor", **actor)
+    dividend.set_defaults(run=_dividend)
     paper_checks = commands.add_parser(
         "paper-check",
         help="the paper record's arithmetic checks, three of the paper-to-live criteria",

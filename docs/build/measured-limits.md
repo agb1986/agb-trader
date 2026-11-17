@@ -218,6 +218,42 @@ run is forced.
 `tests/test_compose.py` enforces that every service still declares a limit, so a limit cannot
 be deleted in passing, only changed.
 
+### What the panel now holds, and the figure that is not a sizing run ([#194](https://github.com/agb1986/agb-trader/issues/194))
+
+The 1441m `pipeline` peak above was taken before this change and no limit moves on this section.
+Two things in the pipeline's working set were reduced, and the reduction is argued from a local
+fixture, not from the server:
+
+- **A name's filings are released once its extract is written.** The panel submits every
+  retrieval ahead of the model calls, so every name's raw documents, full text, numbered
+  documents and request were in memory together until its call landed. `panel._prepare` now
+  moves each section's raw bytes and text into the content-addressed store as soon as the name
+  is retrieved and keeps only their digests, and `panel._record` lets go of the documents, the
+  request and the answer when the name is on record, even if the write fails.
+- **The lake is read less.** The `sep` view reads with `hive_partitioning`, so a query with a
+  `date` filter opens only the matching day files (`tests/test_features.py` counts the files
+  read: one of the lake's day files for a single date, none of the others), and the `sf1`
+  dedup is built once per connection into a temporary table that the `sf1` view and
+  `sf1_as_of` read, not decoded from parquet again by every query. The feature frame is
+  byte-identical to the one the old views produced; that test compares the frame and its
+  hashes over a fixture lake with restated fundamentals.
+
+The fixture measurement was 40 names of 5 sections each (1 MB raw and 150k characters of text
+per section, about 240 MB of filings in all), a retrieval that takes a second as the network
+does, the fake Analyst, and `panel.run` over the test database, with Python's `tracemalloc`
+peak read at the end. It is not the sampler: it counts Python allocations in one process, not
+a container's resident set, and it is a different shape of data from the real lake.
+
+| `panel.run` over the fixture | peak Python allocation |
+| --- | --: |
+| before (`847101a`) | 266 MB |
+| after | 76 MB |
+
+**Real-lake figures are the operator's.** Nothing here was measured on the server, on the real
+lake, or with real filings. The reading that can move the `pipeline` limit is the next sizing
+run, `make sizing` (the three steps above), and its table goes under a dated heading in this
+file beside the 2026-11-05 one.
+
 ## Run times, poll intervals and leases
 
 `agb runtimes` reports how long each job kind has actually taken, from the claim that started
@@ -330,6 +366,14 @@ plus a suffix, `YYYY-MM-DD-drill-HHMMSS`, which the scheduler never plans. `agb.
 admits that form, and `health.panel_bodies` reads the row recorded last rather than the
 highest period, so the drill's audit is the one it alerts on. `run` takes a period explicitly
 too, `make panel-check CMD="run 2026-11-15-again"`; a bare date will be refused as taken.
+
+A period is checked before anything is sent to the server: a real day, then an optional
+suffix of lowercase letters, digits and hyphens, the form `agb.panel_audit` admits. Anything
+else, such as `2026-10'; --`, is refused with no ssh and no SQL. The period reaches psql only
+as a variable (`-v period=...`, read as `:'period'`), never as text in a statement. The script
+connects as the `cli` role, not `postgres`: its reads run in a read-only session, and the one
+write calls `agb.request_panel_audit(period)`, which `cli` may execute and which enqueues a
+`panel_audit` job and its `created` event and does nothing else.
 
 ### Making the check certain
 

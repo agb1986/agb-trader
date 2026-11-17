@@ -890,3 +890,208 @@ def test_sizing_start_closes_the_remote_shell_s_output(tmp_path):
     assert launch[0].startswith("exec > /dev/null 2>&1;")
     # The sampler's own output still goes to the log it keeps on the server.
     assert ">> /deploy/agb-trader/measure.log 2>&1 < /dev/null &" in launch[0]
+
+
+# deploy.sh, run in a scratch git repository against a fake `docker` and an `ssh` that runs the
+# remote command locally (FAKE_SIDE=server) in a scratch deploy directory. Nothing here reaches
+# a server or a Docker daemon. The image ids are the whole subject: the local build has
+# $FAKE_BUILT_ID, the server holds whatever is in $FAKE_SERVER_ID_FILE, and a `docker load`
+# there writes $FAKE_LOAD_ID (the built id unless it is set to something else).
+FAKE_DEPLOY_DOCKER = """#!/usr/bin/env bash
+echo "${FAKE_SIDE:-local} $*" >> "$FAKE_LOG"
+# The server's engine reports a different .Id from the workstation's for the same image (the
+# containerd image store gives a manifest digest, 20.10 the config digest), but the same layers.
+case $1 in
+build) cat > /dev/null ;;
+save) echo image-bytes ;;
+load) cat > /dev/null
+    echo "${FAKE_LOAD_LAYERS:-$FAKE_BUILT_LAYERS}" > "$FAKE_SERVER_LAYERS_FILE" ;;
+image)
+    format=$4
+    if [ "${FAKE_SIDE:-local}" = server ]; then
+        [ -s "$FAKE_SERVER_LAYERS_FILE" ] || exit 1
+        case $format in
+        *Layers*) cat "$FAKE_SERVER_LAYERS_FILE" ;;
+        *) echo sha256:config-digest ;;
+        esac
+    else
+        case $format in
+        *Layers*) echo "$FAKE_BUILT_LAYERS" ;;
+        *) echo sha256:manifest-digest ;;
+        esac
+    fi ;;
+esac
+exit 0
+"""
+
+FAKE_DEPLOY_SSH = """#!/usr/bin/env bash
+cmd=${!#}
+echo "ssh $cmd" >> "$FAKE_LOG"
+FAKE_SIDE=server exec bash -c "$cmd"
+"""
+
+
+BUILT_LAYERS = '["sha256:l1","sha256:l2"]'
+STALE_LAYERS = '["sha256:l1","sha256:old"]'
+
+
+def deploy(tmp_path, *args, server_layers="", load_layers="", dirty="", env=None):
+    repo = tmp_path / "repo"
+    (repo / "env").mkdir(parents=True)
+    (repo / "scripts/deploy").mkdir(parents=True)
+    names = ("db", "pipeline", "execution", "bot", "vpn")
+    for name in names:
+        (repo / "env" / f"{name}.env.example").write_text("A=1\n")
+    (repo / "compose.yaml").write_text("name: agb-trader\n")
+    (repo / "scripts/deploy/agb-stack").write_text('#!/bin/sh\necho "stack $*" >> "$FAKE_LOG"\n')
+    for cmd in (
+        ["init", "-q"],
+        ["add", "."],
+        ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"],
+    ):
+        subprocess.run(["git", *cmd], cwd=repo, check=True)
+    if dirty:
+        (repo / dirty).write_text("changed\n")
+
+    server = tmp_path / "server"
+    (server / "env").mkdir(parents=True)
+    for name in names:
+        (server / "env" / f"{name}.env").write_text("A=2\n")
+    shutil.copy(repo / "scripts/deploy/agb-stack", server / "agb-stack")
+    (server / "agb-stack").chmod(0o755)
+    layers_file = tmp_path / "server-layers"
+    layers_file.write_text(f"{server_layers}\n" if server_layers else "")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, text in (("docker", FAKE_DEPLOY_DOCKER), ("ssh", FAKE_DEPLOY_SSH)):
+        (bin_dir / name).write_text(text)
+        (bin_dir / name).chmod(0o755)
+    log = tmp_path / "log"
+    log.write_text("")
+    done = subprocess.run(
+        [str(ROOT / "scripts/deploy/deploy.sh"), *args],
+        cwd=repo,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "AGB_DEPLOY_HOST": "server.test",
+            "AGB_DEPLOY_DIR": str(server),
+            "FAKE_LOG": str(log),
+            "FAKE_BUILT_LAYERS": BUILT_LAYERS,
+            "FAKE_SERVER_LAYERS_FILE": str(layers_file),
+            **({"FAKE_LOAD_LAYERS": load_layers} if load_layers else {}),
+            **(env or {}),
+        },
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return done, log.read_text(), layers_file.read_text().strip()
+
+
+def test_deploy_refuses_a_dirty_tree(tmp_path):
+    """The image is built from the commit, so an edit that is not in it is silently left out."""
+    done, log, _ = deploy(tmp_path, dirty="compose.yaml")
+    assert done.returncode == 1
+    assert "the working tree is not clean" in done.stderr
+    assert "compose.yaml" in done.stderr and "--allow-dirty" in done.stderr
+    assert "build" not in log and "ssh" not in log, (
+        "it stops before it builds or reaches the server"
+    )
+
+
+def test_deploy_refuses_an_untracked_file(tmp_path):
+    """A new file that was never added is the commonest way to deploy less than was tested."""
+    done, log, _ = deploy(tmp_path, dirty="forgotten.py")
+    assert done.returncode == 1
+    assert "forgotten.py" in done.stderr
+    assert "build" not in log
+
+
+@pytest.mark.parametrize(
+    "args,env", [(["--allow-dirty"], {}), ([], {"AGB_DEPLOY_ALLOW_DIRTY": "1"})]
+)
+def test_deploy_allows_a_dirty_tree_when_told_to(tmp_path, args, env):
+    done, log, _ = deploy(tmp_path, *args, dirty="compose.yaml", env=env)
+    assert done.returncode == 0, done.stderr
+    assert "deploying the commit without these" in done.stderr
+    assert "stack activate" in log
+
+
+def test_deploy_skips_shipping_an_image_the_server_has_by_layers(tmp_path):
+    """The server's engine reports another `.Id` for the same image, so only the layers can say
+    the two are one image; comparing `.Id` would re-ship this every time."""
+    done, log, _ = deploy(tmp_path, server_layers=BUILT_LAYERS)
+    assert done.returncode == 0, done.stderr
+    assert "already has agb-trader-app" in done.stdout
+    assert "save" not in log and "load" not in log
+    assert "stack activate" in log
+
+
+def test_deploy_ships_an_image_the_server_has_with_other_layers(tmp_path):
+    """The tag exists on the server, but it is not the image that was built."""
+    done, log, now = deploy(tmp_path, server_layers=STALE_LAYERS)
+    assert done.returncode == 0, done.stderr
+    assert "has agb-trader-app" in done.stdout and "shipping it again" in done.stdout
+    assert re.search(r"layers [0-9a-f]{12}, not the built [0-9a-f]{12}", done.stdout)
+    assert "local save" in log and "server load" in log
+    assert now == BUILT_LAYERS
+    assert "stack activate" in log
+
+
+def test_deploy_ships_an_image_the_server_lacks(tmp_path):
+    done, log, now = deploy(tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert "local save" in log and "server load" in log
+    assert now == BUILT_LAYERS
+
+
+def test_deploy_stops_when_the_loaded_image_is_not_the_built_one(tmp_path):
+    done, log, _ = deploy(tmp_path, load_layers=STALE_LAYERS)
+    assert done.returncode == 1
+    assert "loaded agb-trader-app" in done.stderr
+    assert re.search(r"as layers [0-9a-f]{12}, not the built [0-9a-f]{12}", done.stderr)
+    assert "nothing was activated" in done.stderr
+    assert "stack activate" not in log
+
+
+def test_deploy_accepts_a_load_that_reports_another_id_for_the_same_layers(tmp_path):
+    """A first deploy: nothing on the server, and after the load its engine's `.Id` is not the
+    workstation's. The layers match, so the deploy goes on."""
+    done, log, _ = deploy(tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert "image inspect --format {{.Id}}" not in log
+    assert "stack activate" in log
+
+
+def test_sizing_reads_the_project_name_from_compose_not_the_directory(tmp_path):
+    """Run from a deploy directory called something else, it still watches the project Compose
+    names, because that is the one the containers carry."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    ssh = bin_dir / "ssh"
+    ssh.write_text(FAKE_SSH_START)
+    ssh.chmod(0o755)
+    log = tmp_path / "ssh.log"
+    log.write_text("")
+    done = subprocess.run(
+        [str(ROOT / "scripts/deploy/sizing.sh"), "start"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "AGB_SSH_LOG": str(log),
+            "AGB_DEPLOY_HOST": "server.test",
+            "AGB_DEPLOY_DIR": "/srv/household-stack",
+        },
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.returncode == 0, done.stderr
+    name = yaml.safe_load((ROOT / "compose.yaml").read_text())["name"]
+    assert f"sampling {name} on server.test" in done.stdout
+    assert "household-stack " not in done.stdout.split("on server.test")[0]

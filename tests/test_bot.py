@@ -14,7 +14,7 @@ from agb.health import Finding
 from agb.nyse import NEW_YORK, NyseCalendar
 from agb.roles import OWNER
 from agb.services import bot as bot_service
-from agb.services.bot import POLL_BACKOFF, Bot, help_text, split
+from agb.services.bot import POLL_BACKOFF, Bot, refusal_reply, split
 from agb.telegram import TelegramError
 
 CHAT = "4242"
@@ -414,7 +414,7 @@ def test_only_the_configured_chat_is_answered(db, telegram, rebalance_ahead, cap
     with caplog.at_level(logging.WARNING, logger="agb.services.bot"):
         bot(conn)
         bot(conn)
-    assert telegram.sent == [(CHAT, help_text("not a command"))]
+    assert telegram.sent == [(CHAT, refusal_reply("not a command"))]
     assert "refused a message from chat 999, user 999" in caplog.text
     # Each read confirms the ones before it, so nothing is answered twice.
     assert telegram.offsets == [None, 10]
@@ -567,7 +567,7 @@ def test_a_poll_that_fails_once_still_reads_the_messages(db, telegram):
     Bot(telegram, CHAT, lambda: NOW, sleep=lambda _: None).poll(db.connect("bot"))
 
     assert telegram.offsets == [None, None]
-    assert telegram.sent == [(CHAT, help_text("not a command"))]
+    assert telegram.sent == [(CHAT, refusal_reply("not a command"))]
 
 
 def test_a_poll_tries_no_more_than_it_is_told_to(db, telegram, caplog):
@@ -613,7 +613,7 @@ def test_a_reply_that_fails_once_arrives_on_the_next_cycle(db, telegram, rebalan
     assert telegram.sent == []
     bot.retry_after = timedelta(0)
     bot(conn)
-    assert telegram.sent == [(CHAT, help_text("not a command"))]
+    assert telegram.sent == [(CHAT, refusal_reply("not a command"))]
     assert events(db)[1:] == [("reply", "delivered", "telegram", CHAT, 1001, None, "bot")]
     # The update was claimed once, so the next cycle does not answer it again.
     bot(conn)

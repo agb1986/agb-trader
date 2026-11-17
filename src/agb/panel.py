@@ -208,11 +208,29 @@ class Runner:
         return run_id
 
 
+@dataclass(frozen=True)
+class Filed:
+    """A section already in the store: what `panel_filing` records of it, without its bytes."""
+
+    filing: edgar.Filing
+    section: str
+    document_sha256: str
+    text_sha256: str
+    chars: int
+
+
 @dataclass
 class Name:
-    """One name's work, from retrieval to extract, before it is written."""
+    """One name's work, from retrieval to extract, before it is written.
+
+    Its filings are held only as long as it takes to number them and store their bodies:
+    `_prepare` moves each section's raw document and text into the store and keeps the digests
+    in `filed`, and `_write` lets go of the documents, the request and the answer once the name
+    is on record. With the retrievals queued ahead of the model calls, anything kept longer
+    would be held for every name in the pass at once."""
 
     retrieval: edgar.Retrieval
+    filed: list[Filed] = field(default_factory=list)
     documents: list[analyst.Document] = field(default_factory=list)
     sent: list[int] = field(default_factory=list)
     request: dict[str, Any] | None = None
@@ -220,6 +238,14 @@ class Name:
     completion: analyst.Completion | None = None
     cached: bool = False
     failure: str | None = None
+
+    def release(self) -> None:
+        """Let go of everything heavy: the numbered documents, the request and the answer."""
+        self.filed = []
+        self.documents = []
+        self.sent = []
+        self.request = None
+        self.completion = None
 
 
 def run(
@@ -360,8 +386,7 @@ def _evidence(
                     else:
                         name = calls.pop(future)
                         name.completion, name.failure = future.result()
-                    with conn.transaction():
-                        _write(conn, run_id, name, store)
+                    _record(conn, run_id, name, store)
         except BaseException:
             pool.shutdown(wait=False, cancel_futures=True)
             _salvage(calls, lambda name, outcome: _keep(conn, run_id, name, outcome, store))
@@ -377,8 +402,17 @@ def _keep(
     store: PanelStore,
 ) -> None:
     name.completion, name.failure = outcome
-    with conn.transaction():
-        _write(conn, run_id, name, store)
+    _record(conn, run_id, name, store)
+
+
+def _record(conn: psycopg.Connection, run_id: int, name: Name, store: PanelStore) -> None:
+    """Write `name` in its own transaction, then release what it held, whether or not the
+    write succeeded: the pass either carries on without it or stops."""
+    try:
+        with conn.transaction():
+            _write(conn, run_id, name, store)
+    finally:
+        name.release()
 
 
 def _salvage[T, R](futures: Mapping[Future[R], T], keep: Callable[[T, R], None]) -> None:
@@ -423,10 +457,13 @@ def _prepare(conn: psycopg.Connection, name: Name, model_id: str, store: PanelSt
     retrieval = name.retrieval
     if retrieval.outcome != "retrieved":
         return
-    pieces = [
-        (s.filing.form, s.filing.filed.isoformat(), s.section, s.text) for s in retrieval.sections
-    ]
+    sections, retrieval.sections = retrieval.sections, []
+    pieces = [(s.filing.form, s.filing.filed.isoformat(), s.section, s.text) for s in sections]
     name.documents, name.sent = analyst.documents(pieces)
+    name.filed = [
+        Filed(s.filing, s.section, store.put(s.raw), store.put_text(s.text), len(s.text))
+        for s in sections
+    ]
     name.request = analyst.request(
         retrieval.name or retrieval.ticker, retrieval.ticker, name.documents, model_id
     )
@@ -512,7 +549,7 @@ def _write(conn: psycopg.Connection, run_id: int, name: Name, store: PanelStore)
         return
 
     filing_ids: dict[str, int] = {}
-    for n, (section, sent) in enumerate(zip(retrieval.sections, name.sent, strict=True), start=1):
+    for n, (section, sent) in enumerate(zip(name.filed, name.sent, strict=True), start=1):
         filing = section.filing
         row = conn.execute(
             """
@@ -530,9 +567,9 @@ def _write(conn: psycopg.Connection, run_id: int, name: Name, store: PanelStore)
                 filing.filed,
                 filing.report_date,
                 section.section,
-                store.put(section.raw),
-                store.put_text(section.text),
-                len(section.text),
+                section.document_sha256,
+                section.text_sha256,
+                section.chars,
                 sent,
             ),
         ).fetchone()

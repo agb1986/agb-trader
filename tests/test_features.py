@@ -3,15 +3,19 @@ that keeps a filing out of the months before it was filed, the cross-sectional p
 `sector` as a fixed categorical, and the sanity report's forward returns and rank correlations."""
 
 import ast
+import hashlib
 import itertools
 import math
 import random
+import re
+import shutil
 import statistics
 import sys
 import tomllib
 from datetime import date, timedelta
 from pathlib import Path
 
+import duckdb
 import pyarrow as pa
 import pytest
 
@@ -779,3 +783,158 @@ def test_the_report_summarises_months_against_the_expected_sign():
     reversal = lines["rev_1m"]
     assert (reversal.hit_rate, reversal.as_expected) == (0.0, False)
     assert (lines["roe"].months, lines["roe"].mean_ic, lines["roe"].as_expected) == (0, None, None)
+
+
+# The lake's reads: the same answers, with fewer files opened and the filings ranked once ------
+
+
+def legacy_connect(root):
+    """The connection `lake.connect` built before it pruned `sep` by date and kept the SF1 versions
+    in a table: every view reads the whole of its dataset and ranks the filings per query."""
+    conn = duckdb.connect()
+    period = ", ".join(lake.SF1.primary_key)
+    sep = f"read_parquet('{root}/sep/date=*/part.parquet', hive_partitioning = false)"
+    sf1 = f"read_parquet('{root}/sf1/lastupdated=*/part.parquet', hive_partitioning = false)"
+    newest = sorted(root.glob("tickers/snapshot=*/part.parquet"))[-1]
+    conn.execute(f"CREATE VIEW sep AS SELECT * FROM {sep}")
+    conn.execute(
+        f"CREATE VIEW sf1 AS SELECT * FROM {sf1} "
+        f"QUALIFY row_number() OVER (PARTITION BY {period} ORDER BY lastupdated DESC) = 1"
+    )
+    conn.execute(f"""
+        CREATE MACRO sf1_as_of(as_of) AS TABLE
+        SELECT * FROM {sf1}
+        WHERE datekey <= as_of
+        QUALIFY row_number() OVER (
+            PARTITION BY {period}
+            ORDER BY CASE WHEN lastupdated <= as_of THEN lastupdated END DESC NULLS LAST,
+                     lastupdated
+        ) = 1
+    """)
+    conn.execute(f"CREATE VIEW tickers AS SELECT * FROM read_parquet('{newest}')")
+    return conn
+
+
+def restated_lake(root):
+    """Six names over a year of sessions, each filing a quarter and then restating it in a later
+    version, so that the month-ends before and after the restatement read different figures."""
+    built = Lake(root)
+    for i, ticker in enumerate(("AAA", "BBB", "CCC", "DDD", "EEE", "FFF")):
+        built.trades(
+            ticker,
+            {day: 20.0 + i + (day.day % 5) * 0.25 + day.month * 0.1 * i for day in YEAR},
+            volume=1e6 * (1 + i),
+        )
+        built.listed(ticker, features.SECTORS[i % 4])
+        built.files(
+            ticker, calendardate=date(2025, 12, 31), datekey=date(2026, 2, 20),
+            dimension="ARQ", shares=100e6 + i * 1e6, lastupdated=date(2026, 2, 20),
+        )  # fmt: skip
+        built.files(
+            ticker, calendardate=date(2025, 6, 30), datekey=date(2025, 8, 8),
+            lastupdated=date(2025, 8, 8), **YEAR_AGO,
+        )  # fmt: skip
+        built.files(
+            ticker, calendardate=FILED[0], datekey=FILED[1], lastupdated=FILED[1],
+            **STATEMENTS | {"netinc": (3 + i) * 1e7},
+        )  # fmt: skip
+        if i % 2:  # the vendor restates the quarter a fortnight later
+            built.files(
+                ticker, calendardate=FILED[0], datekey=FILED[1], lastupdated=date(2026, 8, 24),
+                **STATEMENTS | {"netinc": (9 + i) * 1e7},
+            )  # fmt: skip
+    return built.land()
+
+
+def digest(result):
+    """A SHA-256 of a month's features as serialised, so equal digests mean equal bytes."""
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, result.raw.schema) as writer:
+        writer.write_table(result.raw)
+    with pa.ipc.new_stream(sink, result.ranked.schema) as writer:
+        writer.write_table(result.ranked)
+    return hashlib.sha256(sink.getvalue().to_pybytes()).hexdigest()
+
+
+def test_features_are_byte_identical_to_the_unpruned_reads(tmp_path):
+    root = restated_lake(tmp_path)
+    start, end = date(2025, 10, 1), SESSION
+
+    with lake.connect(root) as pruned, legacy_connect(root) as full:
+        now = list(features.history(start, end, root, db=pruned))
+        before = list(features.history(start, end, root, db=full))
+
+    assert len(now) == len(before) == 11
+    assert all(month.raw.num_rows == 6 for month in now[-2:])
+    for new, old in zip(now, before, strict=True):
+        assert new.raw.equals(old.raw)
+        assert new.ranked.equals(old.ranked)
+        assert (new.as_of, new.snapshot_date, new.partition_hash) == (
+            old.as_of,
+            old.snapshot_date,
+            old.partition_hash,
+        )
+        assert digest(new) == digest(old)
+    # The restatement changes the August month-end, so the equality above is not vacuous.
+    assert raw(now[-1], "BBB")["earnings_yield"] != raw(now[-2], "BBB")["earnings_yield"]
+
+
+def test_the_views_answer_every_query_as_the_unpruned_ones_did(tmp_path):
+    root = restated_lake(tmp_path)
+    queries = [
+        "SELECT * FROM sep ORDER BY ALL",
+        "SELECT * FROM sf1 ORDER BY ALL",
+        "SELECT * FROM tickers ORDER BY ALL",
+        "SELECT * FROM sep WHERE date BETWEEN DATE '2026-03-02' AND DATE '2026-03-13' ORDER BY ALL",
+        "SELECT * FROM sep WHERE date > DATE '2026-08-20' ORDER BY ALL",
+        "SELECT ticker, min(date), max(date), count(*) FROM sep GROUP BY ticker ORDER BY ticker",
+    ]
+    days = [date(2025, 7, 1), date(2026, 2, 20), date(2026, 8, 10), date(2026, 8, 23), SESSION]
+    queries += [f"SELECT * FROM sf1_as_of(DATE '{day}') ORDER BY ALL" for day in days]
+
+    with lake.connect(root) as pruned, legacy_connect(root) as full:
+        for query in queries:
+            relation = pruned.sql(query)
+            assert relation.fetchall() == full.sql(query).fetchall(), query
+            assert relation.columns == full.sql(query).columns, query
+            assert relation.types == full.sql(query).types, query
+
+
+def files_read(conn, query, *params):
+    """How many of `sep`'s partition files DuckDB opens to answer `query`."""
+    plan = "\n".join(row[1] for row in conn.execute(f"EXPLAIN ANALYZE {query}", params).fetchall())
+    (count,) = re.findall(r"Total Files Read: (\d+)", plan)
+    return int(count)
+
+
+def test_a_date_filtered_read_of_sep_opens_only_the_sessions_it_asks_for(tmp_path):
+    root = restated_lake(tmp_path)
+    sessions = len(list(root.glob("sep/date=*")))
+    day = date(2026, 3, 2)
+    conn = lake.connect(root)
+
+    assert sessions > 200
+    assert files_read(conn, "SELECT * FROM sep") == sessions
+    assert files_read(conn, "SELECT * FROM sep WHERE date = ?", day) == 1
+    assert (
+        files_read(conn, "SELECT * FROM sep WHERE date BETWEEN ? AND ?", day, date(2026, 3, 6)) == 5
+    )
+    # The universe's recency window: the newest sessions on or before the rebalance date.
+    recent = "SELECT DISTINCT date FROM sep WHERE date <= ? ORDER BY date DESC LIMIT 5"
+    assert files_read(conn, recent, day) < sessions
+    # `legacy_connect` opens every file whatever the filter, which is what this pruning replaces.
+    assert files_read(legacy_connect(root), "SELECT * FROM sep WHERE date = ?", day) == sessions
+
+
+def test_the_sf1_versions_are_read_from_the_lake_once_per_connection(tmp_path):
+    root = restated_lake(tmp_path)
+    conn = lake.connect(root)
+    latest = conn.sql("SELECT * FROM sf1 ORDER BY ALL").fetchall()
+    as_of = conn.sql("SELECT * FROM sf1_as_of(DATE '2026-08-23') ORDER BY ALL").fetchall()
+
+    shutil.rmtree(root / "sf1")  # nothing of SF1 is left to read
+
+    assert conn.sql("SELECT * FROM sf1 ORDER BY ALL").fetchall() == latest
+    assert conn.sql("SELECT * FROM sf1_as_of(DATE '2026-08-23') ORDER BY ALL").fetchall() == as_of
+    assert len(latest) == 18 and len(as_of) == 18
+    assert "_latest" not in conn.sql("SELECT * FROM sf1").columns

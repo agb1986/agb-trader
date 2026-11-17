@@ -40,22 +40,39 @@ Both are safe to redo, so an expired lease is reclaimed: a partition that lands 
 bytes is left untouched and recorded nothing new, a reference already proposed is kept, and a
 basket already gated keeps its verdict. The same holds for a rerun interrupted between
 building and gating.
+
 Data the vendor has not yet published is not a failure: the service keeps the job and shortens
 its lease to RETRY, so the work is tried again once the lease runs out, until it lands. That
 holds for a session the vendor is still publishing, one short of the row floor (agb.lake): it
-is deferred quietly, with no alert of its own, and if it never lands the pull's expected event
-goes overdue. The earlier sessions a deferred pull did land are recorded all the same. A
-request the vendor fails is made again by the lake client, with backoff; one that fails on
-every attempt fails the job, which raises the alert below.
+is deferred quietly, with no alert of its own. The earlier sessions a deferred pull did land
+are recorded all the same. A rebalance waiting for execution to read the account (`NotReady`)
+is kept the same way. Neither waits for ever: each job has a deadline past which its work is
+of no use -- for a pull, the time the next session's pull is due, which lands its session too;
+for a rebalance, its trade session's MOC cutoff -- and a job still waiting then is failed
+once, as `expired`, with the alert below. A request the vendor fails is made again by the
+lake client, with backoff.
 
-A job that fails on its own data -- a corrupt panel body, a database error, an unreadable
-Parquet file, or any of the errors each job names -- fails with the cause named in its
-`failed` event (`StoreError: body ... does not match its hash`), and the service raises a
-`pipeline_job_failed` alert for it and moves on to the next cycle. A failed job is not taken
-again, so the alert is raised once. Only a database connection that has gone away is left to
-stop the service, so it restarts with a new one. A job whose lease was lost -- it ran out and
-another worker reclaimed it -- is left to that worker: the cycle logs it and ends without
-completing, failing or releasing the job. A rerun that fails is logged and raises a
+A job that stops on an error is handled by the error's class (`classify`), which is the first
+word of its `failed` event:
+
+  * transient -- an operating-system error such as a timeout or a reset socket, a database
+    operational error, or a DuckDB I/O error. The job is released (a `released` event naming
+    the error) and taken again next cycle, up to TRANSIENT_RETRIES times; the next such
+    error fails it.
+  * configuration -- a setting the service needs is missing (agb.errors.NotConfigured), such
+    as SHARADAR_API_KEY or EDGAR_USER_AGENT. The job is held, with one `pipeline_job_held`
+    alert, and tried again every RETRY until its deadline, when it fails as expired.
+  * permanent -- everything else: a corrupt panel body, an unreadable Parquet file, a missing
+    path, a refused check, or any of the errors each job names. The job fails at once.
+
+A failed job's event names the cause (`permanent: StoreError: body ... does not match its
+hash`), and the service raises a `pipeline_job_failed` alert for it and moves on to the next
+cycle. A failed job is not taken again, so the alert is raised once. It shows in `agb.overdue`
+until someone acknowledges it (`agb acknowledge`) or it is older than
+`agb.failed_overdue_age()`. Only a database connection that has gone away is left to stop the
+service, so it restarts with a new one. A job whose lease was lost -- it ran out and another
+worker reclaimed it -- is left to that worker: the cycle logs it and ends without completing,
+failing or releasing the job. A rerun that fails is logged and raises a
 `pipeline_rerun_failed` alert, once per rerun; it has no job to fail, so it is tried again each
 cycle. That includes a gate that refuses to approve a basket past its cutoff (the
 `transition_timely` trigger's `CheckViolation`). A rerun that is `NotReady`, because execution
@@ -98,6 +115,7 @@ from agb import (
     schedule,
 )
 from agb.basket import BasketError, NotReady
+from agb.errors import NotConfigured
 from agb.gate import GateError
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.lake import LakeError, NotYet, Partition, Sharadar
@@ -106,6 +124,7 @@ from agb.panel_store import PanelStore, StoreError
 from agb.ranker import Ranker
 from agb.registry import RegistryError
 from agb.roles import PIPELINE
+from agb.rows import one
 from agb.universe import UniverseError
 
 log = logging.getLogger(__name__)
@@ -165,17 +184,54 @@ def cause(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def fail(conn: psycopg.Connection, claim: jobs.Claim, what: str, exc: Exception) -> None:
-    """Fail `claim` with `exc` named as its cause and raise an alert for it.
+# How a job that stopped on an error is handled, decided by `classify` from the error's type.
+# Each is the first word of the job's `failed` event, so the event names its cause.
+#   transient: the machine, not the work -- a disk, a socket, a database lock. The job is
+#       released and taken again next cycle, up to TRANSIENT_RETRIES times, then failed.
+#   configuration: a setting the service needs is missing (agb.errors.NotConfigured). The
+#       job is held, with one `pipeline_job_held` alert, until the setting is supplied or
+#       its date passes, then failed.
+#   permanent: anything else, such as bad data or a refused check. The job is failed.
+#   expired: not an error but a deadline -- data the vendor has not published, or an
+#       account not yet read, by the time the job's work could still be used. The job is
+#       failed.
+TRANSIENT = "transient"
+CONFIGURATION = "configuration"
+PERMANENT = "permanent"
+EXPIRED = "expired"
 
-    A database error on a connection that has gone away is re-raised instead: nothing more
-    can be written on it, and the service restarts with a new one. A job whose lease was lost
-    raises `jobs.LeaseLost`, which the cycle handles. The job is failed before the alert is
-    raised, so an alert always names a job that has stopped.
+# How many times a job released on a transient error is taken again before it fails.
+TRANSIENT_RETRIES = 3
+
+# Raised once per held job, when it is first held for missing configuration.
+JOB_HELD = "pipeline_job_held"
+
+# Errors from the operating system that trying again does not mend: a path that is not there,
+# or not what it should be, or that the service may not read.
+_LASTING_OS_ERRORS = (FileNotFoundError, NotADirectoryError, IsADirectoryError, PermissionError)
+
+_RELEASES = "SELECT count(*) FROM agb.job_event WHERE job_id = %s AND event = 'released'"
+_SESSION = "SELECT session_date FROM agb.job WHERE id = %s"
+
+
+def classify(exc: BaseException) -> str:
+    """Which of TRANSIENT, CONFIGURATION or PERMANENT `exc` is. The one place a job's error is
+    sorted; a database error on a connection that has gone away never reaches it."""
+    if isinstance(exc, NotConfigured):
+        return CONFIGURATION
+    if isinstance(exc, OSError) and not isinstance(exc, _LASTING_OS_ERRORS):
+        return TRANSIENT
+    if isinstance(exc, (psycopg.OperationalError, duckdb.IOException)):
+        return TRANSIENT
+    return PERMANENT
+
+
+def fail(conn: psycopg.Connection, claim: jobs.Claim, what: str, detail: str) -> None:
+    """Fail `claim` with `detail` as its cause and raise an alert for it, once.
+
+    A job whose lease was lost raises `jobs.LeaseLost`, which the cycle handles. The job is
+    failed before the alert is raised, so an alert always names a job that has stopped.
     """
-    if isinstance(exc, psycopg.Error) and (conn.closed or conn.broken):
-        raise exc
-    detail = cause(exc)
     jobs.fail(conn, claim, detail)
     log.error("%s %s failed: %s", what, claim.period, detail)
     body = f"The {what} for {claim.period} failed and will not be tried again: {detail}"
@@ -304,6 +360,73 @@ class Pipeline:
             beat=lambda: self.beat(conn, claim),
         )
 
+    def deadline(self, conn: psycopg.Connection, claim: jobs.Claim) -> datetime | None:
+        """The last moment `claim`'s work is still worth doing, or None for a job that is
+        never held. A data pull is done for by the time the next session's pull is due, which
+        lands its session too (agb.lake); a rebalance, by its trade session's MOC cutoff,
+        after which its basket cannot be submitted."""
+        if claim.kind not in (schedule.DATA_PULL, schedule.REBALANCE):
+            return None
+        session: date = one(conn.execute(_SESSION, (claim.job_id,)))[0]
+        calendar = nyse.NyseCalendar(session - timedelta(days=7), session + timedelta(days=14))
+        if claim.kind == schedule.DATA_PULL:
+            return calendar.close_at(calendar.next_session(session)) + schedule.PULL_DELAY
+        return calendar.moc_cutoff(session)
+
+    def wait(self, conn: psycopg.Connection, claim: jobs.Claim, what: str, reason: str) -> bool:
+        """Keep `claim` for another try in `self.retry`, while its deadline has not passed.
+        Past it, fail the job as expired instead, with an alert, and return False."""
+        deadline = self.deadline(conn, claim)
+        if deadline is not None and self.clock() >= deadline:
+            fail(
+                conn,
+                claim,
+                what,
+                f"{EXPIRED}: its work could be used only until {deadline:%Y-%m-%d %H:%M} UTC;"
+                f" {reason}",
+            )
+            return False
+        jobs.renew(conn, claim, self.retry)
+        return True
+
+    def stop(self, conn: psycopg.Connection, claim: jobs.Claim, what: str, exc: Exception) -> None:
+        """Handle a job that stopped on `exc`, by the class `classify` gives it: release it to
+        be tried again, hold it, or fail it with the class and the error named as its cause.
+
+        A database error on a connection that has gone away is re-raised instead: nothing more
+        can be written on it, and the service restarts with a new one.
+        """
+        if isinstance(exc, psycopg.Error) and (conn.closed or conn.broken):
+            raise exc
+        failure = classify(exc)
+        detail = cause(exc)
+        if failure == TRANSIENT:
+            tries = one(conn.execute(_RELEASES, (claim.job_id,)))[0]
+            if tries < TRANSIENT_RETRIES:
+                jobs.release(conn, claim, f"{TRANSIENT}: {detail}")
+                log.warning(
+                    "%s %s: %s; released to be tried again (%d of %d)",
+                    what,
+                    claim.period,
+                    detail,
+                    tries + 1,
+                    TRANSIENT_RETRIES,
+                )
+                return
+            fail(conn, claim, what, f"{TRANSIENT}, still after {tries} retries: {detail}")
+            return
+        if failure == CONFIGURATION:
+            if self.wait(conn, claim, what, f"held for missing configuration: {detail}"):
+                log.error("%s %s held: %s", what, claim.period, detail)
+                body = (
+                    f"The {what} for {claim.period} is held: {detail}. Set it in the"
+                    f" pipeline's env file and restart the service; the job is tried again"
+                    f" every {self.retry} until its date passes, then fails."
+                )
+                alert(conn, JOB_HELD, claim.kind, claim.period, body)
+            return
+        fail(conn, claim, what, f"{failure}: {detail}")
+
     def __call__(self, conn: psycopg.Connection) -> None:
         for row in conn.execute(_RERUNS).fetchall():
             self.rerun(conn, *row)
@@ -361,8 +484,8 @@ class Pipeline:
                 limits=self.limits,
             )
         except NotReady as exc:
-            jobs.renew(conn, claim, self.retry)
-            log.info("rebalance %s: %s; trying again in %s", claim.period, exc, self.retry)
+            if self.wait(conn, claim, "rebalance", f"not ready: {exc}"):
+                log.info("rebalance %s: %s; trying again in %s", claim.period, exc, self.retry)
             return
         except (
             BasketError,
@@ -378,7 +501,7 @@ class Pipeline:
             psycopg.Error,
             pa.ArrowException,
         ) as exc:
-            fail(conn, claim, "rebalance", exc)
+            self.stop(conn, claim, "rebalance", exc)
             return
         jobs.complete(conn, claim)
         log.info(
@@ -488,7 +611,7 @@ class Pipeline:
             audit = panel_audit.check(conn, store, self.sample)
             panel_audit.record(conn, claim.period, claim.job_id, audit, PIPELINE)
         except (StoreError, OSError, psycopg.Error) as exc:
-            fail(conn, claim, "panel audit", exc)
+            self.stop(conn, claim, "panel audit", exc)
             return
         jobs.complete(conn, claim)
         if audit.unsound:
@@ -518,7 +641,8 @@ class Pipeline:
             # The sessions before this one that the pull did land are the lake's now; record
             # them, so the lake and its ledger agree while this session waits.
             added = record(conn, session, exc.landed, claim.job_id)
-            jobs.renew(conn, claim, self.retry)
+            if not self.wait(conn, claim, "data pull", f"not yet published: {exc}"):
+                return
             log.info(
                 "data pull %s: %s; landed %d earlier partitions, %d of them new or changed;"
                 " trying again in %s",
@@ -530,7 +654,7 @@ class Pipeline:
             )
             return
         except (LakeError, OSError, pa.ArrowException, psycopg.Error) as exc:
-            fail(conn, claim, "data pull", exc)
+            self.stop(conn, claim, "data pull", exc)
             return
         added = record(conn, session, partitions, claim.job_id)
         jobs.complete(conn, claim)
