@@ -5,7 +5,7 @@ items of exactly two lines, then an optional footer, and never longer than Teleg
 
 import re
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -28,7 +28,15 @@ from test_gate import BASE, insert, rows, run, state
 from test_health import distribution, dividend, mode, promote
 
 from agb import execution, readout
-from agb.services.bot import MESSAGE_MAX, Bot, help_text, parse, split
+from agb.services.bot import (
+    MESSAGE_MAX,
+    REFUSAL_LIMIT,
+    REFUSAL_WINDOW,
+    Bot,
+    help_text,
+    parse,
+    split,
+)
 
 SENDER = 7
 ET = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} ET"
@@ -298,7 +306,7 @@ def test_before_anything_has_run_each_command_says_so(db):
 def test_every_message_is_a_command_row_with_its_outcome(db):
     """Acceptance criterion 3: valid commands, unknown verbs, malformed arguments, commands a
     later ticket brings, and text that is not a command are each recorded, and each refusal
-    is answered with the reason and the list of commands."""
+    is answered with one line: the reason, and where /help is."""
     texts = [
         "/status",
         "/STATUS@agb_trader_bot",
@@ -349,8 +357,8 @@ def test_every_message_is_a_command_row_with_its_outcome(db):
     for reply, (_, _, outcome, reason) in zip(replies, expected, strict=True):
         assert_style(reply)
         if outcome == "refused":
-            assert reply == help_text(reason)
-            assert blocks(reply)[0] == reason
+            assert reply == f"{reason} — /help lists the commands"
+            assert "\n" not in reply
     assert blocks(replies[0])[0] == blocks(replies[1])[0] == "agb-trader — PAPER · ACTIVE"
 
 
@@ -374,6 +382,68 @@ def test_a_message_from_another_chat_is_recorded_and_never_answered(db):
         ("telegram:31", "telegram", "/positions", "positions", {"args": []}, "refused",
          "not the configured chat", "999", 100),
     ]  # fmt: skip
+
+
+def test_an_unknown_command_from_the_operator_gets_one_line_pointing_at_help(db):
+    [reply] = ask(db, "/frobnicate now")
+    assert reply == "unknown command /frobnicate — /help lists the commands"
+    assert help_text() not in reply
+    # A long verb is echoed cut short, not at its full length.
+    [long] = ask(db, "/" + "a" * 3000)
+    assert len(long) < 300 and long.endswith(" — /help lists the commands")
+
+
+def test_a_thousand_messages_from_another_chat_write_a_bounded_number_of_rows_and_send_nothing(db):
+    telegram = FakeTelegram()
+    say(telegram, *["/status"] * 1000, chat="999", sender=31)
+    clock = [AFTER]
+    bot = Bot(telegram, CHAT, lambda: clock[0])
+    conn = db.connect("bot")
+    bot.poll(conn, AFTER)
+
+    assert telegram.sent == []
+    refused = commands(db)
+    # The limit's worth of rows, then one summary row that names the limit and carries no text.
+    assert len(refused) == REFUSAL_LIMIT + 1
+    assert all(row[5:8] == ("refused", "not the configured chat", "999") for row in refused[:-1])
+    *_, (actor, _, text, verb, args, outcome, reason, chat, _) = refused
+    assert (actor, text, verb, args, outcome, chat) == (
+        "telegram:31", "", None, {}, "refused", "999"
+    )  # fmt: skip
+    assert reason.startswith(f"refusal limit: {REFUSAL_LIMIT} refused messages from chat 999")
+    # Past the limit not even the update is kept: the table does not grow with the flood.
+    (claimed,) = conn.execute("SELECT count(*) FROM agb.telegram_update").fetchone()
+    assert claimed == REFUSAL_LIMIT + 1
+
+    # The same flood the next minute adds nothing, and the hour after it starts again.
+    for update in telegram.updates:
+        update["update_id"] += 10_000
+    clock[0] = AFTER + timedelta(minutes=1)
+    bot.poll(conn, clock[0])
+    assert len(commands(db)) == REFUSAL_LIMIT + 1
+    for update in telegram.updates:
+        update["update_id"] += 10_000
+    clock[0] = AFTER + REFUSAL_WINDOW
+    bot.poll(conn, clock[0])
+    assert len(commands(db)) == 2 * (REFUSAL_LIMIT + 1)
+    assert telegram.sent == []
+
+
+def test_a_flooding_chat_does_not_use_up_another_chats_rows(db):
+    telegram = FakeTelegram()
+    say(telegram, *["hi"] * (REFUSAL_LIMIT + 5), chat="999")
+    say(telegram, "hi", chat="998")
+    Bot(telegram, CHAT, lambda: AFTER).poll(db.connect("bot"), AFTER)
+    assert [row[7] for row in commands(db)].count("998") == 1
+
+
+def test_the_operators_refusals_are_limited_too_but_still_answered(db):
+    telegram = FakeTelegram()
+    say(telegram, *["hello"] * (REFUSAL_LIMIT + 3))
+    Bot(telegram, CHAT, lambda: AFTER).poll(db.connect("bot"), AFTER)
+    assert len(telegram.sent) == REFUSAL_LIMIT + 3
+    assert len(commands(db)) == REFUSAL_LIMIT + 1
+    assert commands(db)[-1][5] == "refused"
 
 
 def test_only_the_human_surfaces_write_commands_and_nothing_changes_one(db):
