@@ -31,7 +31,7 @@ REFERENCE = backtest.Options(signal="mom_12_1", size=5, hold_through=8)
 # shares at the fill, and the engine's capital compounds through its account where vectorbt's
 # compounds through a cash group. Over the fake market's thirty months the differences come out
 # at a fraction of these.
-TOLERANCE = {"total_return": 0.02, "sharpe": 0.25, "max_drawdown": 0.01}
+TOLERANCE = {"total_return": 0.02, "return_over_volatility": 0.25, "max_drawdown": 0.01}
 SMALL = dict(size=3, hold_through=5)
 
 
@@ -659,9 +659,11 @@ def test_the_report_has_gross_and_net_turnover_participation_and_start_dates(
         REFERENCE.init_cash * (1 + results["total_return"])
     )
     assert results["annual_volatility"] > 0
-    assert results["sharpe"] == pytest.approx(
+    assert results["return_over_volatility"] == pytest.approx(
         results["annual_return"] / results["annual_volatility"]
     )
+    # The old key names the same number; it is not the Sharpe the gates read (issue #187).
+    assert results["sharpe"] == results["return_over_volatility"]
     assert -1 < results["max_drawdown"] < 0
     assert 0 < results["turnover"] < 1, "two-sided notional traded over the value, a month's mean"
     assert 0 < results["participation_mean"] <= results["participation_max"] < 1
@@ -674,8 +676,8 @@ def test_the_report_has_gross_and_net_turnover_participation_and_start_dates(
     assert [start["months"] for start in starts] == [23, 15, 8]
     for start in starts:
         assert set(start) == {
-            "start", "months", "total_return", "annual_return", "annual_volatility", "sharpe",
-            "max_drawdown",
+            "start", "months", "total_return", "annual_return", "annual_volatility",
+            "return_over_volatility", "sharpe", "max_drawdown",
         }  # fmt: skip
         assert start["total_return"] != results["total_return"]
     assert len({start["total_return"] for start in starts}) == 3
@@ -858,7 +860,10 @@ def test_each_combinatorial_path_is_reported_for_the_gates(research_panel, resea
     paths = results["paths"]
     assert [path["path"] for path in paths] == ["0", "1"]
     for path in paths:
-        assert {"total_return", "gross_return", "sharpe", "max_drawdown", "turnover"} <= set(path)
+        assert {"total_return", "gross_return", "return_over_volatility", "max_drawdown"} <= set(
+            path
+        )
+        assert "turnover" in path and path["sharpe"] == path["return_over_volatility"]
         assert {"participation_max", "delisting_exits", "orders", "fees_paid"} <= set(path)
         assert len(path["monthly"]) == 6
         assert all(
@@ -890,7 +895,10 @@ def test_each_combinatorial_path_is_reported_for_the_gates(research_panel, resea
     assert summary["total_return_mean"] == pytest.approx(
         np.mean([path["total_return"] for path in paths])
     )
-    assert summary["sharpe_mean"] == pytest.approx(np.mean([path["sharpe"] for path in paths]))
+    assert summary["return_over_volatility_mean"] == pytest.approx(
+        np.mean([path["return_over_volatility"] for path in paths])
+    )
+    assert summary["sharpe_mean"] == summary["return_over_volatility_mean"]
     assert json.loads(ledger.get(run.trial_id)["features"]) == ["score"]
     json.dumps(results)  # what the ledger holds and the gates load
 
@@ -1009,3 +1017,28 @@ def test_the_cli_runs_a_backtest(research_panel, research_lake, tmp_path, monkey
     assert json.loads(row["config"])["backtest"]["cost_multiple"] == 2.0
     with pytest.raises(SystemExit, match="backtest: 'alpha' is not a feature"):
         cli.main(["backtest", "--signal", "alpha"])
+
+
+def test_a_fill_claims_the_charge_of_its_own_order():
+    """Issue #187: charges pair with fills by client order id, not by position in the run, so
+    fills arriving in another order than the fee model priced them still read their own charge,
+    and an order filled in parts claims one charge per part, in order."""
+    book = backtest._Book(multiple=1.0)
+    book.charge("O-1", "AAA", 1.0, 0.01, 0.0)
+    book.charge("O-2", "BBB", 2.0, 0.02, 0.0)
+    book.charge("O-1", "AAA", 3.0, 0.03, -0.5)
+    assert book.claim("O-2", "BBB") == (2.0, 0.02, 0.0)
+    assert book.claim("O-1", "AAA") == (1.0, 0.01, 0.0)
+    assert book.claim("O-1", "AAA") == (3.0, 0.03, -0.5)
+    assert book.unclaimed == {}
+    assert [charge[0] for charge in book.charges] == ["AAA", "BBB", "AAA"]
+
+
+def test_a_fill_with_no_charge_for_its_order_is_refused():
+    book = backtest._Book(multiple=1.0)
+    book.charge("O-1", "AAA", 1.0, 0.01, 0.0)
+    with pytest.raises(backtest.BacktestError, match="a fill of order O-2 that was never charged"):
+        book.claim("O-2", "BBB")
+    book.claim("O-1", "AAA")
+    with pytest.raises(backtest.BacktestError, match="a fill of order O-1 that was never charged"):
+        book.claim("O-1", "AAA")

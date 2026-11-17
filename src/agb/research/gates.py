@@ -45,10 +45,20 @@ The gates, from docs/architecture/01:
     deflated Sharpe at 2x  the DSR again on the paths rerun at twice the modelled cost, from
                            the same trial count: the specification wants DSR to pass there
                            too, and the 2x pass adds no trial.
+    gross Sharpe           the suspicion check of docs/architecture/02: the highest of the
+                           gross, total-return net and gated net annualised Sharpes must not
+                           exceed the suspicious level (~2). A Sharpe that high on monthly
+                           rebalancing is far likelier a leak than an edge, so it fails the
+                           verdict rather than being flagged beside it (issue #187).
+                           `gross_sharpe_flag` still reports the same check as a boolean.
+    start date             the gated net Sharpe from each later start date (a quarter, a half
+                           and three quarters of the way in, given eight months) must clear
+                           the Sharpe bar: an edge that lives only in the first months fails
+                           (issue #187). `start_date_stable` still reports it as a boolean, and
+                           it fails with the cause named when the excess Sharpe is undefined.
 
 Reported beside them: the total-return net Sharpe, the break-even cost multiple, the
-gross-Sharpe suspicion flag, the participation the paths needed, the gated net Sharpe from
-later start dates, and the path
+participation the paths needed, the gated net Sharpe from each later start date, and the path
 distribution of maximum drawdown, longest losing run and tracking dispersion, whose quantiles
 become the live performance alerts' thresholds (docs/architecture/04). The break-even multiple
 and the path distribution stay on total returns: a live month is compared against them as it
@@ -57,9 +67,15 @@ is, not net of the benchmark.
 The arithmetic is on monthly returns: a path is one row of monthly net returns, and a Sharpe
 here is the monthly mean over the monthly standard deviation, annualised by the square root
 of twelve where it is reported and left monthly inside the DSR, whose `T` is the number of
-months. Skewness and kurtosis are pooled over every path's months, and the variance of the
-Sharpe across trials, which the DSR needs and the ledger cannot give for every trial, is the
-variance across the paths, floored at the sampling variance one over `T`."""
+months. The variance of the Sharpe across trials, which sets the expected best Sharpe of
+`trials` tries, is the variance of the monthly Sharpe across the distinct candidate
+configurations the ledger holds for this window, on the gated basis; the variance across this
+model's paths and the sampling variance one over `T` are floors under it, so it is never
+smaller than the paths alone gave. The skewness and kurtosis are those of the de-duplicated
+monthly series, the paths' mean month, since the paths share most of their months and pooling
+them repeats each month once per path; the pooled moments are still computed, and the DSR is
+the lower of the two statistics. A variance term in the DSR's denominator that is not positive
+raises rather than being floored. See `deflated_sharpe`."""
 
 import math
 from collections.abc import Sequence
@@ -100,7 +116,7 @@ class Thresholds:
     dsr: float = 0.9  # DSR fails below this, at 1x and at 2x cost
     pbo: float = 0.5  # PBO fails above this
     sharpe: float = 0.0  # the annualised net Sharpe fails at or below this
-    suspicious_sharpe: float = 2.0  # a gross or net annualised Sharpe above this is flagged
+    suspicious_sharpe: float = 2.0  # a gross or net annualised Sharpe above this fails
     blocks: int = 16  # the CSCV block count, even; reduced to the months when they are fewer
 
     def __post_init__(self) -> None:
@@ -132,7 +148,9 @@ def path_sharpe(paths: np.ndarray) -> float:
     return float(np.mean([sharpe(path) for path in _paths(paths)]))
 
 
-def deflated_sharpe(paths: np.ndarray, trials: int) -> dict[str, Any]:
+def deflated_sharpe(
+    paths: np.ndarray, trials: int, candidates: np.ndarray | None = None
+) -> dict[str, Any]:
     """The deflated Sharpe ratio of the paths given `trials` tries recorded against them.
 
     The expected best Sharpe of `trials` tries of pure noise is
@@ -140,7 +158,21 @@ def deflated_sharpe(paths: np.ndarray, trials: int) -> dict[str, Any]:
     with `g` the Euler-Mascheroni constant and Z the standard normal quantile, zero for one
     trial. The DSR is the probability, given the observed series' length, skewness and
     kurtosis, that the true Sharpe exceeds it:
-        DSR = Phi[(SR - SR*) sqrt(T - 1) / sqrt(1 - g3 SR + (g4 - 1) / 4 SR^2)]."""
+        DSR = Phi[(SR - SR*) sqrt(T - 1) / sqrt(1 - g3 SR + (g4 - 1) / 4 SR^2)].
+
+    `V[SR]` is the variance of the monthly Sharpe across the trials: across the distinct
+    columns of `candidates`, a months-by-configurations matrix of the configurations the ledger
+    holds for this window on the paths' own basis, when it has at least two. The paths of one
+    model share most of their months, so their spread understates it (issue #187); it is still
+    taken, with the sampling variance one over `T`, as a floor under the trials' variance, so
+    that the variance never comes out smaller than it did before the trials were read.
+
+    The skewness and kurtosis are those of the de-duplicated monthly series, the paths' mean
+    month, rather than of every path's months pooled, which repeat each month once per path
+    that holds it. The pooled moments are still computed, and the DSR is the lower of the two,
+    so that reading the de-duplicated series never raises it. A variance term
+    `1 - g3 SR + (g4 - 1) / 4 SR^2` that is not positive raises `GateError` rather than being
+    floored into an extreme statistic."""
     if trials < 1:
         raise GateError("the trial count must be at least one")
     rows = _paths(paths)
@@ -149,10 +181,9 @@ def deflated_sharpe(paths: np.ndarray, trials: int) -> dict[str, Any]:
         raise GateError("the deflated Sharpe needs at least two months")
     sharpes = np.array([sharpe(row, annualise=False) for row in rows])
     observed = float(np.mean(sharpes))
-    across = float(np.var(sharpes, ddof=1)) if len(sharpes) > 1 else 0.0
-    variance = max(across, 1.0 / months)
-    pooled = rows.ravel()
-    skewness, kurtosis = _skewness(pooled), _kurtosis(pooled)
+    across_paths = float(np.var(sharpes, ddof=1)) if len(sharpes) > 1 else 0.0
+    across_trials, trial_count = _trial_variance(candidates)
+    variance = max(across_paths, 1.0 / months, across_trials or 0.0)
     if trials == 1:
         expected = 0.0
     else:
@@ -160,15 +191,30 @@ def deflated_sharpe(paths: np.ndarray, trials: int) -> dict[str, Any]:
             (1.0 - EULER_GAMMA) * _NORMAL.inv_cdf(1.0 - 1.0 / trials)
             + EULER_GAMMA * _NORMAL.inv_cdf(1.0 - 1.0 / (trials * math.e))
         )
-    scale = 1.0 - skewness * observed + (kurtosis - 1.0) / 4.0 * observed**2
-    statistic = (observed - expected) * math.sqrt(months - 1) / math.sqrt(max(scale, 1e-12))
+    deduplicated, pooled = rows.mean(axis=0), rows.ravel()
+    moments = {
+        "deduplicated": (_skewness(deduplicated), _kurtosis(deduplicated)),
+        "pooled": (_skewness(pooled), _kurtosis(pooled)),
+    }
+    statistics = {
+        name: _deflated_statistic(observed, expected, months, skewness, kurtosis)
+        for name, (skewness, kurtosis) in moments.items()
+    }
+    # The lower statistic, the de-duplicated moments on a tie.
+    chosen = min(statistics, key=lambda name: statistics[name])
     return {
-        "dsr": float(_NORMAL.cdf(statistic)),
+        "dsr": float(_NORMAL.cdf(statistics[chosen])),
         "sharpe_monthly": observed,
         "expected_max_sharpe_monthly": expected,
         "sharpe_variance": variance,
-        "skewness": skewness,
-        "kurtosis": kurtosis,
+        "sharpe_variance_trials": across_trials,
+        "sharpe_variance_paths": across_paths,
+        "trial_sharpes": trial_count,
+        "skewness": moments["deduplicated"][0],
+        "kurtosis": moments["deduplicated"][1],
+        "skewness_pooled": moments["pooled"][0],
+        "kurtosis_pooled": moments["pooled"][1],
+        "moments": chosen,
         "months": months,
         "trials": trials,
         "paths": len(rows),
@@ -223,7 +269,9 @@ def overfitting_probability(candidates: np.ndarray, blocks: int = 16) -> dict[st
         relative = rank / (count + 1)
         logits.append(math.log(relative / (1.0 - relative)))
     return {
-        "pbo": float(np.mean(np.array(logits) < 0.0)),
+        # A logit of exactly zero is the in-sample best landing on the median out of sample:
+        # no better than chance, so it counts as overfit (issue #187).
+        "pbo": float(np.mean(np.array(logits) <= 0.0)),
         "defined": True,
         "cause": None,
         "candidates": count,
@@ -349,11 +397,27 @@ def evaluate(
         gated, gated_2x = net_rows - bench_rows, twice_rows - bench_rows
     else:
         gated, gated_2x = net_rows, twice_rows
+    # The trials the DSR deflates by, on the gated basis: the candidates are total returns, so
+    # on the excess basis each month's benchmark return, the same on every path holding it,
+    # comes off every configuration's month.
+    trial_matrix = np.asarray(candidates, dtype="float64")
+    if benchmark is not None and trial_matrix.ndim == 2 and trial_matrix.shape[1]:
+        if trial_matrix.shape[0] != net_rows.shape[1]:
+            raise GateError("the candidates must have one row per month of the paths")
+        trial_matrix = trial_matrix - bench_rows.mean(axis=0)[:, np.newaxis]
     sharpe_total = path_sharpe(net_rows)
     sharpe_gross = path_sharpe(gross_rows)
     if cause is None:
-        deflated = {**deflated_sharpe(gated, trials), "defined": True, "cause": None}
-        deflated_2x = {**deflated_sharpe(gated_2x, trials), "defined": True, "cause": None}
+        deflated = {
+            **deflated_sharpe(gated, trials, trial_matrix),
+            "defined": True,
+            "cause": None,
+        }
+        deflated_2x = {
+            **deflated_sharpe(gated_2x, trials, trial_matrix),
+            "defined": True,
+            "cause": None,
+        }
         sharpe_net = path_sharpe(gated)
         starts = [
             {**start, "sharpe_total": total["sharpe_net"]}
@@ -380,15 +444,17 @@ def evaluate(
         ]
         stable = False
     overfitting = overfitting_probability(candidates, thresholds.blocks)
+    sharpes = [sharpe_gross, sharpe_total] + ([sharpe_net] if cause is None else [])
     gates = {
         "dsr": _sharpe_gate(deflated["dsr"], thresholds.dsr, "at least", basis, cause),
         "pbo": {**_overfitting_gate(overfitting, thresholds.pbo, missing), "basis": TOTAL},
         "sharpe_net": _sharpe_gate(sharpe_net, thresholds.sharpe, "above", basis, cause),
         "dsr_2x": _sharpe_gate(deflated_2x["dsr"], thresholds.dsr, "at least", basis, cause),
+        "gross_sharpe": _gate(max(sharpes), thresholds.suspicious_sharpe, "at most"),
+        "start_date": _start_date_gate(starts, thresholds.sharpe, stable, basis, cause),
     }
     maxima = [p for p, _ in participation if p is not None]
     means = [m for _, m in participation if m is not None]
-    sharpes = [sharpe_gross, sharpe_total] + ([sharpe_net] if cause is None else [])
     return {
         "certifies": CERTIFIES,
         "passed": all(gate["passed"] for gate in gates.values()),
@@ -444,6 +510,31 @@ def _sharpe_gate(
     return gate
 
 
+def _start_date_gate(
+    starts: Sequence[dict[str, Any]],
+    threshold: float,
+    stable: bool,
+    basis: str,
+    cause: str | None,
+) -> dict[str, Any]:
+    """The start-date gate: the gated net Sharpe from every later start date must clear the
+    Sharpe bar, as docs/architecture/02 requires. Its value is the lowest of them, none when
+    there is no later start date to read or the excess Sharpe is undefined, in which case the
+    gate fails with the cause named."""
+    sharpes = [start["sharpe_net"] for start in starts if start["sharpe_net"] is not None]
+    lowest = min(sharpes) if sharpes and cause is None else None
+    return {
+        "value": lowest,
+        "threshold": threshold,
+        "rule": "above",
+        "passed": bool(stable) and cause is None,
+        "basis": basis,
+        "defined": cause is None,
+        "cause": cause,
+        "starts": len(starts),
+    }
+
+
 def _overfitting_gate(
     overfitting: dict[str, Any], threshold: float, missing: Sequence[str]
 ) -> dict[str, Any]:
@@ -470,6 +561,41 @@ def _paths(paths: np.ndarray) -> np.ndarray:
     if not np.isfinite(rows).all():
         raise GateError("every monthly return must be finite")
     return rows
+
+
+def _trial_variance(candidates: np.ndarray | None) -> tuple[float | None, int]:
+    """The variance of the monthly Sharpe across the distinct columns of `candidates`, and how
+    many there were: none when no matrix is given or it has fewer than two distinct columns or
+    two months, since one Sharpe has no spread to measure."""
+    if candidates is None:
+        return None, 0
+    matrix = np.asarray(candidates, dtype="float64")
+    if matrix.ndim != 2:
+        raise GateError("the candidates must be a months-by-configurations matrix")
+    if matrix.shape[1] and not np.isfinite(matrix).all():
+        raise GateError("every candidate's monthly return must be finite")
+    if matrix.shape[1]:
+        _, first = np.unique(matrix, axis=1, return_index=True)
+        matrix = matrix[:, np.sort(first)]
+    count = matrix.shape[1]
+    if count < 2 or matrix.shape[0] < 2:
+        return None, count
+    return float(np.var(_column_sharpes(matrix), ddof=1)), count
+
+
+def _deflated_statistic(
+    observed: float, expected: float, months: int, skewness: float, kurtosis: float
+) -> float:
+    """The DSR's standardised statistic, which refuses a variance term that is not positive:
+    flooring it would turn a series whose moments make no sense into an extreme statistic,
+    a near-certain pass when the Sharpe beats the expected maximum."""
+    scale = 1.0 - skewness * observed + (kurtosis - 1.0) / 4.0 * observed**2
+    if not scale > 0.0:
+        raise GateError(
+            f"the deflated Sharpe's variance term is {scale:.6g}, not positive: skewness "
+            f"{skewness:.6g} and kurtosis {kurtosis:.6g} at a monthly Sharpe of {observed:.6g}"
+        )
+    return (observed - expected) * math.sqrt(months - 1) / math.sqrt(scale)
 
 
 def _column_sharpes(matrix: np.ndarray) -> np.ndarray:

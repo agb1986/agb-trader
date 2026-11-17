@@ -641,6 +641,22 @@ def test_the_validation_view_names_the_returns_the_sharpe_gate_read(conn, db):
     assert "(total return)" not in page
 
 
+def test_the_validation_view_lists_the_gross_sharpe_and_start_date_gates(conn, db):
+    """Issue #187: the suspicion check and the start-date check are gates, recorded only in the
+    gates object, and the page lists each by name with its verdict."""
+    later = {
+        "gross_sharpe": {"value": 2.4, "threshold": 2.0, "rule": "at most", "passed": False},
+        "start_date": {"value": 0.7, "threshold": 0.5, "rule": "above", "passed": True},
+    }
+    certify(db, {**GATES, **later})
+
+    page = html.unescape(ui.validation(conn, LATER))
+
+    assert "Highest annualised Sharpe (suspicion check)" in page
+    assert "Lowest Sharpe from a later start date" in page
+    assert page.count(">pass<") == 5 and page.count(">FAIL<") == 1
+
+
 def test_the_validation_view_ends_by_naming_what_the_certification_does_not_cover(conn, certified):
     """The sentence the ticket asks for in as many words: these gates are stage 1's."""
     page = html.unescape(ui.validation(conn, LATER))

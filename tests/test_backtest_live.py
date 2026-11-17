@@ -65,7 +65,7 @@ pytestmark = [
 TOLERANCE = {
     "annual_return": 0.03,
     "annual_volatility": 0.03,
-    "sharpe": 0.20,
+    "return_over_volatility": 0.20,
     "max_drawdown": 0.10,
 }
 # How much of the order sets may remain unexplained once the delisting exits and the scan's
@@ -163,10 +163,10 @@ def test_the_two_sides_ran_the_same_panel(both):
     engine, fast = both.engine, both.scan
     print(
         f"\n{engine['months']} months: engine annual {engine['annual_return']:+.4f} sharpe"
-        f" {engine['sharpe']:.3f} drawdown {engine['max_drawdown']:+.4f},"
+        f" {engine['return_over_volatility']:.3f} drawdown {engine['max_drawdown']:+.4f},"
         f" {engine['orders']} orders, {engine['delisting_exits']} delisting exits,"
         f" {engine['trimmed']} trims, {engine['unfilled']} unfilled; vectorbt annual"
-        f" {fast['annual_return']:+.4f} sharpe {fast['sharpe']:.3f} drawdown"
+        f" {fast['annual_return']:+.4f} sharpe {fast['return_over_volatility']:.3f} drawdown"
         f" {fast['max_drawdown']:+.4f}, {fast['orders']} orders"
         f" over {fast['months']} months"
     )

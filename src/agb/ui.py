@@ -688,6 +688,13 @@ GATES = (
     ("sharpe_net", "Cost-inclusive Sharpe", 2),
     ("dsr_2x", "Deflated Sharpe at 2x cost", 3),
 )
+# The gates that carry their measurement only in the `gates` object, with no column of their own:
+# the suspicion check and the start-date check, binding since issue #187. A gate this module does
+# not know is still listed, under its key.
+LATER_GATES = {
+    "gross_sharpe": "Highest annualised Sharpe (suspicion check)",
+    "start_date": "Lowest Sharpe from a later start date",
+}
 # The returns a Sharpe gate read, as each gate records it (issue #167). Certifications up to
 # lgbm-2026-10 recorded no basis and gated total returns.
 BASES = {"total": "total return", "excess_spy": "excess over SPY"}
@@ -836,7 +843,7 @@ def validation(conn: psycopg.Connection, now: datetime) -> str:
             continue
         gate_rows.append(
             (
-                key,
+                LATER_GATES.get(key, key),
                 _number(_as_float(applied.get("value"))),
                 f"{applied.get('rule', '')} {applied.get('threshold', '')}".strip(),
                 "pass" if applied.get("passed") else "FAIL",

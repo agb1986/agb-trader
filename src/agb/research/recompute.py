@@ -224,7 +224,7 @@ def recorded(
 def thresholds(recorded: dict[str, Any]) -> gates.Thresholds:
     """The thresholds a manifest says it was gated at, refused if any is looser than this
     code's: a deflated Sharpe bar lower, an overfitting bar higher, a Sharpe bar lower or a
-    suspicion flag raised later, or another CSCV block count. Stricter ones are a certification
+    suspicious-Sharpe bar higher, or another CSCV block count. Stricter ones are a certification
     that asked more of the model, and its verdict is recomputed at them."""
     names = {f.name for f in fields(gates.Thresholds)}
     if not isinstance(recorded, dict) or set(recorded) != names:
