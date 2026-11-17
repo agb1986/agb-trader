@@ -180,7 +180,7 @@ class Artifact:
         }
         manifest["files"] = files
         manifest["ledger_sha256"] = files[trials.FILE]
-        manifest["artifact_sha256"] = artifact.artifact_sha256(files)
+        manifest["artifact_sha256"] = artifact.artifact_sha256(manifest)
         (self.directory / artifact.MANIFEST).write_text(json.dumps(manifest))
 
 
@@ -214,7 +214,9 @@ def test_a_passing_run_leaves_the_artifact_directory(certified, prior):
         name: artifact.file_sha256(certified.directory / name)
         for name in ("model.txt", "paths.json", "report.md", "trials.parquet")
     }
-    assert manifest["artifact_sha256"] == artifact.artifact_sha256(manifest["files"])
+    # The digest covers the manifest itself, every field but the digest, and through its
+    # file digests every other file (issue #211).
+    assert manifest["artifact_sha256"] == artifact.artifact_sha256(manifest)
     assert manifest["ledger_sha256"] == manifest["files"]["trials.parquet"]
 
 
@@ -599,9 +601,13 @@ def test_an_artifact_that_does_not_say_where_it_was_certified_is_refused(db, cer
         artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
 
-def test_a_row_must_say_what_it_certifies(db, certified, tmp_path):
+def test_a_row_must_say_what_it_certifies(db, certified, tmp_path, monkeypatch):
     copy = copied(certified, tmp_path)
     copy.rewrite(certifies="stage 1 and the blend")
+    with pytest.raises(artifact.CertificationError, match="this code certifies only"):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
+    # The table's own check holds behind the artifact's, for a row that reaches it unchecked.
+    monkeypatch.setattr(artifact, "load", lambda directory: copy.manifest)
     with pytest.raises(errors.CheckViolation):
         artifact.import_artifact(db.connect(RESEARCH), copy.directory)
 
@@ -702,9 +708,10 @@ def test_a_benchmark_that_covers_part_of_the_run_fails_closed(partly_benchmarked
     ), "the same book either way"
 
 
-def test_an_artifact_without_a_basis_loads_and_verifies_as_total(db, certified, tmp_path):
-    """Certifications up to lgbm-2026-10 recorded no basis: they verify unchanged, are read as
-    having gated total returns, and import."""
+def test_an_artifact_without_a_basis_is_refused_and_its_report_reads_total(certified, tmp_path):
+    """Certifications up to lgbm-2026-10 recorded no basis. The import recomputes the basis, so
+    one without it is refused and has to be certified again (issue #211); a report rendered
+    from such a manifest still says it gated total returns."""
     copy = copied(certified, tmp_path)
     manifest = {
         key: value
@@ -721,20 +728,23 @@ def test_an_artifact_without_a_basis_loads_and_verifies_as_total(db, certified, 
     }
     (copy.directory / artifact.MANIFEST).write_text(json.dumps(manifest))
     copy.rewrite()
-
-    loaded = artifact.load(copy.directory)
-    assert "sharpe_basis" not in loaded
-    assert loaded.get("sharpe_basis", gates.TOTAL) == gates.TOTAL
-    report = certify.report(loaded)
+    with pytest.raises(
+        artifact.CertificationError, match="lacks sharpe_basis, excess, sharpe_total; re-certify"
+    ):
+        artifact.load(copy.directory)
+    report = certify.report(manifest)
     assert "The deflated Sharpe and Sharpe gates read total returns." in report
-    assert f"total-return Sharpe {loaded['sharpe_net']:.4f}" in report
-    assert imported(db, copy.directory)["sharpe_net"] == loaded["sharpe_net"]
+    assert f"total-return Sharpe {manifest['sharpe_net']:.4f}" in report
 
 
 def test_an_unknown_basis_is_refused(certified, tmp_path):
     copy = copied(certified, tmp_path)
     copy.rewrite(sharpe_basis="excess_cash")
-    with pytest.raises(artifact.CertificationError, match="unknown Sharpe basis"):
+    with pytest.raises(
+        artifact.CertificationError,
+        match="differs from manifest.json in 1 field.*sharpe_basis: manifest 'excess_cash',"
+        " recomputed 'excess_spy'",
+    ):
         artifact.load(copy.directory)
 
 
@@ -897,7 +907,7 @@ def test_a_manifest_whose_digest_was_edited_is_refused(db, certified, tmp_path):
     manifest = copy.manifest
     manifest["artifact_sha256"] = "0" * 64
     (copy.directory / artifact.MANIFEST).write_text(json.dumps(manifest))
-    with pytest.raises(artifact.CertificationError, match="digest does not match"):
+    with pytest.raises(artifact.CertificationError, match="manifest.json has been altered"):
         artifact.import_artifact(db.connect(RESEARCH), copy.directory)
     del manifest["dsr"]
     (copy.directory / artifact.MANIFEST).write_text(json.dumps(manifest))
@@ -908,6 +918,81 @@ def test_a_manifest_whose_digest_was_edited_is_refused(db, certified, tmp_path):
     assert db.connect(RESEARCH).execute(
         "SELECT count(*) FROM agb.model_certification"
     ).fetchone() == (0,)
+
+
+def test_a_trial_count_by_any_other_rule_is_refused(db, certified, tmp_path):
+    """The rule is fixed in the code (issue #211). A manifest that names `rows` and declares
+    the ledger's row count, which agrees with itself, is refused before anything is counted;
+    so is one that names no rule, as every certification before the fix does."""
+    copy = copied(certified, tmp_path)
+    rows = copy.ledger().rows()
+    copy.rewrite(
+        declared_trials_rule="rows",
+        declared_trials=trials.declared(rows, rule="rows"),
+    )
+    with pytest.raises(
+        artifact.CertificationError,
+        match=r"counted its trials as 'rows', and the only rule this code accepts is 'started';"
+        " re-certify",
+    ):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
+    manifest = copy.manifest
+    del manifest["declared_trials_rule"]
+    (copy.directory / artifact.MANIFEST).write_text(json.dumps(manifest))
+    with pytest.raises(
+        artifact.CertificationError, match="names no trial count rule.*issue #211.*re-certify"
+    ):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
+    assert db.connect(RESEARCH).execute(
+        "SELECT count(*) FROM agb.model_certification"
+    ).fetchone() == (0,)
+
+
+def test_a_gate_value_edited_with_every_digest_recomputed_is_refused(db, certified, tmp_path):
+    """A forger who knows the digest scheme can make every digest agree; the gates run again
+    over the shipped paths and ledger cannot be made to agree with an edited value."""
+    copy = copied(certified, tmp_path)
+    dsr = copy.manifest["dsr"]
+    copy.rewrite(dsr=dsr + 0.01)
+    with pytest.raises(
+        artifact.CertificationError,
+        match=r"differs from manifest.json in 1 field\(s\): dsr: manifest",
+    ):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
+    copy = copied(certified, tmp_path / "gate")
+    gated = copy.manifest["gates"]
+    copy.rewrite(gates={**gated, "pbo": {**gated["pbo"], "value": 0.0, "passed": True}})
+    with pytest.raises(artifact.CertificationError, match=r"gates\.pbo\.value: manifest 0\.0"):
+        artifact.import_artifact(db.connect(RESEARCH), copy.directory)
+    assert db.connect(RESEARCH).execute(
+        "SELECT count(*) FROM agb.model_certification"
+    ).fetchone() == (0,)
+
+
+def test_a_difference_within_the_tolerance_is_not_one(certified, tmp_path):
+    """Floating-point noise in the last digits is not a forgery: a relative 1e-12 passes, a
+    relative 1e-6 does not."""
+    copy = copied(certified, tmp_path)
+    dsr = copy.manifest["dsr"]
+    copy.rewrite(dsr=dsr * (1 + 1e-12))
+    assert artifact.load(copy.directory)["dsr"] == dsr * (1 + 1e-12)
+    copy.rewrite(dsr=dsr * (1 + 1e-6))
+    with pytest.raises(artifact.CertificationError, match="dsr: manifest"):
+        artifact.load(copy.directory)
+
+
+def test_a_digest_over_the_files_alone_is_refused_by_name(certified, tmp_path):
+    """The digest certifications up to lgbm-2026-10 carry covers the files and not the
+    manifest; such an artifact is refused as one to certify again, not as a forgery."""
+    copy = copied(certified, tmp_path)
+    manifest = copy.manifest
+    manifest["artifact_sha256"] = artifact._files_sha256(manifest["files"])
+    (copy.directory / artifact.MANIFEST).write_text(json.dumps(manifest))
+    with pytest.raises(
+        artifact.CertificationError,
+        match="covers its files and not manifest.json.*issue #211.*re-certify",
+    ):
+        artifact.load(copy.directory)
 
 
 # The command line -----------------------------------------------------------------------------
@@ -976,3 +1061,30 @@ def test_the_cli_exits_1_on_a_failed_certification_after_writing_it(
         (research_dir / "certifications" / "cli-failed" / artifact.MANIFEST).read_text()
     )
     assert manifest["passed"] is False
+
+
+def test_the_nesting_sweep_agrees_with_asking_every_row_of_every_other():
+    """`trials.nested` sweeps the rows by start (issue #204) where it once compared each row with
+    every other. Over ties, zombies, the open run and plain overlaps, the two must agree."""
+    import random
+
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    generator = random.Random(211)
+    for _ in range(200):
+        rows = []
+        for i in range(generator.randint(1, 12)):
+            start = base + timedelta(minutes=generator.randint(0, 20))
+            finished = generator.choice([None, start + timedelta(minutes=generator.randint(0, 20))])
+            rows.append({"trial_id": f"t{i}", "started_at": start, "finished_at": finished})
+        current = generator.choice([None, *(row["trial_id"] for row in rows)])
+        pairwise = {
+            row["trial_id"]
+            for row in rows
+            if any(
+                other["started_at"] < row["started_at"]
+                and trials._closes_at(other, current) >= trials._closes_at(row, current)
+                for other in rows
+                if other["trial_id"] != row["trial_id"]
+            )
+        }
+        assert trials.nested(rows, current=current) == pairwise
