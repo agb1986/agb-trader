@@ -45,9 +45,13 @@ CASES = {
         RANKING, names(*range(1, 20), 35), names(35),
         Selection(names(*range(1, 20)), (), (), names(35)),
     ),
-    "a halted name outside the book is passed over": (
+    "a halted name outside the book is passed over, and its slot stays in cash": (
         RANKING, (), names(3),
-        Selection((), names(1, 2, *range(4, 22)), (), ()),
+        Selection((), names(1, 2, *range(4, 21)), (), ()),
+    ),
+    "buys never reach below rank twenty": (
+        RANKING, names(25), names(*range(1, 6)),
+        Selection(names(25), names(*range(6, 21)), (), ()),
     ),
     "a ranking short of twenty tradeable names leaves slots empty": (
         RANKING[:15], (), (), Selection((), names(*range(1, 16)), (), ()),
@@ -66,17 +70,17 @@ DIVEST_CASES = {
         RANKING, names(*range(1, 20), 25), (), names(25),
         Selection(names(*range(1, 20)), names(20), names(25), ()),
     ),
-    "acquirer shares are sold though the name ranks top of the book": (
+    "acquirer shares are sold though the name ranks top of the book, and rank 21 not bought": (
         RANKING, names(*range(1, 21)), (), names(1),
-        Selection(names(*range(2, 21)), names(21), names(1), ()),
+        Selection(names(*range(2, 21)), (), names(1), ()),
     ),
     "a name both untradeable and divested is sold, not carried": (
         RANKING, names(*range(1, 20), 35), names(35), names(35),
         Selection(names(*range(1, 20)), names(20), names(35), ()),
     ),
-    "a divested name outside the book is not bought": (
+    "a divested name outside the book is not bought, nor replaced from below rank 20": (
         RANKING, (), (), names(3),
-        Selection((), names(1, 2, *range(4, 22)), (), ()),
+        Selection((), names(1, 2, *range(4, 21)), (), ()),
     ),
 }  # fmt: skip
 
@@ -212,6 +216,13 @@ def test_a_name_without_a_price_cannot_be_ordered():
     selection = Selection((), ("X",), (), ())
     with pytest.raises(ValueError, match="X: no price"):
         rebalance.orders(selection, rebalance.weights(["X"]), {}, {}, Decimal(1000))
+
+
+@pytest.mark.parametrize("price", [Decimal(0), Decimal("-1")])
+def test_a_zero_price_is_refused_as_not_positive_not_as_missing(price):
+    selection = Selection((), ("X",), (), ())
+    with pytest.raises(ValueError, match=f"X: the price {price} is not positive"):
+        rebalance.orders(selection, rebalance.weights(["X"]), {"X": price}, {}, Decimal(1000))
 
 
 IMPORTS = """

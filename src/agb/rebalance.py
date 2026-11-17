@@ -14,8 +14,8 @@ docs/architecture/02-classical-ranker.md:
     inside the buffer outnumber the slots, the lowest-ranked incumbent is dropped first.
   * **Fewer than twenty when a forced event requires it.** An incumbent that cannot trade on
     the signal session (a halt spanning the rebalance) is carried: it keeps its slot, gets no
-    order and is not replaced, so the basket runs nineteen names that month. A ranking with
-    too few tradeable names leaves slots empty.
+    order and is not replaced, so the basket runs nineteen names that month. A top 20 with
+    too few tradeable names leaves slots empty: buys never reach below rank 20.
   * **A name a forced event divests leaves whatever its rank.** A delisted stub and the
     acquirer shares a merger paid in were never chosen, so they are sold at the next
     rebalance even where the ranking would have kept them (`agb.corporate`).
@@ -93,7 +93,9 @@ def select(
 
     `held` is the names in the book before the rebalance, `untradeable` those with no print
     on the signal session. An untradeable incumbent is carried; an untradeable name that is
-    not held cannot be bought and is passed over. An empty book buys the top `size`.
+    not held cannot be bought and is passed over. Buys come only from the top `size` of the
+    ranking, so a passed-over name there leaves its slot in cash rather than reaching below
+    rank `size` for a replacement. An empty book buys the tradeable names in the top `size`.
 
     `divest` is the names a forced event sells whatever their rank: they are never kept,
     carried or bought, and one that is held is sold. A name in both is sold, because a stub
@@ -115,7 +117,9 @@ def select(
     while len(keep) > slots:
         keep.pop()  # the lowest-ranked incumbent goes first
     sell = sorted(held - set(keep) - set(carry), key=by_rank)
-    buy = [s for s in ranking if s not in held and s not in passed_over][: slots - len(keep)]
+    # Buys come from the top `size` only: a slot a passed-over name leaves in the top 20 is
+    # left in cash, never filled from rank 21 down.
+    buy = [s for s in ranking[:size] if s not in held and s not in passed_over][: slots - len(keep)]
     return Selection(tuple(keep), tuple(buy), tuple(sell), tuple(carry))
 
 
@@ -182,6 +186,8 @@ def _by_rank(position: Mapping[str, int]):
 
 def _price(prices: Mapping[str, Decimal], symbol: str) -> Decimal:
     price = prices.get(symbol)
-    if price is None or price <= 0:
+    if price is None:
         raise ValueError(f"{symbol}: no price on the signal session")
+    if price <= 0:
+        raise ValueError(f"{symbol}: the price {price} is not positive, so no order is sized at it")
     return price

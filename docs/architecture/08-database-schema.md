@@ -30,7 +30,7 @@ Rejected: a session-scoped advisory lock. It releases when the connection dies, 
 
 The state set is the one the risk and Telegram documents already use (proposed, halted at the gate, pending, approved, rejected, missed, submitted, filled), plus unfilled for a submitted basket whose orders all ended at the close with nothing filled. A settled basket's `basket_outcome` row, written with the event that settled it, counts its orders filled in full, filled in part and unfilled, and says whether the basket filled in full, in part or not at all. The exact enumeration is left to the build.
 
-**References people can type.** Each basket has an internal key and a unique human reference, `2026-10` for that month's rebalance. A deliberate next-session rerun after a missed approval is a new basket, `2026-10r1`, with `deviation_of` pointing at the original, which keeps its missed outcome. Shadow baskets (`kind = 'shadow'`) have no typeable reference.
+**References people can type.** Each basket has an internal key and a unique human reference, `2026-10` for that month's rebalance. A deliberate next-session rerun after a missed approval is a new basket, `2026-10r1`, with `deviation_of` pointing at the original, which keeps its missed outcome. A basket is rerun once: the database holds at most one accepted `rerun` command per basket and per rerun reference, so two requests at once leave one rerun and one recorded refusal, and only a missed basket is copied. Shadow baskets (`kind = 'shadow'`) have no typeable reference.
 
 Rejected: a mutable `state` column plus an audit copy, which gives two records of the same fact with nothing forcing them to agree. Rejected: full event sourcing with projections, a great deal of machinery for about twelve baskets a year.
 

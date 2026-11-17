@@ -253,7 +253,9 @@ def test_a_cash_acquisition_terminates_the_position_and_its_cash_waits_for_the_r
 
 def test_a_stock_merger_sells_the_acquirer_shares_whatever_their_rank(db, tmp_path):
     """OLDCO was bought with ACQ stock, 200 shares for its 400. ACQ ranks first in the
-    market, and is sold anyway: that position was never chosen."""
+    market, and is sold anyway: that position was never chosen. Its slot is not refilled from
+    rank 21, since buys come from the top twenty only, so the slot stays in cash and the
+    basket holds nineteen, short one name against the two the merger puts on the record."""
     root = Market(tmp_path).names(25).name("ACQ", growth=0.012).land()
     filled_basket(db, "2026-09", {"N01": 100, "OLDCO": 400})
     file_event(
@@ -270,10 +272,11 @@ def test_a_stock_merger_sells_the_acquirer_shares_whatever_their_rank(db, tmp_pa
 
     assert job_state(db) == "completed"
     by_symbol = {t[0]: t[1:] for t in targets(db)}
-    assert len(by_symbol) == SIZE
+    assert len(by_symbol) == SIZE - 1
     assert "ACQ" not in by_symbol and "OLDCO" not in by_symbol
+    assert "N20" not in by_symbol  # rank 21, behind ACQ, is below the buy cap
     assert ("ACQ", "sell", 200) in [(o[0], o[1], o[2]) for o in orders(db)]
-    assert gate_check(db, "positions") == ("20", True)
+    assert gate_check(db, "positions") == ("19, short 1 against 2 on the record", True)
 
 
 def test_a_delisting_exits_at_the_last_listed_print_rather_than_being_dropped(db, tmp_path):

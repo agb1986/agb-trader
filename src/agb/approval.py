@@ -773,7 +773,18 @@ def request_rerun(
     session = rerun_session(basket.session_date, now, calendar)
     cutoff = cutoff_of(calendar, session)
     args |= {"basket_id": basket.id, "rerun": new, "session_date": session.isoformat()}
-    record(conn, source, RERUN, args)
+    try:
+        # Two requests at once both pass the checks above; the unique indexes on accepted
+        # reruns let only one record, and the other waits for it and is refused here.
+        with conn.transaction():
+            record(conn, source, RERUN, args)
+    except UniqueViolation:
+        if taken := conn.execute(_RERUN_OF, {"id": basket.id}).fetchone():
+            why = f"rebalance {reference} is already rerun as {taken[0]}"
+        else:
+            why = f"the rerun reference {new} was taken by another rerun as this one asked"
+        record(conn, source, RERUN, {"reference": reference}, why)
+        raise RerunRefused(why) from None
     return (
         f"rerun {new} asked for: rebalance {reference} again, at the close of {session}.\n"
         "The pipeline builds and gates it, and the approval request follows in Telegram; "

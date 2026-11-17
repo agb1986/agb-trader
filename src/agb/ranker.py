@@ -13,6 +13,7 @@ the universe and the lake for the reader; nothing here imports them at runtime.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
@@ -49,7 +50,13 @@ class Ranker(Protocol):
 
 def order(symbols: Iterable[str], scores: Mapping[str, float | None]) -> list[Ranked]:
     """Rank `symbols` by score, highest first. Ties break by symbol, so a ranking is a
-    deterministic function of its scores, and unscored names come last, by symbol."""
+    deterministic function of its scores, and unscored names come last, by symbol.
+
+    A NaN score raises `ValueError`: NaN compares false both ways, so where it sorts is
+    undefined, and a name the model could not score is `None`, never NaN."""
     scored = [(s, scores.get(s)) for s in set(symbols)]
+    nan = sorted(s for s, score in scored if score is not None and math.isnan(score))
+    if nan:
+        raise ValueError(f"the model scored {nan} NaN; a NaN score has no place in a ranking")
     scored.sort(key=lambda item: (item[1] is None, -(item[1] or 0.0), item[0]))
     return [Ranked(symbol, i + 1, score) for i, (symbol, score) in enumerate(scored)]

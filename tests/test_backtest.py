@@ -460,7 +460,11 @@ def test_a_recorded_cash_acquisition_ends_the_position_and_the_cash_waits(
     ranking wants and never buys the acquired name back."""
     panel, root = forced_panel(tmp_path)
     months = panel.months
-    picks = [["N01", "N02", "N03", "N04", "N05"]] * len(months)
+    # From the month the deal closes, the acquired name still ranks inside the top three and
+    # N04 enters it: buys come from the top `size` only, so a ranking that left N04 fourth
+    # would leave the slot in cash rather than reach below the top for it.
+    after = ["N02", "N01", "N04", "N03", "N05"]
+    picks = [["N01", "N02", "N03", "N04", "N05"]] * 2 + [after] * (len(months) - 2)
     day, close = between(root, "N01", months[1].entry, months[2].snapshot_date)
     # The deal price is that session's close to the cent: a deal that is certain prints at the
     # price it pays.
