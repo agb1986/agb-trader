@@ -37,7 +37,7 @@ Checks span three levels, because a basket can be perfectly self-consistent and 
 - The Sharadar snapshot date equals the expected month-end.
 - Universe size falls in a plausible band, 1,500 to 3,500 names, so a 200-name universe stops everything. The band brackets the measured history (1,700 to 2,500 at month-ends since mid-1998) with room either side; it is a provenance check on the lake and the filters, not a view on how many names the strategy wants.
 - The model artifact hash matches the promoted certification.
-- The panel returned scores for the entire shortlist, with dispersion above the gate specified in [03 — LLM panel](03-llm-panel.md).
+- The panel returned scores for the entire shortlist, with dispersion above the gate specified in [03 — LLM panel](03-llm-panel.md). A basket that names a panel run but records no blend rows breaches on its own check (`panel_blend`) rather than skipping the panel checks, and a basket's blend, like the rest of its content, is frozen once the gate has run.
 
 **Basket invariants.**
 - Exactly 20 target positions (or fewer only through the forced-event cases the ranker defines). As built, a short basket passes only when a recorded forced event explains each missing name; a name carried with nothing on the record, or a shortfall the record does not cover, breaches. The weight-sum check scales its expectation to the names the basket actually holds, so a legitimate 19-name basket does not breach it as well.

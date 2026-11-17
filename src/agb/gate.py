@@ -266,9 +266,22 @@ def _provenance(
 
 def _panel(panel: Panel | None, limits: Limits) -> list[Check]:
     """The panel's coverage and spread. A basket no panel scored has neither check: there is
-    nothing to measure, and the stage-1 ranking is what it traded."""
+    nothing to measure, and the stage-1 ranking is what it traded. A basket that names a panel
+    run but records no blend row has nothing to measure either, and that is itself the
+    failure: the blend that chose its names is missing, so its single check fails."""
     if panel is None:
         return []
+    if panel.shortlisted == 0:
+        return [
+            Check(
+                PROVENANCE,
+                "panel_blend",
+                None,
+                f"no blend rows for panel run {panel.run_id}",
+                "a blend row for every shortlisted name",
+                False,
+            )
+        ]
     return [
         Check(
             PROVENANCE,
@@ -576,13 +589,15 @@ _BASKET = """
     FROM agb.basket WHERE id = %s
 """
 # The blend behind the basket, if a panel scored it. stddev_pop is NULL for no scored rows
-# and 0 for one, so the count decides whether there is a spread to read at all.
+# and 0 for one, so the count decides whether there is a spread to read at all. The join is
+# outer so that a basket naming a panel run with no blend rows still reads as a panel basket,
+# with nothing shortlisted, rather than as one no panel touched.
 _PANEL = """
     SELECT b.panel_run_id, b.panel_w,
-           count(*) FILTER (WHERE NOT l.neutral), count(*),
+           count(l.id) FILTER (WHERE NOT l.neutral), count(l.id),
            stddev_pop(l.llm_score) FILTER (WHERE NOT l.neutral)
     FROM agb.basket b
-    JOIN agb.basket_blend l ON l.basket_id = b.id
+    LEFT JOIN agb.basket_blend l ON l.basket_id = b.id
     WHERE b.id = %s AND b.panel_run_id IS NOT NULL
     GROUP BY b.panel_run_id, b.panel_w
 """

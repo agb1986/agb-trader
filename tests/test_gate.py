@@ -17,8 +17,9 @@ from market_fake import PERIOD, SIGNAL, TRADE
 from psycopg import errors
 from registry_fake import ARTIFACT
 
-from agb import approval, basket, corporate, gate
+from agb import approval, basket, corporate, gate, panel
 from agb.gate import GateError
+from agb.roles import OWNER, SERVICE_ROLES
 
 NAMES = [f"N{i:02d}" for i in range(1, 21)]
 HELD = [f"H{i:02d}" for i in range(1, 11)]
@@ -506,6 +507,32 @@ def test_the_cutoff_moves_with_an_early_close():
     )
 
 
+# A basket that names a panel run but records none of its blend: the panel's name is on it and
+# nothing it scored is.
+BLENDLESS = gate.Panel(1, Decimal("0.2"), 0, 0, None)
+
+
+def test_a_panel_basket_with_no_blend_rows_fails_with_a_named_cause():
+    """Coverage of none of nothing would read as complete, so a missing blend is not measured
+    for coverage or spread: it fails on its own check, which names the run it is missing."""
+    checks = evaluate(Case(replace(BASE, panel=BLENDLESS)))
+
+    assert [
+        (c.level, c.name, c.measured, c.threshold, c.passed)
+        for c in checks
+        if c.name.startswith("panel")
+    ] == [
+        (
+            "provenance",
+            "panel_blend",
+            "no blend rows for panel run 1",
+            "a blend row for every shortlisted name",
+            False,
+        )
+    ]
+    assert {c.name for c in checks if not c.passed} == {"panel_blend"}
+
+
 # The gate in the database.
 
 
@@ -513,9 +540,10 @@ def rows(db, query, *params):
     return db.connect("cli").execute(query, params).fetchall()
 
 
-def insert(db, target=BASE, reference=None, proposed=True):
+def insert(db, target=BASE, reference=None, proposed=True, panel_run=(None, None, None)):
     """Write `target` as the pipeline does, and propose it unless told otherwise. A basket with
-    a model digest names the stand-in model's certification, which this records."""
+    a model digest names the stand-in model's certification, which this records. `panel_run`
+    is the panel configuration, run and weight it was blended with, none by default."""
     certification_id = registry_fake.certify(db) if target.model_sha256 else None
     conn = db.connect("pipeline")
     reference = reference or target.period
@@ -523,8 +551,9 @@ def insert(db, target=BASE, reference=None, proposed=True):
         [(basket_id,)] = conn.execute(
             "INSERT INTO agb.basket (reference, period, session_date, signal_date, snapshot_date,"
             " partition_hash, universe_size, ranker, model_certification_id, model_sha256,"
-            " cost_model_version, capital_usd, actor)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, '1', %s, 'pipeline') RETURNING id",
+            " cost_model_version, capital_usd, actor, panel_config_id, panel_run_id, panel_w)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, '1', %s, 'pipeline', %s, %s, %s)"
+            " RETURNING id",
             (
                 reference,
                 target.period,
@@ -537,6 +566,7 @@ def insert(db, target=BASE, reference=None, proposed=True):
                 certification_id,
                 target.model_sha256,
                 target.capital,
+                *panel_run,
             ),
         ).fetchall()
         with conn.cursor() as cur:
@@ -914,6 +944,13 @@ def go_live(db, reason="promoted"):
     )
 
 
+# A name the pipeline might add to a basket's blend: one the panel did not score.
+LATE_BLEND = (
+    "INSERT INTO agb.basket_blend (basket_id, symbol, stage1_rank, stage1_rank_pct,"
+    " llm_score_pct, neutral, final_score) VALUES (%s, 'X', 99, 1, 0.5, true, 0)"
+)
+
+
 def test_once_the_gate_has_run_the_basket_and_its_result_are_frozen(db):
     go_live(db)
     basket_id = insert(db)
@@ -928,6 +965,7 @@ def test_once_the_gate_has_run_the_basket_and_its_result_are_frozen(db):
         "INSERT INTO agb.basket_order (basket_id, client_order_id, symbol, side, qty,"
         " reference_price, notional_usd, cost_model_version, floor_bps, impact_bps, fees_usd,"
         " modelled_cost_bps) VALUES (%s, 'late-X', 'X', 'buy', 1, 1, 1, '1', 0, 0, 0, 0)",
+        LATE_BLEND,
     ):
         with pytest.raises(errors.CheckViolation, match="content is frozen once the gate has run"):
             pipeline.execute(statement, (basket_id,))
@@ -952,6 +990,70 @@ def test_once_the_gate_has_run_the_basket_and_its_result_are_frozen(db):
     assert rows(db, "SELECT count(*) FROM agb.basket_target WHERE basket_id = %s", basket_id) == [
         (20,)
     ]
+
+
+def blended(db):
+    """A panel configuration and a run of it as the pipeline records them, for a basket to
+    name. The run scored nothing: what the basket records of it is up to the test."""
+    config_id = panel.create_config(db.connect("cli"), "operator", shortlist_n=25, w=0.2)
+    [(run_id,)] = (
+        db.connect("pipeline")
+        .execute(
+            "INSERT INTO agb.panel_run (panel_config_id, as_of, actor)"
+            " VALUES (%s, %s, 'pipeline') RETURNING id",
+            (config_id, BASE.session_date),
+        )
+        .fetchall()
+    )
+    return config_id, run_id, Decimal("0.2")
+
+
+def test_a_panel_basket_with_no_blend_rows_halts_on_the_missing_blend(db):
+    """The panel's name on a basket with none of its blend: before, the join found no rows and
+    read the basket as one no panel touched, so neither panel check ran and it passed."""
+    panel_run = blended(db)
+    basket_id = insert(db, panel_run=panel_run)
+
+    assert gate.load(db.connect("pipeline"), basket_id).panel == gate.Panel(
+        panel_run[1], Decimal("0.2"), 0, 0, None
+    )
+    verdict = run(db, basket_id)
+
+    assert (verdict.state, {c.name for c in verdict.failed}) == ("halted", {"panel_blend"})
+    assert rows(db, "SELECT name, measured FROM agb.gate_check WHERE NOT passed") == [
+        ("panel_blend", f"no blend rows for panel run {panel_run[1]}")
+    ]
+    [(cause, reason)] = rows(db, "SELECT cause, reason FROM agb.halt_open")
+    assert cause == "gate_breach"
+    assert reason.startswith("pre-trade gate failed: panel_blend")
+
+
+@pytest.mark.parametrize("role", SERVICE_ROLES)
+def test_no_service_role_may_edit_or_delete_a_basket_blend(db, role):
+    basket_id = insert(db)
+    db.connect("pipeline").execute(LATE_BLEND, (basket_id,))
+    conn = db.connect(role)
+
+    for statement in (
+        "UPDATE agb.basket_blend SET final_score = 1",
+        "DELETE FROM agb.basket_blend",
+    ):
+        with pytest.raises(errors.InsufficientPrivilege):
+            conn.execute(statement)
+
+
+def test_the_owner_may_not_edit_or_delete_a_basket_blend_either(db):
+    basket_id = insert(db)
+    db.connect("pipeline").execute(LATE_BLEND, (basket_id,))
+    owner = db.connect(OWNER)
+
+    for op, statement in (
+        ("UPDATE", "UPDATE agb.basket_blend SET final_score = 1"),
+        ("DELETE", "DELETE FROM agb.basket_blend"),
+    ):
+        with pytest.raises(errors.RaiseException, match=f"append-only: {op} refused"):
+            owner.execute(statement)
+    assert rows(db, "SELECT symbol, final_score FROM agb.basket_blend") == [("X", 0.0)]
 
 
 def test_a_second_run_reads_the_recorded_verdict_back(db):
