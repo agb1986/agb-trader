@@ -281,6 +281,22 @@ def _where(conn: psycopg.Connection) -> str:
     return f"database {info.dbname} on {info.host or 'a local socket'} as {info.user}"
 
 
+def _acknowledge(args: argparse.Namespace) -> int:
+    from agb import jobs
+
+    with psycopg.connect(application_name="agb-cli") as conn:
+        try:
+            added = jobs.acknowledge(conn, args.job_id, args.actor, args.reason)
+        except jobs.NotAcknowledged as exc:
+            print(f"agb: refused: {exc}", file=sys.stderr)
+            return 1
+    if added:
+        print(f"job {args.job_id} acknowledged; it no longer shows in agb.overdue")
+    else:
+        print(f"job {args.job_id} was already acknowledged; the first acknowledgement stands")
+    return 0
+
+
 def _void(args: argparse.Namespace) -> int:
     from agb import registry
 
@@ -734,6 +750,16 @@ def main(argv: list[str] | None = None) -> int:
     promote.add_argument("--reason", help="why the waiver is being taken, for the audit log")
     promote.add_argument("--actor", **actor)
     promote.set_defaults(run=_promote)
+    acknowledge = commands.add_parser(
+        "acknowledge",
+        help="acknowledge a failed job, which takes it out of the overdue view",
+        description="Refuses a job that has not failed. A failed job also leaves the overdue "
+        "view on its own once it is older than agb.failed_overdue_age() (default 14 days).",
+    )
+    acknowledge.add_argument("job_id", type=int, help="the failed job, as agb.job_state shows it")
+    acknowledge.add_argument("--reason", required=True, help="what was decided, kept with it")
+    acknowledge.add_argument("--actor", **actor)
+    acknowledge.set_defaults(run=_acknowledge)
     void = commands.add_parser(
         "void",
         help="void a model's certification for good",

@@ -264,6 +264,23 @@ ls -l backups/
 The failure's message is in `./agb-stack logs backup` and in the job's `failed` event in
 `agb.job_event`.
 
+A failed job is never retried, so its expected events would stay overdue for good. They leave
+the overdue view once the failure is acknowledged, or once it is older than
+`agb.failed_overdue_age`, 14 days unless set otherwise. Acknowledge a failed job, by its id,
+once you have dealt with it:
+
+```sh
+./agb-stack exec -T db psql -U postgres -d agb -c \
+  "SELECT s.id, s.kind, s.period, e.detail FROM agb.job_state s
+   JOIN agb.job_event e ON e.job_id = s.id AND e.event = 'failed'"
+./agb-stack agb acknowledge 1234 --reason "re-ran the backup by hand"
+./agb-stack exec -T db psql -U postgres -d agb -c \
+  "ALTER DATABASE agb SET agb.failed_overdue_age = '7 days'"
+```
+
+Only a failed job can be acknowledged, only once, and only through the `cli` role. The
+acknowledgement is kept in `agb.job_acknowledgement`.
+
 ### What the backups hold, and who can read them
 
 The dumps hold every table in the database: orders, fills, positions, the audit log, and the
@@ -330,13 +347,25 @@ the fundamentals the vendor changed since a week before the last pull, and the t
 delisted tickers included. It records each partition's date
 and SHA-256 in `agb.lake_snapshot`. If the vendor has not published a session yet, or has
 published fewer than 90% of the rows the session before it had, the service lands the
-complete sessions before it and tries again every 15 minutes, without an alert of its own.
+complete sessions before it and tries again every 15 minutes, without an alert of its own,
+until two hours after the next session's close. A pull still waiting then can no longer be
+used: it fails once, as expired, with a `pipeline_job_failed` alert, and is never tried again.
 A request that meets a vendor error is tried up to three times with backoff, honouring
 `Retry-After`; an error that outlasts the tries fails the job and raises a
-`pipeline_job_failed` alert. A pull that fails, or never completes, shows in the overdue
-view from the next open. A gap of more than 45 days is left to the backfill below. Re-running
-a pull for a session that already landed writes the same bytes, so it leaves each file and
-its hash as they were.
+`pipeline_job_failed` alert.
+
+The service sorts any other failure by its type, in one place (`classify` in
+`agb.services.pipeline`), and the failed event names the class. A transient error, such as a
+local disk or network error or a lost database or DuckDB connection, releases the job, and a
+later cycle claims it again; after three releases the next transient error fails it. A
+missing setting, such as an unset `SHARADAR_API_KEY` or `EDGAR_USER_AGENT`, holds the job and
+raises one `pipeline_job_held` alert, and the job is tried each cycle until its deadline, when
+it fails as expired. Anything else is permanent and fails the job at once. A rebalance whose
+inputs are not ready waits the same way, until its market-on-close cutoff.
+
+A pull that fails, or never completes, shows in the overdue view from the next open. A gap of
+more than 45 days is left to the backfill below. Re-running a pull for a session that already
+landed writes the same bytes, so it leaves each file and its hash as they were.
 
 The first time, land the history from 1998 on. It downloads the vendor's full exports, so
 it takes a while, and it is safe to run again:
