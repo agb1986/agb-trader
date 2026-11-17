@@ -170,7 +170,7 @@ def test_each_command_answers_from_the_database_after_a_paper_rebalance(db, pape
     assert blocks(gate)[1] == "  ok  snapshot_date\n        measured 2026-09-30, needs 2026-09-30"
     assert "  ok  notional, 20 orders\n        measured 4.80% of 100000.00, needs <= 8%" in gate
     assert "  ok  suspend_trade\n        measured false, needs false" in gate
-    assert blocks(gate)[-1] == "152 of 152 checks passed."
+    assert blocks(gate)[-1] == "153 of 153 checks passed."
 
     assert blocks(log)[0] == f"LOG — last {readout.LOG_DEFAULT} events, oldest first"
     assert len(blocks(log)) == 1 + readout.LOG_DEFAULT
@@ -410,7 +410,7 @@ def test_after_a_gate_halt_gate_leads_with_the_failing_check_and_its_measurement
     assert_style(gate)
     assert blocks(gate)[1] == "  FAIL  universe_size\n          measured 1499, needs 1500 to 3500"
     assert blocks(gate)[2] == "  ok  snapshot_date\n        measured 2026-09-30, needs 2026-09-30"
-    assert blocks(gate)[-1] == "1 of 108 checks failed. The rebalance was halted."
+    assert blocks(gate)[-1] == "1 of 109 checks failed. The rebalance was halted."
 
     telegram = FakeTelegram()
     cycle(db, telegram)
@@ -444,7 +444,7 @@ def test_a_failed_broker_check_raises_the_gate_halt_alert_too(db):
     assert blocks(halted)[1] == "  FAIL  suspend_trade\n          measured true, needs false"
     [gate] = ask(db, "/gate")
     assert blocks(gate)[1] == blocks(halted)[1]
-    assert blocks(gate)[-1] == "1 of 152 checks failed. The rebalance was halted."
+    assert blocks(gate)[-1] == "1 of 153 checks failed. The rebalance was halted."
 
 
 def test_log_reads_the_audit_view_and_shows_the_system_as_an_actor(db, paper):

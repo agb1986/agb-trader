@@ -143,6 +143,63 @@ def test_orders_buy_whole_shares_of_each_weight_and_sell_whole_positions():
     assert plan[1].notional == Decimal("4995.0")
 
 
+def _top_up(held, price=Decimal("10"), capital=Decimal("100000")):
+    """The plan for one kept name, K, holding `held` shares at `price`, with C carried."""
+    selection = Selection(keep=("K",), buy=(), sell=(), carry=("C",))
+    return rebalance.orders(
+        selection,
+        rebalance.weights(selection.names),
+        {"K": price, "C": price},
+        {"K": held, "C": 1},
+        capital,
+    )
+
+
+def test_a_kept_name_at_two_percent_of_the_book_is_bought_back_to_its_weight():
+    """A partial fill left K at 200 shares, $2,000 of $100,000: three points under its
+    twentieth, so the rebalance buys the 300 shares that bring it back to $5,000."""
+    assert _top_up(200) == [Order("K", Side.BUY, 300, Decimal("10"))]
+
+
+def test_a_top_up_buys_whole_shares_rounded_down():
+    assert _top_up(Decimal(100), price=Decimal("33")) == [
+        Order("K", Side.BUY, 51, Decimal("33"))  # floor((5000 - 3300) / 33)
+    ]
+
+
+def test_a_kept_name_within_the_tolerance_is_left_alone():
+    assert _top_up(401) == []  # $4,010: 0.99 points under
+    assert _top_up(400) == []  # $4,000: exactly one point under is still inside
+    assert _top_up(399) == [Order("K", Side.BUY, 101, Decimal("10"))]
+
+
+def test_a_kept_name_over_its_weight_is_not_trimmed():
+    assert _top_up(900) == []  # $9,000, 9% of the book
+
+
+def test_a_top_up_that_buys_no_whole_share_is_skipped():
+    """A gap over the tolerance but under one share's price buys nothing, and the rebalance
+    goes on rather than refusing as it would for an entering name."""
+    assert _top_up(1, price=Decimal("3000")) == []  # $3,000: $2,000 short, a share is $3,000
+
+
+def test_top_ups_follow_the_buys_of_entering_names():
+    selection = Selection(keep=("K",), buy=("B",), sell=("S",), carry=())
+    plan = rebalance.orders(
+        selection,
+        rebalance.weights(selection.names),
+        {"K": Decimal("10"), "B": Decimal("10"), "S": Decimal("10")},
+        {"K": 100, "S": 50},
+        Decimal("100000"),
+    )
+
+    assert plan == [
+        Order("S", Side.SELL, 50, Decimal("10")),
+        Order("B", Side.BUY, 500, Decimal("10")),
+        Order("K", Side.BUY, 400, Decimal("10")),
+    ]
+
+
 def test_a_weight_that_buys_no_whole_share_is_an_error():
     selection = Selection((), ("X",), (), ())
     with pytest.raises(ValueError, match="X: 50.00 buys no whole share"):

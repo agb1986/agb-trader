@@ -132,6 +132,39 @@ def test_the_strategy_runs_the_rebalance_code_the_pipeline_runs(
     assert {len(args[2]) for args, _, _ in calls["liquidity"]} == {backtest.LIQUIDITY_BARS}
 
 
+def test_the_backtest_does_not_top_up_a_kept_name_that_has_drifted_under_its_weight(
+    research_panel, research_lake, ledger, monkeypatch
+):
+    """Live buys a kept name back to its weight once it sits more than a point under it; the
+    backtest does not, so its plans are the sells and entering buys it made before top-ups
+    existed, and its results stay those the promoted model was certified on. The fake market
+    drifts kept names far enough that live would have topped some up, which is what makes this
+    a test of the switch and not of a quiet month."""
+    real = rebalance.orders
+    calls: list = []
+
+    def spy(*args, **kwargs):
+        # The book is the engine's own dict and moves on after the month, so the plan live
+        # would have made is computed now, on the same inputs.
+        result = real(*args, **kwargs)
+        calls.append((args[0], kwargs, result, real(*args)))
+        return result
+
+    monkeypatch.setattr(rebalance, "orders", spy)
+    options = backtest.Options(signal="mom_6_1", **SMALL)
+    backtest.run(sliced(research_panel, 12), options, ledger, lake_dir=research_lake)
+
+    assert calls
+    drifted = 0
+    for selection, kwargs, plan, live in calls:
+        assert kwargs == {"top_up": False}
+        top_ups = [o for o in live if o.side is rebalance.Side.BUY and o.symbol in selection.keep]
+        drifted += bool(top_ups)
+        assert plan == [o for o in live if o not in top_ups], "the plan without the top-ups"
+        assert not {o.symbol for o in plan if o.side is rebalance.Side.BUY} & set(selection.keep)
+    assert drifted, "no month had a kept name live would have topped up"
+
+
 # Fills, costs and fees ------------------------------------------------------------------------
 
 

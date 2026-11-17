@@ -37,8 +37,8 @@ def targets(symbols, weight=Decimal("0.05"), shares=Decimal(240)):
     return tuple(gate.Target(s, weight, shares) for s in symbols)
 
 
-def buy(symbol, qty=Decimal(240), notional=Decimal(4800), tif="cls"):
-    return gate.Order(symbol, "buy", qty, tif, notional)
+def buy(symbol, qty=Decimal(240), notional=Decimal(4800), tif="cls", cost=Decimal(0)):
+    return gate.Order(symbol, "buy", qty, tif, notional, cost)
 
 
 def sell(symbol, qty=Decimal(300), notional=Decimal(6000)):
@@ -114,6 +114,46 @@ OTHER_RANKER = gate.Held("placeholder-momentum-252-21", ZERO_HASH)
 RETRAINED = gate.Held(MODEL, ZERO_HASH)
 UNRECORDED = gate.Held(MODEL, None)
 
+# A kept name, N01, that a partial fill left at 100 shares: $2,000, 2% of the book, three
+# points under its twentieth, with no order to top it up.
+UNDERWEIGHT = Case(
+    replace(
+        BASE,
+        targets=targets(["N01"], shares=Decimal(100)) + targets(NAMES[1:]),
+        orders=BASE.orders[1:],
+    ),
+    book={"N01": Decimal(100)},
+)
+# The same name topped back up: 150 more shares bring it to 250, $5,000.
+TOPPED_UP = replace(
+    UNDERWEIGHT,
+    target=replace(
+        UNDERWEIGHT.target,
+        targets=targets(["N01"], shares=Decimal(250)) + targets(NAMES[1:]),
+        orders=(buy("N01", qty=Decimal(150), notional=Decimal(3000)), *BASE.orders[1:]),
+    ),
+)
+# Shares at $2,600, one to a name: each name is short of its $5,000 by less than a share, so
+# each passes, but the basket holds $52,000 of $100,000, far short of fully invested.
+DEAR = {s: Decimal(2600) for s in NAMES}
+UNDERINVESTED = Case(
+    replace(
+        BASE,
+        targets=targets(NAMES, shares=Decimal(1)),
+        orders=tuple(buy(s, qty=Decimal(1), notional=Decimal(2600)) for s in NAMES),
+    ),
+    marks=DEAR,
+)
+# Twenty $4,800 buys against $96,500 of equity, each modelled to cost $30: the targets fit,
+# but the $600 the trading costs leaves the account $100 overdrawn.
+OVERSPENT = Case(
+    replace(
+        BASE,
+        capital=Decimal(96500),
+        orders=tuple(buy(s, cost=Decimal(30)) for s in NAMES),
+    )
+)
+
 # Each fixture fails exactly the check it names, and nothing else.
 FAILURES = [
     pytest.param(Case(replace(BASE, snapshot_date=date(2026, 9, 29))), "snapshot_date",
@@ -129,15 +169,17 @@ FAILURES = [
                      orders=tuple(buy(s) for s in NAMES[:19]))),
         "positions", id="positions",
     ),
+    pytest.param(UNDERINVESTED, "weight_sum", id="weight_sum"),
+    pytest.param(UNDERWEIGHT, "weights", id="weights_under"),
     pytest.param(
-        Case(replace(BASE, targets=targets(NAMES[:19]) + targets(["N20"], Decimal("0.06")))),
-        "weight_sum", id="weight_sum",
+        Case(replace(BASE, targets=targets(["N01"], shares=Decimal(310)) + targets(NAMES[1:]),
+                     orders=(buy("N01", qty=Decimal(310), notional=Decimal(6200)),
+                             *BASE.orders[1:]))),
+        "weights", id="weights_over",
     ),
     pytest.param(Case(replace(BASE, targets=targets(NAMES[:19] + ["N01"]))), "duplicates",
                  id="duplicates"),
-    pytest.param(Case(replace(BASE, capital=Decimal(95000))), "cash", id="cash"),
-    pytest.param(Case(marks={s: p for s, p in MARKS.items() if s != "N05"}), "cash",
-                 id="cash_unmarked"),
+    pytest.param(OVERSPENT, "cash", id="cash"),
     pytest.param(TURNOVER, "turnover", id="turnover"),
     pytest.param(Case(members=MEMBERS - {"N05"}), "universe", id="universe"),
     pytest.param(Case(book={"N05": Decimal(100)}), "side", id="side"),
@@ -159,9 +201,9 @@ REFUSED_BY_SCHEMA = {"duplicates", "tif"}
 def test_a_sound_basket_passes_every_check_and_each_says_what_it_measured():
     checks = evaluate()
 
-    assert len(checks) == 3 + 5 + 5 * len(NAMES)
+    assert len(checks) == 3 + 6 + 5 * len(NAMES)
     assert all(c.passed for c in checks)
-    assert [(c.level, c.name, c.symbol, c.measured, c.threshold) for c in checks[:8]] == [
+    assert [(c.level, c.name, c.symbol, c.measured, c.threshold) for c in checks[:9]] == [
         ("provenance", "snapshot_date", None, "2026-09-30", "2026-09-30"),
         ("provenance", "universe_size", None, "2000", "1500 to 3500"),
         ("provenance", "model", None, f"{MODEL} {ARTIFACT[:12]}", f"{MODEL} {ARTIFACT[:12]}"),
@@ -172,20 +214,30 @@ def test_a_sound_basket_passes_every_check_and_each_says_what_it_measured():
             "20",
             "20, or fewer where a recorded forced event explains each one",
         ),
-        ("basket", "weight_sum", None, "1.00", "1 within 0.0001"),
+        ("basket", "weight_sum", None, "0.9600", "0.8000 to 1"),
+        (
+            "basket",
+            "weights",
+            None,
+            "4.80% to 4.80%",
+            "each name 5.00% within 1.00%, or under by at most one share;"
+            " a kept name not bought may sit over, and a carried name is exempt",
+        ),
         ("basket", "duplicates", None, "none", "none"),
-        ("basket", "cash", None, "4000.00", ">= 0"),
+        ("basket", "cash", None, "4000.00", ">= 0 after modelled costs"),
         ("basket", "turnover", None, "no book", "< 60%"),
     ]
-    assert [(c.level, c.name, c.symbol, c.measured, c.threshold) for c in checks[8:13]] == [
+    orders = checks[9:]
+    assert [(c.level, c.name, c.symbol, c.measured, c.threshold) for c in orders[:5]] == [
         ("order", "universe", "N01", "in the universe", "in the universe, or held for a sell"),
         ("order", "side", "N01", "buy 240, holding 0",
-         "a buy opens a position; a sell closes at most what is held"),
+         "a buy opens a position or tops a kept one up to its target;"
+         " a sell closes at most what is held"),
         ("order", "notional", "N01", "4.80% of 100000.00", "<= 8%"),
         ("order", "tif", "N01", "cls", "cls"),
         ("order", "clock", "N01", "2026-09-30 18:00 ET", "before 2026-10-01 15:45 ET"),
     ]  # fmt: skip
-    assert [c.symbol for c in checks[8:]] == [s for s in NAMES for _ in range(5)]
+    assert [c.symbol for c in orders] == [s for s in NAMES for _ in range(5)]
 
 
 @pytest.mark.parametrize(("case", "name"), FAILURES)
@@ -202,10 +254,50 @@ def test_the_failing_checks_say_what_they_measured():
         return [(c.symbol, c.measured) for c in evaluate(case) if not c.passed]
 
     assert failed(TURNOVER) == [(None, "70.00%")]
-    assert failed(Case(replace(BASE, capital=Decimal(95000)))) == [(None, "-1000.00")]
-    assert failed(Case(marks={})) == [(None, f"no mark for {', '.join(NAMES)}")]
+    assert failed(UNDERINVESTED) == [(None, "0.5200")]
+    assert failed(UNDERWEIGHT) == [(None, "N01 2.00%")]
+    assert failed(OVERSPENT) == [(None, "-100.00")]
+    unmarked = f"no mark for {', '.join(NAMES)}"
+    assert failed(Case(marks={})) == [
+        (None, unmarked),
+        (None, ", ".join(f"{s} no mark" for s in NAMES)),
+        (None, unmarked),
+    ]
     assert failed(Case(book={"N05": Decimal(100)})) == [("N05", "buy 240, holding 100")]
     assert failed(Case(now=LATE)) == [(s, "2026-10-01 15:45 ET") for s in NAMES]
+
+
+def test_a_kept_name_topped_up_to_its_target_passes_the_gate():
+    """A partial fill left N01 at 2% of the book. The buy that brings it back to its twentieth
+    is a buy on a held name, which the gate admits because it lands on the target."""
+    checks = {(c.name, c.symbol): c for c in evaluate(TOPPED_UP)}
+
+    assert all(c.passed for c in checks.values())
+    assert checks[("weights", None)].measured == "4.80% to 5.00%"
+    assert checks[("side", "N01")].measured == "buy 150, holding 100"
+
+
+def test_a_buy_on_a_held_name_that_misses_its_target_fails_the_side_check():
+    short_of_target = replace(
+        TOPPED_UP,
+        target=replace(
+            TOPPED_UP.target,
+            orders=(buy("N01", qty=Decimal(100), notional=Decimal(2000)), *BASE.orders[1:]),
+        ),
+    )
+
+    assert [(c.name, c.symbol) for c in evaluate(short_of_target) if not c.passed] == [
+        ("side", "N01")
+    ]
+
+
+def test_a_basket_whose_buys_exceed_its_cash_fails_the_gate():
+    """Twenty $4,800 buys fit $100,000 of equity with $4,000 to spare. Against $95,000 the same
+    buys leave the account $1,000 short before any cost, and the cash check refuses them."""
+    overdrawn = Case(replace(BASE, capital=Decimal(95000)))
+    cash = {c.name: c for c in evaluate(overdrawn)}["cash"]
+
+    assert (cash.measured, cash.passed) == ("-1000.00", False)
 
 
 def test_a_changed_ranker_admits_a_full_rotation_and_the_check_records_what_admitted_it():
@@ -379,9 +471,9 @@ def test_a_short_basket_the_record_explains_passes_and_leaves_the_slot_in_cash()
     assert [c.name for c in evaluate(SHORT) if not c.passed] == []
     assert (checks["positions"].measured, checks["weight_sum"].measured) == (
         "19, short 1 against 1 on the record",
-        "0.95",
+        "0.9120",
     )
-    assert checks["weight_sum"].threshold == "0.95 within 0.0001"
+    assert checks["weight_sum"].threshold == "0.7600 to 1"
     assert checks["cash"].measured == "8800.00"
 
 
@@ -460,10 +552,10 @@ def insert(db, target=BASE, reference=None, proposed=True):
                 "INSERT INTO agb.basket_order (basket_id, client_order_id, symbol, side, qty,"
                 " reference_price, notional_usd, cost_model_version, floor_bps, impact_bps,"
                 " fees_usd, modelled_cost_bps)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, '1', 0, 0, 0, 0)",
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, '1', 0, 0, 0, %s)",
                 [
                     (basket_id, f"{reference}-{o.symbol}", o.symbol, o.side, o.qty,
-                     o.notional / o.qty, o.notional)
+                     o.notional / o.qty, o.notional, o.cost / o.notional * 10000)
                     for o in target.orders
                 ],
             )  # fmt: skip
@@ -570,7 +662,7 @@ def test_a_pass_in_paper_records_every_check_and_the_system_approves(db):
         False,
     )
     assert rows(db, "SELECT basket_id, checks, mode, actor FROM agb.gate_run") == [
-        (basket_id, 108, "paper", "pipeline")
+        (basket_id, 109, "paper", "pipeline")
     ]
     recorded = rows(
         db,
@@ -841,7 +933,7 @@ def test_once_the_gate_has_run_the_basket_and_its_result_are_frozen(db):
             pipeline.execute(statement, (basket_id,))
 
     [(run_id,)] = rows(db, "SELECT id FROM agb.gate_run")
-    with pytest.raises(errors.CheckViolation, match="its 108 checks are recorded"):
+    with pytest.raises(errors.CheckViolation, match="its 109 checks are recorded"):
         pipeline.execute(
             "INSERT INTO agb.gate_check (run_id, level, name, measured, threshold, passed)"
             " VALUES (%s, 'basket', 'extra', 'x', 'y', true)",
@@ -856,7 +948,7 @@ def test_once_the_gate_has_run_the_basket_and_its_result_are_frozen(db):
     owner = db.connect("agb_owner")
     with pytest.raises(errors.RaiseException):
         owner.execute("UPDATE agb.gate_check SET passed = NOT passed")
-    assert rows(db, "SELECT count(*) FROM agb.gate_check") == [(108,)]
+    assert rows(db, "SELECT count(*) FROM agb.gate_check") == [(109,)]
     assert rows(db, "SELECT count(*) FROM agb.basket_target WHERE basket_id = %s", basket_id) == [
         (20,)
     ]
@@ -871,7 +963,7 @@ def test_a_second_run_reads_the_recorded_verdict_back(db):
 
     assert (again.recorded, again.state, again.checks) == (True, "approved", first.checks)
     assert rows(db, "SELECT count(*) FROM agb.gate_run") == [(1,)]
-    assert rows(db, "SELECT count(*) FROM agb.gate_check") == [(108,)]
+    assert rows(db, "SELECT count(*) FROM agb.gate_check") == [(109,)]
     assert rows(db, "SELECT count(*) FROM agb.basket_event") == [(2,)]
 
 

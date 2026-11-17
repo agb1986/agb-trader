@@ -6,9 +6,12 @@ be a second implementation of the strategy. The strategy here ranks each month's
 signal, exactly as `scan.ranking` does, and hands the ranking to `agb.rebalance.select`,
 `agb.rebalance.weights` and `agb.rebalance.orders`, the code the live basket runs, unchanged:
 the 20-buy, 30-hold buffer, the tie-breaks, the equal weights and the whole-share sizing all
-come from there. NautilusTrader has no cross-sectional abstraction of its own, so what the
-strategy adds is only the clock: it decides at the close of each month's signal session and
-trades at the close of the next session, as the live pipeline does.
+come from there. The one switch it sets is `top_up=False`: live buys a kept name back to its
+weight once it sits more than a point under it, and the backtest does not, because its results
+are the ones the promoted model was certified on and a top-up would change them.
+NautilusTrader has no cross-sectional abstraction of its own, so what the strategy adds is only
+the clock: it decides at the close of each month's signal session and trades at the close of
+the next session, as the live pipeline does.
 
     signal session L   `month.snapshot_date`: the ranking, the held names, the prints and the
                        liquidity are read from the bars through this session, and the plan is
@@ -979,8 +982,15 @@ class _Rebalancer(Strategy):
         if equity <= 0:
             raise BacktestError(f"{month.as_of}: the account is worth {equity:.2f}")
         weight = rebalance.weights(selection.names, options.size)
+        # Live tops up a kept name that has fallen more than a point under its weight; the
+        # backtest does not, so its numbers stay those the promoted model was certified on.
         plan = rebalance.orders(
-            selection, weight, prints, self.positions, Decimal(str(round(equity, 2)))
+            selection,
+            weight,
+            prints,
+            self.positions,
+            Decimal(str(round(equity, 2))),
+            top_up=False,
         )
         for order in plan:
             self.book.liquidity[order.symbol] = feed.liquidity(order.symbol, day)
