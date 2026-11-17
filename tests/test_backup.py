@@ -7,7 +7,6 @@ import os
 import stat
 import subprocess
 import threading
-import time
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -21,6 +20,11 @@ from agb.services import backup
 from agb.services.backup import Backup, copy_bodies, prune
 
 PERIOD = "2026-09-14"
+# The test's own clock. The jobs it plans are claimable from an instant before the real one,
+# and a job planned for the far future is not claimable yet.
+NOW = datetime(2026, 9, 14, 12, tzinfo=UTC)
+FAR_AHEAD = datetime(2100, 1, 1, tzinfo=UTC)
+LAPSED = timedelta(seconds=-1)  # a lease that is already over when it is taken
 DUMP = f"agb-{PERIOD}.sql.gz"
 MINUTE = timedelta(minutes=1)
 COMPLETE = b"SELECT 1;\n-- PostgreSQL database dump complete\n"
@@ -36,7 +40,7 @@ FAKE_DUMP = fake(f"printf '{COMPLETE.decode()}'")
 
 def plan_backup(db, period=PERIOD, *, start=None):
     """The scheduler's backup job for `period`, claimable from `start`. Returns when it is due."""
-    start = start or datetime.now(UTC) - timedelta(hours=1)
+    start = start or NOW - timedelta(hours=1)
     due = start + schedule.BACKUP_GRACE
     job = Planned(
         schedule.BACKUP,
@@ -122,7 +126,7 @@ def test_a_failed_dump_is_overdue_and_prunes_nothing(db, tmp_path, command, deta
 
 
 def test_nothing_is_dumped_before_the_job_is_due(db, tmp_path):
-    plan_backup(db, start=datetime.now(UTC) + timedelta(hours=1))
+    plan_backup(db, start=FAR_AHEAD)
     Backup(tmp_path, pg_dump=("/nonexistent/pg_dump",))(db.connect("backup"))
     assert names(tmp_path) == []
 
@@ -130,8 +134,7 @@ def test_nothing_is_dumped_before_the_job_is_due(db, tmp_path):
 def test_a_backup_whose_lease_expired_is_redone(db, tmp_path):
     plan_backup(db)
     conn = db.connect("backup")
-    assert jobs.claim(conn, [schedule.BACKUP], "backup", timedelta(milliseconds=1))
-    time.sleep(0.05)
+    assert jobs.claim(conn, [schedule.BACKUP], "backup", LAPSED)
 
     Backup(tmp_path, pg_dump=FAKE_DUMP)(conn)
 
@@ -228,10 +231,9 @@ def test_a_real_dump_restores_into_a_scratch_database(db, tmp_path, monkeypatch)
     cluster = db.cluster
     for key, value in db.pg_env("backup").items():
         monkeypatch.setenv(key, value)
-    now = datetime.now(UTC)
-    heartbeat.beat(db.connect("scheduler"), now, "v1")
-    heartbeat.beat(db.connect("backup"), now, "v1")
-    later = now + timedelta(days=1)
+    heartbeat.beat(db.connect("scheduler"), NOW, "v1")
+    heartbeat.beat(db.connect("backup"), NOW, "v1")
+    later = NOW + timedelta(days=1)
     pull = Planned(
         schedule.DATA_PULL,
         "2026-09-15",

@@ -53,8 +53,11 @@ make cover      # the fast tests with coverage; fails below the floor in pyproje
 ```
 
 The tests start their own throwaway Postgres container on a random local port and never
-touch the stack's database, so several worktrees can run them at once. The stack test brings up
-its own Compose project with the UI published on a free local port (`AGB_UI_PORT`), so it runs
+touch the stack's database, so several worktrees can run them at once. Each container carries
+the label `agb.test=1` and the pid of the run that started it (`agb.test.pid`); at the start of
+a session the suite removes labelled containers whose run is gone, and nothing else, so a
+killed run does not leave one behind and `agb-trader-db-1` and `agb-trader-ui-1` are never
+touched. The stack test brings up its own Compose project with the UI published on a free local port (`AGB_UI_PORT`), so it runs
 beside a stack that holds `127.0.0.1:8080`; it asserts that every service beats, that `agb
 status` lists them all and that the UI answers on its landing page, and it removes its project
 when it fails or is interrupted.
