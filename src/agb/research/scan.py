@@ -27,6 +27,7 @@ the divergence on the real lake.
 Each scan is a trial, like a model fit: its options, its signal and its results append a
 row."""
 
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
@@ -191,29 +192,44 @@ def simulate(orders: Orders, options: Options) -> Simulation:
     )
     value = portfolio.value()
     value = value.iloc[:, 0] if isinstance(value, pd.DataFrame) else value
-    returns = value.pct_change().dropna()
-    months = len(returns)
-    total = float(value.iloc[-1] / options.init_cash - 1.0)
-    annual = (1.0 + total) ** (MONTHS_PER_YEAR / months) - 1.0 if months else 0.0
-    vol = float(returns.std(ddof=1) * np.sqrt(MONTHS_PER_YEAR)) if months > 1 else None
-    drawdown = float((value / value.cummax() - 1.0).min())
     trades = portfolio.orders.records_readable
     # Under a shared cash group vectorbt names each column (group, ticker); keep the ticker.
     trades["Column"] = [col[-1] if isinstance(col, tuple) else col for col in trades["Column"]]
     fees_paid = float(trades["Fees"].sum())
     results = {
-        "months": months,
-        "total_return": total,
-        "annual_return": float(annual),
-        "annual_volatility": vol,
-        "sharpe": None if not vol else float(annual / vol),
-        "max_drawdown": drawdown,
+        **metrics(value.to_numpy(), options.init_cash),
         "fees_paid": fees_paid,
         "fees_fraction": fees_paid / options.init_cash,
         "orders": int(len(trades)),
         "final_value": float(value.iloc[-1]),
     }
     return Simulation(results, trades)
+
+
+def metrics(marks: Sequence[float] | np.ndarray, init_cash: float) -> dict[str, Any]:
+    """The summary of an equity curve that the scan and the backtest both report: the
+    account's value at each mark, the first a month before the second, measured against the
+    starting cash.
+
+    The monthly returns are the ratios of consecutive marks, the annual return compounds the
+    total over the months there are, the volatility is the sample deviation of the monthly
+    returns scaled by the square root of twelve, and the Sharpe ratio is the one over the other
+    with no risk-free rate. A curve of fewer than three marks has no volatility and so no
+    Sharpe ratio."""
+    curve = np.asarray(marks, dtype="float64")
+    returns = curve[1:] / curve[:-1] - 1.0
+    months = len(returns)
+    total = float(curve[-1] / init_cash - 1.0)
+    annual = (1.0 + total) ** (MONTHS_PER_YEAR / months) - 1.0 if months else 0.0
+    vol = float(np.std(returns, ddof=1) * np.sqrt(MONTHS_PER_YEAR)) if months > 1 else None
+    return {
+        "months": months,
+        "total_return": total,
+        "annual_return": float(annual),
+        "annual_volatility": vol,
+        "sharpe": None if not vol else float(annual / vol),
+        "max_drawdown": float((curve / np.maximum.accumulate(curve) - 1.0).min()),
+    }
 
 
 def _prices(conn, tickers: list[str], sessions: list[date]) -> pd.DataFrame:

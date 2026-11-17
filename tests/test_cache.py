@@ -14,7 +14,7 @@ counts, since a certification served entirely from the cache still fits the mode
 Counting is stronger than timing a run that takes seconds either way on a fake market."""
 
 import shutil
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import pandas as pd
 import pytest
@@ -201,6 +201,61 @@ def test_turning_the_cache_off_recomputes_and_writes_the_rows(panel, research_la
     assert again.manifest["sharpe_net"] == original.manifest["sharpe_net"]
     assert again.manifest["path_quantiles"] == original.manifest["path_quantiles"]
     assert again.manifest["participation_max"] == original.manifest["participation_max"]
+
+
+def test_a_certification_after_a_plain_cpcv_does_no_cross_validation_refit(
+    panel, research_lake, tmp_path, monkeypatch
+):
+    """A cross-validation the operator runs by hand, with no scores asked for, fills the entry
+    the certification of the same configuration reads, so the certification refits only the
+    model it ships. Issue #188."""
+    ledger = Ledger(tmp_path / trials.FILE)
+    plain = cpcv.run(panel, MODEL, VALIDATION, ledger, cache=cache.Cache.under(tmp_path))
+    fits: list[int] = []
+    monkeypatch.setattr(train, "fit", counted(train.fit, fits))
+    certified = certify_run(panel, ledger, research_lake, MODEL_ID)
+    assert len(fits) == 1, "the only fit is the model the certification ships"
+    assert certified.manifest["cpcv_trial_id"] == plain.trial_id
+    assert kinds(ledger) == ["cpcv", "certification", "backtest"]
+
+
+def test_a_plain_cpcv_run_again_is_served_without_a_refit(panel, tmp_path, monkeypatch):
+    ledger = Ledger(tmp_path / trials.FILE)
+    kept = cache.Cache.under(tmp_path)
+    first = cpcv.run(panel, MODEL, VALIDATION, ledger, cache=kept)
+    monkeypatch.setattr(train, "fit", refuse("train.fit"))
+    again = cpcv.run(panel, MODEL, VALIDATION, ledger, cache=kept)
+    assert (again.trial_id, again.results) == (first.trial_id, first.results)
+    assert kinds(ledger) == ["cpcv"]
+
+
+@pytest.mark.parametrize("version", ["test-build", ""])
+def test_the_cpcv_command_fills_the_cache_only_for_a_versioned_build(
+    panel, version, tmp_path, monkeypatch
+):
+    """The command a certification follows writes the entry it reads, under the same key, and
+    a `dev` build, which `certify` refuses, writes none."""
+    from agb.research.__main__ import main
+
+    monkeypatch.setenv("AGB_VERSION", version)
+    monkeypatch.setenv("AGB_RESEARCH_DIR", str(tmp_path))
+    saved = tmp_path / "panel.parquet"
+    panel.save(saved)
+    main([
+        "cpcv", "--panel", str(saved), "--rounds", "20", "--min-leaf", "5",
+        "--groups", "6", "--test-groups", "2", "--embargo-months", "1",
+    ])  # fmt: skip
+    kept = cache.Cache.under(tmp_path)
+    if not version:
+        assert not kept.root.exists()
+        return
+    entry = cache.cpcv_key(
+        kept, Panel.load(saved), model=MODEL.to_dict(), options=asdict(VALIDATION)
+    )
+    payload = entry.read()
+    assert payload is not None and entry.table() is not None
+    [row] = Ledger(tmp_path / trials.FILE).rows()
+    assert payload["trial_id"] == row["trial_id"]
 
 
 # (b): what a change misses ------------------------------------------------------------------
