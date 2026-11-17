@@ -95,11 +95,17 @@ def bootstrap(admin: psycopg.Connection, passwords: Mapping[str, str]) -> None:
 
     `admin` is a superuser connection to the target database. Each role logs in with its own
     password, is never a superuser, and sees UTC timestamps.
+
+    No password reaches the server. Each one is turned into a SCRAM-SHA-256 verifier here, by
+    libpq, as psql's `\\password` does, and the statement carries only the verifier, which
+    Postgres stores as given. A statement log, or an error that echoes the statement, shows a
+    salted hash a client cannot log in with.
     """
     dbname = admin.info.dbname
     with admin.transaction():
         for role in ALL_ROLES:
-            ident, password = sql.Identifier(role), sql.Literal(passwords[role])
+            ident = sql.Identifier(role)
+            password = sql.Literal(verifier(admin, role, passwords[role]))
             exists = admin.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
             verb = sql.SQL("ALTER" if exists.fetchone() else "CREATE")
             admin.execute(
@@ -122,6 +128,16 @@ def bootstrap(admin: psycopg.Connection, passwords: Mapping[str, str]) -> None:
             )
         )
     log.info("bootstrapped roles %s on %s", ", ".join(ALL_ROLES), dbname)
+
+
+def verifier(conn: psycopg.Connection, role: str, password: str) -> str:
+    """The SCRAM-SHA-256 verifier for `role`'s `password`, computed on this side of `conn`.
+
+    A fresh random salt each call, so the stored secret changes on every bootstrap even when
+    the password does not; logins are unaffected.
+    """
+    encrypted = conn.pgconn.encrypt_password(password.encode(), role.encode(), b"scram-sha-256")
+    return encrypted.decode()
 
 
 def applied(owner: psycopg.Connection) -> dict[str, str]:

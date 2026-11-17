@@ -68,6 +68,89 @@ def test_every_service_has_a_memory_limit(resolved):
         assert service.get("mem_limit"), name
 
 
+def test_every_service_has_a_process_limit(resolved):
+    """Issue #190: a runaway fork or thread pool stops at its own ceiling, not the host's."""
+    for name, service in resolved["services"].items():
+        limit = service.get("pids_limit")
+        assert isinstance(limit, int) and limit > 0, name
+
+
+def test_every_service_drops_every_capability_and_cannot_gain_privileges(resolved):
+    """Issue #190: no service starts with Docker's default capability set, and only gluetun
+    adds any back: NET_ADMIN for the tunnel, CHOWN and DAC_OVERRIDE for its own state files."""
+    for name, service in resolved["services"].items():
+        assert service.get("cap_drop") == ["ALL"], name
+        assert "no-new-privileges:true" in service.get("security_opt", []), name
+        expected = ["NET_ADMIN", "CHOWN", "DAC_OVERRIDE"] if name == "vpn" else None
+        assert service.get("cap_add") == expected, name
+
+
+def test_every_service_but_the_vpn_has_a_read_only_root(resolved):
+    """Issue #190: what a service writes goes to a volume, a bind mount or a tmpfs. gluetun
+    writes /etc/passwd as it starts, so its root stays writable."""
+    for name, service in resolved["services"].items():
+        if name == "vpn":
+            assert not service.get("read_only"), name
+            continue
+        assert service.get("read_only") is True, name
+        assert "/tmp" in service.get("tmpfs", []), name
+
+
+def test_the_database_runs_as_postgres_with_a_tmpfs_for_its_socket(resolved):
+    """Started as root, the Postgres entrypoint needs CHOWN, SETUID and SETGID to step down.
+    Started as its own user it needs none, and writes only its volume and the socket directory."""
+    db = resolved["services"]["db"]
+    assert db["user"] == "postgres"
+    assert "/var/run/postgresql" in db["tmpfs"]
+    assert db["volumes"][0]["target"] == "/var/lib/postgresql/data"
+
+
+DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
+
+
+def test_every_stock_image_is_pinned_by_digest(resolved):
+    """Issue #190: a tag moves when upstream republishes it; a digest does not. The app and
+    research images are the ones this repository builds, tagged with the commit."""
+    built = {resolved["services"][name]["image"] for name in ("scheduler", "research")}
+    for name, service in resolved["services"].items():
+        if service["image"] in built:
+            continue
+        assert DIGEST.search(service["image"]), f"{name}: {service['image']}"
+    assert DIGEST.search(resolved["services"]["db"]["image"])
+    assert DIGEST.search(resolved["services"]["vpn"]["image"])
+
+
+def test_every_dockerfile_base_is_pinned_by_digest():
+    froms = [
+        line.split()
+        for line in (ROOT / "Dockerfile").read_text().splitlines()
+        if line.upper().startswith("FROM ")
+    ]
+    stages = {words[-1] for words in froms if len(words) == 4 and words[2].upper() == "AS"}
+    external = [words[1] for words in froms if words[1] not in stages]
+    assert external, "the Dockerfile names no base image"
+    for image in external:
+        assert DIGEST.search(image), image
+
+
+def password_vars(service: dict) -> set[str]:
+    return {key for key in service.get("environment") or {} if key.endswith("PASSWORD")}
+
+
+def test_each_service_holds_only_the_passwords_it_uses(resolved):
+    """Issue #190: migrate is the one service that sets passwords, so it is the one that holds
+    them all; db holds the superuser's to initialise, every other service at most its own login.
+    The vpn and the workstation's research run never reach the database."""
+    services = resolved["services"]
+    assert password_vars(services["migrate"]) == {"PGPASSWORD", *PASSWORD_VARS.values()}
+    assert password_vars(services["db"]) == {"POSTGRES_PASSWORD"}
+    for name, service in services.items():
+        if name in {"migrate", "db"}:
+            continue
+        expected = set() if name in {"vpn", "research"} else {"PGPASSWORD"}
+        assert password_vars(service) == expected, name
+
+
 def test_every_service_has_a_healthcheck(resolved):
     """`up --wait` passes only once each long-running service reports healthy, so each of them
     must check something; the one-shots disable it, because their exit status is the answer."""
@@ -307,7 +390,7 @@ def test_the_vpn_is_a_gluetun_tunnel_that_publishes_nothing(resolved):
     vpn = resolved["services"]["vpn"]
     assert vpn["image"].startswith("qmcgaw/gluetun:")
     assert not vpn.get("ports")
-    assert vpn["cap_add"] == ["NET_ADMIN"]
+    assert vpn["cap_add"] == ["NET_ADMIN", "CHOWN", "DAC_OVERRIDE"]
     assert vpn["environment"]["HTTPPROXY"] == "on"
     assert vpn["environment"]["VPN_PORT_FORWARDING"] == "off"
 
