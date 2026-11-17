@@ -38,7 +38,8 @@ agb.approval): `rerun` copies it, ranks, targets and orders as they were, under 
 reference such as `2026-10r1` whose `deviation_of` names the original, and proposes it for
 the new session. The signal and the provenance are the original's, so the gate checks the
 same universe and marks. So are the panel run, its configuration, the weight and the blend,
-so a rerun of a blended basket gets the panel checks and flags the original did.
+so a rerun of a blended basket gets the panel checks and flags the original did. Only a
+missed basket is copied: any other raises `NotMissed`, which the pipeline alerts on.
 
 Stage 2 joins here when a panel configuration exists (agb.panel, agb.blend): the top N of
 the stage-1 ranking is shortlisted, the panel scores it, and the basket is selected from
@@ -216,6 +217,12 @@ _SHADOW_BOOK = """
 """
 
 
+# The basket a rerun copies, with the state it stands in.
+_ORIGINAL = """
+    SELECT b.signal_date, b.reference, s.state
+    FROM agb.basket b LEFT JOIN agb.basket_state s ON s.id = b.id
+    WHERE b.id = %s
+"""
 # A rerun: the missed basket's provenance under a new reference and session. The panel
 # columns and the blend come too, so a rerun of a blended basket is gated as one.
 _INSERT_RERUN = """
@@ -273,6 +280,11 @@ _PROPOSE_RERUN = """
 
 class BasketError(Exception):
     """A basket that cannot be proposed from what the lake holds."""
+
+
+class NotMissed(BasketError):
+    """A rerun asked of a basket that was not missed: only a missed basket is rerun, so one
+    that is still waiting, was submitted or was rejected is never copied for another session."""
 
 
 class NotReady(BasketError):
@@ -478,7 +490,11 @@ def propose(
         settled = corporate.exits(forced)
         quotes = dict(prints)
         for symbol in sorted((divest & (held.keys() | shadow_held.keys())) - prints.keys()):
-            price = settled.get(symbol) or marks.get(symbol)
+            # A settled price of zero is a price, not a missing one: it goes to the plan, which
+            # refuses it by name, rather than quietly falling back to the last close.
+            price = settled.get(symbol)
+            if price is None:
+                price = marks.get(symbol)
             if price is None:
                 raise BasketError(
                     f"{symbol}: a forced event divests it, and it has no price on or before"
@@ -867,11 +883,17 @@ def rerun(
 ) -> Proposal:
     """Propose a copy of a missed basket for a later session, under the rerun's reference,
     as the operator's `rerun` command asked. Safe to redo: a reference already taken writes
-    nothing and returns the basket that holds it."""
-    row = conn.execute("SELECT signal_date FROM agb.basket WHERE id = %s", (original,)).fetchone()
+    nothing and returns the basket that holds it. Raises `NotMissed` for an original that is
+    not missed: `agb rerun` refuses one, and this refuses it again where the copy is made."""
+    row = conn.execute(_ORIGINAL, (original,)).fetchone()
     if row is None:
         raise BasketError(f"basket {original} does not exist")
-    signal = row[0]
+    signal, reference_of, state = row
+    if state != "missed" and _basket_for(conn, reference) is None:
+        raise NotMissed(
+            f"basket {original} ({reference_of}) is {state or 'never proposed'};"
+            " only a missed basket is rerun"
+        )
     # Marks only: the orders are the original's. The book must still be read since the new
     # session's signal session, which is the one the gate measures the rerun against.
     held = book(conn, signal_session(session_date))

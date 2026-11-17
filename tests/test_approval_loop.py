@@ -4,6 +4,8 @@ The bot talks to a fake Telegram on a clock the test moves; the database is real
 
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -32,6 +34,7 @@ from test_execution import (
 from test_gate import EVENING, LATE, SOUND, SPEAKS_FOR, actor_for, insert, move, rows, run, state
 
 from agb import approval, cli, execution, gate, jobs, migrate, schedule
+from agb import basket as baskets
 from agb.roles import OWNER
 from agb.services.bot import Bot
 from agb.services.execution import Execution
@@ -674,6 +677,91 @@ def test_only_a_missed_rebalance_is_rerun(db, asks, monkeypatch, capsys):
     assert err == "agb: refused: rebalance 2026-10 is proposed; only a missed rebalance is rerun\n"
     code, _, err = cli_main(db, monkeypatch, capsys, "rerun", "2026-12")
     assert (code, err) == (1, "agb: refused: no rebalance 2026-12\n")
+
+
+def test_two_reruns_asked_at_once_leave_one_accepted_and_one_refused(db, asks):
+    """Both requests pass the checks before either commits; the second's insert waits on the
+    first's under the unique index, and is refused, naming the rerun that won."""
+    basket_id = gated(db)
+    Scheduler(lambda: LATE)(db.connect("scheduler"))
+    assert state(db, basket_id)[:2] == ("missed", 2)
+    first, second = db.connect("cli"), db.connect("cli")
+    first.autocommit = second.autocommit = False
+    second.execute("SET lock_timeout = '10s'")
+
+    def ask(conn, actor):
+        source = approval.Source(actor, "cli", "agb rerun 2026-10")
+        try:
+            return approval.request_rerun(conn, "2026-10", source, LATE + MINUTE, CALENDAR)
+        except approval.RerunRefused as exc:
+            return exc
+        finally:
+            conn.commit()
+
+    first_source = approval.Source("alex", "cli", "agb rerun 2026-10")
+    accepted = approval.request_rerun(first, "2026-10", first_source, LATE + MINUTE, CALENDAR)
+    assert accepted.startswith("rerun 2026-10r1 asked for")
+    with ThreadPoolExecutor(1) as pool:
+        waiting = pool.submit(ask, second, "sam")
+        watch = db.connect("cli")
+        deadline = datetime.now(UTC) + timedelta(seconds=10)
+        while not watch.execute("SELECT count(*) FROM pg_locks WHERE NOT granted").fetchone()[0]:
+            assert datetime.now(UTC) < deadline, "the second request never waited on the first"
+            time.sleep(0.01)
+        first.commit()
+        refused = waiting.result(timeout=10)
+
+    assert isinstance(refused, approval.RerunRefused)
+    assert str(refused) == "rebalance 2026-10 is already rerun as 2026-10r1"
+    assert rows(
+        db,
+        "SELECT actor, outcome, reason FROM agb.command WHERE verb = 'rerun' ORDER BY id",
+    ) == [
+        ("alex", "accepted", None),
+        ("sam", "refused", "rebalance 2026-10 is already rerun as 2026-10r1"),
+    ]
+    assert rows(db, "SELECT reference FROM agb.rerun_pending") == [("2026-10r1",)]
+
+
+def test_the_database_refuses_a_second_accepted_rerun_of_one_basket(db, asks):
+    basket_id = gated(db)
+    Scheduler(lambda: LATE)(db.connect("scheduler"))
+    conn = db.connect("cli")
+    source = approval.Source("alex", "cli", "agb rerun 2026-10")
+    args = {"reference": "2026-10", "basket_id": basket_id, "session_date": "2026-10-02"}
+    approval.record(conn, source, approval.RERUN, args | {"rerun": "2026-10r1"})
+    with pytest.raises(errors.UniqueViolation, match="command_rerun_basket"):
+        approval.record(conn, source, approval.RERUN, args | {"rerun": "2026-10r2"})
+    with pytest.raises(errors.UniqueViolation, match="command_rerun_reference"):
+        approval.record(conn, source, approval.RERUN, args | {"basket_id": 0, "rerun": "2026-10r1"})
+    # Refusals are never constrained: each one is kept.
+    for _ in range(2):
+        approval.record(conn, source, approval.RERUN, args, "refused for the test")
+
+
+def test_the_pipeline_refuses_to_copy_a_basket_that_was_not_missed(db, asks, tmp_path):
+    """A rerun command that reached the pipeline for a basket still waiting, or approved,
+    copies nothing: the copy would trade the month twice."""
+    basket_id = gated(db)
+    conn = db.connect("pipeline")
+    with pytest.raises(
+        baskets.NotMissed, match=r"\(2026-10\) is proposed; only a missed basket is rerun"
+    ):
+        baskets.rerun(conn, basket_id, "2026-10r1", date(2026, 10, 2), 1, tmp_path)
+    assert rows(db, "SELECT count(*) FROM agb.basket WHERE reference = '2026-10r1'") == [(0,)]
+    with pytest.raises(baskets.BasketError, match="basket 0 does not exist"):
+        baskets.rerun(conn, 0, "2026-10r1", date(2026, 10, 2), 1, tmp_path)
+
+
+def test_a_submitted_basket_is_not_rerun(db, tmp_path):
+    submitted = approved(db).id
+    move(db, submitted, 3, "approved", "submitted", "execution")
+    assert state(db, submitted)[:2] == ("submitted", 3)
+    with pytest.raises(baskets.NotMissed, match=r"is submitted; only a missed basket is rerun"):
+        baskets.rerun(
+            db.connect("pipeline"), submitted, "2026-10r1", date(2026, 10, 2), 1, tmp_path
+        )
+    assert approval.find(db.connect("cli"), "2026-10r1") is None
 
 
 def test_a_rerun_after_a_weekend_trades_on_the_next_session():
