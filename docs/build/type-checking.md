@@ -37,7 +37,7 @@ Errors per module in the permissive list, 2026-11-16:
 | `agb.services.ui`, `agb.research.cpcv`, `agb.research.artifact`, `agb.research.__main__`, `agb.registry`, `agb.lake`, `agb.features` | 2 each |
 | `agb.universe`, `agb.services.pipeline`, `agb.schedule`, `agb.recovery`, `agb.preflight`, `agb.panel_audit`, `agb.panel`, `agb.migrate` | 1 each |
 
-To count a module again, delete its line from the block and run `uv run mypy`.
+To count a module again, delete its line from the block and run `uv run --frozen mypy`.
 
 ## Coverage: `make cover`
 

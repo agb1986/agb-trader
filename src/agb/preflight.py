@@ -110,7 +110,8 @@ def config_of(conn: psycopg.Connection, run_id: int) -> int:
 
 _EXTRACTS = """
     SELECT count(*) FILTER (WHERE e.outcome = 'extracted'),
-           count(*) FILTER (WHERE e.outcome = 'analyst_failure')
+           count(*) FILTER (WHERE e.outcome = 'analyst_failure'),
+           count(*) FILTER (WHERE e.outcome = 'analyst_refusal')
     FROM agb.panel_extract e
     JOIN agb.panel_retrieval r ON r.id = e.retrieval_id
     WHERE r.run_id = %s
@@ -136,7 +137,9 @@ def fidelity(conn: psycopg.Connection, run_id: int, minimum: int = MIN_NAMES) ->
     """Retrieval fidelity over one run: every quote the Analyst returned was checked against
     the document it cited when it was written, so this reads the verdicts and reports each
     quote that was not found verbatim, or cited no document or section."""
-    extracted, analyst_failures = conn.execute(_EXTRACTS, (run_id,)).fetchone() or (0, 0)
+    extracted, analyst_failures, analyst_refusals = conn.execute(
+        _EXTRACTS, (run_id,)
+    ).fetchone() or (0, 0, 0)
     if extracted < minimum:
         raise PreflightError(
             f"panel_run {run_id} extracted {extracted} names; retrieval fidelity needs at "
@@ -165,6 +168,7 @@ def fidelity(conn: psycopg.Connection, run_id: int, minimum: int = MIN_NAMES) ->
         detail={
             "names": extracted,
             "analyst_failures": analyst_failures,
+            "analyst_refusals": analyst_refusals,
             "verified": verified,
             "rejected": rejected,
             "quotes": quotes,

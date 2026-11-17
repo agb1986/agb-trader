@@ -641,6 +641,22 @@ def test_the_validation_view_names_the_returns_the_sharpe_gate_read(conn, db):
     assert "(total return)" not in page
 
 
+def test_the_validation_view_lists_the_gross_sharpe_and_start_date_gates(conn, db):
+    """Issue #187: the suspicion check and the start-date check are gates, recorded only in the
+    gates object, and the page lists each by name with its verdict."""
+    later = {
+        "gross_sharpe": {"value": 2.4, "threshold": 2.0, "rule": "at most", "passed": False},
+        "start_date": {"value": 0.7, "threshold": 0.5, "rule": "above", "passed": True},
+    }
+    certify(db, {**GATES, **later})
+
+    page = html.unescape(ui.validation(conn, LATER))
+
+    assert "Highest annualised Sharpe (suspicion check)" in page
+    assert "Lowest Sharpe from a later start date" in page
+    assert page.count(">pass<") == 5 and page.count(">FAIL<") == 1
+
+
 def test_the_validation_view_ends_by_naming_what_the_certification_does_not_cover(conn, certified):
     """The sentence the ticket asks for in as many words: these gates are stage 1's."""
     page = html.unescape(ui.validation(conn, LATER))
@@ -998,9 +1014,15 @@ def waiting(db):
     return basket_id
 
 
-def reply_of(body):
-    """The reply the shared module produced, as the answering page carries it."""
-    [reply] = re.findall(r'<pre class="reply">(.*?)</pre>', body, re.S)
+def reply_of(outcome):
+    """The reply the shared module produced, which a write hands back as its outcome."""
+    assert isinstance(outcome, ui.Outcome)
+    return outcome.reply
+
+
+def reply_in(page_body):
+    """The same reply as the page a write redirects to carries it."""
+    [reply] = re.findall(r'<pre class="reply">(.*?)</pre>', page_body, re.S)
     return html.unescape(reply)
 
 
@@ -1196,6 +1218,16 @@ def test_the_server_posts_a_form_to_a_write_route_and_refuses_everything_else(db
             "POST", "/pause", body="", headers=FORM | {"Origin": f"http://{host}:{port}"}
         )
         response = client.getresponse()
+        response.read()
+        assert response.status == 303, "a write is answered with a redirect to a GET"
+        assert_protected(response)
+        where = response.getheader("Location")
+        assert where.startswith("/outcome?id=")
+        client.close()
+
+        client = HTTPConnection(host, port)
+        client.request("GET", where)
+        response = client.getresponse()
         answer = html.unescape(response.read().decode())
         assert response.status == 200
         assert "PAUSED" in answer and "halt cause pause: open." in answer
@@ -1290,3 +1322,220 @@ def test_a_request_addressed_to_another_name_or_a_write_with_no_origin_is_refuse
 
     assert commands(db) == []
     assert state(db, waiting)[0] == "pending", "nothing answered the rebalance"
+
+
+# -- issue #184: redirect after a write and answer on every error --------------------------
+
+
+@pytest.fixture
+def served(db, monkeypatch):
+    """A running UI server on a random port, as (host, port, httpd), and the `here` origin."""
+    for key, value in db.pg_env("ui").items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("AGB_UI_HOST", raising=False)
+    monkeypatch.setattr(service, "PORT", 0)
+    httpd = service.server()
+    host, port = allow_own_address(httpd)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    yield host, port, httpd
+    httpd.shutdown()
+    httpd.server_close()
+
+
+def post(served, path, fields, client=None):
+    """A form posted as a browser posts it, answered as (status, headers, body)."""
+    host, port, _ = served
+    client = client or HTTPConnection(host, port)
+    client.request(
+        "POST", path, body=urlencode(fields), headers=FORM | {"Origin": f"http://{host}:{port}"}
+    )
+    response = client.getresponse()
+    return response.status, response, response.read().decode()
+
+
+def get(served, path, method="GET"):
+    host, port, _ = served
+    client = HTTPConnection(host, port)
+    client.request(method, path)
+    response = client.getresponse()
+    body = response.read().decode()
+    client.close()
+    return response.status, response, body
+
+
+def test_a_write_is_answered_with_a_redirect_and_a_reload_does_not_write_again(served, db):
+    """Acceptance (a): the POST is a 303 to a GET page that shows the outcome, and reading that
+    page again, which is all a reload does, writes nothing: one command row, however many loads."""
+    status, response, _ = post(served, "/pause", {})
+    assert status == 303
+    where = response.getheader("Location")
+    assert re.fullmatch(r"/outcome\?id=[A-Za-z0-9_-]+", where)
+    written = commands(db)
+    assert len(written) == 1
+
+    for _ in range(3):
+        status, _, body = get(served, where)
+        assert status == 200
+        assert "PAUSED" in reply_in(body)
+        assert 'href="/killswitch"' in body, "the page links back to where the form was"
+
+    assert commands(db) == written
+
+
+def test_a_refused_answer_is_a_redirect_too_and_an_outcome_nobody_holds_says_so(served, db):
+    status, response, _ = post(served, "/approve", {"reference": "2026-10"})
+    assert status == 303
+    status, _, body = get(served, response.getheader("Location"))
+    assert status == 200 and "no rebalance 2026-10" in reply_in(body)
+
+    for path in ("/outcome", "/outcome?id=", "/outcome?id=nothing", "/outcome?id=../x%00"):
+        status, _, body = get(served, path)
+        assert status == 404, path
+        assert "That outcome is no longer held here" in body
+
+
+def test_an_outcome_lapses_and_the_held_set_is_bounded():
+    now = [0.0]
+    held = service.Outcomes(clock=lambda: now[0])
+    first = ui.Outcome("/killswitch", "Kill switch", "PAUSED")
+    token = held.put(first)
+    assert held.get(token) is first
+    assert held.get(token) is first, "reading it does not consume it: a reload shows it again"
+    assert held.get("guess") is None
+    now[0] += service.Outcomes.HELD_FOR + 1
+    assert held.get(token) is None
+    tokens = [held.put(first) for _ in range(service.Outcomes.CAPACITY + 5)]
+    assert held.get(tokens[0]) is None, "the oldest go first"
+    assert held.get(tokens[-1]) is first
+    assert len(set(tokens)) == len(tokens), "a token is never reused"
+
+
+def test_a_write_that_raises_is_a_500_page_naming_the_cause_and_no_traceback(
+    served, db, monkeypatch, caplog
+):
+    """Acceptance (b): an exception that is not the database's used to leave the operator with a
+    dropped connection and no answer. Now it is a 500 that names the cause and carries no
+    traceback or file path, the traceback goes to the log, and nothing is redirected."""
+
+    def boom(conn, fields, now):
+        raise RuntimeError("the broker said no\nsecret line two")
+
+    monkeypatch.setitem(ui.WRITES, "/pause", boom)
+    status, response, body = post(served, "/pause", {})
+
+    assert status == 500
+    assert_protected(response)
+    assert response.getheader("Location") is None
+    assert "RuntimeError: the broker said no" in body
+    assert "secret line two" not in body, "one line of the message, no more"
+    assert "Traceback" not in body and ".py" not in body
+    assert "may have been recorded" in body
+    assert "Traceback" in caplog.text, "the traceback is in the log"
+
+
+def test_a_page_that_raises_is_a_500_page_too(served, monkeypatch):
+    def boom(conn, now):
+        raise ValueError("bad row")
+
+    monkeypatch.setitem(ui.ROUTES, "/alerts", boom)
+    status, _, body = get(served, "/alerts")
+    assert status == 500
+    assert "ValueError: bad row" in body and "The page failed" in body
+
+
+def test_a_reference_in_the_reason_field_does_not_approve(writer, db, waiting):
+    """Acceptance (c): the reference is read from its own field alone. The reason box holding
+    the basket's reference, with the reference box empty, is a refusal that is recorded and the
+    basket stays pending; so is a reference box holding the reference and more words, which is
+    no reference."""
+    for fields in (
+        {"reference": "", "reason": "2026-10"},
+        {"reason": "2026-10"},
+        {"reference": "   ", "reason": "2026-10 please"},
+    ):
+        for verb in (ui.approve, ui.reject):
+            assert "needs the rebalance's reference" in reply_of(verb(writer, fields, EVENING))
+    assert state(db, waiting)[:2] == ("pending", 2)
+
+    for verb in (ui.approve, ui.reject):
+        assert "no rebalance 2026-10 now" in reply_of(
+            verb(writer, {"reference": "2026-10 now"}, EVENING)
+        )
+    assert state(db, waiting)[:2] == ("pending", 2)
+    assert {outcome for _, outcome, *_ in commands(db)} == {"refused"}
+
+    reply = reply_of(ui.reject(writer, {"reference": " 2026-10 ", "reason": "too big"}, EVENING))
+    assert reply.startswith("REJECTED 2026-10") and "reason: too big" in reply
+    assert state(db, waiting)[0] == "rejected"
+
+
+def test_head_answers_as_get_does_and_ignores_the_query_string(served):
+    for path in ("/positions?all=1", "/positions/?x=y", "/", "/outcome?id=abc"):
+        status, response, body = get(served, path, "HEAD")
+        assert status == 200, path
+        assert body == "" and int(response.getheader("Content-Length")) == 0
+        assert_protected(response)
+    assert get(served, "/nowhere?x=1", "HEAD")[0] == 404
+
+
+def raw(served, request: bytes) -> bytes:
+    """What the server writes back for raw bytes on one connection, until it closes it or goes
+    quiet, so a test can see whether a second request on that connection was ever answered."""
+    import socket
+
+    host, port, _ = served
+    with socket.create_connection((host, port), timeout=3) as sock:
+        sock.sendall(request)
+        out = b""
+        try:
+            while chunk := sock.recv(65536):
+                out += chunk
+        except TimeoutError:
+            pass
+        return out
+
+
+def test_an_early_error_closes_the_connection_rather_than_parse_the_body_as_a_request(served, db):
+    """The body of a write refused before it is read must not be read as the next request on a
+    kept-alive connection: a POST to a page, to nowhere, an unreadable form and a chunked body
+    each answer and close, so the pipelined `POST /approve` smuggled in the body is never run."""
+    host, port, _ = served
+    smuggled = (
+        f"POST /approve HTTP/1.1\r\nHost: {host}:{port}\r\nOrigin: http://{host}:{port}\r\n"
+        "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 14\r\n\r\n"
+        "reference=2026-10"
+    )
+    head = f"Host: {host}:{port}\r\nOrigin: http://{host}:{port}\r\n"
+    for first, status in (
+        (
+            "POST /positions HTTP/1.1\r\n" + head + f"Content-Length: {len(smuggled)}\r\n\r\n",
+            b" 405 ",
+        ),
+        (
+            "POST /nowhere HTTP/1.1\r\n" + head + f"Content-Length: {len(smuggled)}\r\n\r\n",
+            b" 404 ",
+        ),
+        ("POST /approve HTTP/1.1\r\n" + head + "Content-Length: 99999\r\n\r\n", b" 400 "),
+        ("POST /approve HTTP/1.1\r\n" + head + "Transfer-Encoding: chunked\r\n\r\n", b" 400 "),
+        (
+            "GET /positions HTTP/1.1\r\n" + head + f"Content-Length: {len(smuggled)}\r\n\r\n",
+            b" 200 ",
+        ),
+    ):
+        out = raw(served, (first + smuggled).encode())
+        assert status in out.split(b"\r\n")[0] + b" ", first
+        assert out.count(b"HTTP/1.1 ") == 1, f"a second request was answered after: {first}"
+        assert b"Connection: close" in out
+    assert commands(db) == []
+
+
+def test_a_write_that_read_its_body_keeps_the_connection_alive(served, db):
+    """The close is for answers given before the body was read: one client reusing a connection
+    for a write and then a read still can."""
+    host, port, _ = served
+    client = HTTPConnection(host, port)
+    status, response, _ = post(served, "/pause", {}, client=client)
+    assert status == 303 and response.getheader("Connection") != "close"
+    client.request("GET", response.getheader("Location"))
+    assert client.getresponse().status == 200
+    client.close()

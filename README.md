@@ -43,18 +43,21 @@ rule between a peak and a limit, and the nightly panel-store hash check.
 ## Development
 
 ```sh
-uv sync         # install every dependency group
+uv sync --frozen  # install every dependency group, exactly as uv.lock pins them
 make test       # the whole suite, including a full stack bring-up, without the live tests
 make test-fast  # everything except the stack bring-up and the live tests
 make test-live  # only the live tests, each skipped unless its own variable is set
-make lint
+make lint       # ruff check and format, and shellcheck over scripts/deploy (install shellcheck locally)
 make types      # mypy: strict on four modules, permissive elsewhere
 make cover      # the fast tests with coverage; fails below the floor in pyproject.toml
 ```
 
 The tests start their own throwaway Postgres container on a random local port and never
-touch the stack's database, so several worktrees can run them at once. The stack test brings up
-its own Compose project with the UI published on a free local port (`AGB_UI_PORT`), so it runs
+touch the stack's database, so several worktrees can run them at once. Each container carries
+the label `agb.test=1` and the pid of the run that started it (`agb.test.pid`); at the start of
+a session the suite removes labelled containers whose run is gone, and nothing else, so a
+killed run does not leave one behind and `agb-trader-db-1` and `agb-trader-ui-1` are never
+touched. The stack test brings up its own Compose project with the UI published on a free local port (`AGB_UI_PORT`), so it runs
 beside a stack that holds `127.0.0.1:8080`; it asserts that every service beats, that `agb
 status` lists them all and that the UI answers on its landing page, and it removes its project
 when it fails or is interrupted.
@@ -71,8 +74,8 @@ live tests never run there; the stack test is not run there either. Dependabot o
 pull request a week for the `uv` lockfile and one for the pinned actions.
 
 Tests marked `live` talk to real services, so no default run collects them: `make test`,
-`make test-fast` and a plain `uv run pytest` all deselect them, whatever is exported in the
-shell. `make test-live` (or `uv run pytest -m live`) collects them, and each module still runs
+`make test-fast` and a plain `uv run --frozen pytest` all deselect them, whatever is exported in the
+shell. `make test-live` (or `uv run --frozen pytest -m live`) collects them, and each module still runs
 only when its own variable is set to `1`, with the credentials it names in its docstring read
 from the shell environment:
 
@@ -87,7 +90,7 @@ from the shell environment:
 | `AGB_LIVE_LAKE` | The real lake under `AGB_LAKE_DIR`, read only |
 | `AGB_LIVE_RSYNC` | The server, over the operator's SSH: a dry-run sync of its lake, copies nothing |
 
-Name one module to run only it, e.g. `AGB_LIVE_TELEGRAM=1 uv run pytest -m live
+Name one module to run only it, e.g. `AGB_LIVE_TELEGRAM=1 uv run --frozen pytest -m live
 tests/test_telegram_live.py`.
 
 Schema changes go in [migrations/](migrations/); read its README first.

@@ -37,7 +37,7 @@ from test_gate import (
 )
 
 from agb import cost, execution, health, recovery
-from agb.alpaca import AlpacaError, Asset
+from agb.alpaca import AlpacaError, Asset, Fill, Position
 from agb.execution import ExecutionError
 from agb.nyse import NyseCalendar
 from agb.services.execution import Execution
@@ -1291,6 +1291,110 @@ def test_a_reconcile_or_snapshot_that_fails_is_alerted_on_and_the_cycle_finishes
     ]
     assert "cycle stopped" not in caplog.text
     assert service._failures == 0
+
+
+EARLIER = date(2026, 9, 29)
+
+
+def snapshots(db):
+    return rows(db, "SELECT snapshot_date FROM agb.position_snapshot ORDER BY id")
+
+
+def traded(fake, at):
+    """A fill at `at` the broker's book has taken in: the account has moved on since."""
+    fake.activities.append(
+        Fill(f"act-{len(fake.activities) + 1:04d}", "outside", "N01", "buy", 10, MID, at, False)
+    )
+    fake.book["N01"] = Position("N01", Decimal(10), MID, 10 * MID)
+
+
+def test_every_session_a_cycle_missed_is_snapshotted_oldest_first(db):
+    """No cycle ran after the 30 September or 1 October close. Nothing has filled since, so
+    the broker's book is still the book at both closes, and the next cycle records each."""
+    conn = db.connect("execution")
+    fake = broker()
+    assert execution.snapshot(conn, fake, EARLIER, CALENDAR) is True
+
+    service = Execution(fake, clock=Clock(AFTER))
+    service(conn)
+    service(conn)
+
+    assert snapshots(db) == [(EARLIER,), (SIGNAL,), (TRADE,)]
+    assert alerts(db) == []
+
+
+def test_a_missed_session_the_account_has_traded_since_is_raised_as_one_gap(db):
+    """The 30 September close was missed and the account filled at the 1 October close, so the
+    broker can no longer say what it held on 30 September: that session is a gap, alerted on
+    once, and 1 October, whose own closing auction the fill was, is snapshotted."""
+    conn = db.connect("execution")
+    fake = broker()
+    execution.snapshot(conn, fake, EARLIER, CALENDAR)
+    traded(fake, CLOSE_AT)
+
+    service = Execution(fake, clock=Clock(AFTER))
+    service(conn)
+    service(conn)
+
+    assert snapshots(db) == [(EARLIER,), (TRADE,)]
+    [(kind, subject, period, body)] = alerts(db)
+    assert (kind, subject, period) == (execution.SNAPSHOT_GAP, "execution", str(SIGNAL))
+    assert f"no snapshot of the positions at the {SIGNAL} close" in body
+    assert "a fill at 2026-10-01T20:00:00Z" in body
+
+
+def test_sessions_the_account_has_traded_past_wait_for_the_next_quiet_close(db):
+    """A fill after both missed closes makes both gaps. Every cycle checks them again without
+    raising either twice, and the next close with nothing filled after it is snapshotted,
+    after which the gaps are behind the newest snapshot and no longer owed."""
+    conn = db.connect("execution")
+    fake = broker()
+    execution.snapshot(conn, fake, EARLIER, CALENDAR)
+    traded(fake, AFTER + timedelta(minutes=1))
+
+    clock = Clock(AFTER + timedelta(minutes=5))
+    service = Execution(fake, clock=clock)
+    service(conn)
+    service(conn)
+    assert snapshots(db) == [(EARLIER,)]
+    assert [(kind, period) for kind, _, period, _ in alerts(db)] == [
+        (execution.SNAPSHOT_GAP, str(SIGNAL)),
+        (execution.SNAPSHOT_GAP, str(TRADE)),
+    ]
+
+    clock.now = CALENDAR.close_at(NEXT) + execution.SETTLE
+    service(conn)
+    service(conn)
+    assert snapshots(db) == [(EARLIER,), (NEXT,)]
+    assert len(alerts(db)) == 2
+
+
+def test_a_missed_session_that_fails_to_snapshot_holds_back_the_later_one(db):
+    """The walk stops at a session whose snapshot fails, so a later session is never recorded
+    ahead of an earlier one; the next cycle starts again from the one that failed."""
+    conn = db.connect("execution")
+    fake = broker()
+    execution.snapshot(conn, fake, EARLIER, CALENDAR)
+    readable = fake.positions
+    failed = []
+
+    def unreadable_once():
+        if not failed:
+            failed.append(True)
+            raise AlpacaError("GET /v2/positions: connection reset")
+        return readable()
+
+    fake.positions = unreadable_once
+    service = Execution(fake, clock=Clock(AFTER))
+    service(conn)
+    assert snapshots(db) == [(EARLIER,)]
+    assert [(kind, period) for kind, _, period, _ in alerts(db)] == [
+        ("snapshot_failed", str(SIGNAL))
+    ]
+
+    service(conn)
+    assert snapshots(db) == [(EARLIER,), (SIGNAL,), (TRADE,)]
+    assert len(alerts(db)) == 1
 
 
 def test_without_keys_the_service_beats_only(db, caplog):

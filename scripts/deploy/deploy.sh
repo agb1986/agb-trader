@@ -38,7 +38,7 @@ for name in "${server_env[@]}"; do
     # The names are read on the server, so the values never leave it.
     missing=$(comm -23 <(git show "HEAD:env/$name.env.example" | sed -n "$names_expr" | sort -u) \
         <(remote "sed -n $(q "$names_expr") $(q "$file")" | sort -u))
-    [ -z "$missing" ] || die "$host:$file does not set: $(echo $missing)"
+    [ -z "$missing" ] || die "$host:$file does not set: ${missing//$'\n'/ }"
 done
 
 echo "building $image:$tag"

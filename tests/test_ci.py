@@ -77,7 +77,7 @@ def test_the_fast_tests_run_what_make_test_fast_runs(workflow):
         f"uv python install {SERVER_PYTHON}",
         *recipe("test-fast"),
     ]
-    assert recipe("test-fast") == ['uv run pytest -m "not stack and not live"']
+    assert recipe("test-fast") == ['uv run --frozen pytest -m "not stack and not live"']
 
 
 def test_the_type_check_runs_what_make_types_runs(workflow):
@@ -91,7 +91,7 @@ def test_the_coverage_job_runs_what_make_cover_runs(workflow):
         *recipe("cover"),
     ]
     # The same tests as test-fast, measured.
-    assert recipe("cover") == ['uv run pytest -m "not stack and not live" --cov']
+    assert recipe("cover") == ['uv run --frozen pytest -m "not stack and not live" --cov']
 
 
 def test_the_image_build_builds_the_app_target(workflow):

@@ -393,6 +393,11 @@ def _write(
     return Certification(run.trial_id, directory, manifest)
 
 
+# The gates a report lists, in order; `gross_sharpe` and `start_date` became binding with
+# issue #187 and are absent from older manifests.
+REPORTED_GATES = ("dsr", "pbo", "sharpe_net", "dsr_2x", "gross_sharpe", "start_date")
+
+
 def report(manifest: dict[str, Any]) -> str:
     """The verdict in prose."""
     verdict = "PASSED" if manifest["passed"] else "FAILED"
@@ -414,11 +419,18 @@ def report(manifest: dict[str, Any]) -> str:
         *_basis(manifest),
         "",
     ]
-    for name in ("dsr", "pbo", "sharpe_net", "dsr_2x"):
-        gate = manifest["gates"][name]
+    for name in REPORTED_GATES:
+        gate = manifest["gates"].get(name)
+        if gate is None:  # a manifest written before the gate existed
+            continue
         state = "pass" if gate["passed"] else "FAIL"
         cause = f" ({gate['cause']})" if gate.get("cause") else ""
-        value = "undefined" if gate.get("defined") is False else f"{gate['value']:.4f}"
+        if gate.get("defined") is False:
+            value = "undefined"
+        elif gate["value"] is None:
+            value = "none"
+        else:
+            value = f"{gate['value']:.4f}"
         lines.append(f"- {name}: {value}, {gate['rule']} {gate['threshold']:.4f}: {state}" + cause)
     multiple = manifest["break_even_multiple"]
     total = manifest.get("sharpe_total", manifest["sharpe_net"])

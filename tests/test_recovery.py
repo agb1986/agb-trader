@@ -22,17 +22,19 @@ from test_execution import (
     MID,
     NOW,
     Clock,
+    alerts,
     approved,
     broker,
     events,
     halts,
     order_id,
+    plan_submission,
     rows,
     state,
 )
 from test_pause_resume import Operator, open_causes
 
-from agb import execution, recovery
+from agb import execution, jobs, recovery, schedule
 from agb.alpaca import AlpacaError
 from agb.services.execution import Execution
 
@@ -338,3 +340,51 @@ def test_only_the_operators_clear_closes_the_cause_and_releases_the_lease(db, op
         ("clear", 1),
         ("set", 1),
     ]
+
+
+def expired(db):
+    return [(s, body) for kind, s, _, body in alerts(db) if kind == execution.LEASE_EXPIRED]
+
+
+def test_two_expired_submissions_are_each_halted_and_alerted_on_once(db, operator):
+    """Two submission leases have run out: each is recorded, halted against its own basket and
+    alerted on, and running the sweep again adds nothing. Halting only the first would leave
+    the second basket's orders unreconciled, and its lease held for good."""
+    target = approved(db)
+    crash(db, broker(on_submit=die_before_the_call))
+    # A second period's submission, taken on a lease that has already run out. No basket is
+    # live for it, so its halt names the period for the operator to look up.
+    other = "2026-08"
+    plan_submission(db, other)
+    conn = db.connect("execution")
+    assert jobs.hold(conn, schedule.SUBMISSION, other, execution.ROLE, EXPIRED) is not None
+
+    opened = recovery.halt_expired_submissions(conn)
+    assert recovery.halt_expired_submissions(conn) == []
+    cycle(db, broker())
+
+    assert [reason.split(" expired at ")[0] for reason in opened] == [
+        f"the submission lease for {PERIOD}",
+        f"the submission lease for {other}",
+    ]
+    assert rows(
+        db,
+        "SELECT action, basket_id FROM agb.halt_event WHERE cause = %s ORDER BY id",
+        execution.LEASE_EXPIRED,
+    ) == [("set", target.id), ("set", None)]
+    assert [subject for subject, _ in expired(db)] == [PERIOD, other]
+    [first, second] = [body for _, body in expired(db)]
+    assert f"reconcile basket {target.reference} by client_order_id" in first
+    assert f"reconcile basket {other} by client_order_id" in second
+    for period in (PERIOD, other):
+        assert job(db, period) == ("lease_expired", "execution", True)
+        assert job_events(db, period) == [("claimed", "execution"), ("lease_expired", "execution")]
+    [(cause, *_)] = halts(db)
+    assert cause == execution.LEASE_EXPIRED
+
+    # One clear by the operator gives up both leases.
+    assert "cleared: execution_lease_expired" in operator.says("/resume")
+    recovery.halt_expired_submissions(conn)
+    for period in (PERIOD, other):
+        assert job_events(db, period)[-1] == ("released", "execution")
+    assert len(expired(db)) == 2

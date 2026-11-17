@@ -6,7 +6,6 @@ basket's state machine: the CAS on `basket_event`, the transition trigger and th
 import os
 import re
 import threading
-import time
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -31,10 +30,11 @@ LIMITS = gate.Limits(universe_min=20)
 # The evening of the signal session, well before the trade session's MOC cutoff.
 EVENING = datetime(2026, 9, 30, 22, 0, tzinfo=UTC)
 ZERO_HASH = "0" * 64
+LEASE = timedelta(minutes=5)
 
 
 def plan_rebalance(db, period=PERIOD, session_date=TRADE):
-    start = datetime.now(UTC) - timedelta(hours=1)
+    start = EVENING - timedelta(hours=1)
     due = start + timedelta(hours=15)
     job = Planned(
         schedule.REBALANCE,
@@ -253,7 +253,9 @@ def test_a_cash_acquisition_terminates_the_position_and_its_cash_waits_for_the_r
 
 def test_a_stock_merger_sells_the_acquirer_shares_whatever_their_rank(db, tmp_path):
     """OLDCO was bought with ACQ stock, 200 shares for its 400. ACQ ranks first in the
-    market, and is sold anyway: that position was never chosen."""
+    market, and is sold anyway: that position was never chosen. Its slot is not refilled from
+    rank 21, since buys come from the top twenty only, so the slot stays in cash and the
+    basket holds nineteen, short one name against the two the merger puts on the record."""
     root = Market(tmp_path).names(25).name("ACQ", growth=0.012).land()
     filled_basket(db, "2026-09", {"N01": 100, "OLDCO": 400})
     file_event(
@@ -270,10 +272,11 @@ def test_a_stock_merger_sells_the_acquirer_shares_whatever_their_rank(db, tmp_pa
 
     assert job_state(db) == "completed"
     by_symbol = {t[0]: t[1:] for t in targets(db)}
-    assert len(by_symbol) == SIZE
+    assert len(by_symbol) == SIZE - 1
     assert "ACQ" not in by_symbol and "OLDCO" not in by_symbol
+    assert "N20" not in by_symbol  # rank 21, behind ACQ, is below the buy cap
     assert ("ACQ", "sell", 200) in [(o[0], o[1], o[2]) for o in orders(db)]
-    assert gate_check(db, "positions") == ("20", True)
+    assert gate_check(db, "positions") == ("19, short 1 against 2 on the record", True)
 
 
 def test_a_delisting_exits_at_the_last_listed_print_rather_than_being_dropped(db, tmp_path):
@@ -373,10 +376,11 @@ def test_a_lease_that_expired_mid_proposal_is_reclaimed_and_completed(db, tmp_pa
     plan_rebalance(db)
     root = Market(tmp_path).names(25).land()
     conn = db.connect("pipeline")
-    claim = jobs.claim(conn, [schedule.REBALANCE], "pipeline", timedelta(milliseconds=1))
+    claim = jobs.claim(conn, [schedule.REBALANCE], "pipeline", LEASE)
     read_book(db, SIGNAL)
     basket.propose(conn, claim, root, registry_fake.ranker(db), capital=CAPITAL)
-    time.sleep(0.05)
+    # The lease ran out while the proposal was being made.
+    conn.execute("UPDATE agb.job SET lease_until = now() - interval '1 second'")
 
     run(db, root)
 
@@ -742,6 +746,18 @@ def test_an_account_that_holds_nothing_reads_as_an_empty_book(db):
     assert basket.book(db.connect("pipeline"), SIGNAL) == {}
 
 
+def waiting_on_the_first_insert(db, patience=5):
+    """Block until some session is waiting on a lock, so the release comes after the second
+    insert has reached the first's uncommitted row."""
+    pause = threading.Event()
+    for _ in range(int(patience / 0.01)):
+        [(blocked,)] = rows(db, "SELECT count(*) FROM pg_locks WHERE NOT granted")
+        if blocked:
+            return
+        pause.wait(0.01)
+    raise AssertionError("the second transition never waited on the first")
+
+
 def test_two_transitions_from_the_same_state_let_exactly_one_through(db):
     """Two bots race to put the same proposal to the human. The second insert waits on the
     first's uncommitted row, then fails the unique index when the first commits."""
@@ -773,7 +789,7 @@ def test_two_transitions_from_the_same_state_let_exactly_one_through(db):
     for t in threads:
         t.start()
     first_in.wait(5)
-    time.sleep(0.2)
+    waiting_on_the_first_insert(db)
     release.set()
     for t in threads:
         t.join(10)

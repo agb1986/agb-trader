@@ -25,10 +25,12 @@ from test_basket import rows as cli_rows
 from test_basket import run as rebalance
 from test_blend import fake_panel, market
 from test_gate import LATE
+from test_jobs import age
 
-from agb import approval, heartbeat, jobs, lake, schedule
+from agb import analyst, approval, edgar, heartbeat, jobs, lake, schedule
 from agb.panel_store import PanelStore
 from agb.schedule import Expected, Planned
+from agb.services import pipeline as pipeline_module
 from agb.services.pipeline import JOB_FAILED, RERUN_FAILED, RETRY, Pipeline, record
 from agb.services.scheduler import Scheduler
 
@@ -477,25 +479,121 @@ def test_a_dropped_database_connection_still_stops_the_service(db, tmp_path):
 def test_a_lost_lease_ends_the_job_without_failing_it(db, tmp_path, caplog):
     plan_rebalance(db)
     root = market(tmp_path).land()
+    lost = []
 
     def lose_lease(conn):
         # The lease runs out mid-pass and is given up, as recovery does for a stuck job, so
         # the job is no longer this worker's to complete.
-        time.sleep(0.05)
         [(job_id,)] = cli_rows(db, "SELECT id FROM agb.job WHERE kind = 'rebalance'")
+        age(db, job_id, timedelta(hours=2))
         assert jobs.release_expired(conn, job_id, "pipeline", "lease ran out")
+        lost.append(job_id)
 
     panel = Breaks(fake_panel(db, 0.2).config_id, lose_lease, shortlist_n=25)
 
     with caplog.at_level(logging.ERROR, logger="agb.services.pipeline"):
-        rebalance(db, root, runner=panel, lease=timedelta(0))
+        rebalance(db, root, runner=panel)
 
+    assert len(lost) == 1
     [record] = [r for r in caplog.records if "lease lost" in r.getMessage()]
     assert record.exc_info is None
     assert "rebalance 2026-10" in record.getMessage()
     assert job_state(db) != "failed"
     assert cli_rows(db, "SELECT count(*) FROM agb.job_event WHERE event = 'failed'") == [(0,)]
+    assert cli_rows(db, "SELECT count(*) FROM agb.job_event WHERE event = 'completed'") == [(0,)]
     assert alerts(db) == []
+
+
+def test_a_rebalance_renews_the_lease_between_its_steps(db, tmp_path):
+    plan_rebalance(db)
+    root = market(tmp_path).land()
+    seen = []
+
+    def pass_time(conn):
+        # Most of a lease goes by inside the panel; the rebalance must have the rest of it.
+        [(job_id,)] = cli_rows(db, "SELECT id FROM agb.job WHERE kind = 'rebalance'")
+        age(db, job_id, timedelta(minutes=50))
+        seen.append(job_id)
+
+    panel = Breaks(fake_panel(db, 0.2).config_id, pass_time, shortlist_n=25)
+    rebalance(db, root, runner=panel, lease=timedelta(hours=1))
+
+    assert len(seen) == 1
+    [(lease_until,)] = cli_rows(db, "SELECT lease_until FROM agb.job WHERE id = %s", seen[0])
+    assert lease_until is None or lease_until > datetime.now(UTC) - timedelta(minutes=1)
+
+
+class Panel:
+    """What `panel.Runner` is built with, kept for the test to drive."""
+
+    def __init__(self, config, client, model, store, beat):
+        self.beat = beat
+
+
+def real_panel(db, monkeypatch):
+    """A pipeline whose `stage2` builds its panel as in production, from a configuration the
+    current prompts agree with, with the network and the model left out."""
+    fake_panel(db, 0.2)
+    monkeypatch.setattr(edgar.Edgar, "from_env", staticmethod(lambda: None))
+    monkeypatch.setattr(analyst, "AnthropicModel", lambda: None)
+    monkeypatch.setattr(pipeline_module.panel, "Runner", Panel)
+    return Pipeline()
+
+
+def test_the_panel_run_renews_the_lease_past_its_duration(db, monkeypatch):
+    plan_rebalance(db)
+    conn, rival = db.connect("pipeline"), db.connect("pipeline")
+    service = real_panel(db, monkeypatch)
+    claim = jobs.claim(conn, [schedule.REBALANCE], service.worker, service.lease)
+    beat = service.stage2(conn, claim).beat
+
+    # Three quarters of the lease at a time, three times over: longer than the lease in all.
+    for _ in range(3):
+        age(db, claim.job_id, service.lease * 3 // 4)
+        beat()
+
+    assert (
+        jobs.claim(
+            rival, [schedule.REBALANCE], "pipeline-other", service.lease, reclaim_expired=True
+        )
+        is None
+    )
+    jobs.complete(conn, claim)
+    assert job_state(db) == "completed"
+
+
+def test_the_panel_run_stops_when_its_lease_is_lost(db, monkeypatch):
+    plan_rebalance(db)
+    conn, rival = db.connect("pipeline"), db.connect("pipeline")
+    service = real_panel(db, monkeypatch)
+    claim = jobs.claim(conn, [schedule.REBALANCE], service.worker, service.lease)
+    beat = service.stage2(conn, claim).beat
+    age(db, claim.job_id, service.lease * 2)
+    taken = jobs.claim(
+        rival, [schedule.REBALANCE], "pipeline-other", service.lease, reclaim_expired=True
+    )
+
+    with pytest.raises(jobs.LeaseLost):
+        beat()
+    with pytest.raises(jobs.LeaseLost):
+        jobs.complete(conn, claim)
+    assert cli_rows(db, "SELECT claimed_by FROM agb.job WHERE id = %s", claim.job_id) == [
+        (taken.worker,)
+    ]
+
+
+def test_each_pipeline_claims_under_a_name_of_its_own(db, tmp_path):
+    plan_pull(db)
+    first, second = Pipeline(tmp_path, KEY), Pipeline(tmp_path, KEY)
+    assert first.worker != second.worker
+    assert first.worker.startswith("pipeline-")
+    assert Pipeline(tmp_path, KEY, worker="pipeline-fixed").worker == "pipeline-fixed"
+
+    Pipeline(tmp_path, KEY, opener=sample(), worker="pipeline-fixed")(db.connect("pipeline"))
+
+    assert cli_rows(
+        db, "SELECT actor FROM agb.job_event WHERE event IN ('claimed', 'completed') ORDER BY id"
+    ) == [("pipeline-fixed",), ("pipeline-fixed",)]
 
 
 # The basket cutoff in the database (issue #155): a gate that would approve a basket at or

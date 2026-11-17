@@ -76,7 +76,7 @@ Rejected: a 10-year rolling window, which would discard roughly 60% of an alread
 
 **Cross-validation.** Purged and embargoed folds are mandatory, as described in [01 — Data, broker and backtesting](01-data-broker-backtesting.md).
 
-**Known caveat to check in validation.** The early years are structurally different: decimalisation landed in 2001, Nasdaq had no closing auction until 2004, and pre-2001 small-cap spreads were wide enough that results from that era are unlikely to survive realistic cost modelling. A start-date sensitivity check belongs in the validation suite. If results only hold when 1998–2002 is included, that is a red flag rather than a longer backtest.
+**Known caveat to check in validation.** The early years are structurally different: decimalisation landed in 2001, Nasdaq had no closing auction until 2004, and pre-2001 small-cap spreads were wide enough that results from that era are unlikely to survive realistic cost modelling. A start-date sensitivity check belongs in the validation suite, and it is a binding gate: the verdict fails unless the net Sharpe from each later start date clears the Sharpe bar. If results only hold when 1998–2002 is included, that is a red flag rather than a longer backtest.
 
 **Hyperparameters** (learning rate, leaf count, depth, regularisation) are tuned inside cross-validation folds rather than decided here. Each configuration searched counts as a trial and must be logged accordingly.
 

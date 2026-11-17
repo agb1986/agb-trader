@@ -33,8 +33,10 @@ jobs:
           # The uv the Dockerfile copies in, so the lockfile reads the same everywhere.
           version: "0.10.10"
       - run: uv sync --frozen
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen ruff format --check .
+      # shellcheck ships on the ubuntu-24.04 runner image.
+      - run: shellcheck scripts/deploy/*
 
   fast-tests:
     runs-on: ubuntu-24.04
@@ -52,7 +54,7 @@ jobs:
       - run: uv python install 3.9
       # The tests start their own throwaway Postgres container, and the Compose checks run
       # `docker compose config`; the hosted runner provides both.
-      - run: uv run pytest -m "not stack and not live"
+      - run: uv run --frozen pytest -m "not stack and not live"
 
   # The type checker, strict on four modules and permissive elsewhere (docs/build/type-checking.md).
   types:
@@ -66,7 +68,7 @@ jobs:
         with:
           version: "0.10.10"
       - run: uv sync --frozen
-      - run: uv run mypy
+      - run: uv run --frozen mypy
 
   # The fast tests again, measured, failing below the floor in pyproject.toml. A separate job
   # from fast-tests so that job keeps its name and its meaning for the branch-protection rule.
@@ -82,7 +84,7 @@ jobs:
           version: "0.10.10"
       - run: uv sync --frozen
       - run: uv python install 3.9
-      - run: uv run pytest -m "not stack and not live" --cov
+      - run: uv run --frozen pytest -m "not stack and not live" --cov
 
   image-build:
     runs-on: ubuntu-24.04

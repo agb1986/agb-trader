@@ -2,10 +2,11 @@
 
 Execution holds the period's `submission` job while it sends a basket's orders. If the
 process dies mid-submission, the lease is never reclaimed and no one runs the submission
-again: what reached the broker is not something to guess at. Instead the expiry opens the
-`execution_lease_expired` halt cause (`halt_expired_submissions`), and nothing submits until
-a human has reconciled and cleared it. The clear is also what frees the lease: until then the
-job stays held by the process that died, so no cycle in between can pick the submission up.
+again: what reached the broker is not something to guess at. Instead each expiry opens the
+`execution_lease_expired` halt cause and raises one alert naming its basket
+(`halt_expired_submissions`), and nothing submits until a human has reconciled and cleared it.
+The clear is also what frees the lease: until then the job stays held by the process that
+died, so no cycle in between can pick the submission up.
 
 `recover` is that reconcile, reached as `agb reconcile REFERENCE`. It walks every planned
 order of the basket and asks the broker what it knows by `client_order_id`, reporting each
@@ -75,13 +76,14 @@ _OPEN_HALT = """
     VALUES (%s, 'set', %s, %s, %s)
 """
 # Whether this expiry has already been halted. The scheduler's sweep records every expired
-# lease as a job event, so the event cannot say; a `set` of the cause after the lease ran out
-# can only be about this expiry, because nothing else sets it and an earlier one was cleared
-# before the lease that has now expired was ever taken.
+# lease as a job event, so the event cannot say, and the time of a `set` cannot either once
+# two leases have run out: a halt opened for one would read as the other's. The reason a halt
+# is opened with starts with the period and the moment its lease ran out, and a job's lease
+# runs out at a given moment only once, so a `set` whose reason starts that way is this one's.
 _HALTED = """
     SELECT EXISTS (
         SELECT 1 FROM agb.halt_event
-        WHERE cause = %s AND action = 'set' AND at >= %s)
+        WHERE cause = %s AND action = 'set' AND starts_with(reason, %s))
 """
 # The walk needs only the row and whether one was ever written; what the broker says is
 # asked of the broker, not read back from the view.
@@ -129,47 +131,58 @@ def summarise(walked: tuple[Walked, ...]) -> str:
     return f"{len(walked)} orders: " + (", ".join(found) if found else "nothing found")
 
 
-def halt_expired_submissions(conn: psycopg.Connection, *, actor: str = ACTOR) -> str | None:
-    """Carry an expired submission lease through its halt. Returns the reason it just opened.
+def halt_expired_submissions(conn: psycopg.Connection, *, actor: str = ACTOR) -> list[str]:
+    """Carry every expired submission lease through its halt. Returns the reasons it just
+    opened, oldest first.
 
-    First sight of the expiry records it as a job event and opens `execution_lease_expired`.
-    The lease is left exactly as it is: the job is not reclaimed and `claimed_by` is not
-    cleared, so what happened stays visible in `agb.job_state` and no second attempt can take
-    the job. Nothing submits while the cause is open, so there is only ever one expired
-    submission lease to find; the earliest is taken if that is ever untrue.
+    First sight of an expiry records it as a job event, opens `execution_lease_expired`
+    against its basket and raises one alert naming the reconcile to run, all in one
+    transaction. The lease is left exactly as it is: the job is not reclaimed and
+    `claimed_by` is not cleared, so what happened stays visible in `agb.job_state` and no
+    second attempt can take the job. Nothing submits while the cause is open, so two expiries
+    are rare, but each is halted and alerted on in its own right: one halt would leave the
+    other basket's orders unreconciled.
 
-    Once the operator has reconciled and cleared the cause by hand, the lease is given up:
-    the clear is the human saying what happens next, and the period can be worked again. That
-    is the only way an expired submission lease is ever let go of; nothing here clears the
-    cause, and no cycle in between touches the job.
+    Once the operator has reconciled and cleared the cause by hand, every lease it was opened
+    for is given up: the clear is the human saying what happens next, and those periods can be
+    worked again. That is the only way an expired submission lease is ever let go of; nothing
+    here clears the cause, and no cycle in between touches the job.
     """
-    expired = conn.execute(_EXPIRED, (schedule.SUBMISSION,)).fetchall()
-    if not expired:
-        return None
-    job_id, period, lease_until, holder = expired[0]
-    if conn.execute(_HALTED, (LEASE_EXPIRED, lease_until)).fetchone()[0]:
-        if LEASE_EXPIRED in execution.open_halts(conn):
-            return None
-        given_up = (
+    opened: list[str] = []
+    for job_id, period, lease_until, holder in conn.execute(
+        _EXPIRED, (schedule.SUBMISSION,)
+    ).fetchall():
+        expiry = (
             f"the submission lease for {period} expired at "
-            f"{lease_until.astimezone(UTC):%Y-%m-%dT%H:%M:%SZ}; released after a human "
-            f"reconciled and cleared {LEASE_EXPIRED}"
+            f"{lease_until.astimezone(UTC):%Y-%m-%dT%H:%M:%SZ}"
         )
-        if jobs.release_expired(conn, job_id, actor, given_up):
-            log.warning("job %s released: %s", job_id, given_up)
-        return None
-    found = conn.execute(_LIVE_BASKET, (period,)).fetchone()
-    basket_id, reference = found if found is not None else (None, period)
-    reason = (
-        f"the submission lease for {period} expired at "
-        f"{lease_until.astimezone(UTC):%Y-%m-%dT%H:%M:%SZ} and is never retried; "
-        f"reconcile basket {reference} by client_order_id, then clear this cause"
-    )
-    with conn.transaction():
-        jobs.record_expiry(conn, job_id, lease_until, actor)
-        conn.execute(_OPEN_HALT, (LEASE_EXPIRED, basket_id, actor, reason))
-    log.error("%s held the lease; %s", holder, reason)
-    return reason
+        if conn.execute(_HALTED, (LEASE_EXPIRED, expiry)).fetchone()[0]:
+            if LEASE_EXPIRED in execution.open_halts(conn):
+                continue
+            given_up = f"{expiry}; released after a human reconciled and cleared {LEASE_EXPIRED}"
+            if jobs.release_expired(conn, job_id, actor, given_up):
+                log.warning("job %s released: %s", job_id, given_up)
+            continue
+        found = conn.execute(_LIVE_BASKET, (period,)).fetchone()
+        basket_id, reference = found if found is not None else (None, period)
+        reason = (
+            f"{expiry} and is never retried; "
+            f"reconcile basket {reference} by client_order_id, then clear this cause"
+        )
+        with conn.transaction():
+            jobs.record_expiry(conn, job_id, lease_until, actor)
+            conn.execute(_OPEN_HALT, (LEASE_EXPIRED, basket_id, actor, reason))
+            execution.raise_alert(
+                conn,
+                LEASE_EXPIRED,
+                period,
+                f"{lease_until.astimezone(UTC):%Y-%m-%dT%H:%M:%SZ}",
+                f"{reason}. {holder} held the lease when it ran out; nothing submits until "
+                f"the cause is cleared.",
+            )
+        log.error("%s held the lease; %s", holder, reason)
+        opened.append(reason)
+    return opened
 
 
 def recover(conn: psycopg.Connection, broker: Broker, reference: str, actor: str = ACTOR) -> Report:

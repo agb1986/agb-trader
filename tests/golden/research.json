@@ -339,6 +339,7 @@
     "participation_max": 0.046437829146640665,
     "participation_mean": 0.013209371559062062,
     "path": "0",
+    "return_over_volatility": 0.7813866205473778,
     "sharpe": 0.7813866205473778,
     "stock_merger_events": 0,
     "stock_merger_exits": 0,
@@ -684,6 +685,7 @@
     "participation_max": 0.04740777266681492,
     "participation_mean": 0.014633580920267461,
     "path": "1",
+    "return_over_volatility": 0.6882930177933678,
     "sharpe": 0.6882930177933678,
     "stock_merger_events": 0,
     "stock_merger_exits": 0,
@@ -1029,6 +1031,7 @@
     "participation_max": 0.0411392880668344,
     "participation_mean": 0.01271808546757407,
     "path": "2",
+    "return_over_volatility": 0.10291751783855813,
     "sharpe": 0.10291751783855813,
     "stock_merger_events": 0,
     "stock_merger_exits": 0,
@@ -1040,6 +1043,7 @@
   ],
   "summary": {
    "paths": 3,
+   "return_over_volatility_mean": 0.524199052059768,
    "sharpe_mean": 0.524199052059768,
    "total_return_max": 0.1956046988319997,
    "total_return_mean": 0.12241397752766685,
@@ -1370,6 +1374,7 @@
   "orders": 33,
   "participation_max": 0.012863107602870107,
   "participation_mean": 0.00800235356274203,
+  "return_over_volatility": 2.7644987876850142,
   "sharpe": 2.7644987876850142,
   "start_dates": [
    {
@@ -1377,6 +1382,7 @@
     "annual_volatility": 0.06605773395718387,
     "max_drawdown": -0.033723144686999995,
     "months": 23,
+    "return_over_volatility": 2.659759817654284,
     "sharpe": 2.659759817654284,
     "start": "2024-08-30",
     "total_return": 0.3637456218799999
@@ -1386,6 +1392,7 @@
     "annual_volatility": 0.056464518308893145,
     "max_drawdown": -0.015318471849490978,
     "months": 15,
+    "return_over_volatility": 3.5736112013611643,
     "sharpe": 3.5736112013611643,
     "start": "2025-04-30",
     "total_return": 0.25829428735000026
@@ -1395,6 +1402,7 @@
     "annual_volatility": 0.04558281742307004,
     "max_drawdown": 0.0,
     "months": 8,
+    "return_over_volatility": 5.129146375815877,
     "sharpe": 5.129146375815877,
     "start": "2025-11-28",
     "total_return": 0.150350181049
@@ -1745,6 +1753,7 @@
    "participation_max": 0.04463219814412986,
    "participation_mean": 0.012867742152130726,
    "path": "0",
+   "return_over_volatility": 0.5422766957114122,
    "sharpe": 0.5422766957114122,
    "stock_merger_events": 0,
    "stock_merger_exits": 0,
@@ -2090,6 +2099,7 @@
    "participation_max": 0.04519583353334064,
    "participation_mean": 0.014210898220612457,
    "path": "1",
+   "return_over_volatility": 0.408494266053425,
    "sharpe": 0.408494266053425,
    "stock_merger_events": 0,
    "stock_merger_exits": 0,
@@ -2435,6 +2445,7 @@
    "participation_max": 0.038832040963515634,
    "participation_mean": 0.0123627442429688,
    "path": "2",
+   "return_over_volatility": -0.19311781296348002,
    "sharpe": -0.19311781296348002,
    "stock_merger_events": 0,
    "stock_merger_exits": 0,
@@ -2453,6 +2464,7 @@
   "max_drawdown": -0.03458119664324433,
   "months": 30,
   "orders": 33,
+  "return_over_volatility": 2.724911773451316,
   "sharpe": 2.724911773451316,
   "total_return": 0.47733788482174555
  },
@@ -2465,6 +2477,7 @@
   "max_drawdown": -0.1493988328893635,
   "months": 30,
   "orders": 160,
+  "return_over_volatility": 0.8841099843925839,
   "sharpe": 0.8841099843925839,
   "total_return": 0.2207721878602762
  }

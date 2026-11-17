@@ -210,8 +210,10 @@ def measured(real_panel, lake_dir, tmp_path_factory) -> list[Measured]:
             out.append(Measured(candidate, engine=engine, scan=fast))
             print(
                 f"\n[{len(out)}/{len(CANDIDATES)}] {candidate.label}:"
-                f" engine sharpe {engine['sharpe']:.3f} annual {engine['annual_return']:+.4f},"
-                f" scan sharpe {fast['sharpe']:.3f} annual {fast['annual_return']:+.4f}",
+                f" engine return/volatility {engine['return_over_volatility']:.3f}"
+                f" annual {engine['annual_return']:+.4f},"
+                f" scan return/volatility {fast['return_over_volatility']:.3f}"
+                f" annual {fast['annual_return']:+.4f}",
                 flush=True,
             )
     return out
@@ -266,8 +268,8 @@ def test_every_candidate_either_ran_both_sides_or_the_scan_refused_it(measured):
     )
     for report in ran:
         print(
-            f"{report.candidate.label:<16}{report.engine['sharpe']:>14.3f}"
-            f"{report.scan['sharpe']:>13.3f}{report.engine['annual_return']:>+15.4f}"
+            f"{report.candidate.label:<16}{report.engine['return_over_volatility']:>14.3f}"
+            f"{report.scan['return_over_volatility']:>13.3f}{report.engine['annual_return']:>+15.4f}"
             f"{report.scan['annual_return']:>+13.4f}{report.engine['trimmed']:>7}"
             f"{report.engine['delisting_exits']:>7}"
         )
@@ -286,11 +288,13 @@ def test_the_scan_orders_the_candidates_the_way_the_engine_does(ranked):
     the tail of the set, which a filter never looks at -- but it is the one that says whether
     the disagreement is local or wholesale."""
     correlations = {}
-    for key in ("sharpe", "annual_return"):
+    for key in ("return_over_volatility", "annual_return"):
         correlations[key] = train.spearman(_engine_ordering(ranked, key), _ordering(ranked, key))
     print("\nrank correlation: " + ", ".join(f"{k} {v}" for k, v in correlations.items()))
-    assert correlations["sharpe"] is not None, "the engine or the scan ranked every candidate flat"
-    assert correlations["sharpe"] >= SPEARMAN_FLOOR
+    assert correlations["return_over_volatility"] is not None, (
+        "the engine or the scan ranked every candidate flat"
+    )
+    assert correlations["return_over_volatility"] >= SPEARMAN_FLOOR
 
 
 def test_the_scan_sends_forward_the_configurations_the_engine_would_have_chosen(ranked):
@@ -298,8 +302,8 @@ def test_the_scan_sends_forward_the_configurations_the_engine_would_have_chosen(
     TOP_K configurations the scan would send forward, how many the engine also puts in its own
     top TOP_K. A filter that loses the engine's best configuration has cost more than it saved,
     however well it correlates over the rest of the set."""
-    engine = _top(_engine_ordering(ranked, "sharpe"), TOP_K)
-    fast = _top(_ordering(ranked, "sharpe"), TOP_K)
+    engine = _top(_engine_ordering(ranked, "return_over_volatility"), TOP_K)
+    fast = _top(_ordering(ranked, "return_over_volatility"), TOP_K)
     labels = [report.candidate.label for report in ranked]
     print(
         f"\ntop-{TOP_K} engine {sorted(labels[i] for i in engine)}"

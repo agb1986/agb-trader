@@ -192,7 +192,10 @@ restore() {
 
     db_psql --dbname=postgres --command="CREATE DATABASE $db"
     if ! $keep; then
-        trap "db_psql --dbname=postgres --command='DROP DATABASE IF EXISTS $db' && echo 'dropped $db'" EXIT
+        # The trap runs after restore() returns, when its locals are gone, so the name is kept
+        # in a global that the single-quoted trap reads when it fires.
+        restore_db=$db
+        trap 'db_psql --dbname=postgres --command="DROP DATABASE IF EXISTS $restore_db" && echo "dropped $restore_db"' EXIT
     fi
     echo "loading $dump into $db"
     gunzip -c -- "$dump" | db_psql --dbname="$db" >/dev/null

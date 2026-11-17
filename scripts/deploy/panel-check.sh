@@ -152,8 +152,9 @@ corrupt() {
     local before after
     before=$(remote "sha256sum < $(q "$path")" | cut -d' ' -f1)
     after=$(remote "sha256sum < $(q "$keep_dir/$sha.zst.keep")" | cut -d' ' -f1)
-    [ -n "$before" ] && [ "$before" = "$after" ] ||
+    if [ -z "$before" ] || [ "$before" != "$after" ]; then
         die "the backup of $sha does not match the body; nothing was overwritten"
+    fi
     remote "printf '%s\n' $(q "$sha $before") > $(q "$marker")"
 
     remote "printf 'not a zstd frame' > $(q "$path")"

@@ -93,6 +93,11 @@ SETTLE = timedelta(minutes=5)
 # its own, and nothing re-submits it, so a human has to look.
 RECONCILE_DEADLINE = timedelta(hours=1)
 RECONCILE_OVERDUE = "reconcile_overdue"
+# How far back execution looks for closed sessions still owed a snapshot. A cycle that misses a
+# close, through a restart, an outage or a failed step, snapshots it on the next cycle that runs
+# if the broker can still answer for it, and raises one `snapshot_gap` alert if it cannot.
+SNAPSHOT_LOOKBACK = timedelta(days=14)
+SNAPSHOT_GAP = "snapshot_gap"
 # How far before a basket's first order, or before the reconcile itself, the fills are read. The
 # broker's clock is not this database's clock, and `created_at` is this database's, so a fill
 # stamped a moment before the row that caused it would be dropped for good by an exact window.
@@ -307,6 +312,7 @@ _SNAPSHOT = "SELECT id, observed_at FROM agb.position_snapshot WHERE snapshot_da
 _LAST_SNAPSHOT = """
     SELECT observed_at FROM agb.position_snapshot ORDER BY snapshot_date DESC LIMIT 1
 """
+_NEWEST_SNAPSHOT = "SELECT max(snapshot_date) FROM agb.position_snapshot"
 _INSERT_SNAPSHOT = """
     INSERT INTO agb.position_snapshot (snapshot_date, positions, actor)
     VALUES (%s, %s, %s) RETURNING id
@@ -976,6 +982,68 @@ def reconcile(
             )
     log.info("basket %s %s: %s", basket.reference, state, reason)
     return Outcome(basket.id, state, len(orders), reason)
+
+
+def sessions_owed(
+    conn: psycopg.Connection, calendar: nyse.NyseCalendar, now: datetime, settle: timedelta
+) -> list[date]:
+    """The closed sessions still owed a snapshot, oldest first: every session in the lookback
+    whose close is `settle` behind `now` and that falls after the newest snapshot.
+
+    Only sessions after the newest snapshot are owed, because `agb.position_mismatch` reads
+    snapshots in date order: one taken now for an earlier date would sit before a later one it
+    was observed after. With no snapshot at all only the latest closed session is owed, so a
+    fresh account starts from its present book rather than a fortnight of gaps."""
+    today = nyse.trading_date(now)
+    closed = [
+        session
+        for session in calendar.sessions(today - SNAPSHOT_LOOKBACK, today)
+        if now >= calendar.close_at(session) + settle
+    ]
+    (newest,) = one(conn.execute(_NEWEST_SNAPSHOT))
+    if newest is None:
+        return closed[-1:]
+    return [session for session in closed if session > newest]
+
+
+def last_fill(broker: Broker, after: datetime) -> datetime | None:
+    """When the account last filled anything after `after`, or None if it has not since."""
+    return max((fill.at for fill in broker.fills(after)), default=None)
+
+
+def moved_on(
+    calendar: nyse.NyseCalendar, session: date, settle: timedelta, filled: datetime
+) -> bool:
+    """Whether a fill at `filled` means the broker can no longer say what the account held at
+    `session`'s close.
+
+    The broker reports only the positions it holds now, so they are the positions at a past
+    close only if nothing has filled since. A fill within `settle` of the close is that
+    session's own closing auction, which the snapshot is meant to include; any later one has
+    moved the book on, and a snapshot taken now would record it against the wrong session."""
+    return filled > calendar.close_at(session) + settle
+
+
+def record_gap(
+    conn: psycopg.Connection, calendar: nyse.NyseCalendar, session: date, filled: datetime
+) -> None:
+    """Raise the one `snapshot_gap` alert for a session the broker can no longer answer for.
+    No snapshot is written for it, so the next one is compared with the last one before it,
+    with every fill between the two."""
+    closed = calendar.close_at(session).astimezone(UTC)
+    filled = filled.astimezone(UTC)
+    raise_alert(
+        conn,
+        SNAPSHOT_GAP,
+        ROLE,
+        session.isoformat(),
+        f"no snapshot of the positions at the {session} close ({closed:%Y-%m-%dT%H:%M:%SZ}): "
+        f"execution did not read the account after that close, and the broker reports only "
+        f"the positions it holds now, which a fill at {filled:%Y-%m-%dT%H:%M:%SZ} has since "
+        f"changed. The next snapshot is checked against the last one before {session}, with "
+        f"every fill between the two.",
+    )
+    log.error("snapshot %s: gap, the account has filled since its close", session)
 
 
 def snapshot(

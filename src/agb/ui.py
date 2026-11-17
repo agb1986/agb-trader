@@ -40,11 +40,18 @@ place. Approving is never one click: the operator types the rebalance's referenc
 the friction Telegram's typed command has and the whole reason the landing page is the log
 rather than a basket with a green button. Every write is a `command` row with the actor and
 the surface on it, refused ones included.
+
+A write returns an `Outcome` rather than a page: the server stores it and answers the POST with
+a 303 to `/outcome?id=<token>`, which `outcome` renders, so reloading the page the operator ends
+on is a GET and cannot write twice. A write that raises is `failed`: a 500 page that names the
+cause and nothing else of the exception. The reference of a basket is read from the form's
+reference field alone; the reason field is only ever a reason.
 """
 
 import html
 import statistics
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, DivisionByZero, InvalidOperation
 
@@ -681,6 +688,13 @@ GATES = (
     ("sharpe_net", "Cost-inclusive Sharpe", 2),
     ("dsr_2x", "Deflated Sharpe at 2x cost", 3),
 )
+# The gates that carry their measurement only in the `gates` object, with no column of their own:
+# the suspicion check and the start-date check, binding since issue #187. A gate this module does
+# not know is still listed, under its key.
+LATER_GATES = {
+    "gross_sharpe": "Highest annualised Sharpe (suspicion check)",
+    "start_date": "Lowest Sharpe from a later start date",
+}
 # The returns a Sharpe gate read, as each gate records it (issue #167). Certifications up to
 # lgbm-2026-10 recorded no basis and gated total returns.
 BASES = {"total": "total return", "excess_spy": "excess over SPY"}
@@ -829,7 +843,7 @@ def validation(conn: psycopg.Connection, now: datetime) -> str:
             continue
         gate_rows.append(
             (
-                key,
+                LATER_GATES.get(key, key),
                 _number(_as_float(applied.get("value"))),
                 f"{applied.get('rule', '')} {applied.get('threshold', '')}".strip(),
                 "pass" if applied.get("passed") else "FAIL",
@@ -1467,8 +1481,22 @@ def kill_switch(conn: psycopg.Connection, now: datetime) -> str:
     return page("Kill switch", "/killswitch", [banner(conn, now), section("Kill switch", blocks)])
 
 
-# The write paths. Each takes the fields the form posted and answers with a page carrying the
-# reply the shared module produced, which is the same text the bot sends to Telegram.
+# The write paths. Each takes the fields the form posted and returns the `Outcome`: the reply
+# the shared module produced, which is the same text the bot sends to Telegram. The server does
+# not render it in answer to the POST: it holds it and redirects to `OUTCOME`, a GET, so a
+# reload re-reads the outcome and never posts the write again.
+
+# Where the server redirects a write to, with the held outcome's token in the query.
+OUTCOME = "/outcome"
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """What a write did: the page it belongs to, the heading and the shared module's reply."""
+
+    path: str
+    heading: str
+    reply: str
 
 
 def _source(text: str) -> approval.Source:
@@ -1484,49 +1512,89 @@ def calendar(now: datetime) -> NyseCalendar:
     return NyseCalendar(today - timedelta(days=7), today + timedelta(days=30))
 
 
-def _reply(conn: psycopg.Connection, now: datetime, path: str, heading: str, reply: str) -> str:
-    blocks = [
-        Html(f'<pre class="reply">{esc(reply)}</pre>'),
-        tag("p", tag("a", "Back", href=path)),
-    ]
-    return page(heading, path, [banner(conn, now), section(heading, blocks)])
-
-
-def _answer(conn: psycopg.Connection, verb: str, fields: Mapping[str, str], now: datetime) -> str:
+def _answer(
+    conn: psycopg.Connection, verb: str, fields: Mapping[str, str], now: datetime
+) -> Outcome:
     """Approve or reject the rebalance whose reference was typed. `agb.approval` checks the
     reference, refuses a wrong, missing or late one and records that refusal, and settles a race
-    with the bot on the basket's own sequence, so the loser is told who answered and when."""
-    words = [*fields.get("reference", "").split(), *fields.get("reason", "").split()]
+    with the bot on the basket's own sequence, so the loser is told who answered and when.
+
+    The reference is read from its own field and from nowhere else. Whatever the reason box
+    holds is only a reason, so a reference typed there leaves the reference empty and is
+    refused as missing. A reference box that holds more than one word is not a reference either:
+    it is looked up whole, found missing, refused and recorded."""
+    reference = fields.get("reference", "").strip()
+    words = [reference, *fields.get("reason", "").split()] if reference else []
     source = _source(" ".join([f"/{verb}", *words]))
     reply = approval.decide(conn, verb, words, source, now, calendar(now))
-    return _reply(conn, now, "/rebalance", "Your answer", reply)
+    return Outcome("/rebalance", "Your answer", reply)
 
 
-def approve(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> str:
+def approve(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
     return _answer(conn, "approve", fields, now)
 
 
-def reject(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> str:
+def reject(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
     return _answer(conn, "reject", fields, now)
 
 
-def pause(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> str:
-    return _reply(
-        conn, now, "/killswitch", "Kill switch", killswitch.pause(conn, _source("/pause"))
-    )
+def pause(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
+    return Outcome("/killswitch", "Kill switch", killswitch.pause(conn, _source("/pause")))
 
 
-def resume(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> str:
-    return _reply(
-        conn, now, "/killswitch", "Kill switch", killswitch.resume(conn, _source("/resume"))
-    )
+def resume(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
+    return Outcome("/killswitch", "Kill switch", killswitch.resume(conn, _source("/resume")))
 
 
-def liquidate(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> str:
+def liquidate(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
     words = fields.get("token", "").split()
     source = _source(" ".join(["/liquidate", *words]))
     reply = killswitch.liquidate(conn, source, words[0] if words else None, now)
-    return _reply(conn, now, "/killswitch", "Kill switch", reply)
+    return Outcome("/killswitch", "Kill switch", reply)
+
+
+def outcome(conn: psycopg.Connection, now: datetime, held: Outcome | None) -> str:
+    """The page a write redirects to: the reply it produced, above the banner as it reads now.
+    An outcome the server no longer holds, because it expired or the server restarted, says so
+    and points at the log, where every write the operator made is a row."""
+    if held is None:
+        return page(
+            "No outcome",
+            "/",
+            [
+                banner(conn, now),
+                section(
+                    "No outcome",
+                    [
+                        note(
+                            "That outcome is no longer held here: it is kept for a few minutes "
+                            "after a write. What the write did is a row in the log."
+                        ),
+                        tag("p", tag("a", "Log", href="/")),
+                    ],
+                ),
+            ],
+        )
+    blocks = [
+        Html(f'<pre class="reply">{esc(held.reply)}</pre>'),
+        tag("p", tag("a", "Back", href=held.path)),
+    ]
+    return page(held.heading, held.path, [banner(conn, now), section(held.heading, blocks)])
+
+
+def failed(path: str, cause: str, wrote: bool) -> str:
+    """The page for a request that raised something that was not the database's: the route and
+    the cause by name, and no traceback, which goes to the log. A write may have been recorded
+    before it raised, so its page says to look in the log and not to retry."""
+    heading = "The write failed" if wrote else "The page failed"
+    blocks = [
+        note(f"{path} raised an error."),
+        Html(f'<pre class="reply">{esc(cause)}</pre>'),
+    ]
+    if wrote:
+        blocks.append(note("It may have been recorded before it failed: check the log first."))
+    blocks.append(tag("p", tag("a", "Log", href="/")))
+    return page(heading, path, [section(heading, blocks)])
 
 
 # What the server routes: the pages, which only read, and the writes, which are these five and

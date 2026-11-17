@@ -63,6 +63,7 @@ class FakePanel:
         delinquent: dict[str, str] | None = None,
         ipo: tuple[str, ...] = (),
         analyst_failure: tuple[str, ...] = (),
+        analyst_refusal: tuple[str, ...] = (),
     ):
         self.config_id = config_id
         self.shortlist_n = shortlist_n
@@ -72,6 +73,7 @@ class FakePanel:
         self.delinquent = delinquent or {}
         self.ipo = ipo
         self.analyst_failure = analyst_failure
+        self.analyst_refusal = analyst_refusal
         self.calls: list[Call] = []
 
     def dimensions(self, symbol: str, i: int) -> tuple[int, ...] | None:
@@ -117,6 +119,9 @@ class FakePanel:
         self._filings(conn, retrieval_id, symbol, as_of)
         if symbol in self.analyst_failure:
             self._extract(conn, retrieval_id, symbol, "analyst_failure")
+            return
+        if symbol in self.analyst_refusal:
+            self._extract(conn, retrieval_id, symbol, "analyst_refusal")
             return
         self._extract(conn, retrieval_id, symbol, "extracted")
         self._score(conn, run_id, retrieval_id, symbol, sector, delinquent, i)

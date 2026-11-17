@@ -213,21 +213,29 @@ def metrics(marks: Sequence[float] | np.ndarray, init_cash: float) -> dict[str, 
 
     The monthly returns are the ratios of consecutive marks, the annual return compounds the
     total over the months there are, the volatility is the sample deviation of the monthly
-    returns scaled by the square root of twelve, and the Sharpe ratio is the one over the other
-    with no risk-free rate. A curve of fewer than three marks has no volatility and so no
-    Sharpe ratio."""
+    returns scaled by the square root of twelve, and `return_over_volatility` is the one over
+    the other with no risk-free rate. A curve of fewer than three marks has no volatility and
+    so no ratio.
+
+    That ratio is not the Sharpe the gates read, the mean monthly return over its deviation
+    annualised by the square root of twelve (`gates.sharpe`): compounding the annual return
+    and dividing it by the volatility gives a different number, lower for a volatile curve.
+    It was reported as `sharpe`, and the key stays as an alias of it so that ledger rows and
+    reports already written keep reading the same way (issue #187)."""
     curve = np.asarray(marks, dtype="float64")
     returns = curve[1:] / curve[:-1] - 1.0
     months = len(returns)
     total = float(curve[-1] / init_cash - 1.0)
     annual = (1.0 + total) ** (MONTHS_PER_YEAR / months) - 1.0 if months else 0.0
     vol = float(np.std(returns, ddof=1) * np.sqrt(MONTHS_PER_YEAR)) if months > 1 else None
+    ratio = None if not vol else float(annual / vol)
     return {
         "months": months,
         "total_return": total,
         "annual_return": float(annual),
         "annual_volatility": vol,
-        "sharpe": None if not vol else float(annual / vol),
+        "return_over_volatility": ratio,
+        "sharpe": ratio,  # deprecated: the same number under its old, misleading name
         "max_drawdown": float((curve / np.maximum.accumulate(curve) - 1.0).min()),
     }
 

@@ -3,6 +3,10 @@
 Built so any number of worktrees can run `make test` at once:
   - The Postgres container is named after this worktree and the pytest process, keeps its
     data on tmpfs, and publishes on a random localhost port, never a fixed one.
+  - The container carries a label naming the pytest process. A session that is killed before it
+    can remove its container leaves it behind, so each session starts by removing the labelled
+    containers whose process has gone, and nothing else: a running session's container, and any
+    container without our label, are left alone.
   - The schema is built once per session into a template database, then each test gets its
     own copy, which is dropped afterwards.
   - Role passwords are random for each session; no real env file is ever read.
@@ -80,6 +84,48 @@ def _docker(*args: str) -> str:
     ).stdout.strip()
 
 
+LABEL = "agb.test"
+PID_LABEL = "agb.test.pid"
+NAME_PREFIX = "agb-test-"
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # the process exists and belongs to someone else
+        return True
+    return True
+
+
+def stale_containers(listing: str, running=alive) -> list[str]:
+    """The names to remove from `docker ps` output of `name<TAB>pid label` lines: containers our
+    harness started (by label and by name) whose pytest process is no longer running. A line
+    with no usable pid, such as a container from before the pid label, is read from the name's
+    last field, and left alone if that is no pid either."""
+    names = []
+    for line in listing.splitlines():
+        name, _, label = line.partition("\t")
+        if not name.startswith(NAME_PREFIX):
+            continue
+        pid = label.strip() or name.rsplit("-", 1)[-1]
+        if pid.isdigit() and not running(int(pid)):
+            names.append(name)
+    return names
+
+
+def remove_stale_containers() -> list[str]:
+    listing = _docker(
+        "ps", "--all", "--filter", f"label={LABEL}=1",
+        "--format", '{{.Names}}\t{{.Label "' + PID_LABEL + '"}}',
+    )  # fmt: skip
+    names = stale_containers(listing)
+    if names:
+        subprocess.run(["docker", "rm", "--force", *names], capture_output=True)
+    return names
+
+
 def _wait_for(cluster: Cluster, timeout: float = 60.0) -> None:
     # A TCP connection is the only reliable signal: during initdb the entrypoint runs a
     # temporary server on the Unix socket only, where pg_isready already reports success.
@@ -115,10 +161,11 @@ def pin_approval_clock(owner: psycopg.Connection) -> None:
 @pytest.fixture(scope="session")
 def cluster() -> Iterator[Cluster]:
     passwords = {role: secrets.token_hex(16) for role in (SUPERUSER, *ALL_ROLES)}
-    name = f"agb-test-{worktree_slug()}-{os.getpid()}"
+    name = f"{NAME_PREFIX}{worktree_slug()}-{os.getpid()}"
+    remove_stale_containers()
     _docker(
         "run", "--detach", "--rm", "--name", name,
-        "--label", "agb.test=1",
+        "--label", f"{LABEL}=1", "--label", f"{PID_LABEL}={os.getpid()}",
         "--publish", "127.0.0.1::5432",
         "--tmpfs", "/var/lib/postgresql/data",
         "--env", f"POSTGRES_PASSWORD={passwords[SUPERUSER]}",
@@ -202,23 +249,48 @@ def blank_db(cluster: Cluster) -> Iterator[str]:
 
 
 # The research panel: a fake lake of two dozen names over several years, built once per
-# session because the feature history over thirty month-ends takes a while.
+# session because the feature history over thirty month-ends takes a while. The lake is
+# locked read-only once landed, so a test that writes into it fails where it writes. The built
+# panel is shared too, and the session checks at its end that it never changed.
+
+
+def _lock(root: Path, locked: bool) -> None:
+    """Make every file and directory under `root` read-only, or writable again."""
+    paths = [root, *sorted(root.rglob("*"), reverse=locked)]
+    for path in paths:
+        if path.is_dir():
+            path.chmod(0o555 if locked else 0o755)
+        else:
+            path.chmod(0o444 if locked else 0o644)
 
 
 @pytest.fixture(scope="session")
-def research_lake(tmp_path_factory) -> Path:
+def research_lake(tmp_path_factory) -> Iterator[Path]:
     from research_fake import Market
 
-    return Market(tmp_path_factory.mktemp("research-lake")).names().benchmark().land()
+    root = Market(tmp_path_factory.mktemp("research-lake")).names().benchmark().land()
+    _lock(root, True)
+    try:
+        yield root
+    finally:
+        _lock(root, False)
 
 
 @pytest.fixture(scope="session")
 def research_panel(research_lake: Path):
+    """The session's built panel. Read it, never change it: the session fails at its end if the
+    frame no longer matches what was built, and a test that needs to change one copies it."""
+    import pandas as pd
     from research_fake import END, PANEL_START
 
     from agb.research import panel
 
-    return panel.build(research_lake, PANEL_START, END)
+    built = panel.build(research_lake, PANEL_START, END)
+    fingerprint = pd.util.hash_pandas_object(built.frame, index=True).sum()
+    yield built
+    assert pd.util.hash_pandas_object(built.frame, index=True).sum() == fingerprint, (
+        "a test changed the session's shared research panel"
+    )
 
 
 @pytest.fixture(scope="module")

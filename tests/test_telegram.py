@@ -152,6 +152,27 @@ def test_the_bot_env_example_routes_telegram_through_the_vpn(no_proxy_env):
     assert Telegram.from_env().proxy == "http://vpn:8888"
 
 
+def test_a_proxy_url_is_shown_without_its_credentials():
+    assert telegram_module.redact_url("http://user:pw@vpn:8888") == "http://***@vpn:8888"
+    assert telegram_module.redact_url("http://user@vpn:8888/x") == "http://***@vpn:8888/x"
+    assert telegram_module.redact_url("http://:pw@vpn:8888") == "http://***@vpn:8888"
+    assert telegram_module.redact_url("http://vpn:8888") == "http://vpn:8888"
+
+
+def test_the_check_command_prints_the_proxy_without_its_credentials(no_proxy_env, capsys):
+    no_proxy_env.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
+    no_proxy_env.setenv("HTTPS_PROXY", "http://user:hunter2@127.0.0.1:9")
+    no_proxy_env.setattr(Telegram, "get_me", lambda self: {"username": "agb_bot"})
+
+    assert telegram_module.main() == 0
+
+    out = capsys.readouterr().out
+    assert "through http://***@127.0.0.1:9" in out
+    assert "hunter2" not in out and "user" not in out.split("through")[1]
+    # The client itself still uses the whole URL, or the proxy would refuse it.
+    assert Telegram.from_env().proxy == "http://user:hunter2@127.0.0.1:9"
+
+
 def test_the_check_command_fails_without_a_proxy(no_proxy_env, capsys):
     no_proxy_env.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
     assert telegram_module.main() == 1
