@@ -488,3 +488,66 @@ def test_an_event_that_took_effect_before_the_previous_snapshot_is_not_counted_t
     # That earlier window (the signal-session read to the trade session) does flag N01,
     # since the book kept what the event says left it; this snapshot must not flag it again.
     assert rows(db, "SELECT symbol FROM agb.position_mismatch WHERE snapshot_date = %s", NEXT) == []
+
+
+# The dividend verb.
+
+DIVIDEND = (
+    "dividend", "N04", "12.40",
+    "--ex-date", "2026-11-07",
+    "--detail", "Alpaca statement",
+    "--actor", "ada",
+)  # fmt: skip
+
+
+def test_the_dividend_command_writes_one_row_with_its_actor_and_refuses_a_repeat(
+    db, monkeypatch, capsys
+):
+    code, out, _ = run(db, monkeypatch, capsys, *DIVIDEND)
+
+    assert code == 0
+    assert out.startswith("dividend ")
+    assert rows(
+        db, "SELECT period, symbol, amount_usd, paid_on, actor, surface FROM agb.dividend"
+    ) == [("2026-11", "N04", Decimal("12.40"), date(2026, 11, 7), "ada", "cli")]
+
+    code, out, err = run(db, monkeypatch, capsys, *DIVIDEND)
+
+    assert code == 1
+    assert out == ""
+    assert "refused: N04 already has a dividend recorded for 2026-11-07, by ada" in err
+    assert rows(db, "SELECT count(*) FROM agb.dividend") == [(1,)]
+    assert rows(db, "SELECT verb, outcome FROM agb.command ORDER BY id") == [
+        ("dividend", "accepted"),
+        ("dividend", "refused"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("symbol", "amount", "ex_date", "why"),
+    [
+        ("n 04", "12.40", "2026-11-07", "not a symbol"),
+        ("N04", "0", "2026-11-07", "positive amount"),
+        ("N04", "-1", "2026-11-07", "positive amount"),
+        ("N04", "NaN", "2026-11-07", "positive amount"),
+        ("N04", "twelve", "2026-11-07", ""),
+        ("N04", "12.40", "07/11/2026", ""),
+    ],
+)
+def test_the_dividend_command_refuses_bad_input_and_writes_nothing(
+    db, monkeypatch, capsys, symbol, amount, ex_date, why
+):
+    code, _, err = run(
+        db, monkeypatch, capsys, "dividend", symbol, amount, "--ex-date", ex_date, "--actor", "ada"
+    )
+
+    assert code == 1
+    assert "refused" in err and why in err
+    assert rows(db, "SELECT count(*) FROM agb.dividend") == [(0,)]
+
+
+def test_the_dividend_help_ends_with_an_example(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["dividend", "--help"])
+
+    assert "Example: agb dividend" in capsys.readouterr().out

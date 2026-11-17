@@ -44,7 +44,9 @@ import psycopg
 from agb import approval
 
 PERIOD = re.compile(r"^\d{4}-\d{2}$")
+SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9.\-]*$")
 VERB = "corporate"
+DIVIDEND_VERB = "dividend"
 
 
 class CorporateError(Exception):
@@ -293,3 +295,86 @@ def line(event: Event) -> str:
 
 def _filed(event: Event) -> tuple[date, str]:
     return event.effective_date, event.symbol
+
+
+@dataclass(frozen=True)
+class Dividend:
+    """One cash dividend as the operator recorded it from a broker statement. The paper broker
+    credits none, so the paper comparison adds these back (agb.dividend). The period is the
+    month the ex-date falls in, which is how agb.basket names a rebalance."""
+
+    symbol: str
+    amount_usd: Decimal  # the total cash credited, not per share
+    ex_date: date
+    detail: str
+
+    def __post_init__(self) -> None:
+        if not SYMBOL.match(self.symbol):
+            raise CorporateError(f"{self.symbol!r} is not a symbol")
+        if not self.amount_usd.is_finite() or self.amount_usd <= 0:
+            raise CorporateError(f"{self.symbol}: a dividend must be a positive amount")
+        if not self.detail:
+            raise CorporateError(f"{self.symbol}: say where the fact came from")
+
+    @property
+    def period(self) -> str:
+        return f"{self.ex_date:%Y-%m}"
+
+
+_DIVIDEND_INSERT = """
+    INSERT INTO agb.dividend
+        (period, symbol, amount_usd, paid_on, detail, actor, surface, command_id)
+    VALUES (%(period)s, %(symbol)s, %(amount_usd)s, %(paid_on)s, %(detail)s, %(actor)s,
+            %(surface)s, %(command_id)s)
+    RETURNING id
+"""
+_DIVIDEND_EXISTS = """
+    SELECT actor, at FROM agb.dividend WHERE period = %s AND symbol = %s AND paid_on = %s
+"""
+
+
+def record_dividend(conn: psycopg.Connection, dividend: Dividend, source: approval.Source) -> int:
+    """Record a dividend, and return its id. Written in one transaction with the command that
+    carried it. A second dividend for the same name on the same date is refused rather than
+    counted twice in the month's total; the refusal is recorded too."""
+    args: dict[str, Any] = {
+        "symbol": dividend.symbol,
+        "amount_usd": str(dividend.amount_usd),
+        "ex_date": dividend.ex_date.isoformat(),
+        "detail": dividend.detail,
+    }
+    key = (dividend.period, dividend.symbol, dividend.ex_date)
+    with conn.transaction():
+        conn.execute(_LOCK, (_LOCK_CLASS, "dividend/" + "/".join(map(str, key))))
+        seen = conn.execute(_DIVIDEND_EXISTS, key).fetchone()
+        if seen is None:
+            command_id = approval.record(conn, source, DIVIDEND_VERB, args)
+            row = conn.execute(
+                _DIVIDEND_INSERT,
+                {
+                    "period": dividend.period,
+                    "symbol": dividend.symbol,
+                    "amount_usd": dividend.amount_usd,
+                    "paid_on": dividend.ex_date,
+                    "detail": dividend.detail,
+                    "actor": source.actor,
+                    "surface": source.surface,
+                    "command_id": command_id,
+                },
+            ).fetchone()
+    if seen is not None:
+        why = (
+            f"{dividend.symbol} already has a dividend recorded for {dividend.ex_date}, "
+            f"by {seen[0]} on {seen[1]:%Y-%m-%d}"
+        )
+        approval.record(conn, source, DIVIDEND_VERB, args, why)
+        raise CorporateError(why)
+    assert row is not None, "the insert returns the id it wrote"
+    return row[0]
+
+
+def dividend_line(dividend: Dividend) -> str:
+    return (
+        f"{dividend.symbol} dividend {dividend.amount_usd} on {dividend.ex_date:%Y-%m-%d}; "
+        f"{dividend.period} month"
+    )
