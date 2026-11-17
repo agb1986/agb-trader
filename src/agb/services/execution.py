@@ -8,8 +8,10 @@ whose trade session is in its submission window and sends their orders
 (`agb.execution.submit`), reads back the orders of submitted baskets once the session has
 closed (`reconcile`), raising one alert for a basket still waiting on the broker an hour
 after the close (`agb.execution.RECONCILE_DEADLINE`), and after the close of each session
-snapshots the broker's positions and account state once (`snapshot`). Between those it
-observes the account's flags every few minutes, so the bot can compare the broker's
+snapshots the broker's positions and account state once (`snapshot_owed`). A session a cycle
+missed is snapshotted late if nothing has filled since its close, and is otherwise raised as
+one `snapshot_gap` alert, since the broker reports only the positions it holds now. Between
+those it observes the account's flags every few minutes, so the bot can compare the broker's
 `suspend_trade` with the halt latch.
 
 Without keys it beats and does nothing else, so the stack starts whole before the operator
@@ -28,7 +30,7 @@ is the exception, and ends the process as it does in every service.
 
 import logging
 from collections.abc import Callable
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import psycopg
 
@@ -230,14 +232,7 @@ class Execution:
                 raise
             except Exception as exc:
                 self.step_failed(conn, RECONCILE_FAILED, basket.reference, basket.period, exc)
-        session = self.closed_session(calendar, now)
-        if session is not None:
-            try:
-                execution.snapshot(conn, self.broker, session, calendar)
-            except psycopg.Error:
-                raise
-            except Exception as exc:
-                self.step_failed(conn, SNAPSHOT_FAILED, ROLE, session.isoformat(), exc)
+        self.snapshot_owed(conn, calendar, now)
 
     def step_failed(
         self, conn: psycopg.Connection, kind: str, subject: str, period: str, exc: Exception
@@ -357,13 +352,31 @@ class Execution:
         )
         self._missed.add(basket.id)
 
-    def closed_session(self, calendar: NyseCalendar, now: datetime) -> date | None:
-        """The latest session whose close is at least `settle` behind `now`."""
-        today = trading_date(now)
-        for session in reversed(calendar.sessions(today - timedelta(days=14), today)):
-            if now >= calendar.close_at(session) + self.settle:
-                return session
-        return None
+    def snapshot_owed(self, conn: psycopg.Connection, calendar: NyseCalendar, now: datetime):
+        """Snapshot every closed session owed one, oldest first, or record the gap where the
+        broker can no longer answer for it.
+
+        The account's fills are read once, from the oldest owed close: a session the account
+        has filled since (`execution.moved_on`) is a gap, raised once as `snapshot_gap`.
+        A step that fails stops the walk at that session, so a later one is never snapshotted
+        ahead of it, and the next cycle tries again from there."""
+        owed = execution.sessions_owed(conn, calendar, now, self.settle)
+        if not owed:
+            return
+        session = owed[0]
+        try:
+            filled = execution.last_fill(self.broker, calendar.close_at(session) + self.settle)
+            for session in owed:
+                if filled is not None and execution.moved_on(
+                    calendar, session, self.settle, filled
+                ):
+                    execution.record_gap(conn, calendar, session, filled)
+                else:
+                    execution.snapshot(conn, self.broker, session, calendar)
+        except psycopg.Error:
+            raise
+        except Exception as exc:
+            self.step_failed(conn, SNAPSHOT_FAILED, ROLE, session.isoformat(), exc)
 
 
 def main() -> None:
