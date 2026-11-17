@@ -45,6 +45,8 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, BinaryIO
 
+from agb.errors import NotConfigured
+
 TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 OLDER_URL = "https://data.sec.gov/submissions/{name}"
@@ -125,7 +127,7 @@ class Edgar:
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not user_agent or not user_agent.strip():
-            raise ValueError(
+            raise NotConfigured(
                 "EDGAR_USER_AGENT is not set: the SEC requires a User-Agent with a name and "
                 "contact email, as 'agb-trader <name> <email>'"
             )

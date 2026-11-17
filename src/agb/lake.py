@@ -71,6 +71,7 @@ import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 
 from agb import nyse
+from agb.errors import NotConfigured
 
 BASE_URL = "https://api.sharadar.com/v1.0/data"
 PAGE = 10_000  # the most rows the API returns for one request
@@ -140,6 +141,10 @@ _DUCKDB_TYPES = {STRING: "VARCHAR", FLOAT: "DOUBLE", DATE: "DATE", INT: "BIGINT"
 
 class LakeError(Exception):
     """A pull that cannot land: the vendor refused, failed, or sent something unexpected."""
+
+
+class KeyNotSet(LakeError, NotConfigured):
+    """The vendor's API key is missing from the pipeline's env file."""
 
 
 class NotYet(LakeError):
@@ -290,7 +295,7 @@ class Sharadar:
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if not api_key:
-            raise LakeError("SHARADAR_API_KEY is not set in the pipeline's env file")
+            raise KeyNotSet("SHARADAR_API_KEY is not set in the pipeline's env file")
         self.api_key = api_key
         self.opener = opener
         self.base_url = base_url

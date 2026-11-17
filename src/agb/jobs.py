@@ -326,3 +326,34 @@ def record_expiries(conn: psycopg.Connection, actor: str) -> int:
         (actor,),
     )
     return recorded.rowcount
+
+
+class NotAcknowledged(Exception):
+    """A job that cannot be acknowledged: there is no such job, or it has not failed."""
+
+
+def acknowledge(conn: psycopg.Connection, job_id: int, actor: str, reason: str) -> bool:
+    """Acknowledge a failed job, which takes its expected events out of `agb.overdue`.
+
+    Returns False if it was already acknowledged, in which case the first acknowledgement
+    stands. Raises `NotAcknowledged` for a job that does not exist or has not failed.
+    """
+    with conn.transaction():
+        row = conn.execute(
+            "SELECT kind, period, EXISTS (SELECT 1 FROM agb.job_event e"
+            " WHERE e.job_id = j.id AND e.event = 'failed') FROM agb.job j WHERE j.id = %s",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise NotAcknowledged(f"job {job_id} does not exist")
+        kind, period, failed = row
+        if not failed:
+            raise NotAcknowledged(
+                f"job {job_id} ({kind} {period}) has not failed: only a failed job is acknowledged"
+            )
+        added = conn.execute(
+            "INSERT INTO agb.job_acknowledgement (job_id, actor, reason) VALUES (%s, %s, %s)"
+            " ON CONFLICT (job_id) DO NOTHING",
+            (job_id, actor, reason),
+        )
+        return added.rowcount == 1
