@@ -40,6 +40,7 @@ holds that line."""
 import json
 import math
 from collections.abc import Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, fields
 from datetime import date
 from typing import Any
@@ -80,7 +81,7 @@ def candidates(
     start: date,
     end: date,
     labels: Sequence[str],
-    exclude: set[str] = frozenset(),
+    exclude: AbstractSet[str] = frozenset(),
     current: str | None = None,
 ) -> Candidates:
     """The monthly net return series the overfitting gate ranks a model against, one per
