@@ -8,7 +8,7 @@ import pytest
 from edgar_fake import AS_OF, FakeEdgar, client
 from test_jobs import add_job
 
-from agb import analyst, cli, panel
+from agb import analyst, cli, edgar, panel
 from agb.analyst import AnalystError, Completion, normalise
 from agb.panel_store import PanelStore
 
@@ -257,6 +257,49 @@ def extract(db, store, symbol, run_id=None):
         run_id,
     )
     return outcome, detail, sha and json.loads(store.get(sha))
+
+
+def test_a_name_holds_its_filings_only_until_it_is_written(db, config, store, monkeypatch):
+    written = []
+    write = panel._write
+
+    def spy(conn, run_id, name, store):
+        if name.retrieval.outcome == "retrieved":
+            # By the time a name is written its bodies are in the store, not on the name.
+            assert name.retrieval.sections == []
+            assert name.documents and name.request is not None
+            assert [f.document_sha256 for f in name.filed]
+            assert all(
+                store.has(f.document_sha256) and store.has(f.text_sha256) for f in name.filed
+            )
+        written.append(name)
+        write(conn, run_id, name, store)
+
+    monkeypatch.setattr(panel, "_write", spy)
+
+    run(db, config, store, FakeAnalyst())
+
+    assert len(written) == len(SHORTLIST)
+    for name in written:
+        assert name.retrieval.sections == []
+        assert (name.filed, name.documents, name.sent) == ([], [], [])
+        assert name.request is None and name.completion is None
+
+
+def test_a_name_is_released_even_when_its_write_fails(monkeypatch, db):
+    def broken(conn, run_id, name, store):
+        raise RuntimeError("the database went away")
+
+    monkeypatch.setattr(panel, "_write", broken)
+    name = panel.Name(edgar.Retrieval("ACME", "retrieved"))
+    name.documents = [analyst.Document("D1", "10-K", "2026-01-01", "Item 1A", "text")]
+    name.sent = [4]
+    name.request = {"model": "m"}
+
+    with pytest.raises(RuntimeError):
+        panel._record(db.connect("pipeline"), 1, name, None)
+
+    assert (name.documents, name.sent, name.request) == ([], [], None)
 
 
 def test_a_run_beats_as_each_retrieval_and_each_call_lands(db, config, store):

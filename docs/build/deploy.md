@@ -352,7 +352,10 @@ vendor's current basis.
 
 The views are `sep`, `sf1`, which shows the latest version of each fundamentals row, and
 `tickers`, which shows the newest snapshot. `sf1_as_of('2020-06-30')` shows the fundamentals
-as they were known on that day, which is what research and replays read.
+as they were known on that day, which is what research and replays read. `sep` is read by its
+`date=` partitions, so a filter on `date` opens only the days it names; `sf1` is deduplicated
+once when a connection opens, so that is where a connection spends its first moments on a large
+lake and not each query.
 
 ## Promoting a model
 
