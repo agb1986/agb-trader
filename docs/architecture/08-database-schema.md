@@ -28,7 +28,7 @@ Rejected: a session-scoped advisory lock. It releases when the connection dies, 
 
 **State is a sequence of events.** `basket_event` rows carry `seq`, `from_state`, `to_state`, actor (a human identity or `system`), surface (`telegram`, `ui`, `cli`, `scheduler`, `pipeline`, `execution`), timestamp and reason. `unique(basket_id, seq)` makes every transition a compare-and-swap: a writer inserts `seq = last + 1`, and a concurrent writer hits the constraint. That settles the Telegram-versus-UI race inside the database: the first answer wins, and the loser replies "already approved by X at T". Current state is a view over the latest event. A trigger checks every insert against a `basket_transition` table of permitted `(from, to, role)` triples. Another binds the actor to the writing role: the bot writes from `telegram` as the Telegram user who answered (`telegram:<id>`), or as `bot` when it puts a basket to the human; the UI writes from `ui` as `ui:operator`; and only the pipeline, scheduler and execution roles may write as `system`.
 
-The state set is the one the risk and Telegram documents already use (proposed, halted at the gate, pending, approved, rejected, missed, submitted, filled). The exact enumeration is left to the build.
+The state set is the one the risk and Telegram documents already use (proposed, halted at the gate, pending, approved, rejected, missed, submitted, filled), plus unfilled for a submitted basket whose orders all ended at the close with nothing filled. A settled basket's `basket_outcome` row, written with the event that settled it, counts its orders filled in full, filled in part and unfilled, and says whether the basket filled in full, in part or not at all. The exact enumeration is left to the build.
 
 **References people can type.** Each basket has an internal key and a unique human reference, `2026-10` for that month's rebalance. A deliberate next-session rerun after a missed approval is a new basket, `2026-10r1`, with `deviation_of` pointing at the original, which keeps its missed outcome. Shadow baskets (`kind = 'shadow'`) have no typeable reference.
 
@@ -147,7 +147,7 @@ Rejected: everything in Postgres, which grows the dump by hundreds of megabytes 
 | `liquidation` | bot, ui (token, confirm), execution (result) | no |
 | `liquidation_order`, `liquidation_fill` | execution | no |
 | `halt_event`, `broker_state` | pipeline (gate_breach), execution (lease, broker_state), bot / ui (pause, resume, liquidation) | no |
-| `order`, `order_event`, `fill`, position snapshots | execution | no |
+| `order`, `order_event`, `fill`, `basket_outcome`, position snapshots | execution | no |
 | `reconcile_run` | execution (the operator's `agb reconcile`) | no |
 | `model_certification`, `certification_event`, `promotion_event` | research (certification, via artifact import), cli (promotion, voiding) | no |
 | `ladder_event`, `mode_event` | cli (up), scheduler or execution as `system` (down) | no |

@@ -27,7 +27,7 @@ from test_execution import (
     approved,
     broker,
 )
-from test_gate import SOUND, move, rows
+from test_gate import NAMES, SOUND, move, rows
 
 from agb import cost, execution, lake, mechanics
 
@@ -325,10 +325,28 @@ def test_a_short_fill_that_alerted_passes(db):
     assert result.measured == "1 short fills in 1 rebalances, each alerted"
     assert result.threshold == (
         "every rebalance with a short fill raises partial_rebalance_short_fill, "
+        "basket_unfilled if it filled nothing, "
         "or partial_rebalance_halted or partial_rebalance_paused if it was halted"
     )
     assert result.detail == {"orders": 1, "rebalances": ["2026-10"], "unalerted": []}
     assert alerts(db) == [("partial_rebalance_short_fill", "2026-10")]
+
+
+def test_a_rebalance_that_filled_nothing_and_alerted_passes(db):
+    """A basket whose orders all expired unfilled settles as unfilled, not filled, and its
+    one unfilled alert says so out loud; every one of its orders is a short fill."""
+    conn = db.connect("execution")
+    target = approved(db, SOUND)
+    fake = broker()
+    assert execution.submit(conn, fake, target, lambda: NOW, CUTOFF).state == "submitted"
+    fake.close(CLOSE_AT, short={s: Decimal(0) for s in NAMES})
+    assert execution.reconcile(conn, fake, target, AFTER).state == "unfilled"
+
+    result = mechanics.partial_fills(conn)
+
+    assert result.passed is True
+    assert result.measured == "20 short fills in 1 rebalances, each alerted"
+    assert alerts(db) == [("basket_unfilled", "2026-10")]
 
 
 def test_a_short_fill_that_passed_in_silence_fails(db):
