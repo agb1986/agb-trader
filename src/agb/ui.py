@@ -312,23 +312,55 @@ _CYCLES = """
 # Every audit-log line about one cycle. The log names a basket by the string the view builds
 # for it, so this catches its state changes and its halts alike.
 _CYCLE_EVENTS = """
-    SELECT at, actor, event, detail FROM agb.audit_log
-    WHERE subject = %s
-    ORDER BY at, event
+    SELECT subject, at, actor, event, detail FROM agb.audit_log
+    WHERE subject = ANY(%s)
+    ORDER BY subject, at, event
 """
 # A cycle's flags: the anomalies the system raised for the month it trades. The panel's
 # name-level flags join here once the panel runs on the live path; a quiet month stays quiet.
 _PERIOD_ALERTS = """
-    SELECT kind, subject, raised_at, raised_by FROM agb.alert
-    WHERE period = %s
-    ORDER BY raised_at, id
+    SELECT period, kind, subject, raised_at, raised_by FROM agb.alert
+    WHERE period = ANY(%s)
+    ORDER BY period, raised_at, id
 """
 
 
-def period_return(conn: psycopg.Connection, period: str) -> tuple[str, str]:
+@dataclass(frozen=True)
+class _CycleReads:
+    """Everything the cycles of the log read besides the cycles themselves, each read once
+    for all of them and keyed by what a cycle looks it up by: a page that listed twenty-four
+    cycles asked the database about each of them one at a time, over two hundred queries."""
+
+    diffs: dict[int, readout.Diff]
+    windows: dict[str | None, readout.Window | None]
+    checks: dict[int, list[readout.CheckRow]]
+    events: dict[str, list[tuple]]
+    flags: dict[str, list[tuple]]
+
+    @classmethod
+    def of(cls, conn: psycopg.Connection, cycles: Sequence[Sequence]) -> "_CycleReads":
+        ids = [row[0] for row in cycles]
+        periods = sorted({row[2] for row in cycles})
+        events: dict[str, list[tuple]] = {}
+        for subject, *event in conn.execute(
+            _CYCLE_EVENTS, ([f"live basket {row[1]}" for row in cycles],)
+        ).fetchall():
+            events.setdefault(subject, []).append(tuple(event))
+        flags: dict[str, list[tuple]] = {}
+        for period, *flag in conn.execute(_PERIOD_ALERTS, (periods,)).fetchall():
+            flags.setdefault(period, []).append(tuple(flag))
+        return cls(
+            diffs=readout.diffs(conn, ids),
+            windows=readout.equity_windows(conn, periods),
+            checks=readout.checks_of(conn, ids),
+            events=events,
+            flags=flags,
+        )
+
+
+def period_return(window: readout.Window | None) -> tuple[str, str]:
     """A month's realised return and the window it was measured over, from the same two
     equity readings `/pnl` uses."""
-    window = readout.equity_window(conn, period)
     if window is None:
         return "n/a", "no equity readings in the month"
     first_at, first, last_at, last = window
@@ -365,8 +397,7 @@ def _diff_blocks(diff: readout.Diff, capital: Decimal) -> Html:
     )
 
 
-def _gate_block(conn: psycopg.Connection, basket_id: int) -> Html:
-    rows = readout.checks(conn, basket_id)
+def _gate_block(rows: list[readout.CheckRow]) -> Html:
     if not rows:
         return note("the gate has not run on this basket")
     fails = [check for check in rows if not check.passed]
@@ -384,8 +415,7 @@ def _gate_block(conn: psycopg.Connection, basket_id: int) -> Html:
     )
 
 
-def _flags_block(conn: psycopg.Connection, period: str) -> Html:
-    rows = conn.execute(_PERIOD_ALERTS, (period,)).fetchall()
+def _flags_block(rows: list[tuple]) -> Html:
     if not rows:
         return note("none")
     return table(
@@ -394,10 +424,10 @@ def _flags_block(conn: psycopg.Connection, period: str) -> Html:
     )
 
 
-def _cycle(conn: psycopg.Connection, row: Sequence) -> Html:
+def _cycle(reads: _CycleReads, row: Sequence) -> Html:
     basket_id, reference, period, state, since, actor, surface, capital, ranker, names = row
-    diff = readout.diff(conn, basket_id)
-    returned, window = period_return(conn, period)
+    diff = reads.diffs[basket_id]
+    returned, window = period_return(reads.windows[period])
     turnover = readout.turnover_text(diff.measured.get("turnover")).removeprefix("turnover ")
     summary = Html(
         f'<summary><span class="row">'
@@ -409,7 +439,7 @@ def _cycle(conn: psycopg.Connection, row: Sequence) -> Html:
         f'<span class="num">{esc(f"{names} names")}</span>'
         f"</span></summary>"
     )
-    events = conn.execute(_CYCLE_EVENTS, (f"live basket {reference}",)).fetchall()
+    events = reads.events.get(f"live basket {reference}", [])
     detail = join(
         [
             tag("h3", "What it changed"),
@@ -417,9 +447,9 @@ def _cycle(conn: psycopg.Connection, row: Sequence) -> Html:
             tag("h3", "Return"),
             note(f"{returned} over {period}: {window}"),
             tag("h3", "Gate"),
-            _gate_block(conn, basket_id),
+            _gate_block(reads.checks[basket_id]),
             tag("h3", "Flags"),
-            _flags_block(conn, period),
+            _flags_block(reads.flags.get(period, [])),
             tag("h3", "Events"),
             table(
                 ["When", "Event", "Actor", "Detail"],
@@ -444,7 +474,8 @@ def log(conn: psycopg.Connection, now: datetime) -> str:
     cycles = conn.execute(_CYCLES, (LOG_CYCLES,)).fetchall()
     body: list[object] = [note("No rebalance has been proposed yet.")]
     if cycles:
-        body = [_LOG_HEAD, *(_cycle(conn, row) for row in cycles)]
+        reads = _CycleReads.of(conn, cycles)
+        body = [_LOG_HEAD, *(_cycle(reads, row) for row in cycles)]
     return page("Decision log", "/", [banner(conn, now), section("Decision log", body)])
 
 

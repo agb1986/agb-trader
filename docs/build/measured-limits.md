@@ -254,6 +254,34 @@ lake, or with real filings. The reading that can move the `pipeline` limit is th
 run, `make sizing` (the three steps above), and its table goes under a dated heading in this
 file beside the 2026-11-05 one.
 
+## What the landing page and the bot's performance beat cost in queries ([#197](https://github.com/agb1986/agb-trader/issues/197))
+
+This is a count over a fixture database, not a reading from the server. The fixture
+(`tests/test_ui_queries.py`) holds 24 live cycles, each gated, with alerts, audit lines and
+twenty equity readings a month behind it, and the page is read through the `ui` role on a
+read-only connection with every statement counted.
+
+| What | Before | After |
+|---|---|---|
+| Decision log (`/`), statements per request | 226 | 19 |
+| Promoted thresholds read per bot performance beat | 4 | 1 |
+| Equity months read per bot performance beat | 3 | 1 |
+
+The log asked the database about each cycle it listed: the diff (four statements), the
+month's equity readings, the audit lines, the gate checks and the month's flags. They are now
+read once for all the cycles on the page with `= ANY(...)`, so the cost is a fixed handful of
+statements however many cycles the log lists. A month's return reads the last reading before
+the month and the month's last, not every reading in it. The bot reads the promoted
+thresholds and the equity months once per beat and hands them to the drawdown, losing-run,
+tracking and certified-capital checks.
+
+The HTML of the page, the `/pnl` text for every month and the Telegram text of the four
+performance alerts are held byte for byte in `tests/golden/ui_queries.json`, captured from the
+code as it stood before the change. The 226 is held there too, and a test requires the page to
+cost a fifth of it or less. What the count does not say is how long a request takes on the
+server: `agb.broker_state` has no index on `observed_at`, so the equity window reads are
+sequential scans of a table that grows by a reading a day until one is added.
+
 ## Run times, poll intervals and leases
 
 `agb runtimes` reports how long each job kind has actually taken, from the claim that started

@@ -742,12 +742,13 @@ class Bot:
         like this one would do. These are alerts and not pre-flight items: the pre-flight
         asks whether the machinery will work tomorrow, which is a different question from
         whether the strategy is behaving as it was validated to."""
+        basis = health.Basis(conn)
         return [
-            *health.drawdown(conn),
-            *health.losing_run(conn),
-            *health.tracking(conn),
+            *health.drawdown(conn, basis),
+            *health.losing_run(conn, basis),
+            *health.tracking(conn, basis),
             *health.live_cost(conn),
-            *health.certified_capital(conn),
+            *health.certified_capital(conn, basis),
         ]
 
     def rebalances(self, conn: psycopg.Connection) -> None:
