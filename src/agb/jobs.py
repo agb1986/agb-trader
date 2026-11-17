@@ -6,6 +6,10 @@ job, and a worker that finds a job locked skips it rather than waiting. The work
 lease while it works and releases it by completing or failing the job, or by releasing it
 (`release`) to be held again.
 
+Renewing, completing, failing and releasing are all conditional on the worker's name, so a
+name must belong to one worker only: two processes of one service that shared a name would
+each look like the holder to the other. `worker_name` makes one that is unique per process.
+
 What happens when a lease expires depends on the kind. A pipeline stage is deterministic and
 writes only to the database, so its expired lease is simply reclaimed (`reclaim_expired`).
 Execution submission has side effects at the broker, so it is never reclaimed: its expired
@@ -16,6 +20,8 @@ Every state change appends a `job_event` with an actor, in the same transaction 
 change it records.
 """
 
+import os
+import secrets
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -27,6 +33,14 @@ from agb.rows import one
 
 class LeaseLost(Exception):
     """The worker no longer holds the job's lease: it expired, or someone reclaimed it."""
+
+
+def worker_name(service: str) -> str:
+    """A name for one worker of `service`, unique to it: the service, the process id and a
+    random suffix. The pid alone repeats across container restarts, where every container's
+    first process is pid 1, so the suffix is what tells a restarted worker from the one it
+    replaced."""
+    return f"{service}-{os.getpid()}-{secrets.token_hex(4)}"
 
 
 @dataclass(frozen=True)
