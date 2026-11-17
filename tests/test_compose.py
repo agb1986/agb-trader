@@ -899,15 +899,26 @@ def test_sizing_start_closes_the_remote_shell_s_output(tmp_path):
 # there writes $FAKE_LOAD_ID (the built id unless it is set to something else).
 FAKE_DEPLOY_DOCKER = """#!/usr/bin/env bash
 echo "${FAKE_SIDE:-local} $*" >> "$FAKE_LOG"
+# The server's engine reports a different .Id from the workstation's for the same image (the
+# containerd image store gives a manifest digest, 20.10 the config digest), but the same layers.
 case $1 in
 build) cat > /dev/null ;;
 save) echo image-bytes ;;
-load) cat > /dev/null; echo "${FAKE_LOAD_ID:-$FAKE_BUILT_ID}" > "$FAKE_SERVER_ID_FILE" ;;
+load) cat > /dev/null
+    echo "${FAKE_LOAD_LAYERS:-$FAKE_BUILT_LAYERS}" > "$FAKE_SERVER_LAYERS_FILE" ;;
 image)
+    format=$4
     if [ "${FAKE_SIDE:-local}" = server ]; then
-        [ -s "$FAKE_SERVER_ID_FILE" ] && cat "$FAKE_SERVER_ID_FILE"
+        [ -s "$FAKE_SERVER_LAYERS_FILE" ] || exit 1
+        case $format in
+        *Layers*) cat "$FAKE_SERVER_LAYERS_FILE" ;;
+        *) echo sha256:config-digest ;;
+        esac
     else
-        echo "$FAKE_BUILT_ID"
+        case $format in
+        *Layers*) echo "$FAKE_BUILT_LAYERS" ;;
+        *) echo sha256:manifest-digest ;;
+        esac
     fi ;;
 esac
 exit 0
@@ -920,7 +931,11 @@ FAKE_SIDE=server exec bash -c "$cmd"
 """
 
 
-def deploy(tmp_path, *args, server_id="", load_id="", dirty="", env=None):
+BUILT_LAYERS = '["sha256:l1","sha256:l2"]'
+STALE_LAYERS = '["sha256:l1","sha256:old"]'
+
+
+def deploy(tmp_path, *args, server_layers="", load_layers="", dirty="", env=None):
     repo = tmp_path / "repo"
     (repo / "env").mkdir(parents=True)
     (repo / "scripts/deploy").mkdir(parents=True)
@@ -944,8 +959,8 @@ def deploy(tmp_path, *args, server_id="", load_id="", dirty="", env=None):
         (server / "env" / f"{name}.env").write_text("A=2\n")
     shutil.copy(repo / "scripts/deploy/agb-stack", server / "agb-stack")
     (server / "agb-stack").chmod(0o755)
-    id_file = tmp_path / "server-id"
-    id_file.write_text(f"{server_id}\n" if server_id else "")
+    layers_file = tmp_path / "server-layers"
+    layers_file.write_text(f"{server_layers}\n" if server_layers else "")
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -963,9 +978,9 @@ def deploy(tmp_path, *args, server_id="", load_id="", dirty="", env=None):
             "AGB_DEPLOY_HOST": "server.test",
             "AGB_DEPLOY_DIR": str(server),
             "FAKE_LOG": str(log),
-            "FAKE_BUILT_ID": "sha256:built",
-            "FAKE_SERVER_ID_FILE": str(id_file),
-            **({"FAKE_LOAD_ID": load_id} if load_id else {}),
+            "FAKE_BUILT_LAYERS": BUILT_LAYERS,
+            "FAKE_SERVER_LAYERS_FILE": str(layers_file),
+            **({"FAKE_LOAD_LAYERS": load_layers} if load_layers else {}),
             **(env or {}),
         },
         stdin=subprocess.DEVNULL,
@@ -973,7 +988,7 @@ def deploy(tmp_path, *args, server_id="", load_id="", dirty="", env=None):
         text=True,
         timeout=60,
     )
-    return done, log.read_text(), id_file.read_text().strip()
+    return done, log.read_text(), layers_file.read_text().strip()
 
 
 def test_deploy_refuses_a_dirty_tree(tmp_path):
@@ -1005,22 +1020,24 @@ def test_deploy_allows_a_dirty_tree_when_told_to(tmp_path, args, env):
     assert "stack activate" in log
 
 
-def test_deploy_skips_shipping_an_image_the_server_has_by_id(tmp_path):
-    done, log, _ = deploy(tmp_path, server_id="sha256:built")
+def test_deploy_skips_shipping_an_image_the_server_has_by_layers(tmp_path):
+    """The server's engine reports another `.Id` for the same image, so only the layers can say
+    the two are one image; comparing `.Id` would re-ship this every time."""
+    done, log, _ = deploy(tmp_path, server_layers=BUILT_LAYERS)
     assert done.returncode == 0, done.stderr
     assert "already has agb-trader-app" in done.stdout
     assert "save" not in log and "load" not in log
     assert "stack activate" in log
 
 
-def test_deploy_ships_an_image_the_server_has_under_another_id(tmp_path):
+def test_deploy_ships_an_image_the_server_has_with_other_layers(tmp_path):
     """The tag exists on the server, but it is not the image that was built."""
-    done, log, now = deploy(tmp_path, server_id="sha256:stale")
+    done, log, now = deploy(tmp_path, server_layers=STALE_LAYERS)
     assert done.returncode == 0, done.stderr
-    assert "has agb-trader-app" in done.stdout and "sha256:stale" in done.stdout
-    assert "shipping it again" in done.stdout
+    assert "has agb-trader-app" in done.stdout and "shipping it again" in done.stdout
+    assert re.search(r"layers [0-9a-f]{12}, not the built [0-9a-f]{12}", done.stdout)
     assert "local save" in log and "server load" in log
-    assert now == "sha256:built"
+    assert now == BUILT_LAYERS
     assert "stack activate" in log
 
 
@@ -1028,15 +1045,25 @@ def test_deploy_ships_an_image_the_server_lacks(tmp_path):
     done, log, now = deploy(tmp_path)
     assert done.returncode == 0, done.stderr
     assert "local save" in log and "server load" in log
-    assert now == "sha256:built"
+    assert now == BUILT_LAYERS
 
 
 def test_deploy_stops_when_the_loaded_image_is_not_the_built_one(tmp_path):
-    done, log, _ = deploy(tmp_path, load_id="sha256:other")
+    done, log, _ = deploy(tmp_path, load_layers=STALE_LAYERS)
     assert done.returncode == 1
-    assert "loaded agb-trader-app" in done.stderr and "sha256:other" in done.stderr
+    assert "loaded agb-trader-app" in done.stderr
+    assert re.search(r"as layers [0-9a-f]{12}, not the built [0-9a-f]{12}", done.stderr)
     assert "nothing was activated" in done.stderr
     assert "stack activate" not in log
+
+
+def test_deploy_accepts_a_load_that_reports_another_id_for_the_same_layers(tmp_path):
+    """A first deploy: nothing on the server, and after the load its engine's `.Id` is not the
+    workstation's. The layers match, so the deploy goes on."""
+    done, log, _ = deploy(tmp_path)
+    assert done.returncode == 0, done.stderr
+    assert "image inspect --format {{.Id}}" not in log
+    assert "stack activate" in log
 
 
 def test_sizing_reads_the_project_name_from_compose_not_the_directory(tmp_path):

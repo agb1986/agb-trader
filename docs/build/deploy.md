@@ -94,9 +94,12 @@ That runs `scripts/deploy/deploy.sh`, which:
    default to `dev` when unset, and `certify` refuses to run under `dev`, so a research image
    built by hand without `AGB_VERSION` cannot certify a model.
 4. Ships the image with `docker save | gzip | ssh … docker load`, unless the server already
-   has that tag under the same image id as the one just built. A tag the server holds under a
-   different id is shipped again, and after every load the server's id for the tag is compared
-   with the built one: a mismatch stops the deploy before anything is activated.
+   has that tag with the same image as the one just built. The images are compared by their
+   layer digests (`docker image inspect --format '{{json .RootFS.Layers}}'`), not by `.Id`:
+   `.Id` is a different digest of the same image under the containerd image store on the
+   workstation's Docker 29 than on the server's Docker 20.10. A tag the server holds with other
+   layers is shipped again, and after every load the server's layers for the tag are compared
+   with the built ones: a mismatch stops the deploy before anything is activated.
 5. Installs the release: the commit's `compose.yaml` and `agb-stack` go into
    `releases/<tag>/`.
 6. Runs `agb-stack activate <tag>` on the server. That starts the new release with
