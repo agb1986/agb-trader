@@ -566,6 +566,68 @@ def test_a_basket_still_waiting_says_that_no_answer_means_no_trades(conn, db):
     assert "No answer by the session's cutoff means no trades this month." in html.unescape(page)
 
 
+def _panel_basket(db, totals):
+    """A proposed live basket blended with a panel run that scored `totals`, its names the
+    gate fixtures' own, so the Rebalance view has a score and a sector to read."""
+    run_id, config_id, scores = panel_scores(db, totals)
+    basket_id = insert(db, panel_run=(config_id, run_id, 0.2))
+    conn = db.connect("pipeline")
+    for rank, (symbol, total) in enumerate(totals.items(), start=1):
+        conn.execute(
+            _BLEND,
+            (
+                basket_id,
+                symbol,
+                rank,
+                0.01,
+                scores[symbol][1],
+                total,
+                total / 24,
+                total / 24,
+                False,
+                0.5,
+            ),
+        )
+    return basket_id
+
+
+def test_the_rebalance_view_shows_the_panel_score_top_sector_and_cutoff(conn, db):
+    _panel_basket(db, {NAMES[0]: 20, NAMES[1]: 14})
+    cutoff = approval.cutoff_of(CALENDAR, conn_session(conn))
+
+    page = html.unescape(ui.rebalance(conn, cutoff - timedelta(hours=2, minutes=5)))
+
+    assert "Panel safety score 17.0/24, the mean over 2 of" in page
+    assert "Top sector Industrials" in page
+    assert f"Cutoff {cutoff.astimezone(UTC):%Y-%m-%d %H:%M} UTC (in 2h 5m)" in page
+
+
+def test_the_cutoff_reads_passed_once_it_has_gone(conn, db):
+    _panel_basket(db, {NAMES[0]: 20})
+    cutoff = approval.cutoff_of(CALENDAR, conn_session(conn))
+
+    page = html.unescape(ui.rebalance(conn, cutoff + timedelta(minutes=1)))
+
+    assert f"Cutoff {cutoff.astimezone(UTC):%Y-%m-%d %H:%M} UTC (passed)" in page
+
+
+def test_a_basket_with_no_panel_omits_the_score_and_has_no_sector(conn, db):
+    insert(db)
+
+    page = html.unescape(ui.rebalance(conn, LATER))
+
+    assert "Panel safety score" not in page
+    assert "Top sector not on record" in page
+    assert "Cutoff " in page
+
+
+def conn_session(conn):
+    """The session date of the latest live basket."""
+    return conn.execute(
+        "SELECT session_date FROM agb.basket WHERE kind = 'live' ORDER BY id DESC LIMIT 1"
+    ).fetchone()[0]
+
+
 def test_the_positions_view_shows_the_book_with_its_panel_scores_and_ranks(conn, traded):
     """Acceptance criterion (d), Positions: the latest broker snapshot, each name with its
     weight, return since entry, how long it has been held, panel score and rank."""

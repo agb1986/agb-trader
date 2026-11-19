@@ -61,12 +61,12 @@ import html
 import statistics
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, DivisionByZero, InvalidOperation
 
 import psycopg
 
-from agb import analyst, approval, debate, health, killswitch, ladder, readout
+from agb import analyst, approval, blend, debate, health, killswitch, ladder, readout
 from agb.alerts import acknowledge
 from agb.health import et
 from agb.nyse import NyseCalendar, trading_date
@@ -561,10 +561,66 @@ _ORDERS = """
 """
 
 
+# What the panel recorded about the names a basket holds. A basket is a panel basket when it
+# names a panel run; only then do its names have a score, and the sector is the one the panel
+# was told, so a name the panel did not debate has none on record.
+_PANEL_BASKET = "SELECT session_date, panel_run_id IS NOT NULL FROM agb.basket WHERE id = %s"
+_PANEL_NAMES = """
+    SELECT t.weight, bl.llm_total, ps.sector
+    FROM agb.basket_target t
+    LEFT JOIN agb.basket_blend bl ON bl.basket_id = t.basket_id AND bl.symbol = t.symbol
+    LEFT JOIN agb.panel_score ps ON ps.id = bl.panel_score_id
+    WHERE t.basket_id = %s
+"""
+
+
 def _standing(held: bool, carried: bool) -> str:
     if carried:
         return "carried"
     return "held" if held else "new"
+
+
+def _utc(at: datetime) -> str:
+    return at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _cutoff_line(session: date, now: datetime) -> str:
+    """The session's MOC cutoff in absolute UTC, with how long is left by the page's own clock.
+    Rendered on the server, so it is as old as the page and carries no script."""
+    cutoff = approval.cutoff_of(calendar(now), session)
+    left = approval.countdown(now, cutoff)
+    return f"Cutoff {_utc(cutoff)} ({'passed' if left == 'passed' else f'in {left}'})"
+
+
+def _panel_lines(conn: psycopg.Connection, basket_id: int, panel_basket: bool) -> list[str]:
+    """The basket's panel safety score and top sector, from what the pipeline stored. The score
+    is the mean rubric total out of 24 over the names the panel scored, and is left out for a
+    basket proposed with no panel. The top sector is the heaviest by target weight among the
+    names whose sector the panel recorded."""
+    names = conn.execute(_PANEL_NAMES, (basket_id,)).fetchall()
+    lines: list[str] = []
+    if panel_basket:
+        totals = [total for _, total, _ in names if total is not None]
+        lines.append(
+            f"Panel safety score {sum(totals) / len(totals):.1f}/{blend.MAX_TOTAL}, the mean over "
+            f"{len(totals)} of {len(names)} names scored"
+            if totals
+            else "Panel safety score not available: the panel scored none of the names"
+        )
+    weights: dict[str, Decimal] = {}
+    for weight, _, sector in names:
+        if sector:
+            weights[sector] = weights.get(sector, Decimal(0)) + weight
+    if weights:
+        sector, weight = max(weights.items(), key=lambda item: (item[1], item[0]))
+        known = sum(1 for _, _, name_sector in names if name_sector)
+        lines.append(
+            f"Top sector {sector}, {readout.percent(weight, 0)} of the basket "
+            f"({known} of {len(names)} names have a sector on record)"
+        )
+    else:
+        lines.append("Top sector not on record: only the panel records a sector")
+    return lines
 
 
 def rebalance(conn: psycopg.Connection, now: datetime) -> str:
@@ -576,8 +632,11 @@ def rebalance(conn: psycopg.Connection, now: datetime) -> str:
     basket_id, reference, period, state, since, actor, surface, capital, ranker, _ = latest
     diff = readout.diff(conn, basket_id)
     waiting = state in ("proposed", "pending")
+    [(session, panel_basket)] = conn.execute(_PANEL_BASKET, (basket_id,)).fetchall()
     blocks: list[object] = [
         note(f"{state} since {et(since)} by {actor} ({surface}) · model {ranker} · {period}"),
+        note(_cutoff_line(session, now)),
+        *(note(line) for line in _panel_lines(conn, basket_id, panel_basket)),
     ]
     if waiting:
         blocks += [
