@@ -25,7 +25,7 @@ from decimal import Decimal
 import psycopg
 
 from agb import heartbeat
-from agb.cli import expected_services, format_age
+from agb.common import expected_services, format_age
 from agb.nyse import NEW_YORK
 
 # A service whose heartbeat is older than this is stale. The window is the heartbeat module's,

@@ -93,7 +93,7 @@ _LIVE_MODEL = """
     SELECT model_id, certification_id, promoted_by, promoted_at, voided_at, waived, waived_at
     FROM agb.promoted_model
 """
-_NEXT_SUBMISSION = """
+NEXT_SUBMISSION = """
     SELECT period, due_at FROM agb.expected_event
     WHERE kind = 'submission' AND due_at > %s
     ORDER BY due_at
@@ -203,7 +203,7 @@ def status(conn: psycopg.Connection, now: datetime) -> str:
                 )
             )
 
-    upcoming = conn.execute(_NEXT_SUBMISSION, (now,)).fetchone()
+    upcoming = conn.execute(NEXT_SUBMISSION, (now,)).fetchone()
     if upcoming is None:
         items.append(Item("no rebalance scheduled", "the scheduler has none due"))
     else:

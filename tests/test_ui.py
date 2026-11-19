@@ -940,7 +940,8 @@ def test_no_page_can_write_because_the_connection_is_read_only(conn, traded):
             "INSERT INTO agb.alert (kind, subject, period, body, raised_by)"
             " VALUES ('x', 'x', 'x', 'x', 'ui')"
         )
-    source = (ROOT / "src/agb/ui.py").read_text() + (ROOT / "src/agb/services/ui.py").read_text()
+    source = "".join(path.read_text() for path in sorted((ROOT / "src/agb/ui").glob("*.py")))
+    source += (ROOT / "src/agb/services/ui.py").read_text()
     assert not re.search(r"\b(INSERT|UPDATE|DELETE|TRUNCATE)\b", source)
 
 

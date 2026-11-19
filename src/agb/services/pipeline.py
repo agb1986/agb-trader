@@ -226,6 +226,22 @@ JOB_HELD = "pipeline_job_held"
 # or not what it should be, or that the service may not read.
 _LASTING_OS_ERRORS = (FileNotFoundError, NotADirectoryError, IsADirectoryError, PermissionError)
 
+# What building and gating a basket can raise that is the cycle's to handle: the job is stopped
+# and the cause recorded, rather than the service brought down. A rebalance adds the two errors of
+# loading a model and the panel.
+_BASKET_ERRORS = (
+    BasketError,
+    GateError,
+    UniverseError,
+    LakeError,
+    StoreError,
+    OSError,
+    ValueError,
+    duckdb.Error,
+    psycopg.Error,
+    pa.ArrowException,
+)
+
 _RELEASES = "SELECT count(*) FROM agb.job_event WHERE job_id = %s AND event = 'released'"
 _SESSION = "SELECT session_date FROM agb.job WHERE id = %s"
 
@@ -405,6 +421,17 @@ class Pipeline:
         jobs.renew(conn, claim, self.retry)
         return True
 
+    def run_gate(self, conn: psycopg.Connection, proposal: basket.Proposal) -> gate.Verdict:
+        """Run the pre-trade gate over a proposal, with this pipeline's limits and clock."""
+        return gate.run(
+            conn,
+            proposal.basket_id,
+            members=proposal.members,
+            marks=proposal.marks,
+            now=self.clock(),
+            limits=self.limits,
+        )
+
     def stop(self, conn: psycopg.Connection, claim: jobs.Claim, what: str, exc: Exception) -> None:
         """Handle a job that stopped on `exc`, by the class `classify` gives it: release it to
         be tried again, hold it, or fail it with the class and the error named as its cause.
@@ -491,32 +518,12 @@ class Pipeline:
                 panel=self.stage2(conn, claim),
             )
             jobs.renew(conn, claim, self.lease)
-            verdict = gate.run(
-                conn,
-                proposal.basket_id,
-                members=proposal.members,
-                marks=proposal.marks,
-                now=self.clock(),
-                limits=self.limits,
-            )
+            verdict = self.run_gate(conn, proposal)
         except NotReady as exc:
             if self.wait(conn, claim, "rebalance", f"not ready: {exc}"):
                 log.info("rebalance %s: %s; trying again in %s", claim.period, exc, self.retry)
             return
-        except (
-            BasketError,
-            GateError,
-            PanelError,
-            RegistryError,
-            UniverseError,
-            LakeError,
-            StoreError,
-            OSError,
-            ValueError,
-            duckdb.Error,
-            psycopg.Error,
-            pa.ArrowException,
-        ) as exc:
+        except (*_BASKET_ERRORS, PanelError, RegistryError) as exc:
             self.stop(conn, claim, "rebalance", exc)
             return
         jobs.complete(conn, claim)
@@ -569,31 +576,13 @@ class Pipeline:
             proposal = basket.rerun(
                 conn, original, reference, session_date, command_id, self.lake_dir
             )
-            verdict = gate.run(
-                conn,
-                proposal.basket_id,
-                members=proposal.members,
-                marks=proposal.marks,
-                now=self.clock(),
-                limits=self.limits,
-            )
+            verdict = self.run_gate(conn, proposal)
         except NotReady as exc:
             # Execution has not read the account since the signal session: the rerun waits for
             # the read, as a rebalance does, and its cutoff bounds the wait.
             log.info("rerun %s: %s; trying again next cycle", reference, exc)
             return
-        except (
-            BasketError,
-            GateError,
-            UniverseError,
-            LakeError,
-            StoreError,
-            OSError,
-            ValueError,
-            duckdb.Error,
-            psycopg.Error,
-            pa.ArrowException,
-        ) as exc:
+        except _BASKET_ERRORS as exc:
             if isinstance(exc, psycopg.Error) and (conn.closed or conn.broken):
                 raise
             detail = cause(exc)

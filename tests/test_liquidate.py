@@ -44,7 +44,8 @@ from test_pause_resume import (
 from agb import execution
 from agb.alpaca import Alpaca, AlpacaError, Closed
 from agb.execution import ExecutionError
-from agb.services.bot import TOKEN_VALID, parse
+from agb.killswitch import TOKEN_VALID
+from agb.services.bot import parse
 from agb.services.execution import Execution
 
 TOKEN = re.compile(r"^/liquidate ([a-z0-9]{6})$", re.MULTILINE)

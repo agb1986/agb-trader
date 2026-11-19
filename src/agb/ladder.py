@@ -115,14 +115,16 @@ _BREACH = """
 def current(conn: psycopg.Connection) -> Level:
     """The level the system is at. There is always one: the migration records L0."""
     row = conn.execute(_LEVEL).fetchone()
-    assert row is not None, "agb.ladder_event starts with an L0 event"
+    if row is None:
+        raise LookupError("agb.ladder_event starts with an L0 event")
     return Level(*row)
 
 
 def mode(conn: psycopg.Connection) -> str:
     """The trading mode, `paper` or `live`."""
     row = conn.execute(_MODE).fetchone()
-    assert row is not None, "agb.mode_event starts with a paper event"
+    if row is None:
+        raise LookupError("agb.mode_event starts with a paper event")
     return row[0]
 
 
@@ -145,7 +147,8 @@ def live_status(conn: psycopg.Connection) -> list[Criterion]:
 def live_ready(conn: psycopg.Connection) -> Readiness:
     """Whether paper has earned live, and which criteria are outstanding."""
     row = conn.execute(_LIVE_READY).fetchone()
-    assert row is not None, "agb.live_status always measures its criteria"
+    if row is None:
+        raise LookupError("agb.live_status always measures its criteria")
     return Readiness("live", row[0], row[2])
 
 
