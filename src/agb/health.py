@@ -1,7 +1,7 @@
-"""What is unhealthy, read from the database: stale heartbeats, overdue expected events, a
-rebalance that was never scheduled, open halts, the broker disagreeing with the database, and
-a panel body the nightly integrity check could not read back. The bot turns these into alerts
-and the pre-flight.
+"""What is unhealthy, read from the database: stale heartbeats, services that never beat,
+overdue expected events, a rebalance that was never scheduled, open halts, the broker
+disagreeing with the database, and a panel body the nightly integrity check could not read
+back. The bot turns these into alerts and the pre-flight.
 
 Then how the account is performing, which is a different question with the same answer:
 nothing. A drawdown deeper than the certified paths reached, a losing run longer than they
@@ -17,7 +17,7 @@ text: what is wrong, then the facts behind it.
 """
 
 import statistics
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -25,13 +25,21 @@ from decimal import Decimal
 import psycopg
 
 from agb import heartbeat
-from agb.cli import format_age
+from agb.common import expected_services, format_age
 from agb.nyse import NEW_YORK
 
 # A service whose heartbeat is older than this is stale. The window is the heartbeat module's,
 # so the bot, the UI, `agb status` and each container's healthcheck all apply the same one.
 STALE_AFTER = heartbeat.STALE_AFTER
 stale_after_from_env = heartbeat.stale_after_from_env
+
+# How long an expected service may go without writing its first heartbeat before that is an
+# alert. It is counted from when the bot itself started (the `since` of `never_started`),
+# because a service that never beat leaves no row to count from, and the bot is the one thing
+# known to be running. A fresh stack, started together, is therefore quiet for this long. It
+# is longer than STALE_AFTER because a first beat waits behind the image pull, the migration
+# and the service's own start-up, where a stale one only waits for a missed cycle.
+NEVER_STARTED_GRACE = timedelta(minutes=10)
 
 # The live cost reading is not worth a word before this many fills, and not worth one until
 # the excess over the modelled cost is larger than this many standard errors of itself.
@@ -70,7 +78,7 @@ def ago(now: datetime, at: datetime) -> str:
 
 def stale_heartbeats(conn: psycopg.Connection, now: datetime, stale_after: timedelta):
     """Every other service whose last beat is older than `stale_after`. A service that has
-    never beaten has no row, and is not reported here."""
+    never beaten has no row, and is not reported here but by `never_started`."""
     rows = conn.execute(
         "SELECT service, beat_at FROM agb.heartbeat "
         "WHERE beat_at < %s AND service <> current_user ORDER BY service",
@@ -87,6 +95,39 @@ def stale_heartbeats(conn: psycopg.Connection, now: datetime, stale_after: timed
             f"last beat {ago(now, beat_at)}, at {et(beat_at)}",
         )
         for service, beat_at in rows
+    ]
+
+
+def never_started(
+    conn: psycopg.Connection,
+    now: datetime,
+    since: datetime,
+    expected: Iterable[str] | None = None,
+    grace: timedelta = NEVER_STARTED_GRACE,
+) -> list[Finding]:
+    """Every other expected service with no heartbeat row at all, once `grace` has passed since
+    `since`, the moment the caller started watching (the bot's own start). The expected set is
+    the one `agb status` insists on, `AGB_EXPECTED_SERVICES` or every service, unless `expected`
+    is given. The checking service is never reported: if it can check, it is running.
+
+    One alert per service, for as long as the database has no row for it. The heartbeat table
+    is never emptied, so a service that has beaten once is stale or healthy from then on, and
+    the alert's period is the fixed word `never`."""
+    if now - since < grace:
+        return []
+    (me,) = conn.execute("SELECT current_user").fetchone()
+    beating = {row[0] for row in conn.execute("SELECT service FROM agb.heartbeat").fetchall()}
+    return [
+        Finding(
+            "never_started",
+            service,
+            "never",
+            f"never started: {service}",
+            f"no heartbeat {format_age(now - since)} after the bot began watching, at "
+            f"{et(since)}; expected by AGB_EXPECTED_SERVICES",
+        )
+        for service in dict.fromkeys(expected_services() if expected is None else expected)
+        if service != me and service not in beating
     ]
 
 

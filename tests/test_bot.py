@@ -170,6 +170,201 @@ def test_the_stale_threshold_is_configurable(db, telegram, rebalance_ahead):
     assert [kind for kind, _, _ in alerts(db)] == ["stale_heartbeat"]
 
 
+# Never-started services, repeats and recovery (issue #208).
+
+ALL = ("scheduler", "backup")
+GRACE = bot_service.health.NEVER_STARTED_GRACE
+EVERY = bot_service.REPEAT_EVERY
+
+
+def clock():
+    """A fake clock the test moves: `now.at` is the time, and calling it reads it."""
+
+    class Now:
+        at = NOW
+
+        def __call__(self):
+            return self.at
+
+    return Now()
+
+
+def ack(db, ident, actor="telegram:7"):
+    db.connect("bot").execute(
+        "INSERT INTO agb.alert_event (alert_id, event, channel, chat_id, actor) "
+        "VALUES (%s, 'acknowledged', 'telegram', %s, %s)",
+        (ident, CHAT, actor),
+    )
+
+
+def watching(telegram, now, **options):
+    # The stale threshold is wide unless a test sets it, so a beat does not age out while the
+    # fake clock moves through the grace period and the repeat interval.
+    options.setdefault("stale_after", timedelta(days=1))
+    return Bot(telegram, CHAT, now, expected=ALL, **options)
+
+
+def test_a_service_with_no_heartbeat_alerts_only_after_the_grace_period(
+    db, telegram, rebalance_ahead
+):
+    beat_at(db, "backup", NOW)
+    now = clock()
+    conn = db.connect("bot")
+    bot = watching(telegram, now)
+
+    bot(conn)
+    now.at = NOW + GRACE - timedelta(seconds=1)
+    bot(conn)
+    assert alerts(db) == [], "a fresh stack is not alerted on at once"
+
+    now.at = NOW + GRACE
+    bot(conn)
+    bot(conn)
+    # A restarted bot holds nothing, and its own grace starts again: it says nothing new.
+    watching(FakeTelegram(), now)(conn)
+
+    assert alerts(db) == [("never_started", "scheduler", "never")]
+    assert telegram.sent == [
+        (
+            CHAT,
+            "HEALTH ALERT — nothing has been done and nothing will be.\n\n"
+            "  never started: scheduler\n"
+            "    no heartbeat 10m 0s after the bot began watching, at 2026-09-15 12:00 ET; "
+            "expected by AGB_EXPECTED_SERVICES",
+        )
+    ]
+
+
+def test_only_the_expected_services_are_waited_for(db, telegram, rebalance_ahead):
+    conn = db.connect("bot")
+    bot = Bot(telegram, CHAT, lambda: NOW + GRACE, expected=("scheduler", "bot"))
+    bot._started = NOW
+    bot(conn)
+    # The bot is not waited for: it is the one checking.
+    assert alerts(db) == [("never_started", "scheduler", "never")]
+
+
+def test_an_unacknowledged_alert_repeats_and_an_acknowledged_one_does_not(
+    db, telegram, rebalance_ahead
+):
+    beat_at(db, "scheduler", NOW)
+    beat_at(db, "backup", NOW - timedelta(minutes=14))
+    now = clock()
+    conn = db.connect("bot")
+    bot = watching(telegram, now, stale_after=timedelta(minutes=10))
+
+    bot(conn)
+    now.at = NOW + EVERY - timedelta(seconds=1)
+    # Keep the other service fresh so only the one condition is open.
+    beat_at_update(db, "scheduler", now.at)
+    bot(conn)
+    assert [kind for kind, _, _ in alerts(db)] == ["stale_heartbeat"]
+
+    now.at = NOW + EVERY
+    beat_at_update(db, "scheduler", now.at)
+    bot(conn)
+    bot(conn)
+    [(first,), (second,)] = (
+        db.connect("cli").execute("SELECT id FROM agb.alert ORDER BY id").fetchall()
+    )
+    assert alerts(db)[1] == ("reminder", str(first), "1")
+    assert len(telegram.sent) == 2
+    assert f"/ack {first}" in telegram.sent[1][1]
+    assert telegram.sent[1][1].startswith("REMINDER 1")
+
+    now.at = NOW + 2 * EVERY
+    beat_at_update(db, "scheduler", now.at)
+    bot(conn)
+    assert alerts(db)[2] == ("reminder", str(first), "2")
+
+    ack(db, first)
+    now.at = NOW + 10 * EVERY
+    beat_at_update(db, "scheduler", now.at)
+    bot(conn)
+    now.at = NOW + 20 * EVERY
+    beat_at_update(db, "scheduler", now.at)
+    bot(conn)
+    assert [kind for kind, _, _ in alerts(db)] == ["stale_heartbeat", "reminder", "reminder"]
+    assert len(telegram.sent) == 3
+    assert second != first
+
+
+def beat_at_update(db, service, at):
+    db.connect(OWNER).execute(
+        "UPDATE agb.heartbeat SET beat_at = %s WHERE service = %s", (at, service)
+    )
+
+
+def test_an_alert_that_was_not_delivered_is_not_repeated(db, telegram, rebalance_ahead):
+    beat_at(db, "backup", NOW)
+    now = clock()
+    conn = db.connect("bot")
+    bot = watching(telegram, now)
+    telegram.fail = "sendMessage: Bad Gateway"
+    now.at = NOW + GRACE
+    bot(conn)
+    now.at = NOW + GRACE + EVERY
+    bot(conn)
+    assert [kind for kind, _, _ in alerts(db)] == ["never_started"]
+    assert telegram.sent == []
+
+
+def test_recovery_sends_one_message_when_the_condition_clears(db, telegram, rebalance_ahead):
+    beat_at(db, "backup", NOW)
+    now = clock()
+    conn = db.connect("bot")
+    bot = watching(telegram, now)
+    now.at = NOW + GRACE
+    bot(conn)
+    (ident,) = db.connect("cli").execute("SELECT id FROM agb.alert").fetchone()
+
+    now.at = NOW + GRACE + timedelta(minutes=20)
+    beat_at(db, "scheduler", now.at)
+    bot(conn)
+    bot(conn)
+    # Nor does a restart that finds it healthy say it again.
+    watching(FakeTelegram(), now)(conn)
+    now.at += EVERY
+    beat_at_update(db, "scheduler", now.at)
+    bot(conn)
+
+    assert alerts(db) == [
+        ("never_started", "scheduler", "never"),
+        ("recovery", str(ident), "recovered"),
+    ]
+    assert len(telegram.sent) == 2
+    assert telegram.sent[1][1].startswith(
+        f"RECOVERED — alert {ident} has cleared: never started: scheduler"
+    )
+
+
+def test_a_healthy_state_is_not_announced_on_first_sight(db, telegram, rebalance_ahead):
+    beat_at(db, "scheduler", NOW)
+    beat_at(db, "backup", NOW)
+    now = clock()
+    conn = db.connect("bot")
+    bot = watching(telegram, now)
+    bot(conn)
+    now.at = NOW + GRACE + EVERY
+    beat_at_update(db, "scheduler", now.at)
+    beat_at_update(db, "backup", now.at)
+    bot(conn)
+    assert alerts(db) == []
+    assert telegram.sent == []
+
+
+def test_a_condition_whose_period_rolls_over_has_not_recovered(db, telegram, rebalance_ahead):
+    now = clock()
+    conn = db.connect("bot")
+    bot = watching(telegram, now)
+    bot.follow(conn, [], NOW)
+    for period in ("2026-09", "2026-10"):
+        finding = Finding("drawdown", "equity", period, "drawdown", "deeper")
+        bot.raise_alert(conn, "drawdown", "equity", period, "an alert")
+        bot.follow(conn, [finding], NOW)
+    assert [kind for kind, _, _ in alerts(db)] == ["drawdown", "drawdown"]
+
+
 def test_no_rebalance_within_horizon_alerts_once_until_one_is_scheduled(db, telegram):
     conn = db.connect("bot")
     Bot(telegram, CHAT, lambda: NOW)(conn)

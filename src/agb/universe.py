@@ -244,7 +244,7 @@ def snapshot(
     """
     conn = db if db is not None else lake.connect(lake_dir)
     try:
-        _require(conn)
+        lake.require_columns(conn, _NEEDED, UniverseError)
         session = conn.execute("SELECT max(date) FROM sep WHERE date <= ?", [as_of]).fetchone()[0]
         if session is None:
             raise UniverseError(f"the lake has no session on or before {as_of}")
@@ -309,18 +309,6 @@ def month_ends(start: date = lake.SINCE, end: date | None = None) -> list[date]:
             dates.append(session)
         year, month = year + month // 12, month % 12 + 1
     return dates
-
-
-def _require(db: duckdb.DuckDBPyConnection) -> None:
-    """Fail with the missing dataset or columns named, rather than a DuckDB binder error."""
-    for view, columns in _NEEDED.items():
-        try:
-            present = {row[0] for row in db.execute(f"DESCRIBE {view}").fetchall()}
-        except duckdb.Error:
-            raise UniverseError(f"the lake has no {view} partitions") from None
-        missing = sorted(set(columns) - present)
-        if missing:
-            raise UniverseError(f"the lake's {view} lacks {missing}")
 
 
 def main(argv: list[str] | None = None) -> None:

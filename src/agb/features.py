@@ -325,7 +325,7 @@ def compute(
     when computing a run of dates, so the lake's views are not rebuilt for each."""
     conn = db if db is not None else lake.connect(lake_dir)
     try:
-        _require(conn)
+        lake.require_columns(conn, _NEEDED, FeatureError)
         rows = _raw_rows(conn, universe) if universe.members else []
     finally:
         if db is None:
@@ -581,18 +581,6 @@ def _month_start(day: date, months_back: int) -> date:
     """The first day of the calendar month `months_back` months before `day`'s."""
     index = day.year * 12 + day.month - 1 - months_back
     return date(index // 12, index % 12 + 1, 1)
-
-
-def _require(db: duckdb.DuckDBPyConnection) -> None:
-    """Fail with the missing dataset or columns named, rather than a DuckDB binder error."""
-    for view, columns in _NEEDED.items():
-        try:
-            present = {row[0] for row in db.execute(f"DESCRIBE {view}").fetchall()}
-        except duckdb.Error:
-            raise FeatureError(f"the lake has no {view} partitions") from None
-        missing = sorted(set(columns) - present)
-        if missing:
-            raise FeatureError(f"the lake's {view} lacks {missing}")
 
 
 def main(argv: list[str] | None = None) -> None:

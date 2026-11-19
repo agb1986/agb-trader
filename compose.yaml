@@ -260,6 +260,9 @@ services:
       PGUSER: bot
       PGPASSWORD: ${BOT_DB_PASSWORD:?set in env/db.env}
       AGB_HEARTBEAT_SECONDS: ${AGB_HEARTBEAT_SECONDS:-30}
+      # The services the bot alerts on when none has ever beaten; empty means every service.
+      # The same list `agb status` insists on, so the workstation's narrower one reaches here.
+      AGB_EXPECTED_SERVICES: ${AGB_EXPECTED_SERVICES:-}
     depends_on:
       migrate:
         condition: service_completed_successfully

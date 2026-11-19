@@ -33,7 +33,7 @@ import logging
 import os
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from functools import partial
@@ -44,7 +44,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from agb import alerts, approval, health, jobs, killswitch, ladder, readout, schedule
-from agb.cli import format_age
+from agb.common import format_age
 from agb.health import Finding
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.nyse import NEW_YORK, NyseCalendar, trading_date
@@ -76,6 +76,18 @@ PERFORMANCE_FOOTER = (
     "Both are yours to choose; nothing in this message chooses for you, "
     "and no part of the system will act on it."
 )
+# An alert nobody has acknowledged is said again after this long, and again after each
+# further one, until it is acknowledged or the condition clears. Six hours is a few times a
+# day: often enough that an alert missed overnight is seen in the morning, rarely enough that
+# a condition left alone on purpose is not a nuisance. An acknowledged alert never repeats.
+REPEAT_EVERY = timedelta(hours=6)
+# The kinds of the two follow-ups. Each is an alert of its own, so it is delivered, retried
+# and listed like any other, and each is keyed by the id of the alert it follows: the
+# reminders by their number, and the recovery by the fixed word below, which is what makes
+# the recovery one message however many times the bot is restarted or the cycle is retried.
+REMINDER = "reminder"
+RECOVERY = "recovery"
+RECOVERED = "recovered"
 # A duty of the cycle that raised. One alert per run of failures: the cycle the run began in
 # identifies it, so a duty that recovers and fails again raises a new one.
 CYCLE_FAILURE = "cycle_failure"
@@ -89,9 +101,6 @@ GATE_HALT = "gate_halt"
 RECENT_BASKETS = 3
 # Telegram refuses a message longer than this; a longer answer goes out in parts.
 MESSAGE_MAX = 4096
-# How long a liquidation token stays valid. The kill switch owns it; it is named here
-# because this is the surface that tells the operator how long they have.
-TOKEN_VALID = killswitch.TOKEN_VALID
 # A command older than this when the bot reads it is refused, not acted on. Telegram keeps an
 # unread message for a day, so a `/resume` typed before an outage would otherwise clear a halt
 # raised since. Five minutes is several poll cycles and a retried poll, and far less than the
@@ -125,8 +134,6 @@ COMMANDS = {
     "ack": ("/ack <alert id>", "acknowledge an alert by the id it is listed under"),
     "help": ("/help", "this list"),
 }
-# Commands the spec names that later tickets bring. They are refused, and recorded.
-LATER: frozenset[str] = frozenset()
 # Commands whose arguments `agb.approval` checks, against what is pending.
 DECISIONS = frozenset({"approve", "reject"})
 VERB = re.compile(r"^[a-z][a-z_]*$")
@@ -166,8 +173,6 @@ def parse(text: str) -> Parsed:
         return Parsed(None, args, "not a command")
     if verb == "start":
         verb = "help"
-    if verb in LATER:
-        return Parsed(verb, args, f"/{verb} is not available yet")
     if verb not in COMMANDS:
         return Parsed(verb, args, f"unknown command /{verb}")
     usage = COMMANDS[verb][0]
@@ -223,6 +228,25 @@ def alert_text(finding: Finding) -> str:
     return f"{ALERT_HEADER}\n\n{finding.lines()}"
 
 
+def reminder_text(opened: "Open", number: int, every: timedelta, now: datetime) -> str:
+    return (
+        f"REMINDER {number} — alert {opened.alert_id} is still open and nobody has "
+        f"acknowledged it. Nothing has been done and nothing will be.\n\n"
+        f"{opened.finding.lines()}\n\n"
+        f"Open for {format_age(now - opened.since)} as the bot has watched it. "
+        f"/ack {opened.alert_id} acknowledges it and stops these; "
+        f"until then it is said again every {format_age(every)}."
+    )
+
+
+def recovery_text(opened: "Open", now: datetime) -> str:
+    return (
+        f"RECOVERED — alert {opened.alert_id} has cleared: {opened.finding.what}.\n\n"
+        f"It was open for {format_age(now - opened.since)} as the bot has watched it. "
+        f"This is the only message about it being over."
+    )
+
+
 def _cut(text: str, limit: int = FAILURE_MAX) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -272,6 +296,10 @@ _SETTLED = """
     ORDER BY id
 """
 _RAISED = "SELECT 1 FROM agb.alert WHERE kind = %s AND subject = %s AND period = %s"
+_IDENT = "SELECT id FROM agb.alert WHERE kind = %s AND subject = %s AND period = %s"
+_REMINDED = "SELECT count(*) FROM agb.alert WHERE kind = 'reminder' AND subject = %s"
+_ACKNOWLEDGED = "SELECT 1 FROM agb.alert_event WHERE alert_id = %s AND event = 'acknowledged'"
+_UNDELIVERED = "SELECT 1 FROM agb.undelivered_alert WHERE id = %s"
 
 # The parts of an alert Telegram has accepted, by part number and the message each became.
 _SENT = """
@@ -342,10 +370,26 @@ class RefusalLimit:
         return self._seen.get(chat, (now, 0))[0]
 
 
+@dataclass
+class Open:
+    """An alert's condition that the bot has seen unhealthy and not yet seen clear: the alert
+    it raised or found already raised, the finding as of the latest cycle, when the bot first
+    saw it, when it last said anything about it, and whether it has been acknowledged."""
+
+    alert_id: int
+    finding: Finding
+    since: datetime
+    told: datetime
+    acknowledged: bool = False
+
+
 class Bot:
     """One bot cycle, run by `serve`. Telegram and the clock are injectable for tests.
 
     `halts` and `broker` report open halt causes and a broker mismatch for the pre-flight.
+    `expected` is the services that must have a heartbeat (`AGB_EXPECTED_SERVICES` when not
+    given), and one with none is alerted on once `never_grace` has passed since the bot started.
+    `repeat_every` is how often an unacknowledged alert is said again.
     """
 
     def __init__(
@@ -363,6 +407,9 @@ class Bot:
         sleep: Callable[[float], None] = wait,
         halts: Check = health.open_halt_causes,
         broker: Check = health.broker_mismatch,
+        expected: Sequence[str] | None = None,
+        never_grace: timedelta = health.NEVER_STARTED_GRACE,
+        repeat_every: timedelta = REPEAT_EVERY,
     ) -> None:
         self.telegram = telegram
         self.chat_id = chat_id
@@ -376,6 +423,16 @@ class Bot:
         self._sleep = sleep
         self.halts = halts
         self.broker = broker
+        self.expected = expected
+        self.never_grace = never_grace
+        self.repeat_every = repeat_every
+        # The grace of a service that never beat counts from here: it leaves no row to count
+        # from, and the bot is the one thing known to be running.
+        self._started = clock()
+        # The conditions the bot has told the operator about and not yet seen clear, by the
+        # key of the alert that raised them. Held in memory, so a restart starts the
+        # repeating and the watch for recovery again from the conditions then unhealthy.
+        self._open: dict[tuple[str, str, str], Open] = {}
         self._offset: int | None = None
         self._calendar: NyseCalendar | None = None
         # Each duty that is failing, with the cycle its run of failures began in.
@@ -730,15 +787,69 @@ class Bot:
     # Alerts.
 
     def alerts(self, conn: psycopg.Connection, now: datetime) -> None:
-        """An alert for each unhealthy finding, broker mismatch and performance reading."""
-        for finding in [*self.findings(conn, now), *self.broker(conn), *self.performance(conn)]:
+        """An alert for each unhealthy finding, broker mismatch and performance reading, then
+        the repeats and recoveries those alerts are owed."""
+        found = [*self.findings(conn, now), *self.broker(conn), *self.performance(conn)]
+        for finding in found:
             self.raise_alert(
                 conn, finding.kind, finding.subject, finding.period, alert_text(finding)
             )
+        self.follow(conn, found, now)
+
+    def follow(self, conn: psycopg.Connection, found: list[Finding], now: datetime) -> None:
+        """Say again what is still wrong and unacknowledged, and say once that it is over.
+
+        A condition is its kind and subject, so a finding whose period rolls over, a month's
+        reading say, is the same condition continuing and not one that cleared. One the bot
+        has not seen unhealthy is not followed: nothing is said about a healthy state on
+        first sight, nor about a condition that cleared while the bot was not running.
+
+        Each follow-up is an alert of its own, raised once under its own key, so neither can
+        be sent twice by a restart or a retried cycle."""
+        current = {(f.kind, f.subject): f for f in found}
+        for finding in found:
+            key = (finding.kind, finding.subject, finding.period)
+            if key not in self._open:
+                # The same condition under an earlier period is superseded, not cleared.
+                for old in [k for k in self._open if k[:2] == key[:2]]:
+                    del self._open[old]
+                (ident,) = conn.execute(_IDENT, key).fetchone()
+                self._open[key] = Open(ident, finding, now, now)
+            self._open[key].finding = finding
+        for key, opened in list(self._open.items()):
+            if key[:2] not in current:
+                self._raise(
+                    conn, RECOVERY, str(opened.alert_id), RECOVERED, recovery_text(opened, now)
+                )
+                del self._open[key]
+            elif now - opened.told >= self.repeat_every:
+                self._repeat(conn, opened, now)
+
+    def _repeat(self, conn: psycopg.Connection, opened: Open, now: datetime) -> None:
+        """A reminder for an alert that was delivered, is still unhealthy and has not been
+        acknowledged. One still being retried is waited for, and an acknowledged one is let
+        go for good: the first acknowledgement stands, so it cannot come back."""
+        if opened.acknowledged or conn.execute(_ACKNOWLEDGED, (opened.alert_id,)).fetchone():
+            opened.acknowledged = True
+            return
+        if conn.execute(_UNDELIVERED, (opened.alert_id,)).fetchone():
+            return
+        subject = str(opened.alert_id)
+        (sent,) = conn.execute(_REMINDED, (subject,)).fetchone()
+        number = sent + 1
+        self._raise(
+            conn,
+            REMINDER,
+            subject,
+            str(number),
+            reminder_text(opened, number, self.repeat_every, now),
+        )
+        opened.told = now
 
     def findings(self, conn: psycopg.Connection, now: datetime) -> list[Finding]:
         return [
             *health.stale_heartbeats(conn, now, self.stale_after),
+            *health.never_started(conn, now, self._started, self.expected, self.never_grace),
             *health.overdue(conn, now),
             *health.position_mismatch(conn),
             *health.panel_bodies(conn),

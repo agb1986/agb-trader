@@ -1,349 +1,35 @@
-"""The local UI's pages, rendered from the database by the server beside it
-(docs/architecture/06-local-ui.md). Every page is a read, and a page renders on a connection
-the database itself holds read-only, so a mistake on a page cannot become a write. The
-write paths are forms that post to their own routes, each of which takes a connection of its
-own, and `WRITES` is the whole list of them.
+"""The views: the decision log and the nine views beside it, each a read that renders a page
+on the read-only connection."""
 
-The shell is the decision log, one row per rebalance cycle, newest first: the state it
-reached, who decided it and from which surface, the realised return of the month it traded,
-and the turnover it asked for. A row expands, with no JavaScript, into the basket diff the
-decider saw, the gate's result, that cycle's flags and every audit-log line naming it. The
-landing page is the log rather than a basket with a green button, because a page whose single
-action is approval teaches the operator to rubber-stamp it.
-
-Above the log sits the health banner: stale heartbeats, overdue expected events, open halt
-causes, the broker and position mismatches, and undelivered alerts. It is the only place an
-undelivered alert is visible at all, so a Telegram outage cannot hide a month's approval
-request. A dead scheduler reads here as a stale heartbeat and a rebalance nothing has
-scheduled, never as an empty page.
-
-The views beside the log — Rebalance, Positions, Gate, Validation, Promotion, Performance,
-Panel, Alerts and the kill switch — are the same state read nine other ways. Each speaks the
-Telegram bot's vocabulary, from agb.readout, so the two surfaces cannot describe one basket in
-two dialects.
-
-Four of them are the evidence views, and each is written so that a figure cannot be read out of
-context. Validation states every gate beside the threshold it was applied against and ends by
-naming what the certification covers, which is the classical ranker alone. Promotion is the
-ladder with the date, the actor and the evidence behind every transition it has made. On
-Performance no live figure appears without the backtest expectation beside it, and the page says
-outright that a handful of months cannot tell a model that works from one that has been lucky.
-Panel is the safety panel's own record, name by name, with the Judge's reason on each dimension
-and the note that the panel never learns which company it is reading about. None of the four has
-a write path: nothing on them appears in `WRITES`.
-
-The writes are Telegram's: answering the rebalance, the kill switch, and acknowledging an
-alert. None is written here. Answering goes through `agb.approval`, the switch through
-`agb.killswitch` and acknowledging through `agb.alerts`, the same functions the bot calls,
-with a source naming this surface, so the semantics cannot drift between the two surfaces and
-the race between them is settled in one place. Approving is never one click: the operator
-types the rebalance's reference, which is the friction Telegram's typed command has and the
-whole reason the landing page is the log rather than a basket with a green button.
-Acknowledging is typed too: the Alerts page lists each alert's id, and the operator types the
-one they have seen. Every write is a `command` row with the actor and the surface on it,
-refused ones included.
-
-Pause, Resume and Ask to liquidate are not one click either. Each is a link from the kill switch
-page to a confirmation page (`/confirm/...`, a GET that reads and writes nothing) which says what
-will change, and the write is the form on that page, posted to the same route as before so the
-server's host, origin and redirect protections apply to it unchanged. Resume's page lists the
-open causes with a tick box each, unticked; only the ticked ones are cleared, and a form with none
-ticked is refused and recorded.
-
-A write returns an `Outcome` rather than a page: the server stores it and answers the POST with
-a 303 to `/outcome?id=<token>`, which `outcome` renders, so reloading the page the operator ends
-on is a GET and cannot write twice. A write that raises is `failed`: a 500 page that names the
-cause and nothing else of the exception. The reference of a basket is read from the form's
-reference field alone; the reason field is only ever a reason.
-"""
-
-import html
 import statistics
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, date, datetime
 from decimal import Decimal, DivisionByZero, InvalidOperation
 
 import psycopg
 
-from agb import analyst, approval, debate, health, killswitch, ladder, readout
-from agb.alerts import acknowledge
+from agb import analyst, approval, blend, debate, health, killswitch, ladder, readout
 from agb.health import et
-from agb.nyse import NyseCalendar, trading_date
-
-# The log and the views, in the order the header shows them.
-VIEWS = (
-    ("/", "Log"),
-    ("/rebalance", "Rebalance"),
-    ("/positions", "Positions"),
-    ("/gate", "Gate"),
-    ("/validation", "Validation"),
-    ("/promotion", "Promotion"),
-    ("/performance", "Performance"),
-    ("/panel", "Panel"),
-    ("/alerts", "Alerts"),
-    ("/killswitch", "Kill switch"),
+from agb.ui.shell import (
+    ALERT_MAX,
+    CONFIRM_LIQUIDATE,
+    CONFIRM_PAUSE,
+    CONFIRM_RESUME,
+    LOG_CYCLES,
+    STATE_CLASS,
+    Html,
+    banner,
+    calendar,
+    esc,
+    join,
+    note,
+    page,
+    section,
+    table,
+    tag,
+    write_form,
 )
-# The most cycles the log shows, and the most alerts the Alerts view shows.
-LOG_CYCLES = 24
-ALERT_MAX = 50
-# How the pages connect: as the `ui` role from the PG* environment, and read-only, so the
-# database refuses a write even if a page ever tried one. The write routes connect without it.
-READ_ONLY = "-c default_transaction_read_only=on"
-# Who a write from this surface is attributed to, and the surface it is attributed to. There is
-# no login here — SSH is the authentication — so there is one operator, named as such, and the
-# audit trail says which surface they were sitting at.
-ACTOR = "ui:operator"
-SURFACE = "ui"
-
-STYLE = """
-:root { color-scheme: light dark; --bg: #ffffff; --fg: #1a1a1a; --dim: #595959; --line: #d0d0d0;
-        --link: #0b57d0; --bad: #a40000; --warn: #8a5300; --ok: #14612c; }
-@media (prefers-color-scheme: dark) {
-  :root { --bg: #121212; --fg: #ececec; --dim: #ababab; --line: #3d3d3d; --link: #8ab4f8;
-          --bad: #ff8f8f; --warn: #f2b25c; --ok: #6fcf8a; }
-}
-* { box-sizing: border-box; }
-html { background: var(--bg); }
-body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--fg);
-       overflow-wrap: anywhere; }
-a { color: var(--link); }
-.skip { position: absolute; left: -999px; top: 0; background: var(--bg); padding: 6px 10px; }
-.skip:focus { left: 0; z-index: 1; }
-.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%);
-      white-space: nowrap; }
-header { border-bottom: 1px solid var(--line); padding: 10px 20px; display: flex;
-         gap: 6px 18px; align-items: baseline; flex-wrap: wrap; }
-header .brand { font-size: 15px; font-weight: 700; margin: 0; }
-header nav { display: flex; gap: 4px 18px; flex-wrap: wrap; }
-header nav a { color: inherit; text-decoration: none; padding: 2px 0; }
-header nav a[aria-current] { border-bottom: 2px solid currentColor; font-weight: 600; }
-main { padding: 20px; max-width: 1100px; }
-h1 { font-size: 18px; margin: 24px 0 8px; }
-.banner + h1 { margin-top: 8px; }
-h2 { font-size: 13px; margin: 14px 0 4px; color: var(--dim); text-transform: uppercase;
-     letter-spacing: .04em; }
-p.note { color: var(--dim); margin: 6px 0; }
-.scroll { position: relative; overflow-x: auto; max-width: 100%; margin: 4px 0 10px; }
-.scroll:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
-table { border-collapse: collapse; width: 100%; }
-th, td { text-align: left; padding: 4px 10px 4px 0; border-bottom: 1px solid var(--line);
-         white-space: nowrap; }
-th { color: var(--dim); font-weight: 600; }
-tbody th { color: var(--fg); font-weight: 400; }
-td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
-td.text, th.text { white-space: normal; min-width: 22em; }
-td.empty { color: var(--dim); white-space: normal; }
-.pair { display: flex; gap: 32px; flex-wrap: wrap; }
-.pair > div { flex: 1 1 260px; min-width: 0; }
-.banner { border: 1px solid var(--line); border-left-width: 4px; padding: 8px 12px;
-          margin-bottom: 16px; }
-.banner.clear { border-left-color: var(--ok); }
-.banner.unwell { border-left-color: var(--bad); }
-.banner div { padding: 2px 0; }
-.banner span { color: var(--dim); }
-table.log td.expand { padding: 0; max-width: 0; white-space: normal; }
-table.log tbody.cycle th, table.log tbody.cycle td { border-bottom: 0; }
-table.log tbody.cycle { border-bottom: 1px solid var(--line); }
-details.cycle > summary { padding: 6px 0; cursor: pointer; }
-details.cycle[open] > summary { font-weight: 600; }
-.detail { padding: 4px 0 14px 1.5em; }
-.state { font-size: 12px; }
-.ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
-.dim { color: var(--dim); }
-footer { color: var(--dim); padding: 0 20px 24px; max-width: 1100px; }
-form.write { border: 1px solid var(--line); padding: 10px 12px; margin: 8px 0;
-             max-width: 620px; }
-form.write label { display: block; margin: 0 0 8px; }
-form.write input[type=text] { font: inherit; padding: 4px 6px; width: 14em; max-width: 100%;
-                              margin-top: 4px; }
-form.write button { font: inherit; padding: 4px 14px; }
-pre { white-space: pre-wrap; max-width: 100%; overflow-x: auto; }
-pre.reply { border: 1px solid var(--line); border-left-width: 4px; padding: 10px 12px;
-            max-width: 620px; }
-"""
-
-# A basket's state, coloured by what it means for the month: it traded, it is waiting, it
-# will not trade, or something broke.
-STATE_CLASS = {
-    "proposed": "warn",
-    "pending": "warn",
-    "approved": "ok",
-    "submitted": "ok",
-    "filled": "ok",
-    "unfilled": "bad",
-    "rejected": "dim",
-    "missed": "dim",
-    "halted": "bad",
-}
-
-
-def connect(write: bool = False) -> psycopg.Connection:
-    """A connection for one request: the `ui` role from the PG* environment, read-only unless
-    the request is one of the write routes. A page gets the read-only one, so the database
-    itself stands behind the claim that rendering cannot write."""
-    return psycopg.connect(
-        application_name="agb-ui", options="" if write else READ_ONLY, autocommit=True
-    )
-
-
-class Html(str):
-    """Markup that is already escaped. `esc` leaves it alone; everything else it escapes."""
-
-
-def esc(value: object) -> Html:
-    if isinstance(value, Html):
-        return value
-    return Html(html.escape("" if value is None else str(value)))
-
-
-def tag(name: str, body: object, **attrs: str) -> Html:
-    rendered = "".join(
-        f' {key.rstrip("_").replace("_", "-")}="{esc(value)}"' for key, value in attrs.items()
-    )
-    return Html(f"<{name}{rendered}>{esc(body)}</{name}>")
-
-
-def join(parts: Iterable[object]) -> Html:
-    return Html("".join(esc(part) for part in parts))
-
-
-def note(text: str) -> Html:
-    return tag("p", text, class_="note")
-
-
-def section(heading: str, body: Iterable[object]) -> Html:
-    """A page's heading and what is under it. The heading is the page's one `h1`: every page
-    builds exactly one section, and the headings inside it are `h2`."""
-    return join([tag("h1", heading), *body])
-
-
-def table(
-    headers: Sequence[str],
-    rows: Iterable[Sequence[object]],
-    numeric: Sequence[int] = (),
-    wrap: Sequence[int] = (),
-    *,
-    caption: str,
-    empty: str = "Nothing to show.",
-) -> Html:
-    """One table. `numeric` is the columns that read as figures, right-aligned on a tabular
-    figure; `wrap` is the columns that carry a sentence, which are the only ones allowed to
-    wrap, since a reason the Judge wrote is prose and not a cell.
-
-    The `caption` names the table for a screen reader and is hidden from the eye, since a
-    heading sits above most of them. Every header scopes its column. With no rows the table
-    says `empty` in a row of its own, so it is never a header with nothing under it. The table
-    sits in a box that scrolls sideways, so a wide one never widens the page; the box takes
-    focus (`tabindex`) so a keyboard can scroll it."""
-
-    def cell(kind: str, index: int, value: object) -> str:
-        scope = ' scope="col"' if kind == "th" else ""
-        if index in numeric:
-            return f'<{kind} class="num"{scope}>{esc(value)}</{kind}>'
-        if index in wrap:
-            return f'<{kind} class="text"{scope}>{esc(value)}</{kind}>'
-        return f"<{kind}{scope}>{esc(value)}</{kind}>"
-
-    head = "".join(cell("th", i, header) for i, header in enumerate(headers))
-    body = "".join(
-        "<tr>" + "".join(cell("td", i, value) for i, value in enumerate(row)) + "</tr>"
-        for row in rows
-    ) or (f'<tr><td class="empty" colspan="{len(headers)}">{esc(empty)}</td></tr>')
-    return Html(
-        '<div class="scroll" tabindex="0"><table>'
-        f'<caption class="sr">{esc(caption)}</caption>'
-        f"<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
-    )
-
-
-def write_form(action: str, button: str, fields: Sequence[tuple[str, str]] = ()) -> Html:
-    """One write as a plain form posting to one of `WRITES`. The fields are what the operator
-    has to type; nothing is filled in for them, because a field that arrives already correct is
-    the one-click button this surface is not allowed to have."""
-    body: list[object] = []
-    for name, label in fields:
-        body.append(
-            Html(
-                f"<label>{esc(label)}<br>"
-                f'<input type="text" name="{esc(name)}" autocomplete="off" spellcheck="false">'
-                "</label>"
-            )
-        )
-    body.append(tag("button", button, type="submit"))
-    return Html(f'<form class="write" method="post" action="{esc(action)}">{join(body)}</form>')
-
-
-def page(title: str, path: str, blocks: Iterable[object]) -> str:
-    """The shell: a skip link, the header with the views' navigation (the page being read is
-    marked `aria-current`), the page's own content in `main` and the footer. The content's
-    first heading is the page's `h1`; see `section`."""
-    nav = join(
-        tag("a", label, href=href, aria_current="page")
-        if href == path
-        else tag("a", label, href=href)
-        for href, label in VIEWS
-    )
-    return (
-        "<!doctype html>\n"
-        f'<html lang="en"><head><meta charset="utf-8">'
-        f'<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f"<title>{esc(title)} — agb-trader</title><style>{STYLE}</style></head><body>"
-        '<a class="skip" href="#main">Skip to the page</a>'
-        f'<header><p class="brand">agb-trader</p><nav aria-label="Views">{nav}</nav></header>'
-        f'<main id="main">{join(blocks)}</main>'
-        "<footer>Read-mostly: the pages read, and the only writes are answering a "
-        "rebalance, the kill switch and acknowledging an alert, all recorded against this "
-        "surface. Nothing here "
-        "resizes a position, edits the universe, overrides the ranker, moves the ladder or "
-        "promotes a model.</footer>"
-        "</body></html>\n"
-    )
-
-
-# The health banner.
-
-_UNDELIVERED = """
-    SELECT kind, subject, period, raised_at, failures, last_failure
-    FROM agb.undelivered_alert
-    ORDER BY raised_at
-"""
-
-
-def banner(conn: psycopg.Connection, now: datetime) -> Html:
-    """What is unhealthy, in one block above everything else. `health.stale_heartbeats` leaves
-    out the reader's own service, so the UI never reports itself; every other service,
-    the bot included, is in here."""
-    findings = [
-        *health.stale_heartbeats(conn, now, health.stale_after_from_env()),
-        *health.overdue(conn, now),
-        *health.open_halt_causes(conn),
-        *health.broker_mismatch(conn),
-        *health.position_mismatch(conn),
-    ]
-    lines = [(finding.what, finding.facts) for finding in findings]
-    for kind, subject, period, raised_at, failures, last_failure in conn.execute(_UNDELIVERED):
-        lines.append(
-            (
-                f"alert not delivered: {kind} {subject} {period}",
-                f"raised {et(raised_at)}, {failures} failed attempts"
-                + (f"; last {last_failure}" if last_failure else ""),
-            )
-        )
-    if not lines:
-        upcoming = conn.execute(readout._NEXT_SUBMISSION, (now,)).fetchone()
-        next_cycle = (
-            f"next rebalance {upcoming[0]}, orders due by {et(upcoming[1])}"
-            if upcoming
-            else "no rebalance is scheduled"
-        )
-        body = tag("div", join([tag("b", "Healthy"), esc(f" — {next_cycle}")]))
-        return tag("section", body, class_="banner clear", aria_label="Health")
-    body = join(
-        tag("div", join([tag("b", what), tag("span", f" — {facts}")])) for what, facts in lines
-    )
-    return tag("section", body, class_="banner unwell", aria_label="Health")
-
 
 # The decision log.
 
@@ -561,10 +247,66 @@ _ORDERS = """
 """
 
 
+# What the panel recorded about the names a basket holds. A basket is a panel basket when it
+# names a panel run; only then do its names have a score, and the sector is the one the panel
+# was told, so a name the panel did not debate has none on record.
+_PANEL_BASKET = "SELECT session_date, panel_run_id IS NOT NULL FROM agb.basket WHERE id = %s"
+_PANEL_NAMES = """
+    SELECT t.weight, bl.llm_total, ps.sector
+    FROM agb.basket_target t
+    LEFT JOIN agb.basket_blend bl ON bl.basket_id = t.basket_id AND bl.symbol = t.symbol
+    LEFT JOIN agb.panel_score ps ON ps.id = bl.panel_score_id
+    WHERE t.basket_id = %s
+"""
+
+
 def _standing(held: bool, carried: bool) -> str:
     if carried:
         return "carried"
     return "held" if held else "new"
+
+
+def _utc(at: datetime) -> str:
+    return at.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _cutoff_line(session: date, now: datetime) -> str:
+    """The session's MOC cutoff in absolute UTC, with how long is left by the page's own clock.
+    Rendered on the server, so it is as old as the page and carries no script."""
+    cutoff = approval.cutoff_of(calendar(now), session)
+    left = approval.countdown(now, cutoff)
+    return f"Cutoff {_utc(cutoff)} ({'passed' if left == 'passed' else f'in {left}'})"
+
+
+def _panel_lines(conn: psycopg.Connection, basket_id: int, panel_basket: bool) -> list[str]:
+    """The basket's panel safety score and top sector, from what the pipeline stored. The score
+    is the mean rubric total out of 24 over the names the panel scored, and is left out for a
+    basket proposed with no panel. The top sector is the heaviest by target weight among the
+    names whose sector the panel recorded."""
+    names = conn.execute(_PANEL_NAMES, (basket_id,)).fetchall()
+    lines: list[str] = []
+    if panel_basket:
+        totals = [total for _, total, _ in names if total is not None]
+        lines.append(
+            f"Panel safety score {sum(totals) / len(totals):.1f}/{blend.MAX_TOTAL}, the mean over "
+            f"{len(totals)} of {len(names)} names scored"
+            if totals
+            else "Panel safety score not available: the panel scored none of the names"
+        )
+    weights: dict[str, Decimal] = {}
+    for weight, _, sector in names:
+        if sector:
+            weights[sector] = weights.get(sector, Decimal(0)) + weight
+    if weights:
+        sector, weight = max(weights.items(), key=lambda item: (item[1], item[0]))
+        known = sum(1 for _, _, name_sector in names if name_sector)
+        lines.append(
+            f"Top sector {sector}, {readout.percent(weight, 0)} of the basket "
+            f"({known} of {len(names)} names have a sector on record)"
+        )
+    else:
+        lines.append("Top sector not on record: only the panel records a sector")
+    return lines
 
 
 def rebalance(conn: psycopg.Connection, now: datetime) -> str:
@@ -576,8 +318,11 @@ def rebalance(conn: psycopg.Connection, now: datetime) -> str:
     basket_id, reference, period, state, since, actor, surface, capital, ranker, _ = latest
     diff = readout.diff(conn, basket_id)
     waiting = state in ("proposed", "pending")
+    [(session, panel_basket)] = conn.execute(_PANEL_BASKET, (basket_id,)).fetchall()
     blocks: list[object] = [
         note(f"{state} since {et(since)} by {actor} ({surface}) · model {ranker} · {period}"),
+        note(_cutoff_line(session, now)),
+        *(note(line) for line in _panel_lines(conn, basket_id, panel_basket)),
     ]
     if waiting:
         blocks += [
@@ -1647,279 +1392,3 @@ def kill_switch(conn: psycopg.Connection, now: datetime) -> str:
         write_form("/liquidate", "Liquidate", [("token", "Token")]),
     ]
     return page("Kill switch", "/killswitch", [banner(conn, now), section("Kill switch", blocks)])
-
-
-# Where each kill-switch write is confirmed. The kill switch page links here, and these pages
-# only read: the first click on Pause, Resume or Ask to liquidate writes nothing, and the write is
-# the form on the page it lands on, posted to the same route as before.
-CONFIRM_PAUSE = "/confirm/pause"
-CONFIRM_RESUME = "/confirm/resume"
-CONFIRM_LIQUIDATE = "/confirm/liquidate"
-# What a ticked cause is called in the form the resume confirmation posts: `cause.<name>`.
-CAUSE_FIELD = "cause."
-
-
-def confirm_form(action: str, button: str, ticks: Sequence[str] = ()) -> Html:
-    """The confirmed write as a plain form posting to one of `WRITES`, with a way back. The ticks
-    are unticked and carry no value: nothing here is chosen for the operator, and an untouched
-    form clears nothing."""
-    body: list[object] = [
-        Html(
-            f'<label><input type="checkbox" name="{esc(CAUSE_FIELD + cause)}"> {esc(cause)}</label>'
-        )
-        for cause in ticks
-    ]
-    body.append(tag("button", button, type="submit"))
-    body.append(Html(' <a href="/killswitch">Cancel</a>'))
-    return Html(f'<form class="write" method="post" action="{esc(action)}">{join(body)}</form>')
-
-
-def confirm_pause(conn: psycopg.Connection, now: datetime) -> str:
-    already = next(
-        ((at, actor) for cause, at, actor, _ in killswitch.causes(conn) if cause == "pause"), None
-    )
-    blocks: list[object] = [
-        note("Nothing has been written yet. Confirming does these things:"),
-        Html(
-            "<ul><li>opens the <b>pause</b> halt cause, so no further order goes out, whatever "
-            "else is open;</li><li>asks execution to set the broker's suspend_trade, and to "
-            "cancel the sent orders of a basket still being submitted, which halts that "
-            "basket;</li><li>records the command against this surface.</li></ul>"
-        ),
-        note(
-            f"The pause cause is open already, since {et(already[0])} by {already[1]}: "
-            "confirming records the command and changes nothing else."
-            if already
-            else "The pause cause is not open."
-        ),
-        confirm_form("/pause", "Confirm pause"),
-    ]
-    return page("Confirm pause", "/killswitch", [banner(conn, now), section("Pause?", blocks)])
-
-
-def confirm_resume(conn: psycopg.Connection, now: datetime) -> str:
-    latched = killswitch.causes(conn)
-    if latched:
-        blocks: list[object] = [
-            note(
-                "Nothing has been written yet. Tick each cause to clear; only those are "
-                "cleared, one clear each, and an unticked cause stays open and keeps trading "
-                "halted. Nothing is ticked for you, and ticking none clears nothing."
-            ),
-            table(
-                ["Open cause", "Since", "By", "Reason"],
-                [(cause, et(at), actor, reason or "") for cause, at, actor, reason in latched],
-                caption="Open halt causes",
-            ),
-            note(
-                "The broker's suspend_trade is asked off once the pause cause is cleared, and "
-                "stays on while it is open. A halted rebalance is not resubmitted."
-            ),
-            confirm_form("/resume", "Confirm resume", [cause for cause, *_ in latched]),
-        ]
-    else:
-        blocks = [
-            note("No halt cause is open, so there is nothing to clear."),
-            tag("p", tag("a", "Back", href="/killswitch")),
-        ]
-    return page("Confirm resume", "/killswitch", [banner(conn, now), section("Resume?", blocks)])
-
-
-def confirm_liquidate(conn: psycopg.Connection, now: datetime) -> str:
-    minutes = int(killswitch.TOKEN_VALID.total_seconds() // 60)
-    expires = killswitch.outstanding(conn, now)
-    blocks: list[object] = [
-        note("Nothing has been written yet. Confirming is step one of two, and does only this:"),
-        Html(
-            f"<ul><li>issues a token good for {minutes} minutes, and records the request;</li>"
-            "<li>answers with what closing every position would mean: the positions held and "
-            "their value, and the account's equity.</li></ul>"
-        ),
-        note(
-            "It closes nothing and opens no halt cause. Step two is that token typed back on "
-            "the kill switch page, which opens the liquidation cause and has execution cancel "
-            "open orders and close every position at market."
-        ),
-        note(
-            f"A token is outstanding until {et(expires)}; a new one supersedes it."
-            if expires
-            else "No token is outstanding."
-        ),
-        confirm_form("/liquidate", "Confirm: issue a token"),
-    ]
-    return page(
-        "Confirm liquidate",
-        "/killswitch",
-        [banner(conn, now), section("Ask to liquidate?", blocks)],
-    )
-
-
-# The write paths. Each takes the fields the form posted and returns the `Outcome`: the reply
-# the shared module produced, which is the same text the bot sends to Telegram. The server does
-# not render it in answer to the POST: it holds it and redirects to `OUTCOME`, a GET, so a
-# reload re-reads the outcome and never posts the write again.
-
-# Where the server redirects a write to, with the held outcome's token in the query.
-OUTCOME = "/outcome"
-
-
-@dataclass(frozen=True)
-class Outcome:
-    """What a write did: the page it belongs to, the heading and the shared module's reply."""
-
-    path: str
-    heading: str
-    reply: str
-
-
-def _source(text: str) -> approval.Source:
-    """Who the write is attributed to and what they typed, as the shared modules take it. A row
-    written from here differs from the bot's only in the actor and the surface."""
-    return approval.Source(ACTOR, SURFACE, text)
-
-
-def calendar(now: datetime) -> NyseCalendar:
-    """The sessions the approval loop needs to find a rebalance's cutoff. A month either side
-    of today covers every reference that can still be answered."""
-    today = trading_date(now)
-    return NyseCalendar(today - timedelta(days=7), today + timedelta(days=30))
-
-
-def _answer(
-    conn: psycopg.Connection, verb: str, fields: Mapping[str, str], now: datetime
-) -> Outcome:
-    """Approve or reject the rebalance whose reference was typed. `agb.approval` checks the
-    reference, refuses a wrong, missing or late one and records that refusal, and settles a race
-    with the bot on the basket's own sequence, so the loser is told who answered and when.
-
-    The reference is read from its own field and from nowhere else. Whatever the reason box
-    holds is only a reason, so a reference typed there leaves the reference empty and is
-    refused as missing. A reference box that holds more than one word is not a reference either:
-    it is looked up whole, found missing, refused and recorded."""
-    reference = fields.get("reference", "").strip()
-    words = [reference, *fields.get("reason", "").split()] if reference else []
-    source = _source(" ".join([f"/{verb}", *words]))
-    reply = approval.decide(conn, verb, words, source, now, calendar(now))
-    return Outcome("/rebalance", "Your answer", reply)
-
-
-def approve(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
-    return _answer(conn, "approve", fields, now)
-
-
-def reject(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
-    return _answer(conn, "reject", fields, now)
-
-
-def pause(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
-    return Outcome("/killswitch", "Kill switch", killswitch.pause(conn, _source("/pause")))
-
-
-def resume(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
-    """Clear the causes the confirmation page ticked, and no others. A form that ticks none is
-    refused and recorded, and a cause that opened after the page was drawn is not on it, so it
-    stays open."""
-    ticked = sorted(name[len(CAUSE_FIELD) :] for name in fields if name.startswith(CAUSE_FIELD))
-    source = _source(" ".join(["/resume", *ticked]))
-    return Outcome("/killswitch", "Kill switch", killswitch.resume(conn, source, ticked))
-
-
-def liquidate(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
-    words = fields.get("token", "").split()
-    source = _source(" ".join(["/liquidate", *words]))
-    reply = killswitch.liquidate(conn, source, words[0] if words else None, now)
-    return Outcome("/killswitch", "Kill switch", reply)
-
-
-def ack(conn: psycopg.Connection, fields: Mapping[str, str], now: datetime) -> Outcome:
-    """Acknowledge the alert whose id was typed. `agb.alerts` checks it, refuses and records a
-    missing, malformed or repeated one, and settles a race with the bot on the alert itself."""
-    word = fields.get("alert", "").strip()
-    reply = acknowledge(conn, _source(f"/ack {word}".strip()), word or None, now)
-    return Outcome("/alerts", "Acknowledge alert", reply)
-
-
-def outcome(conn: psycopg.Connection, now: datetime, held: Outcome | None) -> str:
-    """The page a write redirects to: the reply it produced, above the banner as it reads now.
-    An outcome the server no longer holds, because it expired or the server restarted, says so
-    and points at the log, where every write the operator made is a row."""
-    if held is None:
-        return page(
-            "No outcome",
-            "/",
-            [
-                banner(conn, now),
-                section(
-                    "No outcome",
-                    [
-                        note(
-                            "That outcome is no longer held here: it is kept for a few minutes "
-                            "after a write. What the write did is a row in the log."
-                        ),
-                        tag("p", tag("a", "Log", href="/")),
-                    ],
-                ),
-            ],
-        )
-    blocks = [
-        Html(f'<pre class="reply">{esc(held.reply)}</pre>'),
-        tag("p", tag("a", "Back", href=held.path)),
-    ]
-    return page(held.heading, held.path, [banner(conn, now), section(held.heading, blocks)])
-
-
-def failed(path: str, cause: str, wrote: bool) -> str:
-    """The page for a request that raised something that was not the database's: the route and
-    the cause by name, and no traceback, which goes to the log. A write may have been recorded
-    before it raised, so its page says to look in the log and not to retry."""
-    heading = "The write failed" if wrote else "The page failed"
-    blocks = [
-        note(f"{path} raised an error."),
-        Html(f'<pre class="reply">{esc(cause)}</pre>'),
-    ]
-    if wrote:
-        blocks.append(note("It may have been recorded before it failed: check the log first."))
-    blocks.append(tag("p", tag("a", "Log", href="/")))
-    return page(heading, path, [section(heading, blocks)])
-
-
-# What the server routes: the pages, which only read, and the writes, which are these six and
-# no others. A page's form posts to one of these and nowhere else, and the server answers a
-# POST to a page with 405.
-ROUTES = {
-    "/": log,
-    "/rebalance": rebalance,
-    "/positions": positions,
-    "/gate": gate,
-    "/validation": validation,
-    "/promotion": promotion,
-    "/performance": performance,
-    "/panel": panel,
-    "/alerts": alerts,
-    "/killswitch": kill_switch,
-    CONFIRM_PAUSE: confirm_pause,
-    CONFIRM_RESUME: confirm_resume,
-    CONFIRM_LIQUIDATE: confirm_liquidate,
-}
-WRITES = {
-    "/approve": approve,
-    "/reject": reject,
-    "/pause": pause,
-    "/resume": resume,
-    "/liquidate": liquidate,
-    "/ack": ack,
-}
-
-
-def not_found(path: str) -> str:
-    blocks = [note(f"There is no {path} here."), tag("p", tag("a", "Log", href="/"))]
-    return page("Not found", path, [section("Not found", blocks)])
-
-
-def not_allowed(path: str) -> str:
-    """A POST to a page. The pages read; the writes are the routes in `WRITES`."""
-    blocks = [
-        note(f"{path} is a page, and pages are read with GET."),
-        tag("p", tag("a", "Log", href="/")),
-    ]
-    return page("Not allowed", path, [section("Not allowed", blocks)])
