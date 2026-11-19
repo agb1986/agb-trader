@@ -175,3 +175,94 @@ def test_the_database_lets_an_earned_live_be_reached(db):
     db.connect("cli").execute(MODE, ("live", "ada", "sound", command_id))
 
     assert db.connect("cli").execute("SELECT mode FROM agb.current_mode").fetchall() == [("live",)]
+
+
+# -- an alert is acknowledged by the surface its operator is on (issue #209) -----------------
+
+ACKNOWLEDGE = (
+    "INSERT INTO agb.alert_event (alert_id, event, channel, chat_id, actor, at)"
+    " VALUES (%s, 'acknowledged', %s, %s, %s, now())"
+)
+
+
+def an_alert(db):
+    """An alert as the bot raises one, and its id."""
+    (alert_id,) = (
+        db.connect("bot")
+        .execute(
+            "INSERT INTO agb.alert (kind, subject, period, body, raised_at, raised_by)"
+            " VALUES ('halt_open', 'pause', '2026-10', 'on', now(), 'bot') RETURNING id"
+        )
+        .fetchone()
+    )
+    return alert_id
+
+
+def acknowledgements(db):
+    return (
+        db.connect("cli")
+        .execute("SELECT actor FROM agb.alert_event WHERE event = 'acknowledged'")
+        .fetchall()
+    )
+
+
+@pytest.mark.parametrize(
+    ("role", "channel", "chat", "actor"),
+    [
+        ("bot", "ui", "1001", "telegram:7"),
+        ("bot", "telegram", None, "telegram:7"),
+        ("bot", "telegram", "1001", "bot"),
+        ("bot", "telegram", "1001", "ui:operator"),
+        ("bot", "telegram", "1001", "telegram:seven"),
+        ("ui", "telegram", None, "ui:operator"),
+        ("ui", "ui", None, "telegram:7"),
+        ("ui", "ui", None, "ada"),
+        ("scheduler", "telegram", None, "telegram:7"),
+        ("execution", "ui", None, "ui:operator"),
+    ],
+)
+def test_a_role_may_not_acknowledge_an_alert_as_anyone_but_its_operator(
+    db, role, channel, chat, actor
+):
+    alert_id = an_alert(db)
+
+    with pytest.raises((errors.InsufficientPrivilege, errors.RaiseException)) as refused:
+        db.connect(role).execute(ACKNOWLEDGE, (alert_id, channel, chat, actor))
+
+    assert acknowledgements(db) == []
+    message = str(refused.value)
+    assert "alert_actor:" in message or "permission denied" in message
+
+
+@pytest.mark.parametrize(
+    ("role", "channel", "chat", "actor"),
+    [("bot", "telegram", "1001", "telegram:7"), ("ui", "ui", None, "ui:operator")],
+)
+def test_a_surface_acknowledges_as_its_operator_and_only_once(db, role, channel, chat, actor):
+    alert_id = an_alert(db)
+
+    db.connect(role).execute(ACKNOWLEDGE, (alert_id, channel, chat, actor))
+
+    assert acknowledgements(db) == [(actor,)]
+    for second in ("bot", "ui"):
+        with pytest.raises(errors.UniqueViolation):
+            if second == "bot":
+                db.connect("bot").execute(ACKNOWLEDGE, (alert_id, "telegram", "1001", "telegram:7"))
+            else:
+                db.connect("ui").execute(ACKNOWLEDGE, (alert_id, "ui", None, "ui:operator"))
+    assert acknowledgements(db) == [(actor,)]
+
+
+def test_other_alert_events_are_not_bound_to_an_operator(db):
+    alert_id = an_alert(db)
+
+    db.connect("bot").execute(
+        "INSERT INTO agb.alert_event (alert_id, event, channel, telegram_message_id, actor, at)"
+        " VALUES (%s, 'delivered', 'telegram', 4821, 'bot', now())",
+        (alert_id,),
+    )
+    db.connect("bot").execute(
+        "INSERT INTO agb.alert_event (alert_id, event, channel, detail, actor, at)"
+        " VALUES (%s, 'failed', 'telegram', 'proxy unreachable', 'bot', now())",
+        (alert_id,),
+    )

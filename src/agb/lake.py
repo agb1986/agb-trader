@@ -12,6 +12,15 @@ A partition's file is a function of its rows alone: they are sorted by the datas
 key and written with fixed options, so landing the same rows twice writes the same bytes. The
 partition hash is the SHA-256 of that file. A partition whose new bytes match the file already
 there is left untouched, so re-running a pull for a date that already landed changes nothing.
+
+A partition lands in three steps: its bytes are written and synced to a temporary name beside
+the file (a dot-name ending `.partial`), then handed to the caller's `record`, which the
+pipeline uses to note its hash in the ledger, and only then renamed over `part.parquet`. So a
+file under the partition's name has always been recorded, and a crash at any point leaves the
+lake readable: nothing reads the temporary names, the next write of that partition deletes any
+it finds, and landing again writes the same bytes and records nothing new. A crash between the
+record and the rename leaves a hash in the ledger whose bytes never landed, which the next
+landing of the same rows completes; never a landed file the ledger lacks.
 A SEP partition takes the vendor's corrections; an SF1 partition keeps each row the vendor
 has since restated; a tickers snapshot, once landed, is never rewritten.
 
@@ -417,6 +426,15 @@ class Partition:
     rows: int
 
 
+# Called with each partition after its bytes are on disk under a temporary name and before they
+# are renamed into place (see `write_partition`). If it raises, the partition does not land.
+Record = Callable[[Partition], None]
+
+
+def _nothing(partition: Partition) -> None:
+    pass
+
+
 def file_hash(path: Path) -> str:
     with open(path, "rb") as f:
         return hashlib.file_digest(f, "sha256").hexdigest()
@@ -492,10 +510,18 @@ def _merge(old: pa.Table, new: pa.Table, key: tuple[str, ...]) -> pa.Table:
     )
 
 
-def write_partition(lake: Path, dataset: Dataset, value: str, table: pa.Table) -> Partition:
+def write_partition(
+    lake: Path, dataset: Dataset, value: str, table: pa.Table, record: Record = _nothing
+) -> Partition:
     """Write `table` as the partition of `dataset` named `value`, as `dataset.existing` says
     if it already has a file. A file whose new bytes are the same as before is left as it
-    was."""
+    was.
+
+    The bytes go to a temporary name first and are synced; `record` is then called with the
+    partition, and only once it returns are they renamed over the partition's file. A file left
+    as it was is passed to `record` too, so a partition whose record was lost is recorded the
+    next time it lands. If `record` raises, the temporary file is removed and the partition's
+    file is as it was before the call."""
     path = f"{dataset.name}/{dataset.partition}={value}"
     directory = lake / path
     directory.mkdir(parents=True, exist_ok=True)
@@ -503,9 +529,11 @@ def write_partition(lake: Path, dataset: Dataset, value: str, table: pa.Table) -
         stale.unlink(missing_ok=True)
     final = directory / FILE
     if final.exists() and dataset.existing == "keep":
-        return Partition(
+        kept = Partition(
             dataset.name, path, file_hash(final), pq.ParquetFile(final).metadata.num_rows
         )
+        record(kept)
+        return kept
     if final.exists() and dataset.existing == "merge":
         table = _merge(pq.read_table(final), table, dataset.primary_key)
     table = table.sort_by([(column, "ascending") for column in dataset.primary_key])
@@ -516,8 +544,9 @@ def write_partition(lake: Path, dataset: Dataset, value: str, table: pa.Table) -
             pq.write_table(table, out, compression="zstd")
             out.flush()
             os.fsync(out.fileno())
-        digest = file_hash(partial)
-        if final.exists() and file_hash(final) == digest:
+        partition = Partition(dataset.name, path, file_hash(partial), table.num_rows)
+        record(partition)
+        if final.exists() and file_hash(final) == partition.sha256:
             partial.unlink()
         else:
             partial.chmod(0o644)
@@ -526,7 +555,7 @@ def write_partition(lake: Path, dataset: Dataset, value: str, table: pa.Table) -
     except BaseException:
         partial.unlink(missing_ok=True)
         raise
-    return Partition(dataset.name, path, digest, table.num_rows)
+    return partition
 
 
 def split(table: pa.Table, key: str) -> Iterator[tuple[str, pa.Table]]:
@@ -540,13 +569,17 @@ def split(table: pa.Table, key: str) -> Iterator[tuple[str, pa.Table]]:
         start += group["counts"]
 
 
-def land(lake: Path, dataset: Dataset, table: pa.Table, snapshot: date) -> list[Partition]:
+def land(
+    lake: Path, dataset: Dataset, table: pa.Table, snapshot: date, record: Record = _nothing
+) -> list[Partition]:
     """Write `table` into the partitions of `dataset` its rows belong to. A dataset with no
-    partition column lands whole, as the snapshot of `snapshot`."""
+    partition column lands whole, as the snapshot of `snapshot`. Each partition is passed to
+    `record` before it lands; see `write_partition`."""
     if dataset.key is None:
-        return [write_partition(lake, dataset, snapshot.isoformat(), table)]
+        return [write_partition(lake, dataset, snapshot.isoformat(), table, record)]
     return [
-        write_partition(lake, dataset, value, rows) for value, rows in split(table, dataset.key)
+        write_partition(lake, dataset, value, rows, record)
+        for value, rows in split(table, dataset.key)
     ]
 
 
@@ -590,7 +623,7 @@ def _history(client: Sharadar, tickers: list[str], through: date) -> pa.Table | 
     )
 
 
-def restate(lake: Path, history: pa.Table) -> list[Partition]:
+def restate(lake: Path, history: pa.Table, record: Record = _nothing) -> list[Partition]:
     """Replace, in each SEP partition the lake holds, the rows of the tickers in `history` with
     `history`'s rows for that session. A session the lake does not hold is not created."""
     tickers = pc.unique(history.column("ticker"))
@@ -602,11 +635,12 @@ def restate(lake: Path, history: pa.Table) -> list[Partition]:
         old = pq.read_table(path)
         kept = old.filter(pc.invert(pc.is_in(old.column("ticker"), value_set=tickers)))
         table = pa.concat_tables([kept, rows], promote_options="default")
-        partitions.append(write_partition(lake, SEP, value, table.select(old.schema.names)))
+        table = table.select(old.schema.names)
+        partitions.append(write_partition(lake, SEP, value, table, record))
     return partitions
 
 
-def pull(lake: Path, client: Sharadar, session: date) -> list[Partition]:
+def pull(lake: Path, client: Sharadar, session: date, record: Record = _nothing) -> list[Partition]:
     """Land `session` and every session since the last one the lake holds: their SEP prices,
     the SF1 rows the vendor changed from a week before the last pull to `session`, and the
     tickers table as it stands. Nothing is written unless every fetch succeeds.
@@ -621,7 +655,9 @@ def pull(lake: Path, client: Sharadar, session: date) -> list[Partition]:
     ticker the vendor now prices differently on that day has had a split or dividend since:
     the vendor adjusts backwards, so its whole history moved. That ticker's history is fetched
     again and restated in every partition the lake holds, so its adjusted series stays on one
-    basis. The restated partitions are among those returned, or those NotYet carries."""
+    basis. The restated partitions are among those returned, or those NotYet carries.
+
+    Each partition is passed to `record` before it lands; see `write_partition`."""
     previous = _last(lake, SEP, session)
     if previous is not None and session - previous[0] > MAX_GAP:
         raise LakeError(
@@ -674,12 +710,16 @@ def pull(lake: Path, client: Sharadar, session: date) -> list[Partition]:
         tickers = client.tickers()
         if tickers.num_rows == 0:
             raise LakeError("the vendor returned no tickers")
-    landed = [p for day, rows in complete for p in land(lake, SEP, rows, day)]
+    landed = [p for day, rows in complete for p in land(lake, SEP, rows, day, record)]
     if history is not None:
-        landed += restate(lake, history)
+        landed += restate(lake, history, record)
     if short is not None:
         raise NotYet(short, landed)
-    return [*landed, *land(lake, SF1, sf1, session), *land(lake, TICKERS, tickers, session)]
+    return [
+        *landed,
+        *land(lake, SF1, sf1, session, record),
+        *land(lake, TICKERS, tickers, session, record),
+    ]
 
 
 def _sql(text: object) -> str:
@@ -688,13 +728,18 @@ def _sql(text: object) -> str:
 
 
 def land_bulk(
-    lake: Path, dataset: Dataset, archive: Path, since: date, work: Path
+    lake: Path,
+    dataset: Dataset,
+    archive: Path,
+    since: date,
+    work: Path,
+    record: Record = _nothing,
 ) -> list[Partition]:
     """Land the vendor's full export of `dataset`, keeping rows dated from `since` on.
 
     The export is too big for memory, so DuckDB first splits it into partitions on disk under
     `work`, spilling as it goes. Each partition is then written as a pull writes it, so its bytes
-    match what a daily pull of the same rows lands.
+    match what a daily pull of the same rows lands, and passed to `record` before it lands.
 
     The split runs a year of the partition key at a time, because a partitioned write holds a
     buffer per partition and cannot spill them; see BULK_OPEN_FILES. Every copy after the first
@@ -759,7 +804,7 @@ def land_bulk(
         parts = [pq.ParquetFile(f).read() for f in sorted(directory.glob("*.parquet"))]
         table = pa.concat_tables(parts).select(schema.names).cast(schema)
         value = directory.name.partition("=")[2]
-        partitions.append(write_partition(lake, dataset, value, table))
+        partitions.append(write_partition(lake, dataset, value, table, record))
         shutil.rmtree(directory)
     return partitions
 

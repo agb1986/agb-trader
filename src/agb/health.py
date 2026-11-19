@@ -353,6 +353,30 @@ def equity_months(conn: psycopg.Connection) -> list[Month]:
     ]
 
 
+class Basis:
+    """The monthly aggregates the performance readings share, read at most once each: the
+    promoted model's thresholds and the account's months. A beat makes one and hands it to
+    every reading, which otherwise each ask the database for the same two things. Both are
+    read on first use, so a beat with no model promoted never reads the months."""
+
+    def __init__(self, conn: psycopg.Connection) -> None:
+        self._conn = conn
+        self._limits: tuple[Thresholds | None] | None = None
+        self._months: list[Month] | None = None
+
+    @property
+    def limits(self) -> Thresholds | None:
+        if self._limits is None:
+            self._limits = (thresholds(self._conn),)
+        return self._limits[0]
+
+    @property
+    def months(self) -> list[Month]:
+        if self._months is None:
+            self._months = equity_months(self._conn)
+        return self._months
+
+
 def month_of(at: datetime) -> str:
     """The New York month `at` falls in, which is how the performance alerts dedupe: one per
     month per subject, so a drawdown that deepens for a fortnight is said once."""
@@ -392,14 +416,16 @@ def scatter(months: Sequence[Month], expected: float) -> float | None:
     return statistics.stdev(month.total_return - expected for month in months)
 
 
-def drawdown(conn: psycopg.Connection) -> list[Finding]:
+def drawdown(conn: psycopg.Connection, basis: Basis | None = None) -> list[Finding]:
     """The account's worst peak-to-trough fall, against the fifth percentile of the certified
     paths' own worst falls. The peak includes the current month, as the backtest's does, so
-    the two numbers are the same measurement. One alert per trough month."""
-    limits = thresholds(conn)
+    the two numbers are the same measurement. One alert per trough month. A `basis` read
+    once for the beat spares the reads it already holds."""
+    basis = basis or Basis(conn)
+    limits = basis.limits
     if limits is None or limits.drawdown_q05 is None:
         return []
-    worst, trough = worst_drawdown(equity_months(conn))
+    worst, trough = worst_drawdown(basis.months)
     if trough is None or worst >= limits.drawdown_q05:
         return []
     deepest = (
@@ -420,13 +446,14 @@ def drawdown(conn: psycopg.Connection) -> list[Finding]:
     ]
 
 
-def losing_run(conn: psycopg.Connection) -> list[Finding]:
+def losing_run(conn: psycopg.Connection, basis: Basis | None = None) -> list[Finding]:
     """The longest run of losing months the account has had, against the 95th percentile of
     the certified paths' longest runs. One alert per month the run ends in."""
-    limits = thresholds(conn)
+    basis = basis or Basis(conn)
+    limits = basis.limits
     if limits is None or limits.losing_run_q95 is None:
         return []
-    longest, end = longest_losing_run(equity_months(conn))
+    longest, end = longest_losing_run(basis.months)
     if end is None or longest <= limits.losing_run_q95:
         return []
     longest_certified = (
@@ -445,14 +472,15 @@ def losing_run(conn: psycopg.Connection) -> list[Finding]:
     ]
 
 
-def tracking(conn: psycopg.Connection) -> list[Finding]:
+def tracking(conn: psycopg.Connection, basis: Basis | None = None) -> list[Finding]:
     """How far the account's months scatter around the backtest's expected month, against the
     95th percentile of the certified paths' own dispersion. Needs two months to measure a
     dispersion at all. One alert per latest month."""
-    limits = thresholds(conn)
+    basis = basis or Basis(conn)
+    limits = basis.limits
     if limits is None or limits.tracking_q95 is None or limits.monthly_return is None:
         return []
-    months = equity_months(conn)
+    months = basis.months
     dispersion = scatter(months, limits.monthly_return)
     if dispersion is None or dispersion <= limits.tracking_q95:
         return []
@@ -510,11 +538,11 @@ def live_cost(conn: psycopg.Connection) -> list[Finding]:
     ]
 
 
-def certified_capital(conn: psycopg.Connection) -> list[Finding]:
+def certified_capital(conn: psycopg.Connection, basis: Basis | None = None) -> list[Finding]:
     """Account equity beyond the capital the promoted model was certified for. The
     certification measured participation and cost at that size; above it, the numbers it
     passed on are no longer the numbers that apply. One alert per month of the observation."""
-    limits = thresholds(conn)
+    limits = (basis or Basis(conn)).limits
     if limits is None:
         return []
     account = conn.execute(_EQUITY).fetchone()

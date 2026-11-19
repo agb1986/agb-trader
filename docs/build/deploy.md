@@ -368,7 +368,10 @@ more than 45 days is left to the backfill below. Re-running a pull for a session
 landed writes the same bytes, so it leaves each file and its hash as they were.
 
 The first time, land the history from 1998 on. It downloads the vendor's full exports, so
-it takes a while, and it is safe to run again:
+it takes a while, and it is safe to run again. Each partition is written under a temporary
+name, recorded in `agb.lake_snapshot`, and only then renamed into place, so a backfill or pull
+killed part way leaves every file in the lake recorded and readable, and running it again lands
+the rest:
 
 ```sh
 ./agb-stack run --rm pipeline python -m agb.services.pipeline backfill

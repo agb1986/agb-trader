@@ -27,7 +27,8 @@ from test_execution import (
 from test_gate import BASE, insert, rows, run, state
 from test_health import distribution, dividend, mode, promote
 
-from agb import execution, readout
+from agb import approval, execution, readout
+from agb.alerts import acknowledge
 from agb.services.bot import (
     MESSAGE_MAX,
     REFUSAL_LIMIT,
@@ -676,3 +677,144 @@ def test_a_position_the_fills_do_not_explain_raises_a_mismatch_alert(db, paper):
         f" snapshot {NEXT}"
     )
     assert [text for _, text in telegram.sent].count(mismatch) == 1
+
+
+# Acknowledging an alert (issue #209).
+
+
+def raise_alert(db, kind="halt_open", subject="pause", period=PERIOD, at=AFTER):
+    """An alert as the bot raises one, and its id, which is what /ack takes."""
+    (ident,) = (
+        db.connect("bot")
+        .execute(
+            "INSERT INTO agb.alert (kind, subject, period, body, raised_at, raised_by)"
+            " VALUES (%s, %s, %s, 'the kill switch is on', %s, 'bot') RETURNING id",
+            (kind, subject, period, at - timedelta(hours=1)),
+        )
+        .fetchone()
+    )
+    return ident
+
+
+def acknowledged(db):
+    """Every acknowledgement, as (alert, channel, actor, chat) and oldest first."""
+    return rows(
+        db,
+        "SELECT alert_id, channel, actor, chat_id FROM agb.alert_event"
+        " WHERE event = 'acknowledged' ORDER BY id",
+    )
+
+
+def test_the_parser_checks_that_ack_takes_one_whole_number():
+    assert parse("/ack 12").refusal is None
+    for text in ("/ack", "/ack 1 2", "/ack x", "/ack -1", "/ack 1.5", "/ack " + "9" * 30):
+        assert parse(text).refusal == "usage: /ack <alert id>", text
+
+
+def test_ack_acknowledges_the_alert_once_naming_who_and_where(db):
+    ident = raise_alert(db)
+
+    [reply] = ask(db, f"/ack {ident}")
+
+    assert reply == f"Alert {ident} (halt_open, pause {PERIOD}) acknowledged by telegram:{SENDER}."
+    assert acknowledged(db) == [(ident, "telegram", f"telegram:{SENDER}", CHAT)]
+    assert commands(db) == [
+        (
+            f"telegram:{SENDER}",
+            "telegram",
+            f"/ack {ident}",
+            "ack",
+            {"alert": ident},
+            "accepted",
+            None,
+            CHAT,
+            100,
+        )
+    ], "one command row, recorded once"
+
+
+def test_a_second_ack_is_refused_by_name_and_writes_no_second_event(db):
+    ident = raise_alert(db)
+
+    first, second = ask(db, f"/ack {ident}", f"/ack {ident}")
+
+    assert first.endswith(f"acknowledged by telegram:{SENDER}.")
+    assert re.fullmatch(
+        rf"Alert {ident} \(halt_open, pause {PERIOD}\) was already acknowledged by "
+        rf"telegram:{SENDER} from telegram at {ET}\. Nothing changed\.",
+        second,
+    )
+    assert len(acknowledged(db)) == 1
+    assert [(row[3], row[5]) for row in commands(db)] == [("ack", "accepted"), ("ack", "refused")]
+
+
+def test_ack_of_an_alert_that_does_not_exist_is_refused_and_recorded(db):
+    ident = raise_alert(db)
+
+    [reply] = ask(db, f"/ack {ident + 50}")
+
+    assert reply == f"There is no alert {ident + 50}; nothing was acknowledged."
+    assert acknowledged(db) == []
+    [command] = commands(db)
+    assert (command[3], command[5], command[6]) == ("ack", "refused", reply)
+
+
+def test_ack_with_no_id_or_a_bad_one_is_refused_with_its_usage(db):
+    raise_alert(db)
+
+    replies = ask(db, "/ack", "/ack soon")
+
+    assert replies == ["usage: /ack <alert id> — /help lists the commands"] * 2
+    assert acknowledged(db) == []
+    assert [(row[3], row[5]) for row in commands(db)] == [("ack", "refused")] * 2
+
+
+def test_ack_from_another_chat_is_refused_and_acknowledges_nothing(db):
+    ident = raise_alert(db)
+    telegram = FakeTelegram()
+    say(telegram, f"/ack {ident}", chat="999", sender=31)
+
+    Bot(telegram, CHAT, lambda: AFTER).poll(db.connect("bot"), AFTER)
+
+    assert telegram.sent == []
+    assert acknowledged(db) == []
+    [command] = commands(db)
+    assert command[:2] == ("telegram:31", "telegram") and command[5:7] == (
+        "refused",
+        "not the configured chat",
+    )
+
+
+def test_an_ack_in_the_ui_and_one_in_telegram_acknowledge_an_alert_once_between_them(db):
+    ident = raise_alert(db)
+    ui_source = approval.Source("ui:operator", "ui", f"/ack {ident}")
+    reply = acknowledge(db.connect("ui"), ui_source, str(ident), AFTER)
+    assert reply.endswith("acknowledged by ui:operator.")
+
+    [late] = ask(db, f"/ack {ident}")
+
+    assert "already acknowledged by ui:operator from ui at" in late
+    assert acknowledged(db) == [(ident, "ui", "ui:operator", None)]
+
+
+def test_status_counts_the_unacknowledged_alerts_and_names_the_newest_to_acknowledge(db):
+    [none] = ask(db, "/status")
+    assert "alerts of the last" not in none
+
+    old = raise_alert(db, "gate_halt", "rebalance", "2026-09", at=AFTER - timedelta(days=9))
+    seen = raise_alert(db, "partial_rebalance", "live basket", PERIOD)
+    newest = raise_alert(db, "halt_open", "pause", PERIOD)
+    ask(db, f"/ack {seen}")
+
+    [status] = ask(db, "/status")
+
+    assert_style(status)
+    assert (
+        f"  1 of 2 alerts of the last 7 days unacknowledged\n"
+        f"    newest is {newest}, halt_open for pause {PERIOD}: /ack {newest}"
+    ) in status
+    assert f"/ack {old}" not in status, "an alert older than the window is not counted"
+
+    ask(db, f"/ack {newest}")
+    [status] = ask(db, "/status")
+    assert "  all 2 alerts of the last 7 days acknowledged\n    nothing awaits you" in status

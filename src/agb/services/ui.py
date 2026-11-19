@@ -12,7 +12,7 @@ Every request opens its own connection as the `ui` role and closes it again, whi
 what a threaded server needs — a psycopg connection is not safe to share between threads — and
 the cheapest way to be certain a request cannot leave a transaction open. A GET renders a page
 and gets a read-only connection; a POST to one of the write routes in `ui.WRITES` gets one that
-may write. A POST to a page is 405 and anything else is 404, so the write paths are the five
+may write. A POST to a page is 405 and anything else is 404, so the write paths are the six
 the UI declares and nothing else.
 
 A write is answered with a 303 to a GET page, never with the outcome itself, so a reload or a

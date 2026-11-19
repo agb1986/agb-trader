@@ -9,7 +9,7 @@ adds no prose of its own and never recommends.
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import psycopg
@@ -25,6 +25,8 @@ LOG_DEFAULT = 10
 DETAIL_MAX = 120
 # A halt's reason is cut to this in /status.
 HALT_MAX = 240
+# /status says whether the alerts raised in this long have been acknowledged.
+ALERT_WINDOW = timedelta(days=7)
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,35 @@ _NEXT_SUBMISSION = """
     ORDER BY due_at
     LIMIT 1
 """
+
+
+_RECENT_ALERTS = """
+    SELECT a.id, a.kind, a.subject, a.period,
+           EXISTS (SELECT 1 FROM agb.alert_event e
+                   WHERE e.alert_id = a.id AND e.event = 'acknowledged')
+    FROM agb.alert a
+    WHERE a.raised_at > %s
+    ORDER BY a.id DESC
+"""
+
+
+def _alerts_item(conn: psycopg.Connection, now: datetime) -> Item | None:
+    """Whether the alerts of the last `ALERT_WINDOW` have been acknowledged, or None when none
+    was raised. The newest one still waiting is named with the command that acknowledges it."""
+    rows = conn.execute(_RECENT_ALERTS, (now - ALERT_WINDOW,)).fetchall()
+    if not rows:
+        return None
+    waiting = [row for row in rows if not row[4]]
+    days = ALERT_WINDOW.days
+    if not waiting:
+        return Item(
+            f"all {len(rows)} alerts of the last {days} days acknowledged", "nothing awaits you"
+        )
+    ident, kind, subject, period, _ = waiting[0]
+    return Item(
+        f"{len(waiting)} of {len(rows)} alerts of the last {days} days unacknowledged",
+        f"newest is {ident}, {kind} for {subject} {period}: /ack {ident}",
+    )
 
 
 def status(conn: psycopg.Connection, now: datetime) -> str:
@@ -178,6 +209,9 @@ def status(conn: psycopg.Connection, now: datetime) -> str:
     else:
         period, due_at = upcoming
         items.append(Item(f"next rebalance {period}", f"orders due by {et(due_at)}"))
+    alert_item = _alerts_item(conn, now)
+    if alert_item is not None:
+        items.append(alert_item)
     return message(header, items)
 
 
@@ -216,18 +250,38 @@ def positions(conn: psycopg.Connection) -> str:
 
 PERIOD = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
 
-_READINGS = """
-    SELECT observed_at, equity_usd FROM agb.broker_state
-    WHERE equity_usd IS NOT NULL
-      AND (%(start)s::timestamptz IS NULL OR observed_at >= %(start)s)
-      AND (%(end)s::timestamptz IS NULL OR observed_at < %(end)s)
-    ORDER BY observed_at
-"""
-_BEFORE = """
-    SELECT observed_at, equity_usd FROM agb.broker_state
-    WHERE equity_usd IS NOT NULL AND observed_at < %s
-    ORDER BY observed_at DESC
-    LIMIT 1
+# The two readings a period is measured between, and the one before it, for each period named:
+# the first and the last reading inside it and the last before it, so a month's return costs
+# three rows and not every reading the account took in it. A period with no bounds is the whole
+# record, which has nothing before it. The id breaks a tie between readings at one instant.
+_WINDOWS = """
+    SELECT p.ord, f.observed_at, f.equity_usd, l.observed_at, l.equity_usd,
+           b.observed_at, b.equity_usd
+    FROM unnest(%(starts)s::timestamptz[], %(ends)s::timestamptz[])
+         WITH ORDINALITY AS p(start_at, end_at, ord)
+    LEFT JOIN LATERAL (
+        SELECT observed_at, equity_usd FROM agb.broker_state
+        WHERE equity_usd IS NOT NULL
+          AND (p.start_at IS NULL OR observed_at >= p.start_at)
+          AND (p.end_at IS NULL OR observed_at < p.end_at)
+        ORDER BY observed_at, id
+        LIMIT 1
+    ) f ON true
+    LEFT JOIN LATERAL (
+        SELECT observed_at, equity_usd FROM agb.broker_state
+        WHERE equity_usd IS NOT NULL
+          AND (p.start_at IS NULL OR observed_at >= p.start_at)
+          AND (p.end_at IS NULL OR observed_at < p.end_at)
+        ORDER BY observed_at DESC, id DESC
+        LIMIT 1
+    ) l ON true
+    LEFT JOIN LATERAL (
+        SELECT observed_at, equity_usd FROM agb.broker_state
+        WHERE equity_usd IS NOT NULL AND observed_at < p.start_at
+        ORDER BY observed_at DESC, id DESC
+        LIMIT 1
+    ) b ON true
+    ORDER BY p.ord
 """
 _FILLS = """
     SELECT count(*),
@@ -254,21 +308,38 @@ def month_bounds(period: str) -> tuple[datetime, datetime]:
     return start, end
 
 
-def equity_window(
-    conn: psycopg.Connection, period: str | None = None
-) -> tuple[datetime, Decimal, datetime, Decimal] | None:
-    """The two equity readings a period is measured between, as (first_at, first, last_at,
+Window = tuple[datetime, Decimal, datetime, Decimal]
+
+
+def equity_windows(
+    conn: psycopg.Connection, periods: Sequence[str | None]
+) -> dict[str | None, Window | None]:
+    """The two equity readings each period is measured between, as (first_at, first, last_at,
     last): from the last reading before the period, or its own first reading, to its last.
-    None if there are no readings in it. The UI's decision log reads a month's realised
-    return from the same two readings `/pnl` does."""
-    start, end = month_bounds(period) if period else (None, None)
-    readings = conn.execute(_READINGS, {"start": start, "end": end}).fetchall()
-    if not readings:
-        return None
-    opening = conn.execute(_BEFORE, (start,)).fetchone() if start else None
-    first_at, first = opening or readings[0]
-    last_at, last = readings[-1]
-    return first_at, first, last_at, last
+    None for a period with no readings in it. One query for all of them, which the decision log
+    needs for each cycle it lists."""
+    bounds = [month_bounds(period) if period else (None, None) for period in periods]
+    rows = conn.execute(
+        _WINDOWS, {"starts": [start for start, _ in bounds], "ends": [end for _, end in bounds]}
+    ).fetchall()
+    windows: dict[str | None, Window | None] = {}
+    for period, (_, first_at, first, last_at, last, before_at, before) in zip(
+        periods, rows, strict=True
+    ):
+        if last_at is None:
+            windows[period] = None
+        elif before_at is not None:
+            windows[period] = (before_at, before, last_at, last)
+        else:
+            windows[period] = (first_at, first, last_at, last)
+    return windows
+
+
+def equity_window(conn: psycopg.Connection, period: str | None = None) -> Window | None:
+    """The two equity readings one period is measured between, as `equity_windows` reads them.
+    The UI's decision log reads a month's realised return from the same two readings `/pnl`
+    does."""
+    return equity_windows(conn, [period])[period]
 
 
 def pnl(conn: psycopg.Connection, period: str | None = None) -> str:
@@ -372,7 +443,7 @@ def basket(conn: psycopg.Connection) -> str:
 # The book the basket trades from is the last filled live basket; a sold name's old rank is
 # the rank it held there.
 _SOLD = """
-    SELECT o.symbol, r.rank, w.rank
+    SELECT o.basket_id, o.symbol, r.rank, w.rank
     FROM agb.basket_order o
     LEFT JOIN agb.basket_rank r ON r.basket_id = o.basket_id AND r.symbol = o.symbol
     LEFT JOIN agb.basket_target w ON w.symbol = o.symbol AND w.basket_id = (
@@ -381,21 +452,28 @@ _SOLD = """
         ORDER BY session_date DESC, id DESC
         LIMIT 1
     )
-    WHERE o.basket_id = %s AND o.side = 'sell'
-    ORDER BY r.rank DESC NULLS FIRST, o.symbol
+    WHERE o.basket_id = ANY(%s) AND o.side = 'sell'
+    ORDER BY o.basket_id, r.rank DESC NULLS FIRST, o.symbol
 """
 _BOUGHT = """
-    SELECT o.symbol, r.rank
+    SELECT o.basket_id, o.symbol, r.rank
     FROM agb.basket_order o
     LEFT JOIN agb.basket_rank r ON r.basket_id = o.basket_id AND r.symbol = o.symbol
-    WHERE o.basket_id = %s AND o.side = 'buy'
-    ORDER BY r.rank NULLS LAST, o.symbol
+    WHERE o.basket_id = ANY(%s) AND o.side = 'buy'
+    ORDER BY o.basket_id, r.rank NULLS LAST, o.symbol
 """
-_KEPT = "SELECT count(*) FROM agb.basket_target WHERE basket_id = %s AND held"
+_KEPT = """
+    SELECT basket_id, count(*) FROM agb.basket_target
+    WHERE basket_id = ANY(%s) AND held
+    GROUP BY basket_id
+"""
+# Where a basket has more than one gate run, the latest run's measurement is the one that
+# stands, so the runs are read oldest first and the later overwrites the earlier.
 _MEASURED = """
-    SELECT c.name, c.measured FROM agb.gate_check c
+    SELECT r.basket_id, c.name, c.measured FROM agb.gate_check c
     JOIN agb.gate_run r ON r.id = c.run_id
-    WHERE r.basket_id = %s AND c.name IN ('cash', 'turnover') AND c.symbol IS NULL
+    WHERE r.basket_id = ANY(%s) AND c.name IN ('cash', 'turnover') AND c.symbol IS NULL
+    ORDER BY r.id, c.id
 """
 
 
@@ -414,13 +492,27 @@ class Diff:
         return max([6, *(len(symbol) + 1 for symbol, *_ in (*self.sold, *self.bought))])
 
 
+def diffs(conn: psycopg.Connection, basket_ids: Sequence[int]) -> dict[int, Diff]:
+    """The diff of each basket named, in four queries however many that is."""
+    ids = list(basket_ids)
+    sold: dict[int, list[tuple[str, int | None, int | None]]] = {i: [] for i in ids}
+    bought: dict[int, list[tuple[str, int | None]]] = {i: [] for i in ids}
+    measured: dict[int, dict[str, str]] = {i: {} for i in ids}
+    for basket_id, symbol, rank, was in conn.execute(_SOLD, (ids,)).fetchall():
+        sold[basket_id].append((symbol, rank, was))
+    for basket_id, symbol, rank in conn.execute(_BOUGHT, (ids,)).fetchall():
+        bought[basket_id].append((symbol, rank))
+    held = dict(conn.execute(_KEPT, (ids,)).fetchall())
+    for basket_id, name, value in conn.execute(_MEASURED, (ids,)).fetchall():
+        measured[basket_id][name] = value
+    return {
+        i: Diff(sold=sold[i], bought=bought[i], held=held.get(i, 0), measured=measured[i])
+        for i in ids
+    }
+
+
 def diff(conn: psycopg.Connection, basket_id: int) -> Diff:
-    return Diff(
-        sold=conn.execute(_SOLD, (basket_id,)).fetchall(),
-        bought=conn.execute(_BOUGHT, (basket_id,)).fetchall(),
-        held=conn.execute(_KEPT, (basket_id,)).fetchone()[0],
-        measured=dict(conn.execute(_MEASURED, (basket_id,)).fetchall()),
-    )
+    return diffs(conn, [basket_id])[basket_id]
 
 
 def rank_text(rank: int | None) -> str:
@@ -456,15 +548,20 @@ _LATEST_GATE = """
     LIMIT 1
 """
 _GATE_CHECKS = """
-    SELECT 'gate', c.level, c.name, c.symbol, c.measured, c.threshold, c.passed
-    FROM agb.gate_check c
-    JOIN agb.gate_run r ON r.id = c.run_id
-    WHERE r.basket_id = %(basket)s
-    UNION ALL
-    SELECT 'broker', c.level, c.name, c.symbol, c.measured, c.threshold, c.passed
-    FROM agb.broker_check c
-    JOIN agb.broker_check_run r ON r.id = c.run_id
-    WHERE r.basket_id = %(basket)s
+    SELECT basket_id, source, level, name, symbol, measured, threshold, passed FROM (
+        SELECT r.basket_id, 0 AS rank, c.id, 'gate' AS source, c.level, c.name, c.symbol,
+               c.measured, c.threshold, c.passed
+        FROM agb.gate_check c
+        JOIN agb.gate_run r ON r.id = c.run_id
+        WHERE r.basket_id = ANY(%(baskets)s)
+        UNION ALL
+        SELECT r.basket_id, 1, c.id, 'broker', c.level, c.name, c.symbol,
+               c.measured, c.threshold, c.passed
+        FROM agb.broker_check c
+        JOIN agb.broker_check_run r ON r.id = c.run_id
+        WHERE r.basket_id = ANY(%(baskets)s)
+    ) checks
+    ORDER BY basket_id, rank, id
 """
 _BROKER_RUN = "SELECT at FROM agb.broker_check_run WHERE basket_id = %s"
 
@@ -484,9 +581,17 @@ class CheckRow:
         return f"{self.name} {self.symbol}" if self.symbol else self.name
 
 
+def checks_of(conn: psycopg.Connection, basket_ids: Sequence[int]) -> dict[int, list[CheckRow]]:
+    """The gate checks and the broker checks of each basket named, in one query: the gate's
+    first, each in the order it was recorded."""
+    found: dict[int, list[CheckRow]] = {basket_id: [] for basket_id in basket_ids}
+    for basket_id, *row in conn.execute(_GATE_CHECKS, {"baskets": list(basket_ids)}).fetchall():
+        found[basket_id].append(CheckRow(*row))
+    return found
+
+
 def checks(conn: psycopg.Connection, basket_id: int) -> list[CheckRow]:
-    rows = conn.execute(_GATE_CHECKS, {"basket": basket_id}).fetchall()
-    return [CheckRow(*row) for row in rows]
+    return checks_of(conn, [basket_id])[basket_id]
 
 
 def failed(check: CheckRow) -> str:
