@@ -190,7 +190,8 @@ On the server, in the deploy directory:
 `AGB_STALE_AFTER_SECONDS` (default 300), and exits 1 if there is one. On the server every
 service is expected, the bot included. `AGB_EXPECTED_SERVICES`, a list of service names, narrows
 that: `make status` on the workstation sets it to every service but the bot unless
-`COMPOSE_PROFILES` includes `telegram`.
+`COMPOSE_PROFILES` includes `telegram`. The bot reads the same variable, and alerts on an expected
+service that has no heartbeat ten minutes after the bot started.
 
 `./agb-stack ps` shows each container's health. A long-running app service runs
 `python -m agb.heartbeat` every 30 seconds, which fails once the service's own heartbeat is

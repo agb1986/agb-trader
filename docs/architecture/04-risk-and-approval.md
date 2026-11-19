@@ -188,7 +188,7 @@ The alerts:
 - **Partial rebalance** — a mid-submission pause could not cancel every sent order before it moved the book; names what remains live or filled.
 - **Broker latch mismatch** — `suspend_trade` at Alpaca disagrees with the database latch.
 - **Position snapshot mismatch** — the daily broker snapshot differs from the previous snapshot plus the day's fills (a split will fire this, correctly).
-- **Health** — stale heartbeat, overdue expected event, undelivered alert; see [08 — Database schema](08-database-schema.md).
+- **Health** — stale heartbeat, an expected service that never started, overdue expected event, undelivered alert; see [08 — Database schema](08-database-schema.md).
 
 As built, the five performance readings are `drawdown`, `losing_run`, `tracking`, `live_cost` and `certified_capital` in `agb.health`, run by the bot's cycle beside the health checks, and each one's threshold is read from `agb.alert_threshold`, a view over the promoted certification's `path_quantiles`. A quantile the certification never recorded leaves its own check silent rather than falling back to a round number, because a threshold nobody validated is worse than no alert: the certification carries its thresholds, so promoting a model that did not record a distribution simply means those three readings say nothing until one does.
 
