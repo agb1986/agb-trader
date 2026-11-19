@@ -65,7 +65,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -913,6 +913,23 @@ WHERE dividend <= 0
     )
 ORDER BY ticker
 """
+
+
+def require_columns(
+    db: duckdb.DuckDBPyConnection,
+    needed: Mapping[str, Sequence[str]],
+    error: type[Exception],
+) -> None:
+    """Fail with `error`, naming the missing dataset or columns, rather than let a query meet a
+    DuckDB binder error. `needed` maps each view to the columns a computation reads from it."""
+    for view, columns in needed.items():
+        try:
+            present = {row[0] for row in db.execute(f"DESCRIBE {view}").fetchall()}
+        except duckdb.Error:
+            raise error(f"the lake has no {view} partitions") from None
+        missing = sorted(set(columns) - present)
+        if missing:
+            raise error(f"the lake's {view} lacks {missing}")
 
 
 def inconsistent(lake: Path = DEFAULT_DIR) -> list[str]:

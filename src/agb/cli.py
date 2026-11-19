@@ -11,6 +11,7 @@ from pathlib import Path
 import psycopg
 
 from agb import heartbeat, panel
+from agb.common import expected_services, format_age
 from agb.nyse import NyseCalendar, trading_date
 from agb.roles import SERVICES
 
@@ -19,20 +20,6 @@ _HEARTBEATS = """
     FROM agb.heartbeat
     ORDER BY service
 """
-
-
-def format_age(age: timedelta) -> str:
-    seconds = max(0, int(age.total_seconds()))
-    days, rem = divmod(seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, seconds = divmod(rem, 60)
-    if days:
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {minutes}m"
-    if minutes:
-        return f"{minutes}m {seconds}s"
-    return f"{seconds}s"
 
 
 def format_status(rows: Iterable[tuple[str, datetime, timedelta, str | None]]) -> str:
@@ -52,14 +39,6 @@ def format_status(rows: Iterable[tuple[str, datetime, timedelta, str | None]]) -
 
 def status(conn: psycopg.Connection) -> str:
     return format_status(conn.execute(_HEARTBEATS).fetchall())
-
-
-def expected_services() -> tuple[str, ...]:
-    """The services `agb status` insists on: AGB_EXPECTED_SERVICES, separated by spaces or
-    commas, or every service when it is unset or empty. The workstation's `make status` leaves
-    the bot out unless the telegram profile runs there; the server expects all of them."""
-    names = os.environ.get("AGB_EXPECTED_SERVICES", "").replace(",", " ").split()
-    return tuple(names) or SERVICES
 
 
 def unhealthy(
@@ -181,8 +160,8 @@ def _panel_config_list(args: argparse.Namespace) -> int:
     return 0
 
 
-# agb.approval reads agb.health, which reads this module's format_age, so the commands that
-# use it, directly or through agb.registry, import it where they run.
+# The commands import the modules they use where they run, so `agb status` does not load the
+# lake, the model registry or the research stack to print a table.
 
 
 def _paper_approval(args: argparse.Namespace) -> int:
@@ -649,10 +628,13 @@ def _paper_check(args: argparse.Namespace) -> int:
     return 0 if result.passed else 1
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="agb", description="agb-trader operator CLI")
-    parser.add_argument("--version", action="version", version=os.environ.get("AGB_VERSION", "dev"))
-    commands = parser.add_subparsers(dest="command", required=True)
+# One builder per command, each adding its subparser and its arguments to the `commands`
+# group; `_COMMANDS` is their order, which is the order `agb --help` lists them in.
+# `actor` is the shared `--actor` option, which the commands that write take.
+type Commands = argparse._SubParsersAction[argparse.ArgumentParser]
+
+
+def _add_status(commands: Commands, actor: dict[str, str]) -> None:
     commands.add_parser(
         "status",
         help="each service's last heartbeat and its age",
@@ -660,12 +642,18 @@ def main(argv: list[str] | None = None) -> int:
         "service) has never beaten or last beat longer ago than AGB_STALE_AFTER_SECONDS "
         "(default 300).",
     ).set_defaults(run=_status)
+
+
+def _add_runtimes(commands: Commands, actor: dict[str, str]) -> None:
     commands.add_parser(
         "runtimes",
         help="how long each job kind has taken, claim to completion",
         description="Reads the measured durations out of the job event log, which is what "
         "the poll intervals and lease durations in src/agb/schedule.py are set from.",
     ).set_defaults(run=_runtimes)
+
+
+def _add_panel_config(commands: Commands, actor: dict[str, str]) -> None:
     configs = commands.add_parser(
         "panel-config", help="the panel's immutable configurations"
     ).add_subparsers(dest="action", required=True)
@@ -689,10 +677,9 @@ def main(argv: list[str] | None = None) -> int:
     configs.add_parser("list", help="every panel_config, oldest first").set_defaults(
         run=_panel_config_list
     )
-    actor = {
-        "default": os.environ.get("USER") or "operator",
-        "help": "who is asking (default $USER)",
-    }
+
+
+def _add_paper_approval(commands: Commands, actor: dict[str, str]) -> None:
     paper = commands.add_parser(
         "paper-approval",
         help="whether a paper rebalance waits for the human, as live mode does",
@@ -704,6 +691,9 @@ def main(argv: list[str] | None = None) -> int:
     paper.add_argument("--reason", help="why, kept with the setting")
     paper.add_argument("--actor", **actor)
     paper.set_defaults(run=_paper_approval)
+
+
+def _add_rerun(commands: Commands, actor: dict[str, str]) -> None:
     rerun = commands.add_parser(
         "rerun",
         help="trade a missed rebalance at the next session's close",
@@ -714,6 +704,9 @@ def main(argv: list[str] | None = None) -> int:
     rerun.add_argument("reference", help="the missed rebalance, e.g. 2026-10")
     rerun.add_argument("--actor", **actor)
     rerun.set_defaults(run=_rerun)
+
+
+def _add_import_certification(commands: Commands, actor: dict[str, str]) -> None:
     certification = commands.add_parser(
         "import-certification",
         help="insert a certified model's row from its artifact under AGB_MODELS_DIR",
@@ -727,6 +720,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     certification.add_argument("model_id", help="the artifact's directory under AGB_MODELS_DIR")
     certification.set_defaults(run=_import_certification)
+
+
+def _add_promote(commands: Commands, actor: dict[str, str]) -> None:
     promote = commands.add_parser(
         "promote",
         help="make a certified model the one the pipeline ranks with",
@@ -750,6 +746,9 @@ def main(argv: list[str] | None = None) -> int:
     promote.add_argument("--reason", help="why the waiver is being taken, for the audit log")
     promote.add_argument("--actor", **actor)
     promote.set_defaults(run=_promote)
+
+
+def _add_acknowledge(commands: Commands, actor: dict[str, str]) -> None:
     acknowledge = commands.add_parser(
         "acknowledge",
         help="acknowledge a failed job, which takes it out of the overdue view",
@@ -760,6 +759,9 @@ def main(argv: list[str] | None = None) -> int:
     acknowledge.add_argument("--reason", required=True, help="what was decided, kept with it")
     acknowledge.add_argument("--actor", **actor)
     acknowledge.set_defaults(run=_acknowledge)
+
+
+def _add_void(commands: Commands, actor: dict[str, str]) -> None:
     void = commands.add_parser(
         "void",
         help="void a model's certification for good",
@@ -770,6 +772,9 @@ def main(argv: list[str] | None = None) -> int:
     void.add_argument("--reason", required=True, help="why, kept with the voiding")
     void.add_argument("--actor", **actor)
     void.set_defaults(run=_void)
+
+
+def _add_void_stale(commands: Commands, actor: dict[str, str]) -> None:
     stale = commands.add_parser(
         "void-stale",
         help="void every certification made under an earlier cost model",
@@ -778,6 +783,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     stale.add_argument("--actor", **actor)
     stale.set_defaults(run=_void_stale)
+
+
+def _add_reconcile(commands: Commands, actor: dict[str, str]) -> None:
     reconcile = commands.add_parser(
         "reconcile",
         help="ask the broker what it knows about every order of a basket, by client_order_id",
@@ -791,6 +799,9 @@ def main(argv: list[str] | None = None) -> int:
     reconcile.add_argument("reference", help="the basket to walk, e.g. 2026-10")
     reconcile.add_argument("--actor", **actor)
     reconcile.set_defaults(run=_reconcile)
+
+
+def _add_panel_preflight(commands: Commands, actor: dict[str, str]) -> None:
     preflight_commands = commands.add_parser(
         "panel-preflight",
         help="the panel pre-flight suite: four checks, recorded per panel_config",
@@ -845,6 +856,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     show.add_argument("config", type=int, metavar="CONFIG", help="the panel_config to read")
     show.set_defaults(run=_panel_preflight_show)
+
+
+def _add_level(commands: Commands, actor: dict[str, str]) -> None:
     level = commands.add_parser(
         "level",
         help="the autonomy level, and the one deliberate way to move it",
@@ -858,6 +872,9 @@ def main(argv: list[str] | None = None) -> int:
     level.add_argument("--attest", help="why the move is warranted, recorded with it")
     level.add_argument("--actor", **actor)
     level.set_defaults(run=_level)
+
+
+def _add_mode(commands: Commands, actor: dict[str, str]) -> None:
     mode = commands.add_parser(
         "mode",
         help="paper or live, and the criteria between them",
@@ -869,6 +886,9 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--attest", help="why going live is warranted, recorded with it")
     mode.add_argument("--actor", **actor)
     mode.set_defaults(run=_mode)
+
+
+def _add_corporate(commands: Commands, actor: dict[str, str]) -> None:
     corporate_commands = commands.add_parser(
         "corporate",
         help="record a forced corporate event, and read the ones a rebalance carries",
@@ -920,6 +940,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     corporate_show.add_argument("period", metavar="YYYY-MM", help="the rebalance to read")
     corporate_show.set_defaults(run=_corporate)
+
+
+def _add_dividend(commands: Commands, actor: dict[str, str]) -> None:
     dividend = commands.add_parser(
         "dividend",
         help="record a dividend the paper broker did not credit",
@@ -939,6 +962,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     dividend.add_argument("--actor", **actor)
     dividend.set_defaults(run=_dividend)
+
+
+def _add_paper_check(commands: Commands, actor: dict[str, str]) -> None:
     paper_checks = commands.add_parser(
         "paper-check",
         help="the paper record's arithmetic checks, three of the paper-to-live criteria",
@@ -954,6 +980,39 @@ def main(argv: list[str] | None = None) -> int:
         check = paper_checks.add_parser(command, help=helptext)
         check.add_argument("--actor", **actor)
         check.set_defaults(run=_paper_check, check_name=name)
+
+
+_COMMANDS = (
+    _add_status,
+    _add_runtimes,
+    _add_panel_config,
+    _add_paper_approval,
+    _add_rerun,
+    _add_import_certification,
+    _add_promote,
+    _add_acknowledge,
+    _add_void,
+    _add_void_stale,
+    _add_reconcile,
+    _add_panel_preflight,
+    _add_level,
+    _add_mode,
+    _add_corporate,
+    _add_dividend,
+    _add_paper_check,
+)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="agb", description="agb-trader operator CLI")
+    parser.add_argument("--version", action="version", version=os.environ.get("AGB_VERSION", "dev"))
+    commands = parser.add_subparsers(dest="command", required=True)
+    actor = {
+        "default": os.environ.get("USER") or "operator",
+        "help": "who is asking (default $USER)",
+    }
+    for add in _COMMANDS:
+        add(commands, actor)
     args = parser.parse_args(argv)
     try:
         return args.run(args)

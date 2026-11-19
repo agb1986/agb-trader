@@ -4,7 +4,7 @@ How the 32 build tickets (issues #14–#45) are worked in parallel with Orca, an
 
 The tickets and their blocking edges live on GitHub: every ticket is an issue labelled `ready-for-agent`, and native `blocked_by` links carry the dependencies. This plan adds no new dependencies between tickets. It mirrors the GitHub graph into an Orca run, and adds merge and operator steps so that "ready" in Orca means the same thing as "unblocked" on GitHub.
 
-`scripts/orca/plan.py` implements the plan:
+`scripts/orca/plan.py` implemented the plan. All 32 tickets have merged, so the script has been removed (it is in the git history, last at `ae0541e`), and the commands below, and the `plan.py` references through the rest of this document, describe how the build phase was run:
 
 | Command | What it does |
 |---|---|

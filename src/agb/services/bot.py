@@ -44,7 +44,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from agb import alerts, approval, health, jobs, killswitch, ladder, readout, schedule
-from agb.cli import format_age
+from agb.common import format_age
 from agb.health import Finding
 from agb.heartbeat import interval_from_env, serve, stop_on_signals
 from agb.nyse import NEW_YORK, NyseCalendar, trading_date
@@ -101,9 +101,6 @@ GATE_HALT = "gate_halt"
 RECENT_BASKETS = 3
 # Telegram refuses a message longer than this; a longer answer goes out in parts.
 MESSAGE_MAX = 4096
-# How long a liquidation token stays valid. The kill switch owns it; it is named here
-# because this is the surface that tells the operator how long they have.
-TOKEN_VALID = killswitch.TOKEN_VALID
 # A command older than this when the bot reads it is refused, not acted on. Telegram keeps an
 # unread message for a day, so a `/resume` typed before an outage would otherwise clear a halt
 # raised since. Five minutes is several poll cycles and a retried poll, and far less than the
@@ -137,8 +134,6 @@ COMMANDS = {
     "ack": ("/ack <alert id>", "acknowledge an alert by the id it is listed under"),
     "help": ("/help", "this list"),
 }
-# Commands the spec names that later tickets bring. They are refused, and recorded.
-LATER: frozenset[str] = frozenset()
 # Commands whose arguments `agb.approval` checks, against what is pending.
 DECISIONS = frozenset({"approve", "reject"})
 VERB = re.compile(r"^[a-z][a-z_]*$")
@@ -178,8 +173,6 @@ def parse(text: str) -> Parsed:
         return Parsed(None, args, "not a command")
     if verb == "start":
         verb = "help"
-    if verb in LATER:
-        return Parsed(verb, args, f"/{verb} is not available yet")
     if verb not in COMMANDS:
         return Parsed(verb, args, f"unknown command /{verb}")
     usage = COMMANDS[verb][0]

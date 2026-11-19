@@ -81,8 +81,6 @@ show_missing = false
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-# The Orca coordinator script predates these settings and is not part of the product.
-extend-exclude = ["scripts/orca"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "S", "SIM", "PTH", "RET", "DTZ", "PL"]
@@ -185,6 +183,7 @@ module = [
     "agb.services.pipeline",
     "agb.services.ui",
     "agb.ui",
+    "agb.ui.*",
     "agb.universe",
 ]
 ignore_errors = true
