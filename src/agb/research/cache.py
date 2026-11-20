@@ -273,7 +273,7 @@ def values_digest(frame: pd.DataFrame) -> str:
         if pd.api.types.is_numeric_dtype(column.dtype):
             hasher.update(column.to_numpy(dtype="<f8", na_value=np.nan).tobytes())
         else:
-            hasher.update("\n".join(column.astype(str)).encode())
+            hasher.update("\n".join(str(value) for value in column.tolist()).encode())
     return hasher.hexdigest()
 
 

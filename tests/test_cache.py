@@ -462,3 +462,14 @@ def test_a_cache_whose_ledger_is_gone_recomputes(panel, research_lake, scored, t
     )
     assert elsewhere.count() == 1
     assert again.results["summary"]
+
+
+def test_values_digest_hashes_a_text_column_with_missing_values() -> None:
+    """A sector missing for some rows is the text 'nan' in the digest, not a crash: pandas keeps
+    a missing value in a string column as a float after astype(str)."""
+    from agb.research.cache import values_digest
+
+    frame = pd.DataFrame({"sector": pd.array(["tech", None, "energy"], dtype="string")})
+    assert values_digest(frame) == values_digest(frame.copy())
+    other = pd.DataFrame({"sector": pd.array(["tech", "x", "energy"], dtype="string")})
+    assert values_digest(frame) != values_digest(other)
