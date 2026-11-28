@@ -558,6 +558,21 @@ def test_the_backfill_lands_history_from_1998_and_records_it(db, tmp_path):
     assert mtimes(tmp_path) == files
 
 
+def test_the_backfill_lands_the_benchmark_and_records_it(db, tmp_path):
+    vendor = sample()
+    vendor.rows["funds"] += [
+        sep_row("SPY", day, "500") for day in ("1997-12-31", "2026-09-11", "2026-09-14")
+    ]
+    conn = db.connect("pipeline")
+
+    Pipeline(tmp_path, KEY, opener=vendor).backfill(conn, snapshot=SESSION)
+
+    sfp = ["sfp/date=2026-09-11", "sfp/date=2026-09-14"]
+    assert [p for p in landed(tmp_path) if p.startswith("sfp/")] == sfp
+    assert [r[2] for r in snapshots(db) if r[2].startswith("sfp/")] == sfp
+    assert lake.connect(tmp_path).sql("SELECT DISTINCT ticker FROM sfp").fetchall() == [("SPY",)]
+
+
 def test_a_backfill_stopped_between_a_write_and_its_record_lands_again(db, tmp_path, monkeypatch):
     # The ledger fails on the third partition, its bytes written but not yet recorded: that
     # partition does not land, every file that did is recorded, the lake reads, and the backfill

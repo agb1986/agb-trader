@@ -328,11 +328,12 @@ the lake, because the panel's answers were paid for and cannot be pulled again.
 
 ## The Parquet lake
 
-The `pipeline` service lands the vendor's SEP, SF1 and TICKERS tables in `lake/`, one Parquet
+The `pipeline` service lands the vendor's SEP, SF1, TICKERS and SFP tables in `lake/`, one Parquet
 file per partition:
 
 ```text
 lake/sep/date=YYYY-MM-DD/part.parquet          prices for one session
+lake/sfp/date=YYYY-MM-DD/part.parquet          SPY's price for one session, the benchmark
 lake/sf1/lastupdated=YYYY-MM-DD/part.parquet   fundamentals rows the vendor changed that day
 lake/tickers/snapshot=YYYY-MM-DD/part.parquet  the tickers table as it stood that session
 ```
@@ -345,7 +346,7 @@ ticker's earlier sessions. Each pull also fetches the last session that landed, 
 the vendor now prices differently on it has its whole history fetched again and rewritten
 across the sessions the lake holds, which changes those partitions' hashes. It also pulls
 the fundamentals the vendor changed since a week before the last pull, and the tickers table,
-delisted tickers included. It records each partition's date
+delisted tickers included, and SPY's prices from SFP, which it lands only once the backfill has seeded that table. It records each partition's date
 and SHA-256 in `agb.lake_snapshot`. If the vendor has not published a session yet, or has
 published fewer than 90% of the rows the session before it had, the service lands the
 complete sessions before it and tries again every 15 minutes, without an alert of its own,
