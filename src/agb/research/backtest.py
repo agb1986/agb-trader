@@ -163,9 +163,12 @@ FROM (
 WHERE back <= $bars
 GROUP BY ticker
 """
+# The benchmark's prices live in `sfp`, the lake's fund table, and SEP is equities only, so the
+# bars come from both where the lake holds SFP. A lake without it still backtests: the
+# benchmark is then simply absent, as it is from any lake of equity prices.
 _BARS = """
 SELECT s.ticker, s.date, s.open, s.high, s.low, s.close, s.closeadj, s.closeunadj, s.volume
-FROM sep s JOIN _backtest_window w ON s.ticker = w.ticker
+FROM {source} s JOIN _backtest_window w ON s.ticker = w.ticker
 WHERE s.date BETWEEN w.since AND $until AND s.close > 0 AND s.closeadj > 0
 ORDER BY s.ticker, s.date
 """
@@ -635,6 +638,16 @@ class Feed:
         return [_equity(ticker) for ticker in self.series]
 
 
+def _bars_query(conn: duckdb.DuckDBPyConnection) -> str:
+    """`_BARS` reading SEP, and SFP too where the lake has it."""
+    views = {row[0] for row in conn.execute("SELECT view_name FROM duckdb_views()").fetchall()}
+    columns = "ticker, date, open, high, low, close, closeadj, closeunadj, volume"
+    source = f"(SELECT {columns} FROM sep"
+    if "sfp" in views:
+        source += f" UNION ALL SELECT {columns} FROM sfp"
+    return _BARS.format(source=source + ")")
+
+
 def _windows(conn: duckdb.DuckDBPyConnection, wanted: Mapping[str, date]) -> dict[str, date]:
     """The first bar to load for each name in `wanted`: the one that leaves it LIQUIDITY_BARS
     bars of history before the first session a decision can read it on, or its own first bar
@@ -676,7 +689,7 @@ def load(
         pd.DataFrame({"ticker": list(windows), "since": list(windows.values())}),
     )
     try:
-        frame = conn.execute(_BARS, {"until": until}).df()
+        frame = conn.execute(_bars_query(conn), {"until": until}).df()
     finally:
         conn.unregister("_backtest_window")
     factor = frame["closeadj"] / frame["close"]

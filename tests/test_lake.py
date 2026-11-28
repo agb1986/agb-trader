@@ -966,3 +966,105 @@ def test_the_consistency_check_flags_a_series_on_two_bases(tmp_path, capsys):
         lake.main(["--lake", str(tmp_path), "--check"])
     assert exit_.value.code == 1
     assert capsys.readouterr().out == "AAPL\nMSFT\n"
+
+
+def spy(vendor, *days, close="500"):
+    """Give `vendor` an SPY price on each of `days`, in the fund table."""
+    vendor.rows["funds"] += [sep_row("SPY", day, close) for day in days]
+    return vendor
+
+
+def sfp_days(root):
+    return [
+        d.isoformat()
+        for (d,) in lake.connect(root).execute("SELECT date FROM sfp ORDER BY date").fetchall()
+    ]
+
+
+def seeded(tmp_path, *fund_days):
+    """A lake whose last session is the 10th, with SPY's prices for the 10th landed as the
+    backfill lands them, and a vendor that has priced SEP for the 10th, 11th and 14th and the
+    fund for `fund_days` more."""
+    vendor = spy(trading(sample(), "2026-09-10"), "2026-09-10", *fund_days)
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 10))
+    backfill = client(vendor).query(lake.SFP, {"date": "2026-09-10"})
+    lake.land(tmp_path, lake.SFP, backfill, date(2026, 9, 10))
+    vendor.urls.clear()
+    return vendor
+
+
+def test_a_pull_into_a_lake_with_no_fund_prices_does_not_land_them(tmp_path):
+    # The first SFP partition comes from the backfill; a daily pull alone would land a few
+    # sessions that look like history.
+    vendor = spy(trading(sample(), "2026-09-10"), "2026-09-10", "2026-09-11", "2026-09-14")
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 10))
+
+    lake.pull(tmp_path, client(vendor), SESSION)
+
+    assert not (tmp_path / "sfp").exists()
+    assert not any("/funds?" in u for u in vendor.urls)
+
+
+def test_a_pull_lands_the_fund_prices_beside_the_equity_ones(tmp_path):
+    vendor = seeded(tmp_path, "2026-09-11", "2026-09-14")
+
+    partitions = lake.pull(tmp_path, client(vendor), SESSION)
+
+    assert sfp_days(tmp_path) == ["2026-09-10", "2026-09-11", "2026-09-14"]
+    assert sorted(p.path for p in partitions if p.path.startswith("sfp/")) == [
+        "sfp/date=2026-09-11",
+        "sfp/date=2026-09-14",
+    ]
+    [fund] = [u for u in vendor.urls if "/funds?" in u]
+    assert "ticker=SPY" in fund and "date.gte=2026-09-10" in fund
+    assert lake.inconsistent(tmp_path) == []
+
+
+def test_fund_prices_never_run_ahead_of_equity_prices(tmp_path):
+    # The vendor has SPY for the 11th and 14th, but SEP has priced only the 11th so far.
+    vendor = seeded(tmp_path, "2026-09-11", "2026-09-14")
+    vendor.rows["stocks"] = [r for r in vendor.rows["stocks"] if r["date"] != "2026-09-14"]
+
+    with pytest.raises(NotYet):
+        lake.pull(tmp_path, client(vendor), SESSION)
+
+    assert sfp_days(tmp_path) == ["2026-09-10", "2026-09-11"]
+
+
+def test_a_session_the_fund_missed_is_landed_by_the_next_pull(tmp_path):
+    vendor = seeded(tmp_path, "2026-09-14")
+    lake.pull(tmp_path, client(vendor), SESSION)
+    assert sfp_days(tmp_path) == ["2026-09-10", "2026-09-14"]
+
+    spy(vendor, "2026-09-11")
+    lake.pull(tmp_path, client(vendor), SESSION)
+
+    # The overlap day is the 10th, so the vendor's late 11th lands now.
+    assert sfp_days(tmp_path) == ["2026-09-10", "2026-09-11", "2026-09-14"]
+
+
+def test_a_dividend_restates_the_funds_history_too(tmp_path):
+    vendor = seeded(tmp_path, "2026-09-11", "2026-09-14")
+    lake.pull(tmp_path, client(vendor), date(2026, 9, 11))
+    for row in vendor.rows["funds"]:
+        if row["date"] < "2026-09-14":
+            row["closeadj"] = str(float(row["closeadj"]) * 0.99)
+    vendor.urls.clear()
+
+    lake.pull(tmp_path, client(vendor), SESSION)
+
+    adjusted = lake.connect(tmp_path).execute("SELECT closeadj FROM sfp ORDER BY date").fetchall()
+    assert [a for (a,) in adjusted] == [pytest.approx(x) for x in (495.0, 495.0, 500.0)]
+    assert history_requests(vendor).count("SPY") == 2
+
+
+def test_the_partition_cut_applies_to_fund_prices(tmp_path):
+    vendor = seeded(tmp_path, "2026-09-11", "2026-09-14")
+    lake.pull(tmp_path, client(vendor), SESSION)
+
+    files = lake.partition_files(tmp_path, date(2026, 9, 11))
+
+    assert [f.parent.name for f in files if f.parts[-3] == "sfp"] == [
+        "date=2026-09-10",
+        "date=2026-09-11",
+    ]

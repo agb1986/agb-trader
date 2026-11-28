@@ -1,4 +1,4 @@
-"""The Parquet lake: Sharadar's SEP, SF1 and TICKERS tables as Parquet under one directory.
+"""The Parquet lake: Sharadar's SEP, SF1, TICKERS and SFP tables as Parquet under one directory.
 
 The server is the only machine that talks to the vendor. It lands the lake on its data disk,
 and the workstation later copies the same bytes. Each dataset is a directory of partitions,
@@ -7,6 +7,11 @@ one Parquet file each:
     sep/date=YYYY-MM-DD/part.parquet          prices for one session
     sf1/lastupdated=YYYY-MM-DD/part.parquet   fundamentals rows the vendor last changed that day
     tickers/snapshot=YYYY-MM-DD/part.parquet  the tickers table as it stood when pulled
+    sfp/date=YYYY-MM-DD/part.parquet          the fund prices the lake keeps, for one session
+
+SFP holds the tickers in FUND_TICKERS only: SPY, the benchmark the certification's Sharpe gates
+measure excess return over. SEP is equities and carries no index fund. SFP rows have SEP's
+columns, and a pull keeps them on one adjustment basis the way it keeps SEP's.
 
 A partition's file is a function of its rows alone: they are sorted by the dataset's primary
 key and written with fixed options, so landing the same rows twice writes the same bytes. The
@@ -119,6 +124,8 @@ CURSOR_HEADER = "cursor_id"
 CURSOR_PARAM = "qopts.cursor_id"
 # The tables whose tickers the lake keeps. TICKERS also lists the vendor's other tables.
 TICKER_TABLES = ("stocks", "fundamentals")
+# The funds whose prices the lake keeps from SFP: the benchmark, and nothing else.
+FUND_TICKERS = ("SPY",)
 DEFAULT_DIR = Path("/lake")
 FILE = "part.parquet"
 # Where a query that outgrows memory spills. It sits in the lake directory, beside the datasets,
@@ -256,7 +263,19 @@ TICKERS = Dataset(
     # A snapshot is the table as it stood when first pulled.
     existing="keep",
 )
-DATASETS = (SEP, SF1, TICKERS)
+# SFP shares SEP's columns and layout. `api` is the vendor's name for it.
+SFP = Dataset(
+    name="sfp",
+    api="funds",
+    partition="date",
+    key="date",
+    primary_key=("ticker", "date"),
+    sort="ticker.asc,date.asc",
+    types={"ticker": STRING, "date": DATE, "lastupdated": DATE},
+    default=FLOAT,
+    since="date",
+)
+DATASETS = (SEP, SF1, TICKERS, SFP)
 
 
 def parse(dataset: Dataset, data: bytes) -> pa.Table:
@@ -441,14 +460,14 @@ def file_hash(path: Path) -> str:
 
 
 def partition_files(lake: Path, through: date | None = None) -> list[Path]:
-    """The partition files `connect` reads, in path order, with SEP cut to the sessions on or
-    before `through`.
+    """The partition files `connect` reads, in path order, with SEP and SFP cut to the sessions
+    on or before `through`.
 
-    Only SEP is cut. SF1 is partitioned by `lastupdated`, the day the vendor last changed a row,
-    so a figure filed in 1999 sits in whichever partition the vendor most recently stamped it
-    with; cutting SF1 by a date in the past would drop nearly all of history. What keeps a later
-    filing out of an earlier result is the `datekey` gate in the query, not the partition it
-    landed in. The tickers table is a snapshot, and `connect` shows the newest one.
+    Only the price tables are cut. SF1 is partitioned by `lastupdated`, the day the vendor last
+    changed a row, so a figure filed in 1999 sits in whichever partition the vendor most recently
+    stamped it with; cutting SF1 by a date in the past would drop nearly all of history. What
+    keeps a later filing out of an earlier result is the `datekey` gate in the query, not the
+    partition it landed in. The tickers table is a snapshot, and `connect` shows the newest one.
     """
     files: list[Path] = []
     for dataset in DATASETS:
@@ -457,7 +476,7 @@ def partition_files(lake: Path, through: date | None = None) -> list[Path]:
             continue
         if dataset.key is None:
             files.append(landed[-1])
-        elif dataset is SEP and through is not None:
+        elif dataset in (SEP, SFP) and through is not None:
             cutoff = through.isoformat()
             files += [p for p in landed if p.parent.name.partition("=")[2] <= cutoff]
         else:
@@ -613,31 +632,71 @@ def _restated(stored: pa.Table, fetched: pa.Table) -> list[str]:
     return sorted(both.filter(moved).column("ticker").to_pylist())
 
 
-def _history(client: Sharadar, tickers: list[str], through: date) -> pa.Table | None:
-    """The SEP prices of each of `tickers` from SINCE to `through`, all on today's basis."""
+def _history(
+    client: Sharadar, tickers: list[str], through: date, dataset: Dataset = SEP
+) -> pa.Table | None:
+    """The `dataset` prices of each of `tickers` from SINCE to `through`, all on today's basis."""
     if not tickers:
         return None
     return pa.concat_tables(
-        [client.query(SEP, {"ticker": t, "date.gte": SINCE, "date.lte": through}) for t in tickers],
+        [
+            client.query(dataset, {"ticker": t, "date.gte": SINCE, "date.lte": through})
+            for t in tickers
+        ],
         promote_options="default",
     )
 
 
-def restate(lake: Path, history: pa.Table, record: Record = _nothing) -> list[Partition]:
-    """Replace, in each SEP partition the lake holds, the rows of the tickers in `history` with
-    `history`'s rows for that session. A session the lake does not hold is not created."""
+def restate(
+    lake: Path, history: pa.Table, record: Record = _nothing, dataset: Dataset = SEP
+) -> list[Partition]:
+    """Replace, in each `dataset` partition the lake holds, the rows of the tickers in `history`
+    with `history`'s rows for that session. A session the lake does not hold is not created."""
     tickers = pc.unique(history.column("ticker"))
     partitions = []
-    for value, rows in split(history, SEP.key):
-        path = lake / SEP.name / f"{SEP.partition}={value}" / FILE
+    for value, rows in split(history, dataset.key):
+        path = lake / dataset.name / f"{dataset.partition}={value}" / FILE
         if not path.exists():
             continue
         old = pq.read_table(path)
         kept = old.filter(pc.invert(pc.is_in(old.column("ticker"), value_set=tickers)))
         table = pa.concat_tables([kept, rows], promote_options="default")
         table = table.select(old.schema.names)
-        partitions.append(write_partition(lake, SEP, value, table, record))
+        partitions.append(write_partition(lake, dataset, value, table, record))
     return partitions
+
+
+def _funds(
+    lake: Path, client: Sharadar, session: date, held: date | None
+) -> tuple[pa.Table | None, pa.Table | None]:
+    """The SFP rows to land with this pull, and the restated history of a fund whose prices the
+    vendor has rescaled since they landed; each None when there is nothing to land.
+
+    A lake with no SFP partitions has not had its backfill, and is left alone: landing only the
+    last few sessions would look like history and hide the gap. Otherwise the fetch starts on
+    SFP's own last session, the overlap day, and lands the sessions after it up to `held`, the
+    newest session SEP holds, so SFP never runs ahead of SEP. A session the vendor had not yet
+    priced a fund for on an earlier pull is picked up by the next. One it never prices is not an
+    error: the benchmark's return over a month it is missing from is undefined, and the
+    certification says so."""
+    last = _last(lake, SFP, session)
+    if last is None or held is None:
+        return None, None
+    rows = pa.concat_tables(
+        [
+            client.query(SFP, {"ticker": t, "date.gte": last[0], "date.lte": session})
+            for t in FUND_TICKERS
+        ],
+        promote_options="default",
+    )
+    overlap = rows.filter(pc.equal(rows.column(SFP.key), pa.scalar(last[0])))
+    restated = _restated(pq.read_table(last[1]), overlap)
+    days = rows.column(SFP.key)
+    new = rows.filter(
+        pc.and_(pc.greater(days, pa.scalar(last[0])), pc.less_equal(days, pa.scalar(held)))
+    )
+    history = _history(client, restated, last[0], SFP) if restated else None
+    return (new if new.num_rows else None), history
 
 
 def pull(lake: Path, client: Sharadar, session: date, record: Record = _nothing) -> list[Partition]:
@@ -700,6 +759,8 @@ def pull(lake: Path, client: Sharadar, session: date, record: Record = _nothing)
     # next pull's overlap day is then the newest landed session, on the vendor's new basis, and
     # would show no change.
     history = _history(client, restated, previous[0]) if complete and previous else None
+    held = max([day for day, _ in complete], default=previous[0] if previous else None)
+    funds, fund_history = _funds(lake, client, session, held)
     if short is None:
         last_pull = _last(lake, TICKERS, session)
         since = min(session, last_pull[0]) if last_pull else session
@@ -713,6 +774,10 @@ def pull(lake: Path, client: Sharadar, session: date, record: Record = _nothing)
     landed = [p for day, rows in complete for p in land(lake, SEP, rows, day, record)]
     if history is not None:
         landed += restate(lake, history, record)
+    if funds is not None:
+        landed += land(lake, SFP, funds, session, record)
+    if fund_history is not None:
+        landed += restate(lake, fund_history, record, SFP)
     if short is not None:
         raise NotYet(short, landed)
     return [

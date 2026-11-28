@@ -70,7 +70,7 @@ class Market:
         self.end = end
         self.sessions = nyse.NyseCalendar(start, end).sessions(start, end)
         self.random = random.Random(seed)
-        self.rows = {"sep": [], "sf1": [], "tickers": []}
+        self.rows = {"sep": [], "sf1": [], "tickers": [], "sfp": []}
         self.permaticker = 100_000
 
     def name(
@@ -162,14 +162,24 @@ class Market:
             self.name(f"{prefix}{i:02d}", drift=drift, **kwargs)
         return self
 
-    def benchmark(self, *, drift=0.0, noise=0.002):
+    def benchmark(self, *, drift=0.0, noise=0.002, fund=False):
         """The index fund the gates measure excess returns over, as an ETF the universe leaves
         out: priced, never ranked or traded. Its drift is the names' average, so it stands for
-        the market they make up, and a book of the better names beats it."""
-        return self.name(BENCHMARK, drift=drift, noise=noise, category="ETF")
+        the market they make up, and a book of the better names beats it. With `fund`, its bars
+        sit in the lake's fund table, where the vendor keeps them, rather than beside the
+        names'."""
+        self.name(BENCHMARK, drift=drift, noise=noise, category="ETF")
+        if fund:
+            bars = [row for row in self.rows["sep"] if row[0] == BENCHMARK]
+            self.rows["sep"] = [row for row in self.rows["sep"] if row[0] != BENCHMARK]
+            self.rows["sfp"] += bars
+        return self
 
     def land(self):
-        for dataset, schema in ((lake.SEP, _SEP), (lake.SF1, _SF1), (lake.TICKERS, _TICKERS)):
+        datasets = [(lake.SEP, _SEP), (lake.SF1, _SF1), (lake.TICKERS, _TICKERS)]
+        if self.rows["sfp"]:
+            datasets.append((lake.SFP, _SEP))
+        for dataset, schema in datasets:
             rows = self.rows[dataset.name]
             table = pa.Table.from_pylist(
                 [dict(zip(schema.names, row, strict=True)) for row in rows], schema=schema

@@ -697,6 +697,16 @@ class Pipeline:
                 landed += partitions
             ledger = Ledger(conn, snapshot, None)
             landed += lake.land(self.lake_dir, lake.TICKERS, client.tickers(), snapshot, ledger)
+            # The benchmark's prices are small and not in the SEP export, so they come by query.
+            ledger = Ledger(conn, snapshot, None)
+            funds = pa.concat_tables(
+                [
+                    client.query(lake.SFP, {"ticker": t, "date.gte": since})
+                    for t in lake.FUND_TICKERS
+                ],
+                promote_options="default",
+            )
+            landed += lake.land(self.lake_dir, lake.SFP, funds, snapshot, ledger)
         finally:
             shutil.rmtree(work, ignore_errors=True)
         return landed
@@ -712,7 +722,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     commands = parser.add_subparsers(dest="command")
     backfill = commands.add_parser(
-        "backfill", help="land the vendor's full SEP and SF1 history and its tickers, then exit"
+        "backfill",
+        help="land the vendor's full SEP and SF1 history, its tickers and SPY, then exit",
     )
     backfill.add_argument(
         "--since",

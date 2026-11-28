@@ -18,6 +18,10 @@ HEADERS = {
         "ticker", "date", "open", "high", "low", "close", "volume", "closeadj", "closeunadj",
         "lastupdated",
     ],
+    "funds": [
+        "ticker", "date", "open", "high", "low", "close", "volume", "closeadj", "closeunadj",
+        "lastupdated",
+    ],
     "fundamentals": [
         "ticker", "dimension", "calendardate", "date", "reportperiod", "fiscalperiod",
         "lastupdated", "revenue", "netinc", "eps",
@@ -100,6 +104,7 @@ class FakeVendor:
     def __init__(self, stocks=(), fundamentals=(), tickers=(), *, cursors=True):
         self.rows = {
             "stocks": list(stocks),
+            "funds": [],
             "fundamentals": list(fundamentals),
             "tickers": list(tickers),
         }

@@ -768,6 +768,19 @@ def test_a_lake_without_the_benchmark_still_backtests(tmp_path, ledger):
     assert all(month["benchmark"] is None for month in run.results["monthly"])
 
 
+def test_a_lake_with_the_benchmark_in_its_fund_table_marks_it_each_month(tmp_path, ledger):
+    """SPY is not in SEP. The lake keeps it in SFP, and the backtest reads both, so each month
+    has a benchmark return and buy-and-hold has a series."""
+    root = Market(tmp_path / "lake").names(12).benchmark(fund=True).land()
+    panel = panel_module.build(root, PANEL_START, FORCED_END)
+
+    run = backtest.run(panel, backtest.Options(**SMALL), ledger, lake_dir=root)
+
+    assert run.results["after_tax"]["buy_and_hold"] is not None
+    assert run.results["monthly"], "the run traded"
+    assert all(month["benchmark"] is not None for month in run.results["monthly"])
+
+
 def benchmark_close(root, day: date) -> Decimal:
     """The benchmark's adjusted close on one session, at the precision the engine reads it."""
     with lake.connect(root) as conn:
